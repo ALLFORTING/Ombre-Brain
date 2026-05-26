@@ -43,6 +43,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+from datetime import datetime, timedelta
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -485,6 +486,74 @@ async def _merge_or_create(
     return bucket_id, False
 
 
+def _bucket_date(meta: dict, *keys: str) -> str:
+    """Return the first available bucket date as YYYY-MM-DD."""
+    for key in keys:
+        value = meta.get(key)
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(str(value)).date().isoformat()
+        except (ValueError, TypeError):
+            continue
+    return ""
+
+
+def _bucket_topic(meta: dict) -> str:
+    domains = meta.get("domain", []) or meta.get("domains", [])
+    if isinstance(domains, list) and domains:
+        return ",".join(str(d) for d in domains if d)
+    if isinstance(domains, str):
+        return domains
+    return "未分类"
+
+
+def _bucket_emotion(meta: dict) -> str:
+    try:
+        val = float(meta.get("valence", 0.5))
+        aro = float(meta.get("arousal", 0.3))
+    except (ValueError, TypeError):
+        val, aro = 0.5, 0.3
+    return f"V{val:.1f}/A{aro:.1f}"
+
+
+def _bucket_summary_line(bucket: dict, score: float | None = None, pinned: bool = False) -> str:
+    meta = bucket.get("metadata", {})
+    label = meta.get("name", bucket["id"])
+    topic = _bucket_topic(meta)
+    emotion = _bucket_emotion(meta)
+    updated = _bucket_date(meta, "updated_at", "last_active", "created")
+    if pinned:
+        importance = meta.get("importance", "?")
+        return f"📌 [bucket_id:{bucket['id']}] {label} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
+    weight = f"{score:.2f}" if score is not None else "0.00"
+    return f"💭 [bucket_id:{bucket['id']}] {label} | 主题:{topic} | {emotion} | 权重:{weight} | 更新:{updated}"
+
+
+def _dream_summary_line(bucket: dict) -> str:
+    meta = bucket.get("metadata", {})
+    label = meta.get("name", bucket["id"])
+    topic = _bucket_topic(meta)
+    emotion = _bucket_emotion(meta)
+    updated = _bucket_date(meta, "updated_at", "last_active", "created")
+    content = strip_wikilinks(bucket.get("content", "")).replace("\n", " ").strip()
+    one_line = content[:80] + ("…" if len(content) > 80 else "")
+    return f"[{label}] 主题:{topic} | {one_line} | {emotion} | 更新:{updated} | bucket_id:{bucket['id']}"
+
+
+def _recent_cutoff(recent_days: int) -> str | None:
+    if recent_days <= 0:
+        return None
+    return (datetime.now().date() - timedelta(days=recent_days)).isoformat()
+
+
+def _is_recent_bucket(bucket: dict, cutoff: str | None) -> bool:
+    if not cutoff:
+        return True
+    updated = _bucket_date(bucket.get("metadata", {}), "updated_at", "last_active", "created")
+    return bool(updated and updated >= cutoff)
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -503,14 +572,19 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    mode: str = "summary",
+    recent_days: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+    mode = (mode or "summary").strip().lower()
+    if mode not in ("summary", "full"):
+        mode = "summary"
+    recent_cutoff = _recent_cutoff(recent_days)
 
     # --- importance_min mode: bulk fetch by importance threshold ---
-    # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
     if importance_min >= 1:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -525,26 +599,10 @@ async def breath(
         filtered = filtered[:20]
         if not filtered:
             return f"没有重要度 >= {importance_min} 的记忆。"
-        results = []
-        token_used = 0
-        for b in filtered:
-            if token_used >= max_tokens:
-                break
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                t = count_tokens_approx(summary)
-                if token_used + t > max_tokens:
-                    break
-                imp = b["metadata"].get("importance", 0)
-                results.append(f"[importance:{imp}] [bucket_id:{b['id']}] {summary}")
-                token_used += t
-            except Exception as e:
-                logger.warning(f"importance_min dehydrate failed: {e}")
+        results = [_bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))) for b in filtered]
         return "\n---\n".join(results) if results else "没有可以展示的记忆。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
-    # --- 无参数或空query：浮现模式（权重池主动推送）---
     if not query or not query.strip():
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -552,69 +610,32 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
-        # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
-
-        # --- Unresolved buckets: surface top N by weight ---
-        # --- 未解决桶：按权重浮现前 N 条 ---
         unresolved = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and _is_recent_bucket(b, recent_cutoff)
         ]
 
-        logger.info(
-            f"Breath surfacing: {len(all_buckets)} total, "
-            f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved"
-        )
-
-        scored = sorted(
-            unresolved,
-            key=lambda b: decay_engine.calculate_score(b["metadata"]),
-            reverse=True,
-        )
-
-        if scored:
-            top_scores = [(b["metadata"].get("name", b["id"]), decay_engine.calculate_score(b["metadata"])) for b in scored[:5]]
-            logger.info(f"Top unresolved scores: {top_scores}")
-
-        # --- Cold-start detection: never-seen important buckets surface first ---
-        # --- 冷启动检测：从未被访问过且重要度>=8的桶优先插入最前面（最多2个）---
+        logger.info(f"Breath surfacing: {len(all_buckets)} total, {len(pinned_buckets)} pinned, {len(unresolved)} unresolved")
+        scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
         cold_start = [
             b for b in unresolved
             if int(b["metadata"].get("activation_count", 0)) == 0
             and int(b["metadata"].get("importance", 0)) >= 8
         ][:2]
         cold_start_ids = {b["id"] for b in cold_start}
-        # Merge: cold_start first, then scored (excluding duplicates)
         scored_deduped = [b for b in scored if b["id"] not in cold_start_ids]
         scored_with_cold = cold_start + scored_deduped
 
-        # --- Token-budgeted surfacing with diversity + hard cap ---
-        # --- 按 token 预算浮现，带多样性 + 硬上限 ---
-        # Top-1 always surfaces; rest sampled from top-20 for diversity
-        token_budget = max_tokens
-        for r in pinned_results:
-            token_budget -= count_tokens_approx(r)
-
         candidates = list(scored_with_cold)
         if len(candidates) > 1:
-            # Cold-start buckets stay at front; shuffle rest from top-20
             n_cold = len(cold_start)
             non_cold = candidates[n_cold:]
             if len(non_cold) > 1:
@@ -623,26 +644,44 @@ async def breath(
                 random.shuffle(pool)
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
-        # Hard cap: never surface more than max_results buckets
         candidates = candidates[:max_results]
 
+        summary_mode = mode == "summary"
+        pinned_results = []
         dynamic_results = []
-        for b in candidates:
-            if token_budget <= 0:
-                break
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
+        token_budget = max_tokens
+
+        if summary_mode:
+            pinned_results = [_bucket_summary_line(b, pinned=True) for b in pinned_buckets]
+            dynamic_results = [_bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])) for b in candidates]
+        else:
+            for b in pinned_buckets:
+                try:
+                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    line = f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
+                    t = count_tokens_approx(line)
+                    if token_budget - t < 0:
+                        break
+                    pinned_results.append(line)
+                    token_budget -= t
+                except Exception as e:
+                    logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+            for b in candidates:
+                if token_budget <= 0:
                     break
-                # NOTE: no touch() here — surfacing should NOT reset decay timer
-                score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-                token_budget -= summary_tokens
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
-                continue
+                try:
+                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    summary_tokens = count_tokens_approx(summary)
+                    if summary_tokens > token_budget:
+                        break
+                    score = decay_engine.calculate_score(b["metadata"])
+                    dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                    token_budget -= summary_tokens
+                except Exception as e:
+                    logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+                    continue
 
         if not pinned_results and not dynamic_results:
             return "权重池平静，没有需要处理的记忆。"
@@ -1116,6 +1155,8 @@ async def pulse(include_archive: bool = False) -> str:
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
+        created_at = _bucket_date(meta, "created_at", "created")
+        updated_at = _bucket_date(meta, "updated_at", "last_active", "created")
         lines.append(
             f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
             f"bucket_id:{b['id']} "
@@ -1123,6 +1164,8 @@ async def pulse(include_archive: bool = False) -> str:
             f"情感:V{val:.1f}/A{aro:.1f} "
             f"重要:{meta.get('importance', '?')} "
             f"权重:{score:.2f} "
+            f"创建:{created_at} "
+            f"更新:{updated_at} "
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
@@ -1139,8 +1182,8 @@ async def pulse(include_archive: bool = False) -> str:
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+async def dream(detail_ids: str = "") -> str:
+    """做梦——默认返回最近 5 个记忆摘要；detail_ids 指定的桶返回全文。"""
     await decay_engine.ensure_started()
 
     try:
@@ -1157,28 +1200,34 @@ async def dream() -> str:
         and not b["metadata"].get("protected", False)
     ]
 
-    # --- Sort by creation time desc, take top 10 ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:10]
+    # --- Sort by latest update time desc, take top 5 ---
+    candidates.sort(
+        key=lambda b: _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
+        reverse=True,
+    )
+    recent = candidates[:5]
 
     if not recent:
         return "没有需要消化的新记忆。"
 
+    detail_id_set = {part.strip() for part in detail_ids.split(",") if part.strip()}
     parts = []
     for b in recent:
         meta = b["metadata"]
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
-        domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
-        created = meta.get("created", "")
-        parts.append(
-            f"[{meta.get('name', b['id'])}]{resolved_tag} "
-            f"主题:{domains} V{val:.1f}/A{aro:.1f} "
-            f"创建:{created}\n"
-            f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'][:500])}"
-        )
+        if b["id"] in detail_id_set:
+            resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
+            domains = ",".join(meta.get("domain", []))
+            val = meta.get("valence", 0.5)
+            aro = meta.get("arousal", 0.3)
+            updated = _bucket_date(meta, "updated_at", "last_active", "created")
+            parts.append(
+                f"[{meta.get('name', b['id'])}]{resolved_tag} "
+                f"主题:{domains} V{val:.1f}/A{aro:.1f} 更新:{updated}\n"
+                f"ID: {b['id']}\n"
+                f"{strip_wikilinks(b['content'][:500])}"
+            )
+        else:
+            parts.append(_dream_summary_line(b))
 
     header = (
         "=== Dreaming ===\n"
