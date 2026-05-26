@@ -41,16 +41,6 @@ from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
 logger = logging.getLogger("ombre_brain.bucket")
 
 
-def _date_only(value: str | None = None) -> str:
-    """Return YYYY-MM-DD, defaulting to today when parsing fails."""
-    if value:
-        try:
-            return datetime.fromisoformat(str(value)).date().isoformat()
-        except (ValueError, TypeError):
-            pass
-    return datetime.now().date().isoformat()
-
-
 class BucketManager:
     """
     Memory bucket manager — entry point for all bucket CRUD operations.
@@ -145,7 +135,6 @@ class BucketManager:
             importance = 10
 
         # --- Build YAML frontmatter metadata / 构建元数据 ---
-        today = _date_only()
         metadata = {
             "id": bucket_id,
             "name": bucket_name,
@@ -157,8 +146,6 @@ class BucketManager:
             "type": bucket_type,
             "created": now_iso(),
             "last_active": now_iso(),
-            "created_at": today,
-            "updated_at": today,
             "activation_count": 0,
         }
         if pinned:
@@ -298,7 +285,6 @@ class BucketManager:
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
-        post["updated_at"] = _date_only()
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -780,15 +766,9 @@ class BucketManager:
         """
         try:
             post = frontmatter.load(file_path)
-            metadata = dict(post.metadata)
-            metadata.setdefault("created_at", _date_only(metadata.get("created")))
-            metadata.setdefault(
-                "updated_at",
-                _date_only(metadata.get("updated_at") or metadata.get("last_active") or metadata.get("created")),
-            )
             return {
                 "id": post.get("id", Path(file_path).stem),
-                "metadata": metadata,
+                "metadata": dict(post.metadata),
                 "content": post.content,
                 "path": file_path,
             }
