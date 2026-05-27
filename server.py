@@ -64,6 +64,14 @@ config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 
+DISPLAY_ALIASES = {"婷易": "婷"}
+
+
+def _apply_display_aliases(text: str) -> str:
+    for source, target in DISPLAY_ALIASES.items():
+        text = text.replace(source, target)
+    return text
+
 # --- Runtime env vars (port + webhook) / 运行时环境变量 ---
 # OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
 try:
@@ -307,6 +315,7 @@ async def root_redirect(request):
 async def health_check(request):
     from starlette.responses import JSONResponse
     try:
+        await decay_engine.ensure_started()
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
             "status": "ok",
@@ -554,6 +563,76 @@ def _is_recent_bucket(bucket: dict, cutoff: str | None) -> bool:
     return bool(updated and updated >= cutoff)
 
 
+def _parse_csv_ids(value: str) -> list[str]:
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def _parse_emotion_history(raw) -> list[dict]:
+    if isinstance(raw, list):
+        history = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            history = _json_lib.loads(raw)
+        except Exception:
+            history = []
+    else:
+        history = []
+    return [item for item in history if isinstance(item, dict)]
+
+
+def _encode_emotion_history(history: list[dict]) -> str:
+    return _json_lib.dumps(history[-20:], ensure_ascii=False, separators=(",", ":"))
+
+
+def _append_emotion_history(meta: dict, valence: float, arousal: float) -> str:
+    history = _parse_emotion_history(meta.get("emotion_history", ""))
+    history.append({
+        "date": datetime.now().date().isoformat(),
+        "v": round(float(valence), 3),
+        "a": round(float(arousal), 3),
+    })
+    return _encode_emotion_history(history)
+
+
+def _related_ids(meta: dict) -> list[str]:
+    raw = meta.get("related_buckets", "")
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return _parse_csv_ids(str(raw))
+
+
+async def _format_related_line(bucket: dict) -> str:
+    related = _related_ids(bucket.get("metadata", {}))
+    if not related:
+        return ""
+    parts = []
+    for related_id in related:
+        related_bucket = await bucket_mgr.get(related_id)
+        if related_bucket:
+            name = related_bucket.get("metadata", {}).get("name", related_id)
+            parts.append(f"[{related_id}] {name}")
+        else:
+            parts.append(f"[{related_id}]")
+    return "关联: " + ", ".join(parts)
+
+
+async def _with_related_line(text: str, bucket: dict) -> str:
+    related_line = await _format_related_line(bucket)
+    return f"{text}\n{related_line}" if related_line else text
+
+
+async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = False) -> str:
+    lines = [text]
+    if emotion_trend:
+        history = bucket.get("metadata", {}).get("emotion_history", "")
+        if history:
+            lines.append(f"emotion_history: {history}")
+    related_line = await _format_related_line(bucket)
+    if related_line:
+        lines.append(related_line)
+    return "\n".join(lines)
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -574,6 +653,7 @@ async def breath(
     importance_min: int = -1,
     mode: str = "summary",
     recent_days: int = -1,
+    emotion_trend: bool = False,
 ) -> str:
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
     await decay_engine.ensure_started()
@@ -583,6 +663,79 @@ async def breath(
     if mode not in ("summary", "full"):
         mode = "summary"
     recent_cutoff = _recent_cutoff(recent_days)
+
+    # --- Session archive retrieval: archived session buckets are searchable by domain ---
+    if domain.strip().lower() == "session":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
+            sessions = [
+                b for b in all_buckets
+                if "session" in b.get("metadata", {}).get("domain", [])
+                and _is_recent_bucket(b, recent_cutoff)
+            ]
+            if query and query.strip():
+                q = query.strip().lower()
+                sessions = [
+                    b for b in sessions
+                    if q in str(b.get("metadata", {}).get("name", "")).lower()
+                    or q in b.get("content", "").lower()
+                ]
+            sessions.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
+            sessions = sessions[:max_results]
+            if not sessions:
+                return "没有找到对话归档。"
+            results = []
+            for b in sessions:
+                meta = b.get("metadata", {})
+                text = (
+                    f"[session] [bucket_id:{b['id']}] {meta.get('name', b['id'])}\n"
+                    f"{strip_wikilinks(b.get('content', '')[:1200])}"
+                )
+                results.append(await _append_bucket_extras(text, b, emotion_trend))
+            return "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Session archive retrieval failed: {e}")
+            return "读取对话归档失败。"
+
+    # --- Feel retrieval: domain="feel" is a special channel ---
+    if domain.strip().lower() == "feel":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = [
+                b for b in all_buckets
+                if b["metadata"].get("type") == "feel"
+                and _is_recent_bucket(b, recent_cutoff)
+            ]
+            if query and query.strip():
+                q = query.strip().lower()
+                feels = [
+                    b for b in feels
+                    if q in str(b.get("metadata", {}).get("name", "")).lower()
+                    or q in b.get("content", "").lower()
+                    or any(q in str(tag).lower() for tag in b.get("metadata", {}).get("tags", []))
+                ]
+            feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
+            if not feels:
+                return "没有留下过 feel。"
+            results = []
+            for f in feels[:max_results]:
+                meta = f["metadata"]
+                created = _bucket_date(meta, "created_at", "created")
+                updated = _bucket_date(meta, "updated_at", "last_active", "created")
+                entry = (
+                    f"[{created}] [bucket_id:{f['id']}] "
+                    f"name:{meta.get('name', f['id'])} updated_at:{updated} "
+                    f"tags:{','.join(meta.get('tags', []))}\n"
+                    f"{strip_wikilinks(f['content'])}"
+                )
+                entry = await _append_bucket_extras(entry, f, emotion_trend)
+                results.append(entry)
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Feel retrieval failed: {e}")
+            return "读取 feel 失败。"
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     if importance_min >= 1:
@@ -599,7 +752,14 @@ async def breath(
         filtered = filtered[:20]
         if not filtered:
             return f"没有重要度 >= {importance_min} 的记忆。"
-        results = [_bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))) for b in filtered]
+        results = [
+            await _append_bucket_extras(
+                _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))),
+                b,
+                emotion_trend,
+            )
+            for b in filtered
+        ]
         return "\n---\n".join(results) if results else "没有可以展示的记忆。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
@@ -652,8 +812,10 @@ async def breath(
         token_budget = max_tokens
 
         if summary_mode:
-            pinned_results = [_bucket_summary_line(b, pinned=True) for b in pinned_buckets]
-            dynamic_results = [_bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])) for b in candidates]
+            for b in pinned_buckets:
+                pinned_results.append(await _append_bucket_extras(_bucket_summary_line(b, pinned=True), b, emotion_trend))
+            for b in candidates:
+                dynamic_results.append(await _append_bucket_extras(_bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend))
         else:
             for b in pinned_buckets:
                 try:
@@ -663,7 +825,7 @@ async def breath(
                     t = count_tokens_approx(line)
                     if token_budget - t < 0:
                         break
-                    pinned_results.append(line)
+                    pinned_results.append(await _append_bucket_extras(line, b, emotion_trend))
                     token_budget -= t
                 except Exception as e:
                     logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
@@ -677,7 +839,8 @@ async def breath(
                     if summary_tokens > token_budget:
                         break
                     score = decay_engine.calculate_score(b["metadata"])
-                    dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                    line = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                    dynamic_results.append(await _append_bucket_extras(line, b, emotion_trend))
                     token_budget -= summary_tokens
                 except Exception as e:
                     logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
@@ -698,14 +861,26 @@ async def breath(
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            feels = [
+                b for b in all_buckets
+                if b["metadata"].get("type") == "feel"
+                and _is_recent_bucket(b, recent_cutoff)
+            ]
+            feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             if not feels:
                 return "没有留下过 feel。"
             results = []
             for f in feels:
-                created = f["metadata"].get("created", "")
-                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
+                meta = f["metadata"]
+                created = _bucket_date(meta, "created_at", "created")
+                updated = _bucket_date(meta, "updated_at", "last_active", "created")
+                entry = (
+                    f"[{created}] [bucket_id:{f['id']}] "
+                    f"name:{meta.get('name', f['id'])} updated_at:{updated} "
+                    f"tags:{','.join(meta.get('tags', []))}\n"
+                    f"{strip_wikilinks(f['content'])}"
+                )
+                entry = await _append_bucket_extras(entry, f, emotion_trend)
                 results.append(entry)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
@@ -774,6 +949,7 @@ async def breath(
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
+            summary = await _append_bucket_extras(summary, bucket, emotion_trend)
             results.append(summary)
             token_used += summary_tokens
         except Exception as e:
@@ -831,6 +1007,7 @@ async def hold(
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+    content = _apply_display_aliases(content)
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -841,14 +1018,20 @@ async def hold(
         # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        try:
+            feel_analysis = await dehydrator.analyze(content)
+        except Exception as e:
+            logger.warning(f"Feel auto-tagging failed, using defaults: {e}")
+            feel_analysis = {"tags": []}
+        feel_name = strip_wikilinks(content).strip().replace("\n", " ")[:20] or None
         bucket_id = await bucket_mgr.create(
             content=content,
-            tags=[],
+            tags=feel_analysis.get("tags", []),
             importance=5,
             domain=[],
             valence=feel_valence,
             arousal=feel_arousal,
-            name=None,
+            name=feel_name,
             bucket_type="feel",
         )
         try:
@@ -936,6 +1119,7 @@ async def grow(content: str) -> str:
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
+    content = _apply_display_aliases(content)
 
     # --- Short content fast path: skip digest, use hold logic directly ---
     # --- 短内容快速路径：跳过 digest 拆分，直接走 hold 逻辑省一次 API ---
@@ -1027,6 +1211,7 @@ async def trace(
     pinned: int = -1,
     digested: int = -1,
     content: str = "",
+    related: str = "",
     delete: bool = False,
 ) -> str:
     """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
@@ -1069,6 +1254,16 @@ async def trace(
         updates["digested"] = bool(digested)
     if content:
         updates["content"] = content
+    related_ids = _parse_csv_ids(related)
+    if related_ids:
+        current_related = _related_ids(bucket.get("metadata", {}))
+        updates["related_buckets"] = ",".join(dict.fromkeys(current_related + related_ids))
+
+    if "valence" in updates or "arousal" in updates:
+        meta = bucket.get("metadata", {})
+        next_valence = updates.get("valence", meta.get("valence", 0.5))
+        next_arousal = updates.get("arousal", meta.get("arousal", 0.3))
+        updates["emotion_history"] = _append_emotion_history(meta, next_valence, next_arousal)
 
     if not updates:
         return "没有任何字段需要修改。"
@@ -1076,6 +1271,20 @@ async def trace(
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
         return f"修改失败: {bucket_id}"
+
+    if related_ids:
+        for related_id in related_ids:
+            if related_id == bucket_id:
+                continue
+            related_bucket = await bucket_mgr.get(related_id)
+            if not related_bucket:
+                continue
+            current_related = _related_ids(related_bucket.get("metadata", {}))
+            if bucket_id not in current_related:
+                await bucket_mgr.update(
+                    related_id,
+                    related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
+                )
 
     # Re-generate embedding if content changed
     if "content" in updates:
@@ -1103,12 +1312,56 @@ async def trace(
 
 
 # =============================================================
-# Tool 5: pulse — Heartbeat, system status + memory listing
+# Tool 5: archive_session — Archive a conversation summary
+# =============================================================
+@mcp.tool()
+async def archive_session(
+    summary: str,
+    highlights: str = "",
+    mood: str = "",
+) -> str:
+    """Archive the current conversation summary into archive/session."""
+    await decay_engine.ensure_started()
+    if not summary or not summary.strip():
+        return "summary 不能为空。"
+
+    today = datetime.now().date().isoformat()
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    existing = [
+        b for b in all_buckets
+        if "session" in b.get("metadata", {}).get("domain", [])
+        and str(b.get("metadata", {}).get("name", "")).startswith(f"session_{today}_")
+    ]
+    session_name = f"session_{today}_{len(existing) + 1:02d}"
+
+    parts = [f"# {session_name}", "", "## Summary", summary.strip()]
+    if highlights.strip():
+        parts.extend(["", "## Highlights", highlights.strip()])
+    if mood.strip():
+        parts.extend(["", "## Mood", mood.strip()])
+
+    bucket_id = await bucket_mgr.create(
+        content="\n".join(parts),
+        tags=["session", "archive"],
+        importance=5,
+        domain=["session"],
+        valence=0.5,
+        arousal=0.3,
+        bucket_type="dynamic",
+        name=session_name,
+    )
+    await bucket_mgr.archive(bucket_id)
+    return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"
+
+
+# =============================================================
+# Tool 6: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
 async def pulse(include_archive: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。"""
+    await decay_engine.ensure_started()
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:

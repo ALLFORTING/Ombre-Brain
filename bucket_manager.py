@@ -159,6 +159,8 @@ class BucketManager:
             "last_active": now_iso(),
             "created_at": today,
             "updated_at": today,
+            "emotion_history": "[]",
+            "related_buckets": "",
             "activation_count": 0,
         }
         if pinned:
@@ -295,6 +297,10 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "emotion_history" in kwargs:
+            post["emotion_history"] = kwargs["emotion_history"]
+        if "related_buckets" in kwargs:
+            post["related_buckets"] = kwargs["related_buckets"]
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()

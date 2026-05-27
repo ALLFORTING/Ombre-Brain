@@ -190,6 +190,7 @@ class DecayEngine:
         checked = 0
         archived = 0
         auto_resolved = 0
+        compressed = 0
         lowest_score = float("inf")
 
         for bucket in buckets:
@@ -201,6 +202,50 @@ class DecayEngine:
                 continue
 
             checked += 1
+
+            try:
+                score = self.calculate_score(meta)
+            except Exception as e:
+                logger.warning(
+                    f"Score calculation failed for {bucket.get('id', '?')} / "
+                    f"计算得分失败: {e}"
+                )
+                continue
+
+            lowest_score = min(lowest_score, score)
+
+            # --- Compress old, unresolved, low-weight dynamic buckets instead of deleting them. ---
+            if not meta.get("resolved", False):
+                tags = list(meta.get("tags", []) or [])
+                imp = int(meta.get("importance", 5))
+                updated_str = meta.get("updated_at", meta.get("last_active", meta.get("created", "")))
+                try:
+                    updated = datetime.fromisoformat(str(updated_str))
+                    days_since_update = (datetime.now() - updated).total_seconds() / 86400
+                except (ValueError, TypeError):
+                    days_since_update = 999
+                if (
+                    imp < 6
+                    and score < 5.0
+                    and days_since_update > 30
+                    and "compressed" not in tags
+                ):
+                    summary = str(meta.get("summary", "") or "").strip()
+                    compressed_content = summary if summary else f"{bucket.get('content', '')[:100]}..."
+                    try:
+                        await self.bucket_mgr.update(
+                            bucket["id"],
+                            content=compressed_content,
+                            tags=list(dict.fromkeys(tags + ["compressed"])),
+                        )
+                        compressed += 1
+                        logger.info(
+                            f"Decay compressed / 衰减压缩: "
+                            f"{meta.get('name', bucket['id'])} "
+                            f"(score={score:.4f}, days={days_since_update:.0f})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Compression failed / 压缩失败: {e}")
 
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
@@ -225,17 +270,6 @@ class DecayEngine:
                     except Exception as e:
                         logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
 
-            try:
-                score = self.calculate_score(meta)
-            except Exception as e:
-                logger.warning(
-                    f"Score calculation failed for {bucket.get('id', '?')} / "
-                    f"计算得分失败: {e}"
-                )
-                continue
-
-            lowest_score = min(lowest_score, score)
-
             # --- Below threshold → archive (simulate forgetting) ---
             # --- 低于阈值 → 归档（模拟遗忘）---
             if score < self.threshold:
@@ -258,6 +292,7 @@ class DecayEngine:
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
+            "compressed": compressed,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
