@@ -655,6 +655,7 @@ async def breath(
     recent_days: int = -1,
     emotion_trend: bool = False,
 ) -> str:
+    # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
@@ -1214,6 +1215,7 @@ async def trace(
     related: str = "",
     delete: bool = False,
 ) -> str:
+    # MCP schema note: related must stay in the tool signature for bidirectional links.
     """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
@@ -1320,6 +1322,7 @@ async def archive_session(
     highlights: str = "",
     mood: str = "",
 ) -> str:
+    # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session."""
     await decay_engine.ensure_started()
     if not summary or not summary.strip():
