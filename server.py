@@ -1164,8 +1164,8 @@ async def pulse(include_archive: bool = False) -> str:
             f"情感:V{val:.1f}/A{aro:.1f} "
             f"重要:{meta.get('importance', '?')} "
             f"权重:{score:.2f} "
-            f"创建:{created_at} "
-            f"更新:{updated_at} "
+            f"created_at:{created_at} "
+            f"updated_at:{updated_at} "
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
