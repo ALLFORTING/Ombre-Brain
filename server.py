@@ -1427,30 +1427,42 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空。"
 
-    newly_dormant = await _mark_dormant_buckets(buckets)
+    await _mark_dormant_buckets(buckets)
     total_buckets = len(buckets)
+    pinned_buckets = [
+        b for b in buckets
+        if b["metadata"].get("pinned", False)
+        or b["metadata"].get("protected", False)
+    ]
+    pinned_ids = {b["id"] for b in pinned_buckets}
+
+    def pulse_score(bucket: dict) -> float:
+        try:
+            return decay_engine.calculate_score(bucket.get("metadata", {}))
+        except Exception:
+            return 0.0
+
     if show_all:
-        visible_buckets = buckets
+        visible_buckets = sorted(
+            buckets,
+            key=lambda b: (
+                bool(b["metadata"].get("pinned") or b["metadata"].get("protected")),
+                _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
+            ),
+            reverse=True,
+        )
+        dynamic_count = total_buckets - len(pinned_buckets)
     else:
-        recent_cutoff = _recent_cutoff(3)
-        visible_buckets = [
+        dynamic_buckets = [
             b for b in buckets
-            if (
-                b["metadata"].get("pinned", False)
-                or b["metadata"].get("protected", False)
-                or (
-                    not b["metadata"].get("dormant", False)
-                    and _is_recent_bucket(b, recent_cutoff)
-                )
-            )
+            if b["id"] not in pinned_ids
+            and not b["metadata"].get("dormant", False)
         ]
-    visible_buckets.sort(
-        key=lambda b: (
-            bool(b["metadata"].get("pinned") or b["metadata"].get("protected")),
-            _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
-        ),
-        reverse=True,
-    )
+        pinned_buckets.sort(key=pulse_score, reverse=True)
+        dynamic_buckets.sort(key=pulse_score, reverse=True)
+        dynamic_buckets = dynamic_buckets[:15]
+        dynamic_count = len(dynamic_buckets)
+        visible_buckets = pinned_buckets + dynamic_buckets
 
     lines = []
     for b in visible_buckets:
@@ -1489,11 +1501,18 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
-    display_stats = (
-        f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
-        f"（本次新沉底{newly_dormant}个）\n"
-    )
-    return status + display_stats + "=== 记忆列表 ===\n" + "\n".join(lines)
+    if show_all:
+        breakdown = f"钉选{len(pinned_buckets)}个 + 全部非钉选{dynamic_count}个"
+        display_stats = (
+            f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
+            f"（{breakdown}）\n"
+        )
+    else:
+        display_stats = (
+            f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
+            f"（钉选{len(pinned_buckets)}个 + 动态Top15）\n"
+        )
+    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines) + display_stats
 
 
 # =============================================================
