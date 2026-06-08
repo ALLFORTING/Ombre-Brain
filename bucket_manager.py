@@ -161,6 +161,7 @@ class BucketManager:
             "updated_at": today,
             "emotion_history": "[]",
             "related_buckets": "",
+            "dormant": False,
             "activation_count": 0,
         }
         if pinned:
@@ -301,6 +302,8 @@ class BucketManager:
             post["emotion_history"] = kwargs["emotion_history"]
         if "related_buckets" in kwargs:
             post["related_buckets"] = kwargs["related_buckets"]
+        if "dormant" in kwargs:
+            post["dormant"] = bool(kwargs["dormant"])
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
@@ -382,6 +385,7 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
+            post["dormant"] = False
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
@@ -392,6 +396,21 @@ class BucketManager:
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+
+    async def set_dormant(self, bucket_id: str, dormant: bool = True) -> bool:
+        """Set dormant without refreshing last_active or updated_at."""
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return False
+        try:
+            post = frontmatter.load(file_path)
+            post["dormant"] = bool(dormant)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
+            return False
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         """
@@ -463,6 +482,7 @@ class BucketManager:
         domain_filter: list[str] = None,
         query_valence: float = None,
         query_arousal: float = None,
+        include_dormant: bool = False,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -495,6 +515,12 @@ class BucketManager:
         else:
             candidates = all_buckets
 
+        if not include_dormant:
+            candidates = [
+                b for b in candidates
+                if not b.get("metadata", {}).get("dormant", False)
+            ]
+
         # --- Layer 1.5: embedding pre-filter (optional, reduces multi-dim ranking set) ---
         # --- 第1.5层：embedding 预筛（可选，缩小精排候选集）---
         if self.embedding_engine and self.embedding_engine.enabled:
@@ -502,7 +528,14 @@ class BucketManager:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=50)
                 if vector_results:
                     vector_ids = {bid for bid, _ in vector_results}
-                    emb_candidates = [b for b in candidates if b["id"] in vector_ids]
+                    exact_ids = {
+                        b["id"] for b in candidates
+                        if self._calc_exact_match_score(query, b) > 0
+                    }
+                    emb_candidates = [
+                        b for b in candidates
+                        if b["id"] in vector_ids or b["id"] in exact_ids
+                    ]
                     if emb_candidates:  # only replace if there's non-empty overlap
                         candidates = emb_candidates
                     # else: keep original candidates as fallback
@@ -571,26 +604,89 @@ class BucketManager:
         Calculate text dimension relevance score (0~1).
         计算文本维度的相关性得分。
         """
+        exact_score = self._calc_exact_match_score(query, bucket)
+        if exact_score:
+            return exact_score
+
         meta = bucket.get("metadata", {})
-
-        name_score = fuzz.partial_ratio(query, meta.get("name", "")) * 3
-        domain_score = (
-            max(
-                (fuzz.partial_ratio(query, d) for d in meta.get("domain", [])),
-                default=0,
-            )
-            * 2.5
+        query_text = self._normalize_search_text(query)
+        name_score = fuzz.partial_ratio(
+            query_text, self._normalize_search_text(meta.get("name", ""))
+        ) / 100
+        domains = meta.get("domain", [])
+        if isinstance(domains, str):
+            domains = [domains]
+        domain_score = max(
+            (
+                fuzz.partial_ratio(query_text, self._normalize_search_text(domain)) / 100
+                for domain in domains
+            ),
+            default=0,
         )
-        tag_score = (
-            max(
-                (fuzz.partial_ratio(query, tag) for tag in meta.get("tags", [])),
-                default=0,
-            )
-            * 2
+        keyword_score = max(
+            (
+                fuzz.ratio(query_text, self._normalize_search_text(keyword)) / 100
+                for keyword in self._metadata_keywords(meta)
+            ),
+            default=0,
         )
-        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:1000]) * self.content_weight
+        body = " ".join([
+            str(meta.get("summary", "")),
+            str(bucket.get("content", "")[:2000]),
+        ])
+        content_score = fuzz.partial_ratio(
+            query_text, self._normalize_search_text(body)
+        ) / 100
 
-        return (name_score + domain_score + tag_score + content_score) / (100 * (3 + 2.5 + 2 + self.content_weight))
+        fuzzy = (
+            name_score * 0.30
+            + domain_score * 0.20
+            + keyword_score * 0.30
+            + content_score * 0.20
+        )
+        return min(0.69, fuzzy)
+
+    @staticmethod
+    def _normalize_search_text(value) -> str:
+        """Normalize without tokenizing, preserving one-character Chinese names."""
+        return "".join(str(value or "").casefold().split())
+
+    def _metadata_keywords(self, meta: dict) -> list[str]:
+        keywords = meta.get("keywords", [])
+        tags = meta.get("tags", [])
+        if isinstance(keywords, str):
+            keywords = [part.strip() for part in keywords.split(",") if part.strip()]
+        if isinstance(tags, str):
+            tags = [part.strip() for part in tags.split(",") if part.strip()]
+        return [
+            str(item)
+            for item in list(keywords or []) + list(tags or [])
+            if str(item).strip()
+        ]
+
+    def _calc_exact_match_score(self, query: str, bucket: dict) -> float:
+        """Exact keywords rank highest; content/summary matches rank second."""
+        query_text = self._normalize_search_text(query)
+        if not query_text:
+            return 0.0
+        meta = bucket.get("metadata", {})
+        keywords = [
+            self._normalize_search_text(item)
+            for item in self._metadata_keywords(meta)
+        ]
+        if query_text in keywords:
+            return 1.0
+        if any(query_text in keyword for keyword in keywords):
+            return 0.95
+
+        searchable = " ".join([
+            str(meta.get("name", "")),
+            str(meta.get("summary", "")),
+            str(bucket.get("content", "")),
+        ])
+        if query_text in self._normalize_search_text(searchable):
+            return 0.85
+        return 0.0
 
     # ---------------------------------------------------------
     # Emotion resonance sub-score:
@@ -792,6 +888,7 @@ class BucketManager:
                 "updated_at",
                 _date_only(metadata.get("updated_at") or metadata.get("last_active") or metadata.get("created")),
             )
+            metadata.setdefault("dormant", False)
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": metadata,

@@ -341,6 +341,7 @@ async def breath_hook(request):
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
                       and b["metadata"].get("type") not in ("permanent", "feel")
+                      and not b["metadata"].get("dormant", False)
                       and not b["metadata"].get("pinned")
                       and not b["metadata"].get("protected")]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
@@ -370,6 +371,7 @@ async def breath_hook(request):
             if summary_tokens > token_budget:
                 break
             parts.append(summary)
+            await bucket_mgr.touch(b["id"])
             token_budget -= summary_tokens
 
         if not parts:
@@ -395,6 +397,7 @@ async def dream_hook(request):
         candidates = [
             b for b in all_buckets
             if b["metadata"].get("type") not in ("permanent", "feel")
+            and not b["metadata"].get("dormant", False)
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
         ]
@@ -407,6 +410,7 @@ async def dream_hook(request):
         parts = []
         for b in recent:
             meta = b["metadata"]
+            await bucket_mgr.touch(b["id"])
             resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
@@ -563,6 +567,33 @@ def _is_recent_bucket(bucket: dict, cutoff: str | None) -> bool:
     return bool(updated and updated >= cutoff)
 
 
+def _last_access_days(meta: dict) -> float:
+    value = meta.get("last_active") or meta.get("updated_at") or meta.get("created")
+    try:
+        last_access = datetime.fromisoformat(str(value))
+        return max(0.0, (datetime.now() - last_access).total_seconds() / 86400)
+    except (ValueError, TypeError):
+        return 999.0
+
+
+async def _mark_dormant_buckets(buckets: list[dict]) -> int:
+    marked = 0
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        if (
+            meta.get("type", "dynamic") == "dynamic"
+            and not meta.get("pinned", False)
+            and not meta.get("protected", False)
+            and not meta.get("dormant", False)
+            and int(meta.get("importance", 5)) < 3
+            and _last_access_days(meta) > 30
+        ):
+            if await bucket_mgr.set_dormant(bucket["id"], True):
+                meta["dormant"] = True
+                marked += 1
+    return marked
+
+
 def _parse_csv_ids(value: str) -> list[str]:
     return [part.strip() for part in (value or "").split(",") if part.strip()]
 
@@ -649,16 +680,18 @@ async def breath(
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
-    max_results: int = 20,
+    max_results: int = 5,
     importance_min: int = -1,
     mode: str = "summary",
     recent_days: int = -1,
     emotion_trend: bool = False,
+    include_dormant: bool = False,
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
     await decay_engine.ensure_started()
-    max_results = min(max_results, 50)
+    query = _apply_display_aliases(query)
+    max_results = max(1, min(max_results, 50))
     max_tokens = min(max_tokens, 20000)
     mode = (mode or "summary").strip().lower()
     if mode not in ("summary", "full"):
@@ -748,11 +781,15 @@ async def breath(
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
+            and (include_dormant or not b["metadata"].get("dormant", False))
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
-        filtered = filtered[:20]
+        total_filtered = len(filtered)
+        filtered = filtered[:max_results]
         if not filtered:
             return f"没有重要度 >= {importance_min} 的记忆。"
+        for bucket in filtered:
+            await bucket_mgr.touch(bucket["id"])
         results = [
             await _append_bucket_extras(
                 _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))),
@@ -761,7 +798,11 @@ async def breath(
             )
             for b in filtered
         ]
-        return "\n---\n".join(results) if results else "没有可以展示的记忆。"
+        response = "\n---\n".join(results) if results else "没有可以展示的记忆。"
+        hidden_count = max(0, total_filtered - len(filtered))
+        if hidden_count:
+            response += f"\n\n还有{hidden_count}个相关桶未显示"
+        return response
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     if not query or not query.strip():
@@ -781,6 +822,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and (include_dormant or not b["metadata"].get("dormant", False))
             and _is_recent_bucket(b, recent_cutoff)
         ]
 
@@ -806,6 +848,8 @@ async def breath(
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
         candidates = candidates[:max_results]
+        for bucket in candidates:
+            await bucket_mgr.touch(bucket["id"])
 
         summary_mode = mode == "summary"
         pinned_results = []
@@ -899,10 +943,11 @@ async def breath(
     try:
         matches = await bucket_mgr.search(
             query,
-            limit=max(max_results, 20),
+            limit=1000,
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            include_dormant=include_dormant,
         )
     except Exception as e:
         logger.error(f"Search failed / 检索失败: {e}")
@@ -920,13 +965,21 @@ async def breath(
         for bucket_id, sim_score in vector_results:
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
-                if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                    bucket["score"] = round(sim_score * 100, 2)
+                if (
+                    bucket
+                    and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
+                    and (include_dormant or not bucket["metadata"].get("dormant", False))
+                ):
+                    bucket["score"] = round(sim_score * 40, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
                     matched_ids.add(bucket_id)
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+
+    matches.sort(key=lambda b: float(b.get("score", 0)), reverse=True)
+    total_matches = len(matches)
+    matches = matches[:max_results]
 
     results = []
     token_used = 0
@@ -957,33 +1010,14 @@ async def breath(
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
 
-    # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
-    # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
-    if len(matches) < 3 and random.random() < 0.4:
-        try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
-            matched_ids = {b["id"] for b in matches}
-            low_weight = [
-                b for b in all_buckets
-                if b["id"] not in matched_ids
-                and decay_engine.calculate_score(b["metadata"]) < 2.0
-            ]
-            if low_weight:
-                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
-                drift_results = []
-                for b in drifted:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
-        except Exception as e:
-            logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
-
     if not results:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
         return "未找到相关记忆。"
 
     final_text = "\n---\n".join(results)
+    hidden_count = max(0, total_matches - len(matches))
+    if hidden_count:
+        final_text += f"\n\n还有{hidden_count}个相关桶未显示"
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return final_text
 
@@ -1211,6 +1245,7 @@ async def trace(
     resolved: int = -1,
     pinned: int = -1,
     digested: int = -1,
+    dormant: int = -1,
     content: str = "",
     related: str = "",
     delete: bool = False,
@@ -1254,6 +1289,8 @@ async def trace(
             updates["importance"] = 10  # pinned → lock importance
     if digested in (0, 1):
         updates["digested"] = bool(digested)
+    if dormant in (0, 1):
+        updates["dormant"] = bool(dormant)
     if content:
         updates["content"] = content
     related_ids = _parse_csv_ids(related)
@@ -1269,6 +1306,8 @@ async def trace(
 
     if not updates:
         return "没有任何字段需要修改。"
+    if "dormant" not in updates:
+        updates["dormant"] = False
 
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
@@ -1362,7 +1401,7 @@ async def archive_session(
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False) -> str:
+async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。"""
     await decay_engine.ensure_started()
     try:
@@ -1388,8 +1427,33 @@ async def pulse(include_archive: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空。"
 
+    newly_dormant = await _mark_dormant_buckets(buckets)
+    total_buckets = len(buckets)
+    if show_all:
+        visible_buckets = buckets
+    else:
+        recent_cutoff = _recent_cutoff(3)
+        visible_buckets = [
+            b for b in buckets
+            if (
+                b["metadata"].get("pinned", False)
+                or b["metadata"].get("protected", False)
+                or (
+                    not b["metadata"].get("dormant", False)
+                    and _is_recent_bucket(b, recent_cutoff)
+                )
+            )
+        ]
+    visible_buckets.sort(
+        key=lambda b: (
+            bool(b["metadata"].get("pinned") or b["metadata"].get("protected")),
+            _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
+        ),
+        reverse=True,
+    )
+
     lines = []
-    for b in buckets:
+    for b in visible_buckets:
         meta = b.get("metadata", {})
         if meta.get("pinned") or meta.get("protected"):
             icon = "📌"
@@ -1425,7 +1489,11 @@ async def pulse(include_archive: bool = False) -> str:
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    display_stats = (
+        f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
+        f"（本次新沉底{newly_dormant}个）\n"
+    )
+    return status + display_stats + "=== 记忆列表 ===\n" + "\n".join(lines)
 
 
 # =============================================================
@@ -1454,6 +1522,7 @@ async def dream(detail_ids: str = "") -> str:
         if b["metadata"].get("type") not in ("permanent", "feel")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
+        and not b["metadata"].get("dormant", False)
     ]
 
     # --- Sort by latest update time desc, take top 5 ---
@@ -1462,6 +1531,8 @@ async def dream(detail_ids: str = "") -> str:
         reverse=True,
     )
     recent = candidates[:5]
+    for bucket in recent:
+        await bucket_mgr.touch(bucket["id"])
 
     if not recent:
         return "没有需要消化的新记忆。"
