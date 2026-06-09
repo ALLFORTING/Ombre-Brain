@@ -625,6 +625,54 @@ def _append_emotion_history(meta: dict, valence: float, arousal: float) -> str:
     return _encode_emotion_history(history)
 
 
+def _emotion_timeline_path() -> str:
+    return os.path.join(config["buckets_dir"], ".emotion_timeline.json")
+
+
+def _load_emotion_timeline() -> list[dict]:
+    path = _emotion_timeline_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = _json_lib.load(handle)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except (OSError, ValueError, TypeError):
+        pass
+    return []
+
+
+def _record_emotion_snapshot(valence: float, arousal: float, source: str) -> None:
+    if not (0 <= valence <= 1 and 0 <= arousal <= 1):
+        return
+    timeline = _load_emotion_timeline()
+    timeline.append({
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "valence": round(float(valence), 3),
+        "arousal": round(float(arousal), 3),
+        "source": source,
+    })
+    path = _emotion_timeline_path()
+    temp_path = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            _json_lib.dump(timeline, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temp_path, path)
+    except OSError as e:
+        logger.warning(f"Failed to persist emotion timeline: {e}")
+
+
+def _with_emotion_timeline(text: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    timeline = sorted(
+        _load_emotion_timeline(),
+        key=lambda item: str(item.get("timestamp", "")),
+    )
+    payload = _json_lib.dumps(timeline, ensure_ascii=False, separators=(",", ":"))
+    return f"{text}\n\nemotion_history: {payload}"
+
+
 def _related_ids(meta: dict) -> list[str]:
     raw = meta.get("related_buckets", "")
     if isinstance(raw, list):
@@ -654,14 +702,97 @@ async def _with_related_line(text: str, bucket: dict) -> str:
 
 async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = False) -> str:
     lines = [text]
-    if emotion_trend:
-        history = bucket.get("metadata", {}).get("emotion_history", "")
-        if history:
-            lines.append(f"emotion_history: {history}")
     related_line = await _format_related_line(bucket)
     if related_line:
         lines.append(related_line)
     return "\n".join(lines)
+
+
+async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
+    if not source_id or source_id == target_id:
+        return "merge 必须指定另一个有效的 bucket_id。"
+    target = await bucket_mgr.get(target_id)
+    source = await bucket_mgr.get(source_id)
+    if not target:
+        return f"未找到目标记忆桶: {target_id}"
+    if not source:
+        return f"未找到源记忆桶: {source_id}"
+
+    source_meta = source.get("metadata", {})
+    if source_meta.get("pinned") or source_meta.get("protected"):
+        return f"源桶 {source_id} 是钉选/保护桶，不能被合并删除。"
+
+    target_meta = target.get("metadata", {})
+    target_content = target.get("content", "").rstrip()
+    source_content = source.get("content", "").strip()
+    merged_content = (
+        f"{target_content}\n\n{source_content}"
+        if target_content and source_content
+        else target_content or source_content
+    )
+    target_tags = target_meta.get("tags", []) or []
+    source_tags = source_meta.get("tags", []) or []
+    if isinstance(target_tags, str):
+        target_tags = _parse_csv_ids(target_tags)
+    if isinstance(source_tags, str):
+        source_tags = _parse_csv_ids(source_tags)
+    merged_tags = list(dict.fromkeys([*target_tags, *source_tags]))
+    merged_importance = max(
+        int(target_meta.get("importance", 5)),
+        int(source_meta.get("importance", 5)),
+    )
+    merged_valence = (
+        float(target_meta.get("valence", 0.5))
+        + float(source_meta.get("valence", 0.5))
+    ) / 2
+    merged_arousal = (
+        float(target_meta.get("arousal", 0.3))
+        + float(source_meta.get("arousal", 0.3))
+    ) / 2
+
+    updated = await bucket_mgr.update(
+        target_id,
+        content=merged_content,
+        tags=merged_tags,
+        importance=merged_importance,
+        valence=merged_valence,
+        arousal=merged_arousal,
+        dormant=False,
+    )
+    if not updated:
+        return f"合并失败，无法更新目标桶: {target_id}"
+
+    deleted = await bucket_mgr.delete(source_id)
+    if not deleted:
+        return f"目标桶已更新，但源桶删除失败: {source_id}"
+    try:
+        await embedding_engine.generate_and_store(target_id, merged_content)
+        embedding_engine.delete_embedding(source_id)
+    except Exception:
+        pass
+    return (
+        f"已合并 {source_id} → {target_id}: "
+        f"importance={merged_importance}, "
+        f"valence={merged_valence:.3f}, arousal={merged_arousal:.3f}, "
+        f"tags={','.join(str(tag) for tag in merged_tags)}"
+    )
+
+
+def _split_search_results(matches: list[dict], max_results: int) -> tuple[list[dict], list[dict], int]:
+    """Return all pinned matches plus a separately limited non-pinned result set."""
+    pinned = [
+        bucket for bucket in matches
+        if bucket.get("metadata", {}).get("pinned")
+        or bucket.get("metadata", {}).get("protected")
+    ]
+    regular = [
+        bucket for bucket in matches
+        if bucket not in pinned
+    ]
+    pinned.sort(key=lambda bucket: float(bucket.get("score", 0)), reverse=True)
+    regular.sort(key=lambda bucket: float(bucket.get("score", 0)), reverse=True)
+    hidden_count = max(0, len(regular) - max_results)
+    return pinned, regular[:max_results], hidden_count
 
 
 # =============================================================
@@ -717,7 +848,7 @@ async def breath(
             sessions.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             sessions = sessions[:max_results]
             if not sessions:
-                return "没有找到对话归档。"
+                return _with_emotion_timeline("没有找到对话归档。", emotion_trend)
             results = []
             for b in sessions:
                 meta = b.get("metadata", {})
@@ -726,7 +857,7 @@ async def breath(
                     f"{strip_wikilinks(b.get('content', '')[:1200])}"
                 )
                 results.append(await _append_bucket_extras(text, b, emotion_trend))
-            return "\n---\n".join(results)
+            return _with_emotion_timeline("\n---\n".join(results), emotion_trend)
         except Exception as e:
             logger.error(f"Session archive retrieval failed: {e}")
             return "读取对话归档失败。"
@@ -750,7 +881,7 @@ async def breath(
                 ]
             feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             if not feels:
-                return "没有留下过 feel。"
+                return _with_emotion_timeline("没有留下过 feel。", emotion_trend)
             results = []
             for f in feels[:max_results]:
                 meta = f["metadata"]
@@ -766,7 +897,10 @@ async def breath(
                 results.append(entry)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            return _with_emotion_timeline(
+                "=== 你留下的 feel ===\n" + "\n---\n".join(results),
+                emotion_trend,
+            )
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
@@ -787,7 +921,10 @@ async def breath(
         total_filtered = len(filtered)
         filtered = filtered[:max_results]
         if not filtered:
-            return f"没有重要度 >= {importance_min} 的记忆。"
+            return _with_emotion_timeline(
+                f"没有重要度 >= {importance_min} 的记忆。",
+                emotion_trend,
+            )
         for bucket in filtered:
             await bucket_mgr.touch(bucket["id"])
         results = [
@@ -802,7 +939,7 @@ async def breath(
         hidden_count = max(0, total_filtered - len(filtered))
         if hidden_count:
             response += f"\n\n还有{hidden_count}个相关桶未显示"
-        return response
+        return _with_emotion_timeline(response, emotion_trend)
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     if not query or not query.strip():
@@ -892,14 +1029,17 @@ async def breath(
                     continue
 
         if not pinned_results and not dynamic_results:
-            return "权重池平静，没有需要处理的记忆。"
+            return _with_emotion_timeline(
+                "权重池平静，没有需要处理的记忆。",
+                emotion_trend,
+            )
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
-        return "\n\n".join(parts)
+        return _with_emotion_timeline("\n\n".join(parts), emotion_trend)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
     # --- Feel 检索：domain="feel" 是独立入口 ---
@@ -913,7 +1053,7 @@ async def breath(
             ]
             feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             if not feels:
-                return "没有留下过 feel。"
+                return _with_emotion_timeline("没有留下过 feel。", emotion_trend)
             results = []
             for f in feels:
                 meta = f["metadata"]
@@ -929,7 +1069,10 @@ async def breath(
                 results.append(entry)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            return _with_emotion_timeline(
+                "=== 你留下的 feel ===\n" + "\n---\n".join(results),
+                emotion_trend,
+            )
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
@@ -953,23 +1096,29 @@ async def breath(
         logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
-    # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
-    matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected"))]
+    matched_ids = {b["id"] for b in matches}
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        for bucket in all_buckets:
+            meta = bucket.get("metadata", {})
+            if (
+                bucket["id"] not in matched_ids
+                and (meta.get("pinned") or meta.get("protected"))
+            ):
+                bucket["score"] = 999.0
+                matches.append(bucket)
+                matched_ids.add(bucket["id"])
+    except Exception as e:
+        logger.warning(f"Failed to add pinned search results: {e}")
 
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
-    matched_ids = {b["id"] for b in matches}
     try:
         vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
         for bucket_id, sim_score in vector_results:
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
-                if (
-                    bucket
-                    and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
-                    and (include_dormant or not bucket["metadata"].get("dormant", False))
-                ):
+                if bucket and (include_dormant or not bucket["metadata"].get("dormant", False)):
                     bucket["score"] = round(sim_score * 40, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
@@ -977,12 +1126,18 @@ async def breath(
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
 
-    matches.sort(key=lambda b: float(b.get("score", 0)), reverse=True)
-    total_matches = len(matches)
-    matches = matches[:max_results]
+    pinned_matches, matches, hidden_count = _split_search_results(matches, max_results)
 
     results = []
     token_used = 0
+    for bucket in pinned_matches:
+        line = await _append_bucket_extras(
+            _bucket_summary_line(bucket, pinned=True),
+            bucket,
+            emotion_trend,
+        )
+        results.append(line)
+
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -1012,14 +1167,13 @@ async def breath(
 
     if not results:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
-        return "未找到相关记忆。"
+        return _with_emotion_timeline("未找到相关记忆。", emotion_trend)
 
     final_text = "\n---\n".join(results)
-    hidden_count = max(0, total_matches - len(matches))
     if hidden_count:
         final_text += f"\n\n还有{hidden_count}个相关桶未显示"
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
-    return final_text
+    return _with_emotion_timeline(final_text, emotion_trend)
 
 
 # =============================================================
@@ -1043,6 +1197,7 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
     content = _apply_display_aliases(content)
+    should_record_emotion = 0 <= valence <= 1 and 0 <= arousal <= 1
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -1069,6 +1224,8 @@ async def hold(
             name=feel_name,
             bucket_type="feel",
         )
+        if should_record_emotion:
+            _record_emotion_snapshot(valence, arousal, "hold")
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
@@ -1122,6 +1279,8 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
         )
+        if should_record_emotion:
+            _record_emotion_snapshot(valence, arousal, "hold")
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
@@ -1138,6 +1297,8 @@ async def hold(
         arousal=final_arousal,
         name=suggested_name,
     )
+    if should_record_emotion:
+        _record_emotion_snapshot(valence, arousal, "hold")
 
     action = "合并→" if is_merged else "新建→"
     return f"{action}{result_name} {','.join(domain)}"
@@ -1248,6 +1409,7 @@ async def trace(
     dormant: int = -1,
     content: str = "",
     related: str = "",
+    merge: str = "",
     delete: bool = False,
 ) -> str:
     # MCP schema note: related must stay in the tool signature for bidirectional links.
@@ -1255,6 +1417,40 @@ async def trace(
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    bucket_ids = list(dict.fromkeys(_parse_csv_ids(bucket_id)))
+    if not bucket_ids:
+        return "请提供有效的 bucket_id。"
+    if len(bucket_ids) > 1:
+        if merge:
+            return "批量 trace 不能与 merge 同时使用。"
+        results = []
+        for current_id in bucket_ids:
+            result = await trace(
+                bucket_id=current_id,
+                name="",
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                importance=importance,
+                tags=tags,
+                resolved=resolved,
+                pinned=pinned,
+                digested=digested,
+                dormant=dormant,
+                content="",
+                related=related,
+                merge="",
+                delete=delete,
+            )
+            results.append(f"[{current_id}] {result}")
+        return "\n".join(results)
+    bucket_id = bucket_ids[0]
+
+    if merge and delete:
+        return "merge 不能与 delete 同时使用。"
+    if merge:
+        return await _merge_bucket_into_target(bucket_id, merge.strip())
 
     # --- Delete mode / 删除模式 ---
     if delete:
@@ -1360,6 +1556,8 @@ async def archive_session(
     summary: str,
     highlights: str = "",
     mood: str = "",
+    valence: float = -1,
+    arousal: float = -1,
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session."""
@@ -1382,17 +1580,22 @@ async def archive_session(
     if mood.strip():
         parts.extend(["", "## Mood", mood.strip()])
 
+    archive_valence = valence if 0 <= valence <= 1 else 0.5
+    archive_arousal = arousal if 0 <= arousal <= 1 else 0.3
+
     bucket_id = await bucket_mgr.create(
         content="\n".join(parts),
         tags=["session", "archive"],
         importance=5,
         domain=["session"],
-        valence=0.5,
-        arousal=0.3,
+        valence=archive_valence,
+        arousal=archive_arousal,
         bucket_type="dynamic",
         name=session_name,
     )
     await bucket_mgr.archive(bucket_id)
+    if 0 <= valence <= 1 and 0 <= arousal <= 1:
+        _record_emotion_snapshot(valence, arousal, "archive")
     return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"
 
 

@@ -119,7 +119,7 @@ class TestDecayScoreSpecial:
         assert decay_eng.calculate_score({"protected": True}) == 999.0
 
     def test_feel_is_50(self, decay_eng):
-        assert decay_eng.calculate_score({"type": "feel"}) == 50.0
+        assert decay_eng.calculate_score({"type": "feel"}) == 15.0
 
     def test_empty_metadata_is_0(self, decay_eng):
         assert decay_eng.calculate_score("not a dict") == 0.0

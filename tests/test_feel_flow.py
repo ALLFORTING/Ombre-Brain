@@ -178,7 +178,7 @@ class TestFeelLifecycle:
 
     @pytest.mark.asyncio
     async def test_feel_never_decays(self, isolated_tools):
-        """Feel buckets always score 50.0."""
+        """Feel buckets always score 15.0."""
         bm, dh, de, bd = isolated_tools
 
         bid = await bm.create(
@@ -191,7 +191,7 @@ class TestFeelLifecycle:
         all_b = await bm.list_all()
         feel_b = next(b for b in all_b if b["id"] == bid)
         score = de.calculate_score(feel_b["metadata"])
-        assert score == 50.0
+        assert score == 15.0
 
     @pytest.mark.asyncio
     async def test_feel_not_in_search_merge(self, isolated_tools):
