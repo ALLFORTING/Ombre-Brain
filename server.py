@@ -44,6 +44,9 @@ import time
 import json as _json_lib
 import httpx
 from datetime import datetime, timedelta
+from typing import Union
+from typing_extensions import Annotated, Literal
+from pydantic import Field
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -1556,8 +1559,14 @@ async def archive_session(
     summary: str,
     highlights: str = "",
     mood: str = "",
-    valence: float = -1,
-    arousal: float = -1,
+    valence: Union[
+        Literal[-1],
+        Annotated[float, Field(ge=0, le=1, description="情绪效价，范围 0-1")],
+    ] = -1,
+    arousal: Union[
+        Literal[-1],
+        Annotated[float, Field(ge=0, le=1, description="情绪唤醒度，范围 0-1")],
+    ] = -1,
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session."""
