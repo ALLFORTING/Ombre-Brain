@@ -1,0 +1,28 @@
+name: Kick tested patch application
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dispatch verified patch workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run apply-tested-backup.yml --ref main
+      - name: Remove one-time scheduler
+        run: |
+          rm .github/workflows/kick-apply.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add --all
+          git commit -m "chore: remove backup patch scheduler"
+          git push
