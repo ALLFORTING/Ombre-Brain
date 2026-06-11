@@ -4,29 +4,29 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
-  issues:
-    types: [opened]
+  create:
 
 permissions:
   actions: write
   contents: write
-  issues: write
 
 jobs:
   dispatch:
-    if: github.event_name != 'issues' || github.event.issue.title == '[automation] apply tested backup patch'
+    if: github.event_name != 'create' || github.event.ref == 'trigger-backup-patch-20260611'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - name: Dispatch verified patch workflow
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run apply-tested-backup.yml --ref main
-      - name: Close trigger issue
-        if: github.event_name == 'issues'
+      - name: Remove trigger branch
+        if: github.event_name == 'create'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue close "${{ github.event.issue.number }}" --comment "Verified patch workflow dispatched."
+        run: gh api --method DELETE repos/${{ github.repository }}/git/refs/heads/trigger-backup-patch-20260611
       - name: Remove one-time scheduler
         run: |
           rm .github/workflows/kick-apply.yml
