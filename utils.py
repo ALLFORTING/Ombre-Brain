@@ -120,7 +120,12 @@ def load_config(config_path: str = None) -> dict:
 
     env_embed_api_key = os.environ.get("OMBRE_EMBEDDING_API_KEY", "")
     if env_embed_api_key:
-        config.setdefault("embedding", {})["api_key"] = env_embed_api_key
+        embedding_config = config.setdefault("embedding", {})
+        embedding_config["api_key"] = env_embed_api_key
+        if not env_embed_model:
+            embedding_config["model"] = "BAAI/bge-m3"
+        if not env_embed_base_url:
+            embedding_config["base_url"] = "https://api.siliconflow.cn/v1"
     if env_embed_api_key or env_embed_model or env_embed_base_url:
         config.setdefault("embedding", {})["independent"] = True
 
