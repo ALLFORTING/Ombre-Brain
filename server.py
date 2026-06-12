@@ -621,6 +621,33 @@ def _parse_csv_ids(value: str) -> list[str]:
     return [part.strip() for part in (value or "").split(",") if part.strip()]
 
 
+def _normalize_todos(raw) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    if isinstance(raw, dict):
+        return [
+            f"{key}: {value}".strip()
+            for key, value in raw.items()
+            if str(value).strip()
+        ]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = _json_lib.loads(text)
+        except (ValueError, TypeError):
+            parsed = None
+        if parsed is not None and parsed != raw:
+            return _normalize_todos(parsed)
+        return [
+            line.strip().lstrip("-* ").strip()
+            for line in text.replace(",", "\n").splitlines()
+            if line.strip().lstrip("-* ").strip()
+        ]
+    return [str(raw).strip()] if raw is not None and str(raw).strip() else []
+
+
 def _parse_emotion_history(raw) -> list[dict]:
     if isinstance(raw, list):
         history = raw
@@ -1625,6 +1652,38 @@ async def archive_session(
 # Tool 6: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
+@mcp.tool()
+async def todos() -> str:
+    """Return todos from every unresolved bucket, grouped by bucket."""
+    await decay_engine.ensure_started()
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+    except Exception as exc:
+        logger.error("Failed to list buckets for todos: %s", exc)
+        return "待办汇总暂时无法读取。"
+
+    groups = []
+    for bucket in all_buckets:
+        meta = bucket.get("metadata", {})
+        if meta.get("resolved", False):
+            continue
+        items = _normalize_todos(meta.get("todos"))
+        if not items:
+            continue
+        name = meta.get("name", bucket["id"])
+        importance = meta.get("importance", "?")
+        lines = [
+            f"[bucket_id:{bucket['id']}] {name} | 重要度:{importance}",
+            *(f"- {item}" for item in items),
+        ]
+        groups.append((int(meta.get("importance", 0) or 0), "\n".join(lines)))
+
+    if not groups:
+        return "当前没有未完成待办。"
+    groups.sort(key=lambda item: item[0], reverse=True)
+    return "\n---\n".join(text for _, text in groups)
+
+
 @mcp.tool()
 async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。"""
