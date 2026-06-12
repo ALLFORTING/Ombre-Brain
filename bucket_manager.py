@@ -36,7 +36,15 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import (
+    DISPLAY_ALIASES,
+    apply_display_aliases,
+    apply_display_aliases_to_value,
+    generate_bucket_id,
+    sanitize_name,
+    safe_path,
+    now_iso,
+)
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -130,13 +138,16 @@ class BucketManager:
         pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
         """
         bucket_id = generate_bucket_id()
+        content = apply_display_aliases(content)
+        name = apply_display_aliases(name) if name else name
+        tags = apply_display_aliases_to_value(tags or [])
+        domain = apply_display_aliases_to_value(domain) if domain else domain
         bucket_name = sanitize_name(name) if name else bucket_id
         # feel buckets are allowed to have empty domain; others default to ["未分类"]
         if bucket_type == "feel":
             domain = domain if domain is not None else []
         else:
             domain = domain or ["未分类"]
-        tags = tags or []
         linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
 
         # --- Pinned/protected buckets: lock importance to 10 ---
@@ -280,18 +291,22 @@ class BucketManager:
 
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
+            kwargs["content"] = apply_display_aliases(kwargs["content"])
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
+            kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
             post["tags"] = kwargs["tags"]
         if "importance" in kwargs:
             post["importance"] = max(1, min(10, int(kwargs["importance"])))
         if "domain" in kwargs:
+            kwargs["domain"] = apply_display_aliases_to_value(kwargs["domain"])
             post["domain"] = kwargs["domain"]
         if "valence" in kwargs:
             post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
         if "arousal" in kwargs:
             post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
         if "name" in kwargs:
+            kwargs["name"] = apply_display_aliases(kwargs["name"])
             post["name"] = sanitize_name(kwargs["name"])
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
@@ -911,6 +926,14 @@ class BucketManager:
         try:
             post = frontmatter.load(file_path)
             metadata = dict(post.metadata)
+            if "name" in metadata:
+                metadata["name"] = apply_display_aliases(metadata["name"])
+            if "tags" in metadata:
+                metadata["tags"] = apply_display_aliases_to_value(metadata["tags"])
+            if "summary" in metadata:
+                metadata["summary"] = apply_display_aliases_to_value(
+                    metadata["summary"]
+                )
             metadata.setdefault("created_at", _date_only(metadata.get("created")))
             metadata.setdefault(
                 "updated_at",
@@ -920,7 +943,7 @@ class BucketManager:
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": metadata,
-                "content": post.content,
+                "content": apply_display_aliases(post.content),
                 "path": file_path,
             }
         except Exception as e:
@@ -928,3 +951,117 @@ class BucketManager:
                 f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
             )
             return None
+
+    async def clean_display_aliases(self) -> dict:
+        """Persist display aliases across all bucket files without changing dates."""
+        changed = []
+        scanned = 0
+        replacements = 0
+        for base_dir in (
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.archive_dir,
+            self.feel_dir,
+        ):
+            if not os.path.exists(base_dir):
+                continue
+            for root, _, files in os.walk(base_dir):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    scanned += 1
+                    path = os.path.join(root, filename)
+                    try:
+                        post = frontmatter.load(path)
+                    except Exception as exc:
+                        logger.warning("Alias cleanup could not read %s: %s", path, exc)
+                        continue
+
+                    original_content = post.content
+                    original_name = post.get("name")
+                    original_tags = post.get("tags")
+                    post.content = apply_display_aliases(post.content)
+                    if original_name is not None:
+                        post["name"] = apply_display_aliases(original_name)
+                    if original_tags is not None:
+                        post["tags"] = apply_display_aliases_to_value(original_tags)
+
+                    before = (
+                        str(original_content)
+                        + str(original_name or "")
+                        + str(original_tags or "")
+                    )
+                    after = (
+                        str(post.content)
+                        + str(post.get("name", ""))
+                        + str(post.get("tags", ""))
+                    )
+                    file_replacements = sum(
+                        before.count(source) for source in DISPLAY_ALIASES
+                    )
+                    if before == after:
+                        continue
+
+                    temp_path = f"{path}.alias-clean.tmp"
+                    try:
+                        with open(temp_path, "w", encoding="utf-8") as handle:
+                            handle.write(frontmatter.dumps(post))
+                        os.replace(temp_path, path)
+                    except OSError as exc:
+                        logger.error("Alias cleanup could not write %s: %s", path, exc)
+                        try:
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                        except OSError:
+                            pass
+                        continue
+
+                    bucket_id = str(post.get("id", Path(path).stem))
+                    replacements += file_replacements
+                    changed.append({
+                        "id": bucket_id,
+                        "name": str(post.get("name", bucket_id)),
+                        "replacements": file_replacements,
+                    })
+                    if (
+                        original_content != post.content
+                        and self.embedding_engine
+                        and self.embedding_engine.enabled
+                    ):
+                        await self.embedding_engine.generate_and_store(
+                            bucket_id,
+                            post.content,
+                        )
+
+        remaining = 0
+        for base_dir in (
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.archive_dir,
+            self.feel_dir,
+        ):
+            if not os.path.exists(base_dir):
+                continue
+            for root, _, files in os.walk(base_dir):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    try:
+                        post = frontmatter.load(os.path.join(root, filename))
+                    except Exception:
+                        continue
+                    searchable = (
+                        str(post.content)
+                        + str(post.get("name", ""))
+                        + str(post.get("tags", ""))
+                    )
+                    remaining += sum(
+                        searchable.count(source) for source in DISPLAY_ALIASES
+                    )
+        return {
+            "scanned": scanned,
+            "changed_count": len(changed),
+            "replacements": replacements,
+            "remaining": remaining,
+            "changed": changed,
+        }

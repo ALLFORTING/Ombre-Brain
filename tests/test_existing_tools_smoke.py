@@ -72,4 +72,5 @@ async def test_all_existing_tools_still_run_in_isolated_storage(tmp_path, monkey
         assert result
     assert callable(backup_entry.backup_export_endpoint)
     assert callable(backup_entry.embeddings_backfill_endpoint)
+    assert callable(backup_entry.aliases_clean_endpoint)
     assert sum(bucket_id in limited_search for bucket_id in regular_ids) == 2

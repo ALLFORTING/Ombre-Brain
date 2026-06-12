@@ -86,6 +86,31 @@ async def embeddings_backfill_endpoint(request):
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
+@server.mcp.custom_route("/api/aliases/clean", methods=["POST"])
+async def aliases_clean_endpoint(request):
+    from starlette.responses import JSONResponse
+
+    try:
+        claims = await _authenticated_claims(request)
+    except Exception as exc:
+        logger.warning("Rejected alias cleanup request: %s", exc)
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    try:
+        result = await server.bucket_mgr.clean_display_aliases()
+    except Exception as exc:
+        logger.exception("Alias cleanup failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    logger.info(
+        "Alias cleanup completed for %s run %s: %s",
+        claims.get("repository"),
+        claims.get("run_id"),
+        result,
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 def run() -> None:
     transport = server.config.get("transport", "stdio")
     logger.info("Ombre Brain starting with backup export | transport: %s", transport)

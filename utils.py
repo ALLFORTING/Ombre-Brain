@@ -18,6 +18,31 @@ from pathlib import Path
 from datetime import datetime
 
 
+DISPLAY_ALIASES = {"婷易": "婷"}
+
+
+def apply_display_aliases(value: str) -> str:
+    text = str(value)
+    for source, target in DISPLAY_ALIASES.items():
+        text = text.replace(source, target)
+    return text
+
+
+def apply_display_aliases_to_value(value):
+    if isinstance(value, str):
+        return apply_display_aliases(value)
+    if isinstance(value, list):
+        return [apply_display_aliases_to_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(apply_display_aliases_to_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: apply_display_aliases_to_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration file.

@@ -74,6 +74,16 @@ def test_oidc_claims_only_allow_expected_private_backup_workflow():
         },
         "ALLFORTING/ob-backup",
     )
+    _validate_claims(
+        {
+            **claims,
+            "workflow_ref": (
+                "ALLFORTING/ob-backup/.github/workflows/"
+                "alias-clean.yml@refs/heads/main"
+            ),
+        },
+        "ALLFORTING/ob-backup",
+    )
 
     for key, invalid_value in [
         ("repository", "someone/else"),

@@ -21,6 +21,7 @@ OIDC_AUDIENCE = "ombre-brain-backup"
 DEFAULT_BACKUP_REPOSITORY = "ALLFORTING/ob-backup"
 BACKUP_WORKFLOW_PATH = ".github/workflows/backup.yml"
 BACKFILL_WORKFLOW_PATH = ".github/workflows/backfill.yml"
+ALIAS_CLEAN_WORKFLOW_PATH = ".github/workflows/alias-clean.yml"
 
 _jwk_client = PyJWKClient(OIDC_JWKS_URL, cache_keys=True)
 _EXCLUDED_NAMES = {
@@ -97,7 +98,11 @@ def backup_payload_json(buckets_dir: str) -> str:
 def _validate_claims(claims: dict[str, Any], allowed_repository: str) -> None:
     expected_workflow_refs = {
         f"{allowed_repository}/{path}@refs/heads/main"
-        for path in (BACKUP_WORKFLOW_PATH, BACKFILL_WORKFLOW_PATH)
+        for path in (
+            BACKUP_WORKFLOW_PATH,
+            BACKFILL_WORKFLOW_PATH,
+            ALIAS_CLEAN_WORKFLOW_PATH,
+        )
     }
     if claims.get("repository") != allowed_repository:
         raise ValueError("Unexpected GitHub repository")

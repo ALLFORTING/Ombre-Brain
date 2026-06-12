@@ -60,20 +60,22 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import (
+    DISPLAY_ALIASES,
+    apply_display_aliases,
+    load_config,
+    setup_logging,
+    strip_wikilinks,
+    count_tokens_approx,
+)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 
-DISPLAY_ALIASES = {"婷易": "婷"}
-
-
 def _apply_display_aliases(text: str) -> str:
-    for source, target in DISPLAY_ALIASES.items():
-        text = text.replace(source, target)
-    return text
+    return apply_display_aliases(text)
 
 # --- Runtime env vars (port + webhook) / 运行时环境变量 ---
 # OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
