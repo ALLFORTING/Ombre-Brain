@@ -20,6 +20,7 @@ OIDC_JWKS_URL = f"{OIDC_ISSUER}/.well-known/jwks"
 OIDC_AUDIENCE = "ombre-brain-backup"
 DEFAULT_BACKUP_REPOSITORY = "ALLFORTING/ob-backup"
 BACKUP_WORKFLOW_PATH = ".github/workflows/backup.yml"
+BACKFILL_WORKFLOW_PATH = ".github/workflows/backfill.yml"
 
 _jwk_client = PyJWKClient(OIDC_JWKS_URL, cache_keys=True)
 _EXCLUDED_NAMES = {
@@ -94,14 +95,15 @@ def backup_payload_json(buckets_dir: str) -> str:
 
 
 def _validate_claims(claims: dict[str, Any], allowed_repository: str) -> None:
-    expected_workflow_ref = (
-        f"{allowed_repository}/{BACKUP_WORKFLOW_PATH}@refs/heads/main"
-    )
+    expected_workflow_refs = {
+        f"{allowed_repository}/{path}@refs/heads/main"
+        for path in (BACKUP_WORKFLOW_PATH, BACKFILL_WORKFLOW_PATH)
+    }
     if claims.get("repository") != allowed_repository:
         raise ValueError("Unexpected GitHub repository")
     if claims.get("ref") != "refs/heads/main":
         raise ValueError("Backup workflow must run from main")
-    if claims.get("workflow_ref") != expected_workflow_ref:
+    if claims.get("workflow_ref") not in expected_workflow_refs:
         raise ValueError("Unexpected GitHub workflow")
     if claims.get("event_name") not in {"schedule", "workflow_dispatch"}:
         raise ValueError("Unsupported GitHub Actions event")

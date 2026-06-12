@@ -7,24 +7,29 @@ import threading
 import httpx
 
 import server
+from backfill_embeddings import backfill_batch
 from backup_export import backup_payload_json, verify_github_oidc
 
 
 logger = logging.getLogger("ombre_brain.backup")
 
 
-@server.mcp.custom_route("/api/backup/export", methods=["GET"])
-async def backup_export_endpoint(request):
-    from starlette.responses import JSONResponse, Response
-
+async def _authenticated_claims(request):
     authorization = request.headers.get("authorization", "")
     token = (
         authorization[7:].strip()
         if authorization.lower().startswith("bearer ")
         else ""
     )
+    return await verify_github_oidc(token)
+
+
+@server.mcp.custom_route("/api/backup/export", methods=["GET"])
+async def backup_export_endpoint(request):
+    from starlette.responses import JSONResponse, Response
+
     try:
-        claims = await verify_github_oidc(token)
+        claims = await _authenticated_claims(request)
     except Exception as exc:
         logger.warning("Rejected backup export request: %s", exc)
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -48,6 +53,37 @@ async def backup_export_endpoint(request):
         media_type="application/json",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@server.mcp.custom_route("/api/embeddings/backfill", methods=["POST"])
+async def embeddings_backfill_endpoint(request):
+    from starlette.responses import JSONResponse
+
+    try:
+        claims = await _authenticated_claims(request)
+    except Exception as exc:
+        logger.warning("Rejected embedding backfill request: %s", exc)
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+        limit = int(body.get("limit", 20)) if isinstance(body, dict) else 20
+        result = await backfill_batch(
+            server.bucket_mgr,
+            server.embedding_engine,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.exception("Embedding backfill failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    logger.info(
+        "Embedding backfill completed for %s run %s: %s",
+        claims.get("repository"),
+        claims.get("run_id"),
+        result,
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 def run() -> None:

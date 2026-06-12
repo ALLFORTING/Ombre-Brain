@@ -12,11 +12,60 @@ Existing vectors from another model are automatically rebuilt.
 import asyncio
 import argparse
 import sys
+from typing import Any
 
 sys.path.insert(0, ".")
 from utils import load_config
 from bucket_manager import BucketManager
 from embedding_engine import EmbeddingEngine
+
+
+async def backfill_batch(
+    bucket_mgr: BucketManager,
+    engine: EmbeddingEngine,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Generate a bounded batch of missing vectors without modifying buckets."""
+    if not engine.enabled:
+        raise RuntimeError("Embedding engine is not enabled")
+
+    limit = max(1, min(int(limit), 50))
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    eligible = [
+        bucket
+        for bucket in all_buckets
+        if str(bucket.get("content", "")).strip()
+    ]
+
+    missing = []
+    for bucket in eligible:
+        if await engine.get_embedding(bucket["id"]) is None:
+            missing.append(bucket)
+
+    success = 0
+    failed = 0
+    for bucket in missing[:limit]:
+        if await engine.generate_and_store(bucket["id"], bucket["content"]):
+            success += 1
+        else:
+            failed += 1
+
+    remaining = 0
+    for bucket in eligible:
+        if await engine.get_embedding(bucket["id"]) is None:
+            remaining += 1
+
+    return {
+        "model": engine.model,
+        "total_buckets": len(all_buckets),
+        "eligible_buckets": len(eligible),
+        "empty_skipped": len(all_buckets) - len(eligible),
+        "indexed_total": len(eligible) - remaining,
+        "attempted": min(limit, len(missing)),
+        "success": success,
+        "failed": failed,
+        "remaining": remaining,
+    }
 
 
 async def backfill(batch_size: int = 20, dry_run: bool = False):
@@ -47,40 +96,24 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
             print(f"  ... and {len(missing) - 10} more")
         return
 
-    total = len(missing)
     success = 0
     failed = 0
-
-    for i in range(0, total, batch_size):
-        batch = missing[i : i + batch_size]
-        batch_num = i // batch_size + 1
-        total_batches = (total + batch_size - 1) // batch_size
-        print(f"\n--- Batch {batch_num}/{total_batches} ({len(batch)} buckets) ---")
-
-        for b in batch:
-            name = b["metadata"].get("name", b["id"])
-            content = b.get("content", "")
-            if not content or not content.strip():
-                print(f"  SKIP (empty): {b['id']} ({name})")
-                continue
-
-            try:
-                ok = await engine.generate_and_store(b["id"], content)
-                if ok:
-                    success += 1
-                    print(f"  OK: {b['id'][:12]} ({name[:30]})")
-                else:
-                    failed += 1
-                    print(f"  FAIL: {b['id'][:12]} ({name[:30]})")
-            except Exception as e:
-                failed += 1
-                print(f"  ERROR: {b['id'][:12]} ({name[:30]}): {e}")
-
-        if i + batch_size < total:
-            print("  Waiting 2s before next batch...")
-            await asyncio.sleep(2)
-
-    print(f"\n=== Done: {success} success, {failed} failed, {total - success - failed} skipped ===")
+    while True:
+        result = await backfill_batch(bucket_mgr, engine, batch_size)
+        success += result["success"]
+        failed += result["failed"]
+        print(
+            f"Batch: {result['success']} success, {result['failed']} failed, "
+            f"{result['remaining']} remaining"
+        )
+        if result["remaining"] == 0 or result["attempted"] == 0:
+            print(
+                f"\n=== Done: {success} newly indexed, {failed} failed, "
+                f"{result['indexed_total']} indexed total, "
+                f"{result['empty_skipped']} empty skipped ==="
+            )
+            break
+        await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
