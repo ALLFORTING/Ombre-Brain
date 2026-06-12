@@ -28,7 +28,7 @@ async def test_backfill_batch_only_indexes_missing_nonempty_buckets():
 
     engine = SimpleNamespace(
         enabled=True,
-        model="BAAI/bge-m3",
+        model="Qwen/Qwen3-Embedding-0.6B",
         get_embedding=AsyncMock(side_effect=get_embedding),
         generate_and_store=AsyncMock(side_effect=generate_and_store),
         last_error="",
@@ -38,7 +38,7 @@ async def test_backfill_batch_only_indexes_missing_nonempty_buckets():
     result = await backfill_batch(bucket_mgr, engine, limit=1)
 
     assert result == {
-        "model": "BAAI/bge-m3",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
         "total_buckets": 4,
         "eligible_buckets": 3,
         "empty_skipped": 1,

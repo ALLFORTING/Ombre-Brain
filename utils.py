@@ -123,7 +123,8 @@ def load_config(config_path: str = None) -> dict:
         embedding_config = config.setdefault("embedding", {})
         embedding_config["api_key"] = env_embed_api_key
         if not env_embed_model:
-            embedding_config["model"] = "BAAI/bge-m3"
+            # The international and China services expose different catalogs.
+            embedding_config["model"] = "Qwen/Qwen3-Embedding-0.6B"
         if not env_embed_base_url:
             embedding_config["base_url"] = "https://api.siliconflow.com/v1"
     if env_embed_api_key or env_embed_model or env_embed_base_url:

@@ -11,7 +11,7 @@ def test_independent_embedding_key_defaults_to_siliconflow(monkeypatch, tmp_path
 
     assert config["embedding"] == {
         "api_key": "test-key",
-        "model": "BAAI/bge-m3",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
         "base_url": "https://api.siliconflow.com/v1",
         "independent": True,
     }

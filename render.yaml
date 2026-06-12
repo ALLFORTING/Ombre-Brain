@@ -18,7 +18,8 @@ services:
       - key: OMBRE_EMBEDDING_BASE_URL
         value: https://api.siliconflow.com/v1
       - key: OMBRE_EMBEDDING_MODEL
-        value: BAAI/bge-m3
+        # International SiliconFlow catalog differs from the China service.
+        value: Qwen/Qwen3-Embedding-0.6B
       - key: OMBRE_BUCKETS_DIR
         value: /opt/render/project/src/buckets
     disk:
