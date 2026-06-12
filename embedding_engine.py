@@ -32,7 +32,12 @@ class EmbeddingEngine:
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
 
-        self.api_key = (embed_cfg.get("api_key") or dehy_cfg.get("api_key") or "").strip()
+        if embed_cfg.get("independent"):
+            self.api_key = str(embed_cfg.get("api_key") or "").strip()
+        else:
+            self.api_key = (
+                embed_cfg.get("api_key") or dehy_cfg.get("api_key") or ""
+            ).strip()
         self.base_url = (
             (embed_cfg.get("base_url") or "").strip()
             or (dehy_cfg.get("base_url") or "").strip()
@@ -66,9 +71,17 @@ class EmbeddingEngine:
             CREATE TABLE IF NOT EXISTS embeddings (
                 bucket_id TEXT PRIMARY KEY,
                 embedding TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
         """)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
+        }
+        if "model" not in columns:
+            conn.execute(
+                "ALTER TABLE embeddings ADD COLUMN model TEXT NOT NULL DEFAULT ''"
+            )
         conn.commit()
         conn.close()
 
@@ -112,8 +125,12 @@ class EmbeddingEngine:
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso()),
+            """
+            INSERT OR REPLACE INTO embeddings
+                (bucket_id, embedding, model, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (bucket_id, json.dumps(embedding), self.model, now_iso()),
         )
         conn.commit()
         conn.close()
@@ -129,7 +146,11 @@ class EmbeddingEngine:
         """Retrieve stored embedding for a bucket. Returns None if not found."""
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
-            "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            """
+            SELECT embedding FROM embeddings
+            WHERE bucket_id = ? AND model = ?
+            """,
+            (bucket_id, self.model),
         ).fetchone()
         conn.close()
         if row:
@@ -158,7 +179,10 @@ class EmbeddingEngine:
 
         # Load all embeddings from SQLite
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        rows = conn.execute(
+            "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
+            (self.model,),
+        ).fetchall()
         conn.close()
 
         if not rows:

@@ -209,6 +209,11 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        if self.embedding_engine and self.embedding_engine.enabled:
+            try:
+                await self.embedding_engine.generate_and_store(bucket_id, content)
+            except Exception as e:
+                logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
         return bucket_id
 
     # ---------------------------------------------------------
@@ -327,6 +332,19 @@ class BucketManager:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
+
+        if (
+            "content" in kwargs
+            and self.embedding_engine
+            and self.embedding_engine.enabled
+        ):
+            try:
+                await self.embedding_engine.generate_and_store(
+                    bucket_id,
+                    kwargs["content"],
+                )
+            except Exception as e:
+                logger.warning(f"Embedding refresh failed for {bucket_id}: {e}")
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -521,24 +539,13 @@ class BucketManager:
                 if not b.get("metadata", {}).get("dormant", False)
             ]
 
-        # --- Layer 1.5: embedding pre-filter (optional, reduces multi-dim ranking set) ---
-        # --- 第1.5层：embedding 预筛（可选，缩小精排候选集）---
+        # --- Layer 1.5: semantic recall for hybrid keyword/vector ranking ---
+        # --- 第1.5层：语义召回，与关键词分数混合排序 ---
+        vector_scores = {}
         if self.embedding_engine and self.embedding_engine.enabled:
             try:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=50)
-                if vector_results:
-                    vector_ids = {bid for bid, _ in vector_results}
-                    exact_ids = {
-                        b["id"] for b in candidates
-                        if self._calc_exact_match_score(query, b) > 0
-                    }
-                    emb_candidates = [
-                        b for b in candidates
-                        if b["id"] in vector_ids or b["id"] in exact_ids
-                    ]
-                    if emb_candidates:  # only replace if there's non-empty overlap
-                        candidates = emb_candidates
-                    # else: keep original candidates as fallback
+                vector_scores = dict(vector_results)
             except Exception as e:
                 logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
 
@@ -551,6 +558,11 @@ class BucketManager:
             try:
                 # Dim 1: topic relevance (fuzzy text, 0~1)
                 topic_score = self._calc_topic_score(query, bucket)
+                exact_score = self._calc_exact_match_score(query, bucket)
+                semantic_score = max(
+                    0.0,
+                    min(1.0, float(vector_scores.get(bucket["id"], 0.0))),
+                )
 
                 # Dim 2: emotion resonance (coordinate distance, 0~1)
                 emotion_score = self._calc_emotion_score(
@@ -577,12 +589,25 @@ class BucketManager:
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
-                if normalized >= self.fuzzy_threshold:
+                if normalized >= self.fuzzy_threshold or semantic_score >= 0.42:
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
+                    hybrid_score = normalized
+                    if semantic_score:
+                        hybrid_score = (
+                            normalized * 0.65 + semantic_score * 100 * 0.35
+                        )
                     if meta.get("resolved", False):
-                        normalized *= 0.3
-                    bucket["score"] = round(normalized, 2)
+                        hybrid_score *= 0.3
+                    bucket["score"] = round(hybrid_score, 2)
+                    bucket["semantic_score"] = round(semantic_score, 4)
+                    bucket["vector_match"] = semantic_score >= 0.42 and not exact_score
+                    if exact_score >= 0.95:
+                        bucket["match_tier"] = 3
+                    elif exact_score > 0:
+                        bucket["match_tier"] = 2
+                    else:
+                        bucket["match_tier"] = 1
                     scored.append(bucket)
             except Exception as e:
                 logger.warning(
@@ -591,7 +616,10 @@ class BucketManager:
                 )
                 continue
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        scored.sort(
+            key=lambda x: (x.get("match_tier", 0), x["score"]),
+            reverse=True,
+        )
         return scored[:limit]
 
     # ---------------------------------------------------------

@@ -536,11 +536,6 @@ class ImportEngine:
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
                     )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(bucket_id, item["content"])
-                        except Exception:
-                            pass
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
                 else:
@@ -660,11 +655,6 @@ class ImportEngine:
                         valence=round((old_v + valence) / 2, 2),
                         arousal=round((old_a + arousal) / 2, 2),
                     )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(bucket["id"], merged)
-                        except Exception:
-                            pass
                     return True
                 except Exception as e:
                     logger.warning(f"Merge failed during import: {e}")
@@ -680,11 +670,6 @@ class ImportEngine:
             arousal=arousal,
             name=name or None,
         )
-        if self.embedding_engine:
-            try:
-                await self.embedding_engine.generate_and_store(bucket_id, content)
-            except Exception:
-                pass
         return False
 
     async def detect_patterns(self) -> list[dict]:

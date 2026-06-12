@@ -476,11 +476,6 @@ async def _merge_or_create(
                     valence=merged_valence,
                     arousal=merged_arousal,
                 )
-                # --- Update embedding after merge ---
-                try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception:
-                    pass
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
@@ -494,11 +489,6 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
     )
-    # --- Generate embedding for new bucket ---
-    try:
-        await embedding_engine.generate_and_store(bucket_id, content)
-    except Exception:
-        pass
     return bucket_id, False
 
 
@@ -769,7 +759,6 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     if not deleted:
         return f"目标桶已更新，但源桶删除失败: {source_id}"
     try:
-        await embedding_engine.generate_and_store(target_id, merged_content)
         embedding_engine.delete_embedding(source_id)
     except Exception:
         pass
@@ -1114,21 +1103,6 @@ async def breath(
     except Exception as e:
         logger.warning(f"Failed to add pinned search results: {e}")
 
-    # --- Vector similarity channel: find semantically related buckets ---
-    # --- 向量相似度通道：找到语义相关的桶 ---
-    try:
-        vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
-        for bucket_id, sim_score in vector_results:
-            if bucket_id not in matched_ids and sim_score > 0.5:
-                bucket = await bucket_mgr.get(bucket_id)
-                if bucket and (include_dormant or not bucket["metadata"].get("dormant", False)):
-                    bucket["score"] = round(sim_score * 40, 2)
-                    bucket["vector_match"] = True
-                    matches.append(bucket)
-                    matched_ids.add(bucket_id)
-    except Exception as e:
-        logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
-
     pinned_matches, matches, hidden_count = _split_search_results(matches, max_results)
 
     results = []
@@ -1229,10 +1203,6 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
         # --- Mark source memory as digested + store model's valence perspective ---
         # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
         if source_bucket and source_bucket.strip():
@@ -1284,10 +1254,6 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -1525,13 +1491,6 @@ async def trace(
                     related_id,
                     related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
                 )
-
-    # Re-generate embedding if content changed
-    if "content" in updates:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception:
-            pass
 
     changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
     if "content" in updates:

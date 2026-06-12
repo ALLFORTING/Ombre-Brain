@@ -4,10 +4,9 @@ Backfill embeddings for existing buckets.
 为存量桶批量生成 embedding。
 
 Usage:
-    OMBRE_BUCKETS_DIR=/data OMBRE_API_KEY=xxx python backfill_embeddings.py [--batch-size 20] [--dry-run]
+    OMBRE_BUCKETS_DIR=/data OMBRE_EMBEDDING_API_KEY=xxx python backfill_embeddings.py [--batch-size 20] [--dry-run]
 
-Each batch calls Gemini embedding API once per bucket.
-Free tier: 1500 requests/day, so ~75 batches of 20.
+Existing vectors from another model are automatically rebuilt.
 """
 
 import asyncio
@@ -32,7 +31,7 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
     all_buckets = await bucket_mgr.list_all(include_archive=True)
     print(f"Total buckets: {len(all_buckets)}")
 
-    # Find buckets without embeddings
+    # get_embedding only returns vectors for the currently configured model.
     missing = []
     for b in all_buckets:
         emb = await engine.get_embedding(b["id"])

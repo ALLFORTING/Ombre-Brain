@@ -42,6 +42,23 @@ async def test_all_existing_tools_still_run_in_isolated_storage(tmp_path, monkey
     dream_result = await server.dream()
     archive_result = await server.archive_session("isolated archive regression")
 
+    for index in range(3):
+        await server.bucket_mgr.create(
+            content=f"pinned control {index}",
+            tags=["pinned"],
+            domain=["regression"],
+            pinned=True,
+        )
+    regular_ids = [
+        await server.bucket_mgr.create(
+            content=f"needle result {index}",
+            tags=["needle"],
+            domain=["regression"],
+        )
+        for index in range(4)
+    ]
+    limited_search = await server.breath(query="needle", max_results=2)
+
     for result in [
         breath_result,
         hold_result,
@@ -54,3 +71,4 @@ async def test_all_existing_tools_still_run_in_isolated_storage(tmp_path, monkey
         assert isinstance(result, str)
         assert result
     assert callable(backup_entry.backup_export_endpoint)
+    assert sum(bucket_id in limited_search for bucket_id in regular_ids) == 2
