@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Backfill embeddings for existing buckets.
-为存量桶批量生成 embedding。
+???????? embedding?
 
 Usage:
     OMBRE_BUCKETS_DIR=/data OMBRE_EMBEDDING_API_KEY=xxx python backfill_embeddings.py [--batch-size 20] [--dry-run]
@@ -65,6 +65,7 @@ async def backfill_batch(
         "success": success,
         "failed": failed,
         "remaining": remaining,
+        "last_error": engine.last_error if failed else "",
     }
 
 

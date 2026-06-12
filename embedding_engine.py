@@ -1,14 +1,14 @@
 # ============================================================
 # Module: Embedding Engine (embedding_engine.py)
-# 模块：向量化引擎
+# ??:?????
 #
 # Generates embeddings via Gemini API (OpenAI-compatible),
 # stores them in SQLite, and provides cosine similarity search.
-# 通过 Gemini API（OpenAI 兼容）生成 embedding，
-# 存储在 SQLite 中，提供余弦相似度搜索。
+# ?? Gemini API(OpenAI ??)?? embedding,
+# ??? SQLite ?,??????????
 #
 # Depended on by: server.py, bucket_manager.py
-# 被谁依赖：server.py, bucket_manager.py
+# ????:server.py, bucket_manager.py
 # ============================================================
 
 import os
@@ -25,7 +25,7 @@ logger = logging.getLogger("ombre_brain.embedding")
 class EmbeddingEngine:
     """
     Embedding generation + SQLite vector storage + cosine search.
-    向量生成 + SQLite 向量存储 + 余弦搜索。
+    ???? + SQLite ???? + ?????
     """
 
     def __init__(self, config: dict):
@@ -45,6 +45,7 @@ class EmbeddingEngine:
         )
         self.model = embed_cfg.get("model", "gemini-embedding-001")
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
+        self.last_error = ""
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
@@ -88,7 +89,7 @@ class EmbeddingEngine:
     async def generate_and_store(self, bucket_id: str, content: str) -> bool:
         """
         Generate embedding for content and store in SQLite.
-        为内容生成 embedding 并存入 SQLite。
+        ????? embedding ??? SQLite?
         Returns True on success, False on failure.
         """
         if not self.enabled or not content or not content.strip():
@@ -99,8 +100,10 @@ class EmbeddingEngine:
             if not embedding:
                 return False
             self._store_embedding(bucket_id, embedding)
+            self.last_error = ""
             return True
         except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"[:500]
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
@@ -117,6 +120,7 @@ class EmbeddingEngine:
                 return response.data[0].embedding
             return []
         except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"[:500]
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
@@ -164,7 +168,7 @@ class EmbeddingEngine:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
-        搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
+        ?????????????? (bucket_id, ?????) ???
         """
         if not self.enabled:
             return []
