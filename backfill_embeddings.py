@@ -66,6 +66,7 @@ async def backfill_batch(
         "failed": failed,
         "remaining": remaining,
         "last_error": engine.last_error if failed else "",
+        "error_details": engine.last_error_details if failed else {},
     }
 
 

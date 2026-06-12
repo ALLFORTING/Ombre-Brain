@@ -32,6 +32,7 @@ async def test_backfill_batch_only_indexes_missing_nonempty_buckets():
         get_embedding=AsyncMock(side_effect=get_embedding),
         generate_and_store=AsyncMock(side_effect=generate_and_store),
         last_error="",
+        last_error_details={},
     )
 
     result = await backfill_batch(bucket_mgr, engine, limit=1)
@@ -47,6 +48,7 @@ async def test_backfill_batch_only_indexes_missing_nonempty_buckets():
         "failed": 0,
         "remaining": 1,
         "last_error": "",
+        "error_details": {},
     }
     engine.generate_and_store.assert_awaited_once_with(
         "missing-1",

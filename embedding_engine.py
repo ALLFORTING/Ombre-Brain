@@ -46,6 +46,7 @@ class EmbeddingEngine:
         self.model = embed_cfg.get("model", "gemini-embedding-001")
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
         self.last_error = ""
+        self.last_error_details = {}
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
@@ -101,9 +102,10 @@ class EmbeddingEngine:
                 return False
             self._store_embedding(bucket_id, embedding)
             self.last_error = ""
+            self.last_error_details = {}
             return True
         except Exception as e:
-            self.last_error = f"{type(e).__name__}: {e}"[:500]
+            self._capture_error(e)
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
@@ -120,9 +122,23 @@ class EmbeddingEngine:
                 return response.data[0].embedding
             return []
         except Exception as e:
-            self.last_error = f"{type(e).__name__}: {e}"[:500]
+            self._capture_error(e)
             logger.warning(f"Embedding API call failed: {e}")
             return []
+
+    def _capture_error(self, error: Exception) -> None:
+        """Keep upstream diagnostics without retaining credentials or headers."""
+        response = getattr(error, "response", None)
+        request = getattr(error, "request", None)
+        if request is None and response is not None:
+            request = getattr(response, "request", None)
+
+        self.last_error = f"{type(error).__name__}: {error}"[:500]
+        self.last_error_details = {
+            "request_url": str(getattr(request, "url", "")),
+            "status_code": getattr(response, "status_code", None),
+            "response_body": getattr(response, "text", "")[:2000],
+        }
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         """Store embedding in SQLite."""
