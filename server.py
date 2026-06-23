@@ -1815,6 +1815,29 @@ async def dream(detail_ids: str = "") -> str:
     """做梦——默认返回最近 5 个记忆摘要；detail_ids 指定的桶返回全文。"""
     await decay_engine.ensure_started()
 
+    requested_ids = list(dict.fromkeys(_parse_csv_ids(detail_ids)))
+    if requested_ids:
+        details = []
+        for bucket_id in requested_ids:
+            bucket = await bucket_mgr.get(bucket_id)
+            if not bucket:
+                details.append(f"未找到记忆桶: {bucket_id}")
+                continue
+            meta = bucket.get("metadata", {})
+            resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
+            domains = ",".join(meta.get("domain", []))
+            val = meta.get("valence", 0.5)
+            aro = meta.get("arousal", 0.3)
+            updated = _bucket_date(meta, "updated_at", "last_active", "created")
+            details.append(
+                f"[{meta.get('name', bucket_id)}]{resolved_tag} "
+                f"主题:{domains} V{val:.1f}/A{aro:.1f} 更新:{updated}\n"
+                f"ID: {bucket_id}\n"
+                f"{strip_wikilinks(bucket.get('content', ''))}"
+            )
+            await bucket_mgr.touch(bucket_id)
+        return "=== Dream Details ===\n" + "\n---\n".join(details)
+
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -1842,24 +1865,10 @@ async def dream(detail_ids: str = "") -> str:
     if not recent:
         return "没有需要消化的新记忆。"
 
-    detail_id_set = {part.strip() for part in detail_ids.split(",") if part.strip()}
     parts = []
     for b in recent:
         meta = b["metadata"]
-        if b["id"] in detail_id_set:
-            resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
-            domains = ",".join(meta.get("domain", []))
-            val = meta.get("valence", 0.5)
-            aro = meta.get("arousal", 0.3)
-            updated = _bucket_date(meta, "updated_at", "last_active", "created")
-            parts.append(
-                f"[{meta.get('name', b['id'])}]{resolved_tag} "
-                f"主题:{domains} V{val:.1f}/A{aro:.1f} 更新:{updated}\n"
-                f"ID: {b['id']}\n"
-                f"{strip_wikilinks(b['content'][:500])}"
-            )
-        else:
-            parts.append(_dream_summary_line(b))
+        parts.append(_dream_summary_line(b))
 
     header = (
         "=== Dreaming ===\n"
