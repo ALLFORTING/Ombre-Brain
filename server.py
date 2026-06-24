@@ -868,6 +868,7 @@ async def breath(
     recent_days: int = -1,
     emotion_trend: bool = False,
     include_dormant: bool = False,
+    include_sealed: bool = False,
     date_from: str = "",
     date_to: str = "",
 ) -> str:
@@ -898,6 +899,11 @@ async def breath(
                 if "session" in b.get("metadata", {}).get("domain", [])
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
+                and (
+                    bool(query.strip())
+                    or include_sealed
+                    or int(b.get("metadata", {}).get("sealed", 0) or 0) != 1
+                )
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -932,6 +938,11 @@ async def breath(
                 if b["metadata"].get("type") == "feel"
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
+                and (
+                    bool(query.strip())
+                    or include_sealed
+                    or int(b.get("metadata", {}).get("sealed", 0) or 0) != 1
+                )
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -978,6 +989,7 @@ async def breath(
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
             and (include_dormant or not b["metadata"].get("dormant", False))
+            and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
             and _is_recent_bucket(b, recent_cutoff)
             and _is_in_date_range(b, date_from, date_to)
         ]
@@ -1017,6 +1029,7 @@ async def breath(
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
             if _is_in_date_range(b, date_from, date_to)
+            if include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1
         ]
         unresolved = [
             b for b in all_buckets
@@ -1025,6 +1038,7 @@ async def breath(
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and (include_dormant or not b["metadata"].get("dormant", False))
+            and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
             and _is_recent_bucket(b, recent_cutoff)
             and _is_in_date_range(b, date_from, date_to)
         ]
@@ -1117,6 +1131,7 @@ async def breath(
                 if b["metadata"].get("type") == "feel"
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
+                and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
             ]
             feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             if not feels:
@@ -1459,6 +1474,7 @@ async def trace(
     pinned: int = -1,
     digested: int = -1,
     dormant: int = -1,
+    sealed: int = -1,
     content: str = "",
     related: str = "",
     merge: str = "",
@@ -1490,6 +1506,7 @@ async def trace(
                 pinned=pinned,
                 digested=digested,
                 dormant=dormant,
+                sealed=sealed,
                 content="",
                 related=related,
                 merge="",
@@ -1539,6 +1556,8 @@ async def trace(
         updates["digested"] = bool(digested)
     if dormant in (0, 1):
         updates["dormant"] = bool(dormant)
+    if sealed in (0, 1):
+        updates["sealed"] = sealed
     if content:
         updates["content"] = content
     related_ids = _parse_csv_ids(related)
@@ -1753,7 +1772,9 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
     lines = []
     for b in visible_buckets:
         meta = b.get("metadata", {})
-        if meta.get("pinned") or meta.get("protected"):
+        if int(meta.get("sealed", 0) or 0) == 1:
+            icon = "🔒"
+        elif meta.get("pinned") or meta.get("protected"):
             icon = "📌"
         elif meta.get("type") == "permanent":
             icon = "📦"
@@ -1773,10 +1794,12 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
+        sealed_tag = " [封存]" if int(meta.get("sealed", 0) or 0) == 1 else ""
+        dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
         created_at = _bucket_date(meta, "created_at", "created")
         updated_at = _bucket_date(meta, "updated_at", "last_active", "created")
         lines.append(
-            f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
+            f"{icon} [{meta.get('name', b['id'])}]{resolved_tag}{sealed_tag}{dormant_tag} "
             f"bucket_id:{b['id']} "
             f"主题:{domains} "
             f"情感:V{val:.1f}/A{aro:.1f} "

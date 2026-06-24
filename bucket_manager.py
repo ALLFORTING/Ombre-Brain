@@ -173,6 +173,7 @@ class BucketManager:
             "emotion_history": "[]",
             "related_buckets": "",
             "dormant": False,
+            "sealed": 0,
             "activation_count": 0,
         }
         if pinned:
@@ -324,6 +325,8 @@ class BucketManager:
             post["related_buckets"] = kwargs["related_buckets"]
         if "dormant" in kwargs:
             post["dormant"] = bool(kwargs["dormant"])
+        if "sealed" in kwargs:
+            post["sealed"] = 1 if int(kwargs["sealed"]) == 1 else 0
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
@@ -940,6 +943,8 @@ class BucketManager:
                 _date_only(metadata.get("updated_at") or metadata.get("last_active") or metadata.get("created")),
             )
             metadata.setdefault("dormant", False)
+            metadata.setdefault("sealed", 0)
+            metadata["sealed"] = 1 if int(metadata.get("sealed", 0) or 0) == 1 else 0
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": metadata,
