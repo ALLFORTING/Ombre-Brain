@@ -74,3 +74,4 @@ async def test_all_existing_tools_still_run_in_isolated_storage(tmp_path, monkey
     assert callable(backup_entry.embeddings_backfill_endpoint)
     assert callable(backup_entry.aliases_clean_endpoint)
     assert sum(bucket_id in limited_search for bucket_id in regular_ids) == 2
+    assert "pinned control" not in limited_search
