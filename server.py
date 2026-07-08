@@ -949,6 +949,25 @@ async def _format_due_triggers(active_buckets: list[dict], max_items: int = 10) 
     return text, [bucket["id"] for bucket in shown]
 
 
+def _format_feel_echo(active_buckets: list[dict]) -> str:
+    feels = [
+        bucket for bucket in active_buckets
+        if bucket.get("metadata", {}).get("type") == "feel"
+        and not _is_sealed(bucket)
+    ]
+    if not feels:
+        return "=== boot: 回声 ===\n（暂无可见 feel）"
+    bucket = random.choice(feels)
+    meta = bucket.get("metadata", {})
+    created = _bucket_date(meta, "created_at", "created")
+    content = strip_wikilinks(bucket.get("content", "")).strip()
+    return (
+        "=== boot: 回声 ===\n"
+        f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} created_at:{created}\n"
+        f"{content}"
+    )
+
+
 def _fit_sections_to_budget(sections: list[tuple[str, str]], max_tokens: int) -> str:
     """Append sections in priority order, truncating lower-priority content first."""
     output = []
@@ -1802,10 +1821,13 @@ async def breath(
     resonance: str = "",
     mailbox: bool = False,
     mailbox_limit: int = 1,
+    feels: bool = False,
 ) -> str:
     """Public MCP wrapper for memory retrieval plus optional mailbox access."""
     if mailbox:
         return _with_response_seal(_format_mailbox(mailbox_limit))
+    if feels:
+        domain = "feel"
     result = await _breath_impl(
         query=query,
         max_tokens=max_tokens,
@@ -2380,6 +2402,7 @@ async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
     )
 
     mailbox_text = _format_mailbox(1).replace("=== 信箱 ===", "=== boot: 最新信箱 ===", 1)
+    echo_text = _format_feel_echo(active_buckets)
 
     sessions = [
         b for b in archive_buckets
@@ -2408,6 +2431,7 @@ async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
             ("triggers", trigger_text),
             ("pinned", pinned_text),
             ("mailbox", mailbox_text),
+            ("echo", echo_text),
             ("sessions", sessions_text),
             ("todos", todos_text),
         ],
