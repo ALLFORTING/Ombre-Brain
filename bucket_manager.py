@@ -267,6 +267,7 @@ class BucketManager:
             "updated_at": today,
             "emotion_history": "[]",
             "related_buckets": "",
+            "source_bucket": "",
             "dormant": False,
             "sealed": 0,
             "activation_count": 0,
@@ -423,6 +424,8 @@ class BucketManager:
             post["emotion_history"] = kwargs["emotion_history"]
         if "related_buckets" in kwargs:
             post["related_buckets"] = kwargs["related_buckets"]
+        if "source_bucket" in kwargs:
+            post["source_bucket"] = kwargs["source_bucket"]
         if "dormant" in kwargs:
             post["dormant"] = bool(kwargs["dormant"])
         if "sealed" in kwargs:
@@ -1049,6 +1052,7 @@ class BucketManager:
             )
             metadata.setdefault("dormant", False)
             metadata.setdefault("sealed", 0)
+            metadata.setdefault("source_bucket", "")
             metadata["sealed"] = 1 if int(metadata.get("sealed", 0) or 0) == 1 else 0
             return {
                 "id": post.get("id", Path(file_path).stem),
