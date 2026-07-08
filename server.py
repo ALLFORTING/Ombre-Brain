@@ -92,6 +92,15 @@ OMBRE_HOOK_URL = os.environ.get("OMBRE_HOOK_URL", "").strip()
 OMBRE_HOOK_SKIP = os.environ.get("OMBRE_HOOK_SKIP", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _response_seal() -> str:
+    """Read the verification phrase from runtime env; never persist it."""
+    return os.environ.get("OMBRE_RESPONSE_SEAL", "").strip()
+
+
+def _with_response_seal(text: str) -> str:
+    return f"{str(text).rstrip()}\n\nseal: {_response_seal()}"
+
+
 async def _fire_webhook(event: str, payload: dict) -> None:
     """
     Fire-and-forget POST to OMBRE_HOOK_URL with the given event payload.
@@ -851,6 +860,51 @@ def _is_sealed(bucket: dict) -> bool:
     return int(bucket.get("metadata", {}).get("sealed", 0) or 0) == 1
 
 
+def _extract_session_summary(content: str, max_chars: int = 700) -> str:
+    """Extract the Summary section from an archived session bucket."""
+    text = strip_wikilinks(content or "").strip()
+    marker = "## Summary"
+    if marker in text:
+        text = text.split(marker, 1)[1].strip()
+        if "\n## " in text:
+            text = text.split("\n## ", 1)[0].strip()
+    return text[:max_chars].strip()
+
+
+def _format_mailbox(limit: int = 1) -> str:
+    letters = bucket_mgr.get_letters(limit)
+    if not letters:
+        return "=== 信箱 ===\n（暂无信件）"
+    parts = ["=== 信箱 ==="]
+    for letter in letters:
+        parts.append(
+            f"[letter_id:{letter.get('id')}] "
+            f"created_at:{letter.get('created_at')} "
+            f"session_id:{letter.get('session_id')}\n"
+            f"{letter.get('content', '')}"
+        )
+    return "\n---\n".join(parts)
+
+
+def _fit_sections_to_budget(sections: list[tuple[str, str]], max_tokens: int) -> str:
+    """Append sections in priority order, truncating lower-priority content first."""
+    output = []
+    used = 0
+    for _, text in sections:
+        section_tokens = count_tokens_approx(text)
+        if used + section_tokens <= max_tokens:
+            output.append(text)
+            used += section_tokens
+            continue
+        remaining = max_tokens - used
+        if remaining <= 40:
+            break
+        chars = max(200, remaining * 3)
+        output.append(text[:chars].rstrip() + "\n...（已按 boot 预算截断）")
+        break
+    return "\n\n".join(output)
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -860,8 +914,7 @@ def _is_sealed(bucket: dict) -> bool:
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
-@mcp.tool()
-async def breath(
+async def _breath_impl(
     query: str = "",
     max_tokens: int = 10000,
     domain: str = "",
@@ -1223,6 +1276,47 @@ async def breath(
         final_text += f"\n\n还有{hidden_count}个相关桶未显示"
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return _with_emotion_timeline(final_text, emotion_trend)
+
+
+@mcp.tool()
+async def breath(
+    query: str = "",
+    max_tokens: int = 10000,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = 5,
+    importance_min: int = -1,
+    mode: str = "summary",
+    recent_days: int = -1,
+    emotion_trend: bool = False,
+    include_dormant: bool = False,
+    include_sealed: bool = False,
+    date_from: str = "",
+    date_to: str = "",
+    mailbox: bool = False,
+    mailbox_limit: int = 1,
+) -> str:
+    """Public MCP wrapper for memory retrieval plus optional mailbox access."""
+    if mailbox:
+        return _with_response_seal(_format_mailbox(mailbox_limit))
+    result = await _breath_impl(
+        query=query,
+        max_tokens=max_tokens,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
+        max_results=max_results,
+        importance_min=importance_min,
+        mode=mode,
+        recent_days=recent_days,
+        emotion_trend=emotion_trend,
+        include_dormant=include_dormant,
+        include_sealed=include_sealed,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return _with_response_seal(result)
 
 
 # =============================================================
@@ -1617,6 +1711,7 @@ async def archive_session(
         Literal[-1],
         Annotated[float, Field(ge=0, le=1, description="情绪唤醒度，范围 0-1")],
     ] = -1,
+    letter: str = "",
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session."""
@@ -1653,6 +1748,8 @@ async def archive_session(
         name=session_name,
     )
     await bucket_mgr.archive(bucket_id)
+    if letter.strip():
+        bucket_mgr.record_letter(letter.strip(), bucket_id)
     if 0 <= valence <= 1 and 0 <= arousal <= 1:
         _record_emotion_snapshot(valence, arousal, "archive")
     return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"
@@ -1694,6 +1791,76 @@ async def todos() -> str:
         return "当前没有未完成待办。"
     groups.sort(key=lambda item: item[0], reverse=True)
     return "\n---\n".join(text for _, text in groups)
+
+
+@mcp.tool()
+async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
+    """One-shot startup context: pinned summaries, latest letter, sessions, todos."""
+    await decay_engine.ensure_started()
+    pinned_chars = max(80, min(int(pinned_chars or 300), 1200))
+    max_tokens = max(1000, min(int(max_tokens or 8000), 12000))
+
+    try:
+        active_buckets = await bucket_mgr.list_all(include_archive=False)
+        archive_buckets = await bucket_mgr.list_all(include_archive=True)
+    except Exception as exc:
+        logger.error("Boot failed to list buckets: %s", exc)
+        return _with_response_seal("boot 暂时无法读取记忆库。")
+
+    pinned = [
+        b for b in active_buckets
+        if (b.get("metadata", {}).get("pinned") or b.get("metadata", {}).get("protected"))
+        and not _is_sealed(b)
+    ]
+    pinned.sort(
+        key=lambda b: _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
+        reverse=True,
+    )
+    pinned_lines = []
+    for bucket in pinned:
+        meta = bucket.get("metadata", {})
+        preview = strip_wikilinks(bucket.get("content", "")).strip()[:pinned_chars]
+        pinned_lines.append(
+            f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
+        )
+    pinned_text = "=== boot: 钉选桶摘要 ===\n" + (
+        "\n---\n".join(pinned_lines) if pinned_lines else "（暂无可见钉选桶）"
+    )
+
+    mailbox_text = _format_mailbox(1).replace("=== 信箱 ===", "=== boot: 最新信箱 ===", 1)
+
+    sessions = [
+        b for b in archive_buckets
+        if "session" in b.get("metadata", {}).get("domain", [])
+        and not _is_sealed(b)
+    ]
+    sessions.sort(
+        key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"),
+        reverse=True,
+    )
+    session_lines = []
+    for bucket in sessions[:3]:
+        meta = bucket.get("metadata", {})
+        summary = _extract_session_summary(bucket.get("content", ""))
+        session_lines.append(
+            f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{summary}"
+        )
+    sessions_text = "=== boot: 最近 3 次归档 ===\n" + (
+        "\n---\n".join(session_lines) if session_lines else "（暂无 session 归档）"
+    )
+
+    todos_text = "=== boot: 未完结 todos ===\n" + await todos()
+
+    body = _fit_sections_to_budget(
+        [
+            ("pinned", pinned_text),
+            ("mailbox", mailbox_text),
+            ("sessions", sessions_text),
+            ("todos", todos_text),
+        ],
+        max_tokens=max_tokens - 20,
+    )
+    return _with_response_seal(body)
 
 
 @mcp.tool()
