@@ -132,6 +132,20 @@ class BucketManager:
                 "CREATE INDEX IF NOT EXISTS idx_bucket_history_bucket_id "
                 "ON bucket_history(bucket_id)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS letters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    session_id TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_letters_created_at "
+                "ON letters(created_at)"
+            )
 
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
         """Persist the old content before a destructive content change."""
@@ -159,6 +173,35 @@ class BucketManager:
                 LIMIT ?
                 """,
                 (bucket_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_letter(self, content: str, session_id: str) -> None:
+        """Persist an inter-window handoff letter outside normal memory buckets."""
+        if not content or not content.strip():
+            return
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO letters (content, created_at, session_id)
+                VALUES (?, ?, ?)
+                """,
+                (content.strip(), now_iso(), session_id or ""),
+            )
+
+    def get_letters(self, limit: int = 1) -> list[dict]:
+        """Return latest handoff letters, newest first."""
+        limit = max(1, min(int(limit or 1), 50))
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, content, created_at, session_id
+                FROM letters
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
