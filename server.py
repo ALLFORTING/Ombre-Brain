@@ -613,6 +613,27 @@ def _is_in_date_range(
     )
 
 
+def _parse_resonance(value: str) -> tuple[float, float] | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        raw_v, raw_a = [part.strip() for part in value.split(",", 1)]
+        target = (float(raw_v), float(raw_a))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("resonance must use 'v,a' format, both between 0 and 1.") from exc
+    if not (0 <= target[0] <= 1 and 0 <= target[1] <= 1):
+        raise ValueError("resonance values must be between 0 and 1.")
+    return target
+
+
+def _resonance_distance(bucket: dict, target: tuple[float, float]) -> float:
+    meta = bucket.get("metadata", {})
+    valence = float(meta.get("valence", 0.5) or 0.5)
+    arousal = float(meta.get("arousal", 0.3) or 0.3)
+    return ((valence - target[0]) ** 2 + (arousal - target[1]) ** 2) ** 0.5
+
+
 def _last_access_days(meta: dict) -> float:
     value = meta.get("last_active") or meta.get("updated_at") or meta.get("created")
     try:
@@ -1230,6 +1251,7 @@ async def _breath_impl(
     include_sealed: bool = False,
     date_from: str = "",
     date_to: str = "",
+    resonance: str = "",
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
@@ -1244,6 +1266,7 @@ async def _breath_impl(
     try:
         date_from = _parse_date_filter(date_from, "date_from")
         date_to = _parse_date_filter(date_to, "date_to")
+        resonance_target = _parse_resonance(resonance)
     except ValueError as exc:
         return str(exc)
     if date_from and date_to and date_from > date_to:
@@ -1366,6 +1389,42 @@ async def _breath_impl(
         hidden_count = max(0, total_filtered - len(filtered))
         if hidden_count:
             response += f"\n\n还有{hidden_count}个相关桶未显示"
+        return _with_emotion_timeline(response, emotion_trend)
+
+    # --- Resonance mode without query: sort visible memories by emotion distance ---
+    if resonance_target and (not query or not query.strip()):
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.error(f"Failed to list buckets for resonance: {e}")
+            return "记忆系统暂时无法访问。"
+        candidates = [
+            b for b in all_buckets
+            if b["metadata"].get("type") not in ("feel",)
+            and (include_dormant or not b["metadata"].get("dormant", False))
+            and (include_sealed or not _is_sealed(b))
+            and _is_recent_bucket(b, recent_cutoff)
+            and _is_in_date_range(b, date_from, date_to)
+        ]
+        candidates.sort(key=lambda b: _resonance_distance(b, resonance_target))
+        total = len(candidates)
+        candidates = candidates[:max_results]
+        for bucket in candidates:
+            await bucket_mgr.touch(bucket["id"])
+        results = [
+            await _append_bucket_extras(
+                _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
+                b,
+                emotion_trend,
+            )
+            for b in candidates
+        ]
+        if not results:
+            return _with_emotion_timeline("未找到共鸣记忆。", emotion_trend)
+        response = "\n---\n".join(results)
+        hidden_count = max(0, total - len(candidates))
+        if hidden_count:
+            response += f"\n\n还有{hidden_count}个共鸣桶未显示"
         return _with_emotion_timeline(response, emotion_trend)
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
@@ -1536,6 +1595,8 @@ async def _breath_impl(
         and _is_in_date_range(bucket, date_from, date_to)
         and (include_sealed or not _is_sealed(bucket))
     ]
+    if resonance_target:
+        matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
     hidden_count = max(0, len(matches) - max_results)
     matches = matches[:max_results]
 
@@ -1618,6 +1679,7 @@ async def breath(
     include_sealed: bool = False,
     date_from: str = "",
     date_to: str = "",
+    resonance: str = "",
     mailbox: bool = False,
     mailbox_limit: int = 1,
 ) -> str:
@@ -1639,6 +1701,7 @@ async def breath(
         include_sealed=include_sealed,
         date_from=date_from,
         date_to=date_to,
+        resonance=resonance,
     )
     return _with_response_seal(result)
 
