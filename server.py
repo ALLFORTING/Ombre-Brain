@@ -1207,6 +1207,62 @@ async def _run_related_backfill(dry_run: bool = True, limit: int = 100, threshol
     return "\n".join(lines)
 
 
+async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
+    api_key, base_url, model = _digest_api_config()
+    if not api_key or not old_buckets:
+        return ""
+    old_parts = []
+    for bucket in old_buckets[:3]:
+        meta = bucket.get("metadata", {})
+        old_parts.append(
+            f"[{bucket['id']}] {meta.get('name', bucket['id'])}\n"
+            f"{strip_wikilinks(bucket.get('content', ''))[:1200]}"
+        )
+    prompt = (
+        "判断新内容和旧记忆之间是否存在日期、数字或事实上的直接矛盾。"
+        "有则用一句中文指出矛盾，并包含相关 bucket_id；无则只回答“无”。"
+        "\n\n# 新内容\n"
+        f"{strip_wikilinks(new_content)[:1500]}"
+        "\n\n# 旧记忆\n"
+        + "\n\n---\n\n".join(old_parts)
+    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "你只做事实矛盾检测，不输出建议或行动指令。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+            },
+        )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+async def _detect_conflict_warning(content: str) -> str:
+    try:
+        candidates = await bucket_mgr.search(content, limit=8)
+        old_buckets = [
+            bucket for bucket in candidates
+            if not _is_sealed(bucket)
+        ][:3]
+        response = await _call_conflict_api(content, old_buckets)
+    except Exception as exc:
+        logger.warning("Conflict detection failed: %s", exc)
+        return ""
+    normalized = response.strip()
+    if not normalized or normalized in ("无", "沒有", "没有", "無"):
+        return ""
+    if normalized.startswith("无") and len(normalized) <= 4:
+        return ""
+    return normalized[:500]
+
+
 async def _digest_scheduler_loop() -> None:
     enabled = os.environ.get("OMBRE_DIGEST_SCHEDULER", "").strip().lower() in ("1", "true", "yes", "on")
     if not enabled:
@@ -1729,6 +1785,7 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
     content = _apply_display_aliases(content)
+    conflict_warning = await _detect_conflict_warning(content)
     try:
         trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
     except ValueError as exc:
@@ -1775,7 +1832,10 @@ async def hold(
                 await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
             except Exception as e:
                 logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
-        return f"🫧feel→{bucket_id}"
+        response = f"🫧feel→{bucket_id}"
+        if conflict_warning:
+            response += f"\nconflict: {conflict_warning}"
+        return response
 
     # --- Step 1: auto-tagging / 自动打标 ---
     try:
@@ -1819,7 +1879,10 @@ async def hold(
         if trigger_date:
             await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
-        return f"📌钉选→{bucket_id} {','.join(domain)}"
+        response = f"📌钉选→{bucket_id} {','.join(domain)}"
+        if conflict_warning:
+            response += f"\nconflict: {conflict_warning}"
+        return response
 
     # --- Step 2: merge or create / 合并或新建 ---
     result_name, is_merged = await _merge_or_create(
@@ -1836,7 +1899,10 @@ async def hold(
         _record_emotion_snapshot(valence, arousal, "hold")
 
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    response = f"{action}{result_name} {','.join(domain)}"
+    if conflict_warning:
+        response += f"\nconflict: {conflict_warning}"
+    return response
 
 
 # =============================================================
@@ -1859,6 +1925,7 @@ async def grow(content: str) -> str:
     # Instead, run analyze + create directly.
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
+        conflict_warning = await _detect_conflict_warning(content)
         try:
             analysis = await dehydrator.analyze(content)
         except Exception as e:
@@ -1877,7 +1944,10 @@ async def grow(content: str) -> str:
             name=analysis.get("suggested_name", ""),
         )
         action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        response = f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        if conflict_warning:
+            response += f"\nconflict: {conflict_warning}"
+        return response
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
@@ -1890,6 +1960,7 @@ async def grow(content: str) -> str:
         return "内容为空或整理失败。"
 
     results = []
+    conflicts = []
     created = 0
     merged = 0
 
@@ -1897,6 +1968,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
+            conflict_warning = await _detect_conflict_warning(item["content"])
             result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
@@ -1913,6 +1985,8 @@ async def grow(content: str) -> str:
             else:
                 results.append(f"📝{item.get('name', result_name)}")
                 created += 1
+            if conflict_warning:
+                conflicts.append(f"{item.get('name', result_name)}: {conflict_warning}")
         except Exception as e:
             logger.warning(
                 f"Failed to process diary item / 日记条目处理失败: "
@@ -1920,7 +1994,10 @@ async def grow(content: str) -> str:
             )
             results.append(f"⚠️{item.get('name', '?')}")
 
-    return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+    response = f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+    if conflicts:
+        response += "\nconflict: " + "；".join(conflicts)
+    return response
 
 
 # =============================================================
