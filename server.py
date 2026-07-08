@@ -500,6 +500,7 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
     )
+    await _auto_link_related(bucket_id)
     return bucket_id, False
 
 
@@ -749,6 +750,8 @@ async def _format_related_line(bucket: dict) -> str:
     for related_id in related:
         related_bucket = await bucket_mgr.get(related_id)
         if related_bucket:
+            if _is_sealed(related_bucket):
+                continue
             name = related_bucket.get("metadata", {}).get("name", related_id)
             parts.append(f"[{related_id}] {name}")
         else:
@@ -1041,6 +1044,107 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
     )
     lines.append(f"已消化: {digested_total} 个桶")
     lines.append(f"日志桶: {log_id}")
+    return "\n".join(lines)
+
+
+async def _auto_link_related(bucket_id: str, threshold: float | None = None, top_k: int = 3) -> list[tuple[str, float]]:
+    """Bidirectionally link a new bucket to its closest non-sealed semantic neighbors."""
+    if threshold is None:
+        threshold = float(os.environ.get("OMBRE_RELATED_THRESHOLD", "0.75") or "0.75")
+    if not embedding_engine or not embedding_engine.enabled:
+        return []
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket or _is_sealed(bucket):
+        return []
+    target_embedding = await embedding_engine.get_embedding(bucket_id)
+    if target_embedding is None:
+        await embedding_engine.generate_and_store(bucket_id, bucket.get("content", ""))
+        target_embedding = await embedding_engine.get_embedding(bucket_id)
+    if target_embedding is None:
+        return []
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    scored = []
+    for other in all_buckets:
+        other_id = other["id"]
+        if other_id == bucket_id or _is_sealed(other):
+            continue
+        other_embedding = await embedding_engine.get_embedding(other_id)
+        if other_embedding is None:
+            continue
+        score = embedding_engine._cosine_similarity(target_embedding, other_embedding)
+        if score >= threshold:
+            scored.append((other_id, score))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected = scored[:max(1, top_k)]
+    if not selected:
+        return []
+
+    target_related = _related_ids(bucket.get("metadata", {}))
+    selected_ids = [bucket_id for bucket_id, _ in selected]
+    await bucket_mgr.update(
+        bucket_id,
+        related_buckets=",".join(dict.fromkeys(target_related + selected_ids)),
+    )
+    for related_id, _ in selected:
+        related_bucket = await bucket_mgr.get(related_id)
+        if not related_bucket or _is_sealed(related_bucket):
+            continue
+        current_related = _related_ids(related_bucket.get("metadata", {}))
+        if bucket_id not in current_related:
+            await bucket_mgr.update(
+                related_id,
+                related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
+            )
+    return selected
+
+
+async def _run_related_backfill(dry_run: bool = True, limit: int = 100, threshold: float | None = None) -> str:
+    if threshold is None:
+        threshold = float(os.environ.get("OMBRE_RELATED_THRESHOLD", "0.75") or "0.75")
+    if not embedding_engine or not embedding_engine.enabled:
+        return "自动 related 回填不可用：embedding 未启用。"
+    buckets = [
+        bucket for bucket in await bucket_mgr.list_all(include_archive=False)
+        if not _is_sealed(bucket)
+    ][:max(1, limit)]
+    planned = []
+    for bucket in buckets:
+        target_embedding = await embedding_engine.get_embedding(bucket["id"])
+        if target_embedding is None:
+            continue
+        scored = []
+        for other in buckets:
+            if other["id"] == bucket["id"] or _is_sealed(other):
+                continue
+            other_embedding = await embedding_engine.get_embedding(other["id"])
+            if other_embedding is None:
+                continue
+            score = embedding_engine._cosine_similarity(target_embedding, other_embedding)
+            if score >= threshold:
+                scored.append((other["id"], score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        top = scored[:3]
+        if top:
+            planned.append((bucket["id"], top))
+    lines = [
+        "=== 自动 related dry-run ===" if dry_run else "=== 自动 related 回填 ===",
+        f"扫描桶数: {len(buckets)}",
+        f"计划关联: {len(planned)} 个桶",
+    ]
+    for bucket_id, links in planned[:50]:
+        lines.append(
+            f"- {bucket_id}: "
+            + ", ".join(f"{related_id}({score:.3f})" for related_id, score in links)
+        )
+    if dry_run:
+        return "\n".join(lines)
+    for bucket_id, links in planned:
+        bucket = await bucket_mgr.get(bucket_id)
+        if not bucket or _is_sealed(bucket):
+            continue
+        current = _related_ids(bucket.get("metadata", {}))
+        next_ids = [related_id for related_id, _ in links]
+        await bucket_mgr.update(bucket_id, related_buckets=",".join(dict.fromkeys(current + next_ids)))
     return "\n".join(lines)
 
 
@@ -1449,6 +1553,18 @@ async def digest(dry_run: bool = True, max_groups: int = 10) -> str:
 
 
 @mcp.tool()
+async def related_backfill(dry_run: bool = True, limit: int = 100, threshold: float = -1) -> str:
+    """Backfill semantic related links. Defaults to dry-run and skips sealed buckets."""
+    await decay_engine.ensure_started()
+    try:
+        actual_threshold = None if threshold < 0 else threshold
+        return await _run_related_backfill(dry_run=dry_run, limit=limit, threshold=actual_threshold)
+    except Exception as exc:
+        logger.error("Related backfill failed: %s", exc)
+        return f"自动 related 回填失败: {exc}"
+
+
+@mcp.tool()
 async def breath(
     query: str = "",
     max_tokens: int = 10000,
@@ -1539,6 +1655,7 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
+        await _auto_link_related(bucket_id)
         # --- Mark source memory as digested + store model's valence perspective ---
         # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
         if source_bucket and source_bucket.strip():
@@ -1590,6 +1707,7 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
+        await _auto_link_related(bucket_id)
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
