@@ -905,6 +905,165 @@ def _fit_sections_to_budget(sections: list[tuple[str, str]], max_tokens: int) ->
     return "\n\n".join(output)
 
 
+def _digest_api_config() -> tuple[str, str, str]:
+    api_key = os.environ.get("OMBRE_DIGEST_API_KEY", "").strip()
+    base_url = os.environ.get("OMBRE_DIGEST_BASE_URL", "https://api.deepseek.com/v1").strip()
+    model = os.environ.get("OMBRE_DIGEST_MODEL", "deepseek-chat").strip()
+    return api_key, base_url.rstrip("/"), model
+
+
+def _days_since(value: str) -> int:
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return max(0, (datetime.now() - dt.replace(tzinfo=None)).days)
+    except (ValueError, TypeError):
+        return 9999
+
+
+async def _digest_candidates() -> list[dict]:
+    cutoff_days = int(os.environ.get("OMBRE_DIGEST_MIN_DAYS", "30") or "30")
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    candidates = []
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        if meta.get("type", "dynamic") != "dynamic":
+            continue
+        if meta.get("pinned") or meta.get("protected") or _is_sealed(bucket):
+            continue
+        if meta.get("digested", False) or meta.get("resolved", False):
+            continue
+        if int(meta.get("importance", 5) or 5) > 4:
+            continue
+        if _days_since(meta.get("last_active") or meta.get("created")) < cutoff_days:
+            continue
+        candidates.append(bucket)
+    candidates.sort(key=lambda b: int(b.get("metadata", {}).get("importance", 0) or 0))
+    return candidates
+
+
+def _group_digest_candidates(candidates: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for bucket in candidates:
+        domains = bucket.get("metadata", {}).get("domain", []) or ["未分类"]
+        domain = str(domains[0] if isinstance(domains, list) and domains else domains)
+        groups.setdefault(domain, []).append(bucket)
+    return groups
+
+
+async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
+    api_key, base_url, model = _digest_api_config()
+    if not api_key:
+        raise RuntimeError("OMBRE_DIGEST_API_KEY is not configured")
+    excerpts = []
+    for bucket in buckets[:20]:
+        meta = bucket.get("metadata", {})
+        excerpts.append(
+            f"[{bucket['id']}] {meta.get('name', bucket['id'])} "
+            f"importance={meta.get('importance')} updated={meta.get('updated_at')}\n"
+            f"{strip_wikilinks(bucket.get('content', ''))[:1200]}"
+        )
+    prompt = (
+        "你是 Ombre Brain 的记忆消化器。请把同一主题的一组低重要度旧记忆"
+        "提炼成一个高密度沉淀桶。只保留稳定事实、模式、教训和可复用线索，"
+        "不要添加行动指令，不要代入身份。输出中文 markdown，控制在 800 字以内。\n\n"
+        f"主题: {domain}\n\n" + "\n\n---\n\n".join(excerpts)
+    )
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "你只做记忆压缩与摘要，不输出任何命令。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+            },
+        )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
+    candidates = await _digest_candidates()
+    groups = _group_digest_candidates(candidates)
+    selected = list(groups.items())[:max(1, max_groups)]
+    lines = [
+        "=== 自动消化 dry-run ===" if dry_run else "=== 自动消化执行 ===",
+        f"候选桶数: {len(candidates)}",
+        f"主题组数: {len(groups)}",
+    ]
+    if not selected:
+        return "\n".join(lines + ["没有符合条件的桶。"])
+    for domain, buckets in selected:
+        ids = ", ".join(bucket["id"] for bucket in buckets)
+        lines.append(f"- {domain}: {len(buckets)} 个桶 -> {ids}")
+    if dry_run:
+        return "\n".join(lines)
+
+    digested_total = 0
+    log_entries = []
+    for domain, buckets in selected:
+        digest_content = await _call_digest_api(domain, buckets)
+        source_ids = [bucket["id"] for bucket in buckets]
+        digest_id = await bucket_mgr.create(
+            content=digest_content,
+            tags=["digest", "auto-digested"],
+            importance=6,
+            domain=[domain, "digest"],
+            valence=0.5,
+            arousal=0.3,
+            bucket_type="dynamic",
+            name=f"digest_{domain}_{datetime.now().date().isoformat()}",
+        )
+        await bucket_mgr.update(digest_id, source_bucket=",".join(source_ids))
+        for bucket_id in source_ids:
+            await bucket_mgr.update(bucket_id, digested=True, source_bucket=digest_id)
+            digested_total += 1
+        log_entries.append(f"[{digest_id}] {domain}: {', '.join(source_ids)}")
+    log_content = (
+        "# 自动消化日志\n\n"
+        f"- 时间: {datetime.now().isoformat(timespec='seconds')}\n"
+        f"- 消化桶数: {digested_total}\n\n"
+        + "\n".join(log_entries)
+    )
+    log_id = await bucket_mgr.create(
+        content=log_content,
+        tags=["digest-log"],
+        importance=5,
+        domain=["system", "digest"],
+        valence=0.5,
+        arousal=0.3,
+        bucket_type="dynamic",
+        name=f"digest_log_{datetime.now().date().isoformat()}",
+    )
+    lines.append(f"已消化: {digested_total} 个桶")
+    lines.append(f"日志桶: {log_id}")
+    return "\n".join(lines)
+
+
+async def _digest_scheduler_loop() -> None:
+    enabled = os.environ.get("OMBRE_DIGEST_SCHEDULER", "").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return
+    dry_run = os.environ.get("OMBRE_DIGEST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no", "off")
+    await asyncio.sleep(30)
+    last_key = ""
+    while True:
+        now = datetime.now()
+        key = now.strftime("%Y-%m-%d-%H")
+        if now.weekday() == 6 and now.hour == 3 and key != last_key:
+            last_key = key
+            try:
+                result = await _run_digest(dry_run=dry_run)
+                logger.info("Scheduled digest completed: %s", result[:1000])
+            except Exception as exc:
+                logger.warning("Scheduled digest failed: %s", exc)
+        await asyncio.sleep(600)
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -1276,6 +1435,17 @@ async def _breath_impl(
         final_text += f"\n\n还有{hidden_count}个相关桶未显示"
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return _with_emotion_timeline(final_text, emotion_trend)
+
+
+@mcp.tool()
+async def digest(dry_run: bool = True, max_groups: int = 10) -> str:
+    """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""
+    await decay_engine.ensure_started()
+    try:
+        return await _run_digest(dry_run=dry_run, max_groups=max_groups)
+    except Exception as exc:
+        logger.error("Digest failed: %s", exc)
+        return f"自动消化失败: {exc}"
 
 
 @mcp.tool()
@@ -2813,6 +2983,13 @@ if __name__ == "__main__":
 
         t = threading.Thread(target=_start_keepalive, daemon=True)
         t.start()
+
+        def _start_digest_scheduler():
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_digest_scheduler_loop())
+
+        digest_thread = threading.Thread(target=_start_digest_scheduler, daemon=True)
+        digest_thread.start()
 
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
