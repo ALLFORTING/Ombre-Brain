@@ -75,3 +75,26 @@ async def test_grow_digest_path_appends_conflict_warning(tmp_path, monkeypatch):
 
     assert "conflict: digest-item: bucket old has conflicting fact" in result
 
+
+@pytest.mark.asyncio
+async def test_conflict_detection_uses_lexical_fallback_candidates(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    old_id = await server.bucket_mgr.create(
+        content="codex_conflict_marker Alpha invoice due date is 2026-07-06.",
+        pinned=True,
+    )
+    server.bucket_mgr.search = AsyncMock(return_value=[])
+    captured = {}
+
+    async def fake_call(new_content, old_buckets):
+        captured["old_ids"] = [bucket["id"] for bucket in old_buckets]
+        return "bucket has conflicting date"
+
+    server._call_conflict_api = fake_call
+
+    warning = await server._detect_conflict_warning(
+        "codex_conflict_marker Alpha invoice due date is 2026-07-01."
+    )
+
+    assert warning == "bucket has conflicting date"
+    assert old_id in captured["old_ids"]

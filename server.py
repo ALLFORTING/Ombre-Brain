@@ -41,6 +41,7 @@ import hashlib
 import hmac
 import secrets
 import time
+import re
 import json as _json_lib
 import httpx
 from datetime import datetime, timedelta
@@ -1244,13 +1245,76 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+def _conflict_tokens(text: str) -> set[str]:
+    normalized = strip_wikilinks(_apply_display_aliases(text or "")).lower()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", normalized)
+        if len(token.strip()) >= 2
+    }
+
+
+async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict]:
+    candidates = []
+    seen = set()
+
+    def add_bucket(bucket: dict) -> None:
+        bucket_id = bucket.get("id")
+        if not bucket_id or bucket_id in seen or _is_sealed(bucket):
+            return
+        seen.add(bucket_id)
+        candidates.append(bucket)
+
+    try:
+        for bucket in await bucket_mgr.search(content, limit=8):
+            add_bucket(bucket)
+    except Exception as exc:
+        logger.warning("Conflict search candidates failed: %s", exc)
+
+    if len(candidates) >= limit:
+        return candidates[:limit]
+
+    query_tokens = _conflict_tokens(content)
+    if not query_tokens:
+        return candidates[:limit]
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as exc:
+        logger.warning("Conflict lexical candidates failed: %s", exc)
+        return candidates[:limit]
+
+    lexical = []
+    for bucket in all_buckets:
+        if bucket.get("id") in seen or _is_sealed(bucket):
+            continue
+        meta = bucket.get("metadata", {})
+        haystack = " ".join([
+            str(meta.get("name", "")),
+            str(meta.get("summary", "")),
+            " ".join(map(str, meta.get("tags", []) or [])),
+            strip_wikilinks(bucket.get("content", "")),
+        ])
+        overlap = query_tokens & _conflict_tokens(haystack)
+        strong_overlap = [
+            token for token in overlap
+            if len(token) >= 4 or any(ch.isdigit() for ch in token)
+        ]
+        if strong_overlap or len(overlap) >= 2:
+            lexical.append((len(strong_overlap) * 3 + len(overlap), bucket))
+
+    lexical.sort(key=lambda item: item[0], reverse=True)
+    for _, bucket in lexical:
+        add_bucket(bucket)
+        if len(candidates) >= limit:
+            break
+
+    return candidates[:limit]
+
+
 async def _detect_conflict_warning(content: str) -> str:
     try:
-        candidates = await bucket_mgr.search(content, limit=8)
-        old_buckets = [
-            bucket for bucket in candidates
-            if not _is_sealed(bucket)
-        ][:3]
+        old_buckets = await _conflict_candidate_buckets(content, limit=3)
         response = await _call_conflict_api(content, old_buckets)
     except Exception as exc:
         logger.warning("Conflict detection failed: %s", exc)
