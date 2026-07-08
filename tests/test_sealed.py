@@ -33,7 +33,7 @@ async def test_trace_sets_and_clears_sealed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sealed_is_hidden_from_surfacing_but_queryable(tmp_path, monkeypatch):
+async def test_sealed_is_hidden_unless_explicitly_included(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None: content
@@ -47,10 +47,16 @@ async def test_sealed_is_hidden_from_surfacing_but_queryable(tmp_path, monkeypat
 
     surfaced = await server.breath(mode="summary")
     queried = await server.breath(query="unique sealed query needle")
+    queried_included = await server.breath(
+        query="unique sealed query needle",
+        include_sealed=True,
+    )
     included = await server.breath(mode="summary", include_sealed=True)
 
     assert bucket_id not in surfaced
-    assert bucket_id in queried
+    assert bucket_id not in queried
+    assert "Sealed control" not in queried
+    assert bucket_id in queried_included
     assert bucket_id in included
 
 
@@ -88,16 +94,46 @@ async def test_decay_never_sets_or_clears_sealed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pulse_marks_sealed_separately_from_dormant(tmp_path, monkeypatch):
+async def test_pulse_hides_sealed_by_default_and_marks_when_included(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     sealed_id = await server.bucket_mgr.create(content="sealed pulse control")
     dormant_id = await server.bucket_mgr.create(content="dormant pulse control")
     await server.trace(sealed_id, sealed=1)
     await server.trace(dormant_id, dormant=1)
 
-    result = await server.pulse(show_all=True)
+    hidden = await server.pulse(show_all=True)
+    result = await server.pulse(show_all=True, include_sealed=True)
 
+    assert sealed_id not in hidden
+    assert "sealed pulse control" not in hidden
     sealed_line = next(line for line in result.splitlines() if sealed_id in line)
     dormant_line = next(line for line in result.splitlines() if dormant_id in line)
-    assert "🔒" in sealed_line and "[封存]" in sealed_line
+    assert "[封存]" in sealed_line
     assert "[休眠]" in dormant_line and "[封存]" not in dormant_line
+
+
+@pytest.mark.asyncio
+async def test_dream_and_todos_hide_sealed_by_default(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    sealed_id = await server.bucket_mgr.create(
+        content="sealed dream todo control",
+        name="Sealed dream todo",
+    )
+    await server.trace(sealed_id, sealed=1)
+    path = server.bucket_mgr._find_bucket_file(sealed_id)
+    post = frontmatter.load(path)
+    post["todos"] = ["hidden sealed todo"]
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(frontmatter.dumps(post))
+
+    dream_recent = await server.dream()
+    dream_detail = await server.dream(detail_ids=sealed_id)
+    todos = await server.todos()
+
+    assert sealed_id not in dream_recent
+    assert "Sealed dream todo" not in dream_recent
+    assert sealed_id not in dream_detail
+    assert "Sealed dream todo" not in dream_detail
+    assert "sealed dream todo control" not in dream_detail
+    assert sealed_id not in todos
+    assert "hidden sealed todo" not in todos
