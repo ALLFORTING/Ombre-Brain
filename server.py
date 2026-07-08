@@ -454,6 +454,7 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    trigger_date: str = "",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -486,6 +487,7 @@ async def _merge_or_create(
                     domain=list(set(bucket["metadata"].get("domain", []) + domain)),
                     valence=merged_valence,
                     arousal=merged_arousal,
+                    **({"trigger_date": trigger_date, "trigger_last_seen": ""} if trigger_date else {}),
                 )
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
@@ -501,6 +503,8 @@ async def _merge_or_create(
         name=name or None,
     )
     await _auto_link_related(bucket_id)
+    if trigger_date:
+        await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
     return bucket_id, False
 
 
@@ -580,6 +584,13 @@ def _parse_date_filter(value: str, parameter: str) -> str:
         return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
     except ValueError as exc:
         raise ValueError(f"{parameter} must use YYYY-MM-DD format.") from exc
+
+
+def _parse_optional_date(value: str, parameter: str) -> str | None:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    return _parse_date_filter(value, parameter)
 
 
 def _is_in_date_range(
@@ -887,6 +898,33 @@ def _format_mailbox(limit: int = 1) -> str:
             f"{letter.get('content', '')}"
         )
     return "\n---\n".join(parts)
+
+
+async def _format_due_triggers(active_buckets: list[dict], max_items: int = 10) -> tuple[str, list[str]]:
+    today = datetime.now().date().isoformat()
+    due = []
+    for bucket in active_buckets:
+        meta = bucket.get("metadata", {})
+        trigger_date = str(meta.get("trigger_date", "") or "").strip()
+        if not trigger_date or trigger_date > today:
+            continue
+        if meta.get("resolved", False) or _is_sealed(bucket):
+            continue
+        if str(meta.get("trigger_last_seen", "") or "") == today:
+            continue
+        due.append(bucket)
+    due.sort(key=lambda b: (str(b["metadata"].get("trigger_date", "")), -int(b["metadata"].get("importance", 0) or 0)))
+    shown = due[:max_items]
+    lines = []
+    for bucket in shown:
+        meta = bucket.get("metadata", {})
+        preview = strip_wikilinks(bucket.get("content", "")).strip()[:300]
+        lines.append(
+            f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
+            f"trigger_date:{meta.get('trigger_date')}\n{preview}"
+        )
+    text = "=== boot: 今日浮现 ===\n" + ("\n---\n".join(lines) if lines else "（今日无到期提醒）")
+    return text, [bucket["id"] for bucket in shown]
 
 
 def _fit_sections_to_budget(sections: list[tuple[str, str]], max_tokens: int) -> str:
@@ -1616,8 +1654,10 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
-    source_bucket: str = "",    valence: float = -1,
+    source_bucket: str = "",
+    valence: float = -1,
     arousal: float = -1,
+    trigger_date: str = "",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
@@ -1626,6 +1666,10 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
     content = _apply_display_aliases(content)
+    try:
+        trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
+    except ValueError as exc:
+        return str(exc)
     should_record_emotion = 0 <= valence <= 1 and 0 <= arousal <= 1
 
     importance = max(1, min(10, importance))
@@ -1655,6 +1699,8 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
+        if trigger_date:
+            await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
         # --- Mark source memory as digested + store model's valence perspective ---
         # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
@@ -1707,6 +1753,8 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
+        if trigger_date:
+            await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
@@ -1719,6 +1767,7 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        trigger_date=trigger_date,
     )
     if should_record_emotion:
         _record_emotion_snapshot(valence, arousal, "hold")
@@ -1835,6 +1884,7 @@ async def trace(
     related: str = "",
     merge: str = "",
     append: bool = False,
+    trigger_date: str = "",
     delete: bool = False,
 ) -> str:
     # MCP schema note: related must stay in the tool signature for bidirectional links.
@@ -1868,6 +1918,7 @@ async def trace(
                 related=related,
                 merge="",
                 append=append,
+                trigger_date=trigger_date,
                 delete=delete,
             )
             results.append(f"[{current_id}] {result}")
@@ -1878,6 +1929,10 @@ async def trace(
         return "merge 不能与 delete 同时使用。"
     if merge:
         return await _merge_bucket_into_target(bucket_id, merge.strip())
+    try:
+        trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
+    except ValueError as exc:
+        return str(exc)
 
     # --- Delete mode / 删除模式 ---
     if delete:
@@ -1916,6 +1971,9 @@ async def trace(
         updates["dormant"] = bool(dormant)
     if sealed in (0, 1):
         updates["sealed"] = sealed
+    if trigger_date:
+        updates["trigger_date"] = trigger_date
+        updates["trigger_last_seen"] = ""
     if content:
         if append:
             current_content = bucket.get("content", "")
@@ -2095,6 +2153,8 @@ async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
         logger.error("Boot failed to list buckets: %s", exc)
         return _with_response_seal("boot 暂时无法读取记忆库。")
 
+    trigger_text, trigger_ids = await _format_due_triggers(active_buckets)
+
     pinned = [
         b for b in active_buckets
         if (b.get("metadata", {}).get("pinned") or b.get("metadata", {}).get("protected"))
@@ -2141,6 +2201,7 @@ async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
 
     body = _fit_sections_to_budget(
         [
+            ("triggers", trigger_text),
             ("pinned", pinned_text),
             ("mailbox", mailbox_text),
             ("sessions", sessions_text),
@@ -2148,6 +2209,9 @@ async def boot(pinned_chars: int = 300, max_tokens: int = 8000) -> str:
         ],
         max_tokens=max_tokens - 20,
     )
+    today = datetime.now().date().isoformat()
+    for bucket_id in trigger_ids:
+        await bucket_mgr.update(bucket_id, trigger_last_seen=today)
     return _with_response_seal(body)
 
 

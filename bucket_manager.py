@@ -268,6 +268,8 @@ class BucketManager:
             "emotion_history": "[]",
             "related_buckets": "",
             "source_bucket": "",
+            "trigger_date": "",
+            "trigger_last_seen": "",
             "dormant": False,
             "sealed": 0,
             "activation_count": 0,
@@ -426,6 +428,10 @@ class BucketManager:
             post["related_buckets"] = kwargs["related_buckets"]
         if "source_bucket" in kwargs:
             post["source_bucket"] = kwargs["source_bucket"]
+        if "trigger_date" in kwargs:
+            post["trigger_date"] = kwargs["trigger_date"]
+        if "trigger_last_seen" in kwargs:
+            post["trigger_last_seen"] = kwargs["trigger_last_seen"]
         if "dormant" in kwargs:
             post["dormant"] = bool(kwargs["dormant"])
         if "sealed" in kwargs:
@@ -1053,6 +1059,8 @@ class BucketManager:
             metadata.setdefault("dormant", False)
             metadata.setdefault("sealed", 0)
             metadata.setdefault("source_bucket", "")
+            metadata.setdefault("trigger_date", "")
+            metadata.setdefault("trigger_last_seen", "")
             metadata["sealed"] = 1 if int(metadata.get("sealed", 0) or 0) == 1 else 0
             return {
                 "id": post.get("id", Path(file_path).stem),
