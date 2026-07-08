@@ -846,6 +846,11 @@ def _split_search_results(matches: list[dict], max_results: int) -> tuple[list[d
     return pinned, regular[:max_results], hidden_count
 
 
+def _is_sealed(bucket: dict) -> bool:
+    """Return True when a bucket is manually sealed."""
+    return int(bucket.get("metadata", {}).get("sealed", 0) or 0) == 1
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -899,11 +904,7 @@ async def breath(
                 if "session" in b.get("metadata", {}).get("domain", [])
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
-                and (
-                    bool(query.strip())
-                    or include_sealed
-                    or int(b.get("metadata", {}).get("sealed", 0) or 0) != 1
-                )
+                and (include_sealed or not _is_sealed(b))
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -938,11 +939,7 @@ async def breath(
                 if b["metadata"].get("type") == "feel"
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
-                and (
-                    bool(query.strip())
-                    or include_sealed
-                    or int(b.get("metadata", {}).get("sealed", 0) or 0) != 1
-                )
+                and (include_sealed or not _is_sealed(b))
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -989,7 +986,7 @@ async def breath(
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
             and (include_dormant or not b["metadata"].get("dormant", False))
-            and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
+            and (include_sealed or not _is_sealed(b))
             and _is_recent_bucket(b, recent_cutoff)
             and _is_in_date_range(b, date_from, date_to)
         ]
@@ -1029,7 +1026,7 @@ async def breath(
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
             if _is_in_date_range(b, date_from, date_to)
-            if include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1
+            if include_sealed or not _is_sealed(b)
         ]
         unresolved = [
             b for b in all_buckets
@@ -1038,7 +1035,7 @@ async def breath(
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and (include_dormant or not b["metadata"].get("dormant", False))
-            and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
+            and (include_sealed or not _is_sealed(b))
             and _is_recent_bucket(b, recent_cutoff)
             and _is_in_date_range(b, date_from, date_to)
         ]
@@ -1131,7 +1128,7 @@ async def breath(
                 if b["metadata"].get("type") == "feel"
                 and _is_recent_bucket(b, recent_cutoff)
                 and _is_in_date_range(b, date_from, date_to)
-                and (include_sealed or int(b["metadata"].get("sealed", 0) or 0) != 1)
+                and (include_sealed or not _is_sealed(b))
             ]
             feels.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
             if not feels:
@@ -1183,6 +1180,7 @@ async def breath(
         for bucket in matches
         if _is_recent_bucket(bucket, recent_cutoff)
         and _is_in_date_range(bucket, date_from, date_to)
+        and (include_sealed or not _is_sealed(bucket))
     ]
     matched_ids = {b["id"] for b in matches}
     try:
@@ -1194,6 +1192,7 @@ async def breath(
                 and (meta.get("pinned") or meta.get("protected"))
                 and _is_recent_bucket(bucket, recent_cutoff)
                 and _is_in_date_range(bucket, date_from, date_to)
+                and (include_sealed or not _is_sealed(bucket))
             ):
                 bucket["score"] = 999.0
                 matches.append(bucket)
@@ -1686,6 +1685,8 @@ async def todos() -> str:
     groups = []
     for bucket in all_buckets:
         meta = bucket.get("metadata", {})
+        if _is_sealed(bucket):
+            continue
         if meta.get("resolved", False):
             continue
         items = _normalize_todos(meta.get("todos"))
@@ -1706,7 +1707,7 @@ async def todos() -> str:
 
 
 @mcp.tool()
-async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
+async def pulse(include_archive: bool = False, show_all: bool = False, include_sealed: bool = False) -> str:
     """系统状态+记忆桶列表。include_archive=True含归档。"""
     await decay_engine.ensure_started()
     try:
@@ -1734,8 +1735,12 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
 
     await _mark_dormant_buckets(buckets)
     total_buckets = len(buckets)
-    pinned_buckets = [
+    listable_buckets = [
         b for b in buckets
+        if include_sealed or not _is_sealed(b)
+    ]
+    pinned_buckets = [
+        b for b in listable_buckets
         if b["metadata"].get("pinned", False)
         or b["metadata"].get("protected", False)
     ]
@@ -1749,17 +1754,17 @@ async def pulse(include_archive: bool = False, show_all: bool = False) -> str:
 
     if show_all:
         visible_buckets = sorted(
-            buckets,
+            listable_buckets,
             key=lambda b: (
                 bool(b["metadata"].get("pinned") or b["metadata"].get("protected")),
                 _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
             ),
             reverse=True,
         )
-        dynamic_count = total_buckets - len(pinned_buckets)
+        dynamic_count = len(listable_buckets) - len(pinned_buckets)
     else:
         dynamic_buckets = [
-            b for b in buckets
+            b for b in listable_buckets
             if b["id"] not in pinned_ids
             and not b["metadata"].get("dormant", False)
         ]
@@ -1846,6 +1851,9 @@ async def dream(detail_ids: str = "") -> str:
             if not bucket:
                 details.append(f"未找到记忆桶: {bucket_id}")
                 continue
+            if _is_sealed(bucket):
+                details.append("指定记忆桶已封存，默认不显示。")
+                continue
             meta = bucket.get("metadata", {})
             resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
             domains = ",".join(meta.get("domain", []))
@@ -1874,6 +1882,7 @@ async def dream(detail_ids: str = "") -> str:
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
         and not b["metadata"].get("dormant", False)
+        and not _is_sealed(b)
     ]
 
     # --- Sort by latest update time desc, take top 5 ---
