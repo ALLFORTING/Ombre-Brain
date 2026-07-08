@@ -1182,36 +1182,11 @@ async def breath(
         and _is_in_date_range(bucket, date_from, date_to)
         and (include_sealed or not _is_sealed(bucket))
     ]
-    matched_ids = {b["id"] for b in matches}
-    try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-        for bucket in all_buckets:
-            meta = bucket.get("metadata", {})
-            if (
-                bucket["id"] not in matched_ids
-                and (meta.get("pinned") or meta.get("protected"))
-                and _is_recent_bucket(bucket, recent_cutoff)
-                and _is_in_date_range(bucket, date_from, date_to)
-                and (include_sealed or not _is_sealed(bucket))
-            ):
-                bucket["score"] = 999.0
-                matches.append(bucket)
-                matched_ids.add(bucket["id"])
-    except Exception as e:
-        logger.warning(f"Failed to add pinned search results: {e}")
-
-    pinned_matches, matches, hidden_count = _split_search_results(matches, max_results)
+    hidden_count = max(0, len(matches) - max_results)
+    matches = matches[:max_results]
 
     results = []
     token_used = 0
-    for bucket in pinned_matches:
-        line = await _append_bucket_extras(
-            _bucket_summary_line(bucket, pinned=True),
-            bucket,
-            emotion_trend,
-        )
-        results.append(line)
-
     for bucket in matches:
         if token_used >= max_tokens:
             break
