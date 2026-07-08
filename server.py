@@ -1477,6 +1477,7 @@ async def trace(
     content: str = "",
     related: str = "",
     merge: str = "",
+    append: bool = False,
     delete: bool = False,
 ) -> str:
     # MCP schema note: related must stay in the tool signature for bidirectional links.
@@ -1509,6 +1510,7 @@ async def trace(
                 content="",
                 related=related,
                 merge="",
+                append=append,
                 delete=delete,
             )
             results.append(f"[{current_id}] {result}")
@@ -1558,7 +1560,15 @@ async def trace(
     if sealed in (0, 1):
         updates["sealed"] = sealed
     if content:
-        updates["content"] = content
+        if append:
+            current_content = bucket.get("content", "")
+            updates["content"] = (
+                f"{current_content}\n\n{content}" if current_content else content
+            )
+            updates["_history_change_type"] = "append"
+        else:
+            updates["content"] = content
+            updates["_history_change_type"] = "replace"
     related_ids = _parse_csv_ids(related)
     if related_ids:
         current_related = _related_ids(bucket.get("metadata", {}))
@@ -1593,9 +1603,14 @@ async def trace(
                     related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
                 )
 
-    changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
+    changed = ", ".join(
+        f"{k}={v}"
+        for k, v in updates.items()
+        if k not in ("content", "_history_change_type")
+    )
     if "content" in updates:
-        changed += (", content=已替换" if changed else "content=已替换")
+        content_label = "content=已追加" if append else "content=已替换"
+        changed += (f", {content_label}" if changed else content_label)
     # Explicit hint about resolved state change semantics
     # 特别提示 resolved 状态变化的语义
     if "resolved" in updates:
