@@ -29,6 +29,7 @@ import os
 import math
 import logging
 import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -76,6 +77,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.history_db_path = os.path.join(self.base_dir, "bucket_history.sqlite3")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -109,6 +111,56 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+        self._init_history_db()
+
+    def _init_history_db(self) -> None:
+        """Create the write-ahead bucket history table if needed."""
+        os.makedirs(self.base_dir, exist_ok=True)
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bucket_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bucket_id TEXT NOT NULL,
+                    old_content TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    change_type TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bucket_history_bucket_id "
+                "ON bucket_history(bucket_id)"
+            )
+
+    def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
+        """Persist the old content before a destructive content change."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO bucket_history
+                    (bucket_id, old_content, changed_at, change_type)
+                VALUES (?, ?, ?, ?)
+                """,
+                (bucket_id, old_content or "", now_iso(), change_type),
+            )
+
+    def get_history(self, bucket_id: str, limit: int = 20) -> list[dict]:
+        """Return recent write-ahead snapshots for manual recovery."""
+        limit = max(1, min(int(limit or 20), 100))
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT bucket_id, old_content, changed_at, change_type
+                FROM bucket_history
+                WHERE bucket_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (bucket_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -274,6 +326,7 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
+        history_change_type = kwargs.pop("_history_change_type", "replace")
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -292,6 +345,10 @@ class BucketManager:
 
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
+            try:
+                self.record_history(bucket_id, post.content, history_change_type)
+            except Exception as e:
+                logger.warning(f"Failed to record bucket history for {bucket_id}: {e}")
             kwargs["content"] = apply_display_aliases(kwargs["content"])
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
@@ -392,9 +449,14 @@ class BucketManager:
             return False
 
         try:
+            post = frontmatter.load(file_path)
+            self.record_history(bucket_id, post.content, "delete")
             os.remove(file_path)
         except OSError as e:
             logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to snapshot/delete bucket {bucket_id}: {e}")
             return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
