@@ -102,6 +102,59 @@ def _with_response_seal(text: str) -> str:
     return f"{str(text).rstrip()}\n\nseal: {_response_seal()}"
 
 
+def _mcp_auth_token() -> str:
+    return os.environ.get("OMBRE_AUTH_TOKEN", "").strip()
+
+
+def _constant_time_token_match(candidate: str, expected: str) -> bool:
+    if not candidate or not expected:
+        return False
+    return secrets.compare_digest(
+        candidate.encode("utf-8"),
+        expected.encode("utf-8"),
+    )
+
+
+def add_mcp_auth_middleware(app):
+    """
+    Protect only the streamable-http MCP endpoint.
+
+    When OMBRE_AUTH_TOKEN is unset, this intentionally keeps the old behavior so
+    existing deployments do not disconnect after upgrading.
+    """
+    if not _mcp_auth_token():
+        logger.warning("OMBRE_AUTH_TOKEN not set, /mcp is unauthenticated")
+        return app
+
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import PlainTextResponse
+
+    class MCPAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            path = request.url.path or ""
+            if path != "/mcp" and not path.startswith("/mcp/"):
+                return await call_next(request)
+
+            expected = _mcp_auth_token()
+            authorization = request.headers.get("authorization", "")
+            bearer = ""
+            if authorization.lower().startswith("bearer "):
+                bearer = authorization[7:].strip()
+            query_token = request.query_params.get("token", "").strip()
+
+            if (
+                _constant_time_token_match(bearer, expected)
+                or _constant_time_token_match(query_token, expected)
+            ):
+                return await call_next(request)
+
+            return PlainTextResponse("Unauthorized", status_code=401)
+
+    app.add_middleware(MCPAuthMiddleware)
+    logger.info("OMBRE_AUTH_TOKEN set, /mcp authentication enabled")
+    return app
+
+
 async def _fire_webhook(event: str, payload: dict) -> None:
     """
     Fire-and-forget POST to OMBRE_HOOK_URL with the given event payload.
@@ -3407,6 +3460,7 @@ if __name__ == "__main__":
             _app = mcp.streamable_http_app()
         else:
             _app = mcp.sse_app()
+        add_mcp_auth_middleware(_app)
         _app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
