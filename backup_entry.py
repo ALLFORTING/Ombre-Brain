@@ -146,6 +146,7 @@ def run() -> None:
         app = server.mcp.streamable_http_app()
     else:
         app = server.mcp.sse_app()
+    server.add_mcp_auth_middleware(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
