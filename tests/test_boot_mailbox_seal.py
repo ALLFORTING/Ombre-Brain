@@ -58,6 +58,31 @@ async def test_archive_letter_boot_and_mailbox(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_boot_pinned_index_defaults_to_2000_chars(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    long_pinned_body = "开机桶正文开始\n" + ("核心索引" * 180) + "\n澄当记事本。"
+    too_long_body = ("临时热桶" * 600) + "SHOULD_NOT_APPEAR_AFTER_LIMIT"
+
+    await server.bucket_mgr.create(
+        content=long_pinned_body,
+        name="Startup index",
+        pinned=True,
+    )
+    await server.bucket_mgr.create(
+        content=too_long_body,
+        name="Temporary hot bucket",
+        pinned=True,
+    )
+
+    boot_result = await server.boot()
+
+    assert "=== boot: 开机索引 ===" in boot_result
+    assert "澄当记事本。" in boot_result
+    assert "SHOULD_NOT_APPEAR_AFTER_LIMIT" not in boot_result
+    assert "seal: test-seal-a" in boot_result
+
+
+@pytest.mark.asyncio
 async def test_response_seal_reads_runtime_env_each_call(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch, seal="first-runtime-seal")
 
