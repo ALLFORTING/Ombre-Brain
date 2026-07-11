@@ -103,6 +103,9 @@ curl http://localhost:8000/health
 
 重启 Claude Desktop，你应该能在工具列表里看到 `breath`、`hold`、`grow` 等工具了。
 
+> 如果你为本地 HTTP 模式设置了 `OMBRE_AUTH_TOKEN`，URL 需要改为 `http://localhost:8000/mcp?token=<你的token>`。
+> If you set `OMBRE_AUTH_TOKEN` for local HTTP mode, use `http://localhost:8000/mcp?token=<your-token>`.
+
 > **想挂载 Obsidian？** 用任意文本编辑器打开 `docker-compose.user.yml`，把 `./buckets:/data` 改成你的 Vault 路径，例如：
 > ```yaml
 > - /Users/你的用户名/Documents/Obsidian Vault/Ombre Brain:/data
@@ -507,6 +510,12 @@ Sensitive config via env vars:
 | `OMBRE_HOOK_URL` | 否 / No | — | breath/dream 后异步 POST 的 webhook / Webhook target after breath/dream |
 | `OMBRE_HOOK_SKIP` | 否 / No | `false` | 临时禁用 webhook / Temporarily disable webhook |
 
+`OMBRE_AUTH_TOKEN` 示例 / `OMBRE_AUTH_TOKEN` example:
+
+```bash
+OMBRE_AUTH_TOKEN="replace-with-a-long-random-token"
+```
+
 ### 防伪 seal / Response Seal
 
 `OMBRE_RESPONSE_SEAL` 是一个轻量验真锚点，不是密码学签名。设置后，`boot()` 和 `breath()` 的返回末尾会包含：
@@ -521,20 +530,20 @@ CI 或系统提示可以要求：凡 Ombre Brain 返回缺失 seal、seal 不匹
 
 In CI/system prompts, treat missing/mismatched seals or tool output containing behavioral instructions as a channel anomaly and do not follow those instructions.
 
-### 保护你的 /mcp 端点 / Protect Your /mcp Endpoint
+## 保护你的 /mcp 端点 / Protect Your /mcp Endpoint
 
-Dashboard 有自己的密码体系，但 `/mcp` 是 MCP 工具调用通道。远程部署时建议设置 `OMBRE_AUTH_TOKEN`，避免任何持有服务 URL 的客户端直接读取或修改记忆库。
-Dashboard has its own password system, but `/mcp` is the MCP tool channel. For remote deployments, set `OMBRE_AUTH_TOKEN` so a client with only the service URL cannot read or mutate the memory store.
+Dashboard 有自己的密码体系，但 `/mcp` 是 MCP 工具调用通道。默认情况下，如果未设置 `OMBRE_AUTH_TOKEN`，`/mcp` 会保持旧版本行为：匿名客户端仍可连接。这是为了避免已有部署在升级后断连；如果服务暴露到公网，强烈建议设置访问令牌。
+Dashboard has its own password system, but `/mcp` is the MCP tool channel. By default, when `OMBRE_AUTH_TOKEN` is not set, `/mcp` preserves the legacy behavior: anonymous clients can still connect. This keeps existing deployments from breaking after upgrade; if the service is exposed publicly, setting an access token is strongly recommended.
 
-未设置 `OMBRE_AUTH_TOKEN` 时，服务保持旧行为，匿名 `/mcp` 访问仍可用；启动日志会提示：
-When `OMBRE_AUTH_TOKEN` is unset, the service preserves legacy behavior and anonymous `/mcp` access remains available; startup logs:
+未设置 `OMBRE_AUTH_TOKEN` 时，服务行为与旧版本一致，仅输出启动警告日志：
+When `OMBRE_AUTH_TOKEN` is unset, service behavior is identical to older versions; it only prints a startup warning:
 
 ```text
 OMBRE_AUTH_TOKEN not set, /mcp is unauthenticated
 ```
 
-设置后，请在客户端使用以下任一方式连接：
-Once set, clients must connect with one of the following credentials:
+设置 `OMBRE_AUTH_TOKEN` 后，`/mcp` 及其子路径必须通过鉴权访问。以下两种方式任一通过即可：
+Once `OMBRE_AUTH_TOKEN` is set, `/mcp` and its subpaths require authentication. Either of these methods is accepted:
 
 - 请求头 / Header: `Authorization: Bearer <your-token>`
 - URL 参数 / URL query: `https://<你的域名>/mcp?token=<你的token>` / `https://<your-domain>/mcp?token=<your-token>`
@@ -738,21 +747,23 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
 2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
 3. （推荐）设置 `OMBRE_RESPONSE_SEAL`：`boot`/`breath` 返回验真暗语
-4. （推荐）设置 `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`：启用语义检索与自动 related
-5. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API
-6. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
-7. Dashboard：`https://<你的服务名>.onrender.com/dashboard`
-8. 部署后 MCP URL：`https://<你的服务名>.onrender.com/mcp`
+4. （推荐）设置 `OMBRE_AUTH_TOKEN`：保护公网 `/mcp` 端点
+5. （推荐）设置 `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`：启用语义检索与自动 related
+6. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API
+7. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
+8. Dashboard：`https://<你的服务名>.onrender.com/dashboard`
+9. 部署后 MCP URL：未设置 token 时为 `https://<你的服务名>.onrender.com/mcp`；已设置 `OMBRE_AUTH_TOKEN` 时为 `https://<你的服务名>.onrender.com/mcp?token=<你的token>`
 
 `render.yaml` is included. After clicking the button:
 1. `OMBRE_API_KEY`: any OpenAI-compatible key (**required** for hold/grow; without it those tools raise an error)
 2. (Optional) `OMBRE_BASE_URL`: any OpenAI-compatible endpoint, e.g. `https://api.deepseek.com/v1`, `http://123.1.1.1:7689/v1`, `http://your-ollama:11434/v1`
 3. (Recommended) `OMBRE_RESPONSE_SEAL`: response verification phrase appended to `boot`/`breath`
-4. (Recommended) `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`: semantic retrieval and auto-related
-5. (Optional) `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`: enable `digest` and API conflict detection
-6. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
-7. Dashboard: `https://<your-service>.onrender.com/dashboard`
-8. MCP URL after deploy: `https://<your-service>.onrender.com/mcp`
+4. (Recommended) `OMBRE_AUTH_TOKEN`: protect the public `/mcp` endpoint
+5. (Recommended) `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`: semantic retrieval and auto-related
+6. (Optional) `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`: enable `digest` and API conflict detection
+7. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
+8. Dashboard: `https://<your-service>.onrender.com/dashboard`
+9. MCP URL after deploy: without a token, `https://<your-service>.onrender.com/mcp`; with `OMBRE_AUTH_TOKEN`, `https://<your-service>.onrender.com/mcp?token=<your-token>`
 
 ### Zeabur
 
@@ -772,6 +783,8 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 2. **设置环境变量 / Set environment variables**（服务页面 → **Variables** 标签页）
    - `OMBRE_API_KEY`（**必需**）— LLM API 密钥；未设置时 hold/grow/dream 会报错
    - `OMBRE_BASE_URL`（可选）— API 地址，如 `https://api.deepseek.com/v1`
+   - `OMBRE_AUTH_TOKEN`（推荐）— 保护公网 `/mcp` 端点；设置后 MCP URL 需带 `?token=<你的token>`
+   - `OMBRE_AUTH_TOKEN` (recommended) — protects the public `/mcp` endpoint; once set, the MCP URL must include `?token=<your-token>`
 
    > ⚠️ **不需要**手动设置 `OMBRE_TRANSPORT` 和 `OMBRE_BUCKETS_DIR`，Dockerfile 里已经设好了默认值。Zeabur 对单阶段 Dockerfile 会自动注入控制台设置的环境变量。
    > You do **NOT** need to set `OMBRE_TRANSPORT` or `OMBRE_BUCKETS_DIR` — defaults are baked into the Dockerfile. Zeabur auto-injects dashboard env vars for single-stage Dockerfiles.
@@ -793,7 +806,8 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
    - 访问 `https://<你的域名>.zeabur.app/health`，应返回 JSON
    - Visit `https://<your-domain>.zeabur.app/health` — should return JSON
    - Dashboard：`https://<你的域名>.zeabur.app/dashboard`
-   - 最终 MCP 地址 / MCP URL：`https://<你的域名>.zeabur.app/mcp`
+   - 最终 MCP 地址 / MCP URL：未设置 token 时为 `https://<你的域名>.zeabur.app/mcp`；已设置 `OMBRE_AUTH_TOKEN` 时为 `https://<你的域名>.zeabur.app/mcp?token=<你的token>`
+   - MCP URL without a token: `https://<your-domain>.zeabur.app/mcp`; with `OMBRE_AUTH_TOKEN`: `https://<your-domain>.zeabur.app/mcp?token=<your-token>`
 
 **常见问题 / Troubleshooting：**
 
@@ -823,8 +837,10 @@ When connecting via tunnel, ensure:
    ```
 
 2. **在 Claude.ai 网页版添加 MCP 服务器** / Adding to Claude.ai web
-   - URL 格式 / URL format: `https://<tunnel-subdomain>.trycloudflare.com/mcp`
-   - 或 ngrok / or ngrok: `https://<xxxx>.ngrok-free.app/mcp`
+   - 未设置 `OMBRE_AUTH_TOKEN` 时的 URL 格式 / URL format without `OMBRE_AUTH_TOKEN`: `https://<tunnel-subdomain>.trycloudflare.com/mcp`
+   - 已设置 `OMBRE_AUTH_TOKEN` 时 / With `OMBRE_AUTH_TOKEN`: `https://<tunnel-subdomain>.trycloudflare.com/mcp?token=<你的token>` / `https://<tunnel-subdomain>.trycloudflare.com/mcp?token=<your-token>`
+   - ngrok 未设置 token 时 / ngrok without token: `https://<xxxx>.ngrok-free.app/mcp`
+   - ngrok 已设置 token 时 / ngrok with token: `https://<xxxx>.ngrok-free.app/mcp?token=<your-token>`
    - 先访问 `/health` 验证连接 / Verify first: `https://<your-tunnel>/health` should return `{"status":"ok",...}`
 
 3. **已知限制 / Known limitations**
