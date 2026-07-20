@@ -93,3 +93,49 @@ async def test_response_seal_reads_runtime_env_each_call(tmp_path, monkeypatch):
     assert "seal: first-runtime-seal" in first
     assert "seal: second-runtime-seal" in second
     assert "seal: first-runtime-seal" not in second
+
+
+@pytest.mark.asyncio
+async def test_boot_hides_sealed_archive_bucket(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    sealed_id = await server.bucket_mgr.create(
+        content="sealed archive boot filter control",
+        domain=["session"],
+        name="sealed_archive_boot_filter",
+        sealed=True,
+    )
+    await server.bucket_mgr.archive(sealed_id)
+
+    boot_result = await server.boot()
+
+    assert sealed_id not in boot_result
+    assert "sealed archive boot filter control" not in boot_result
+
+
+@pytest.mark.asyncio
+async def test_archive_session_sealed_true_persists_sealed_bucket(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    result = await server.archive_session("sealed archive persist control", sealed=True)
+    bucket_id = result.split("bucket_id:", 1)[1].strip()
+    bucket = await server.bucket_mgr.get(bucket_id)
+
+    assert bucket["metadata"]["sealed"] == 1
+    assert "archive" in bucket["path"]
+
+
+@pytest.mark.asyncio
+async def test_seal_letter_hides_default_mailbox_until_included(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    letter = "letter seal by id control"
+    await server.archive_session("letter carrier", letter=letter)
+
+    before = await server.breath(mailbox=True, mailbox_limit=10)
+    result = await server.seal_letter(1, sealed=1)
+    hidden = await server.breath(mailbox=True, mailbox_limit=10)
+    included = await server.breath(mailbox=True, mailbox_limit=10, include_sealed=True)
+
+    assert letter in before
+    assert "letter_id:1 sealed" in result
+    assert letter not in hidden
+    assert letter in included
