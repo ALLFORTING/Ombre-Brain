@@ -960,8 +960,8 @@ def _extract_session_summary(content: str, max_chars: int = 700) -> str:
     return text[:max_chars].strip()
 
 
-def _format_mailbox(limit: int = 1) -> str:
-    letters = bucket_mgr.get_letters(limit)
+def _format_mailbox(limit: int = 1, include_sealed: bool = False) -> str:
+    letters = bucket_mgr.get_letters(limit, include_sealed=include_sealed)
     if not letters:
         return "=== 信箱 ===\n（暂无信件）"
     parts = ["=== 信箱 ==="]
@@ -1076,6 +1076,28 @@ async def _digest_candidates() -> list[dict]:
     return candidates
 
 
+async def _importance_rebalance_candidates() -> list[dict]:
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    candidates = []
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        if meta.get("pinned") or meta.get("protected") or _is_sealed(bucket):
+            continue
+        importance = int(meta.get("importance", 0) or 0)
+        if importance < 8:
+            continue
+        if _days_since(meta.get("created") or meta.get("created_at")) <= 30:
+            continue
+        candidates.append(bucket)
+    candidates.sort(
+        key=lambda b: (
+            -int(b.get("metadata", {}).get("importance", 0) or 0),
+            str(b.get("metadata", {}).get("created") or b.get("metadata", {}).get("created_at") or ""),
+        )
+    )
+    return candidates
+
+
 def _group_digest_candidates(candidates: list[dict]) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = {}
     for bucket in candidates:
@@ -1123,6 +1145,7 @@ async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
 
 async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
     candidates = await _digest_candidates()
+    rebalance_candidates = await _importance_rebalance_candidates()
     groups = _group_digest_candidates(candidates)
     selected = list(groups.items())[:max(1, max_groups)]
     lines = [
@@ -1130,12 +1153,34 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
         f"候选桶数: {len(candidates)}",
         f"主题组数: {len(groups)}",
     ]
-    if not selected:
-        return "\n".join(lines + ["没有符合条件的桶。"])
+    if not selected and not rebalance_candidates:
+        return "\n".join(lines + ["No digest or importance rebalance candidates."])
     for domain, buckets in selected:
         ids = ", ".join(bucket["id"] for bucket in buckets)
         lines.append(f"- {domain}: {len(buckets)} 个桶 -> {ids}")
+    if rebalance_candidates:
+        lines.append(
+            "=== importance rebalance dry-run ==="
+            if dry_run else "=== importance rebalance execute ==="
+        )
+        for bucket in rebalance_candidates:
+            meta = bucket.get("metadata", {})
+            importance = int(meta.get("importance", 0) or 0)
+            created = meta.get("created") or meta.get("created_at") or ""
+            lines.append(
+                f"- bucket_id:{bucket['id']} importance:{importance}->{importance - 1} created:{created}"
+            )
     if dry_run:
+        return "\n".join(lines)
+
+    rebalanced_total = 0
+    if not selected:
+        for bucket in rebalance_candidates:
+            meta = bucket.get("metadata", {})
+            importance = int(meta.get("importance", 0) or 0)
+            await bucket_mgr.update(bucket["id"], importance=importance - 1)
+            rebalanced_total += 1
+        lines.append(f"importance rebalanced: {rebalanced_total}")
         return "\n".join(lines)
 
     digested_total = 0
@@ -1175,7 +1220,13 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
         name=f"digest_log_{datetime.now().date().isoformat()}",
     )
     lines.append(f"已消化: {digested_total} 个桶")
-    lines.append(f"日志桶: {log_id}")
+    lines.append(f"digest log bucket: {log_id}")
+    for bucket in rebalance_candidates:
+        meta = bucket.get("metadata", {})
+        importance = int(meta.get("importance", 0) or 0)
+        await bucket_mgr.update(bucket["id"], importance=importance - 1)
+        rebalanced_total += 1
+    lines.append(f"importance rebalanced: {rebalanced_total}")
     return "\n".join(lines)
 
 
@@ -1878,7 +1929,9 @@ async def breath(
 ) -> str:
     """Public MCP wrapper for memory retrieval plus optional mailbox access."""
     if mailbox:
-        return _with_response_seal(_format_mailbox(mailbox_limit))
+        return _with_response_seal(
+            _format_mailbox(mailbox_limit, include_sealed=include_sealed)
+        )
     if feels:
         domain = "feel"
     result = await _breath_impl(
@@ -2319,6 +2372,18 @@ async def trace(
             changed += " → 已取消隐藏，重新参与浮现"
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
+@mcp.tool()
+async def seal_letter(letter_id: int, sealed: int = 1) -> str:
+    """Hide or unhide a handoff letter by id."""
+    if int(letter_id or 0) < 1:
+        return "Please provide a valid letter_id."
+    if sealed not in (0, 1):
+        return "sealed must be 0 or 1."
+    success = bucket_mgr.seal_letter(int(letter_id), sealed=bool(sealed))
+    if not success:
+        return f"letter_id not found: {letter_id}"
+    state = "sealed" if sealed else "unsealed"
+    return f"letter_id:{letter_id} {state}"
 
 # =============================================================
 # Tool 5: archive_session — Archive a conversation summary
@@ -2337,6 +2402,7 @@ async def archive_session(
         Annotated[float, Field(ge=0, le=1, description="情绪唤醒度，范围 0-1")],
     ] = -1,
     letter: str = "",
+    sealed: bool = False,
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session."""
@@ -2371,10 +2437,11 @@ async def archive_session(
         arousal=archive_arousal,
         bucket_type="dynamic",
         name=session_name,
+        sealed=sealed,
     )
     await bucket_mgr.archive(bucket_id)
     if letter.strip():
-        bucket_mgr.record_letter(letter.strip(), bucket_id)
+        bucket_mgr.record_letter(letter.strip(), bucket_id, sealed=sealed)
     if 0 <= valence <= 1 and 0 <= arousal <= 1:
         _record_emotion_snapshot(valence, arousal, "archive")
     return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"

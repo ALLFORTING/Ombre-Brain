@@ -21,7 +21,9 @@ def _age_bucket(server, bucket_id, days=40):
     path = server.bucket_mgr._find_bucket_file(bucket_id)
     post = frontmatter.load(path)
     old = datetime.now() - timedelta(days=days)
+    post["created"] = old.isoformat()
     post["last_active"] = old.isoformat()
+    post["created_at"] = old.date().isoformat()
     post["updated_at"] = old.date().isoformat()
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(frontmatter.dumps(post))
@@ -82,3 +84,41 @@ async def test_digest_live_creates_digest_and_marks_sources(tmp_path, monkeypatc
     assert source["metadata"]["digested"] is True
     assert source["metadata"]["source_bucket"] == digest_buckets[0]["id"]
     assert digest_buckets[0]["content"] == "condensed digest body"
+
+
+@pytest.mark.asyncio
+async def test_digest_rebalances_old_high_importance_and_skips_pinned(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    candidate_id = await server.bucket_mgr.create(
+        content="old high importance rebalance candidate",
+        importance=9,
+        domain=["rebalance-test"],
+    )
+    pinned_id = await server.bucket_mgr.create(
+        content="old pinned rebalance exclusion",
+        importance=9,
+        domain=["rebalance-test"],
+        pinned=True,
+    )
+    fresh_id = await server.bucket_mgr.create(
+        content="fresh high importance exclusion",
+        importance=9,
+        domain=["rebalance-test"],
+    )
+    _age_bucket(server, candidate_id, days=40)
+    _age_bucket(server, pinned_id, days=40)
+
+    dry_run = await server.digest(dry_run=True)
+    before = await server.bucket_mgr.get(candidate_id)
+    result = await server.digest(dry_run=False)
+    candidate = await server.bucket_mgr.get(candidate_id)
+    pinned = await server.bucket_mgr.get(pinned_id)
+
+    assert "importance rebalance dry-run" in dry_run
+    assert candidate_id in dry_run
+    assert pinned_id not in dry_run
+    assert fresh_id not in dry_run
+    assert before["metadata"]["importance"] == 9
+    assert "importance rebalanced: 1" in result
+    assert candidate["metadata"]["importance"] == 8
+    assert pinned["metadata"]["importance"] == 10

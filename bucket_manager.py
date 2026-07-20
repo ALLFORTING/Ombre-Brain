@@ -138,10 +138,18 @@ class BucketManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    session_id TEXT NOT NULL
+                    session_id TEXT NOT NULL,
+                    sealed INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(letters)").fetchall()
+            }
+            if "sealed" not in columns:
+                conn.execute(
+                    "ALTER TABLE letters ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_letters_created_at "
                 "ON letters(created_at)"
@@ -176,34 +184,45 @@ class BucketManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def record_letter(self, content: str, session_id: str) -> None:
+    def record_letter(self, content: str, session_id: str, sealed: bool = False) -> None:
         """Persist an inter-window handoff letter outside normal memory buckets."""
         if not content or not content.strip():
             return
         with sqlite3.connect(self.history_db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO letters (content, created_at, session_id)
-                VALUES (?, ?, ?)
+                INSERT INTO letters (content, created_at, session_id, sealed)
+                VALUES (?, ?, ?, ?)
                 """,
-                (content.strip(), now_iso(), session_id or ""),
+                (content.strip(), now_iso(), session_id or "", 1 if sealed else 0),
             )
 
-    def get_letters(self, limit: int = 1) -> list[dict]:
+    def get_letters(self, limit: int = 1, include_sealed: bool = False) -> list[dict]:
         """Return latest handoff letters, newest first."""
         limit = max(1, min(int(limit or 1), 50))
+        where = "" if include_sealed else "WHERE sealed = 0"
         with sqlite3.connect(self.history_db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                """
-                SELECT id, content, created_at, session_id
+                f"""
+                SELECT id, content, created_at, session_id, sealed
                 FROM letters
+                {where}
                 ORDER BY id DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def seal_letter(self, letter_id: int, sealed: bool = True) -> bool:
+        """Hide or unhide one handoff letter by id."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            cur = conn.execute(
+                "UPDATE letters SET sealed = ? WHERE id = ?",
+                (1 if sealed else 0, int(letter_id)),
+            )
+            return cur.rowcount > 0
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -223,6 +242,7 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        sealed: bool = False,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -271,7 +291,7 @@ class BucketManager:
             "trigger_date": "",
             "trigger_last_seen": "",
             "dormant": False,
-            "sealed": 0,
+            "sealed": 1 if sealed else 0,
             "activation_count": 0,
         }
         if pinned:
