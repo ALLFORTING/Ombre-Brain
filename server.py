@@ -1098,6 +1098,20 @@ async def _importance_rebalance_candidates() -> list[dict]:
     return candidates
 
 
+def _importance_rebalance_token(candidates: list[dict]) -> str:
+    payload = []
+    for bucket in candidates:
+        meta = bucket.get("metadata", {})
+        payload.append(
+            "|".join([
+                bucket["id"],
+                str(meta.get("importance", "")),
+                str(meta.get("created") or meta.get("created_at") or ""),
+            ])
+        )
+    return hashlib.sha256("\n".join(payload).encode("utf-8")).hexdigest()[:12]
+
+
 def _group_digest_candidates(candidates: list[dict]) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = {}
     for bucket in candidates:
@@ -1143,7 +1157,7 @@ async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
+async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
     candidates = await _digest_candidates()
     rebalance_candidates = await _importance_rebalance_candidates()
     groups = _group_digest_candidates(candidates)
@@ -1159,10 +1173,12 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
         ids = ", ".join(bucket["id"] for bucket in buckets)
         lines.append(f"- {domain}: {len(buckets)} 个桶 -> {ids}")
     if rebalance_candidates:
+        rebalance_token = _importance_rebalance_token(rebalance_candidates)
         lines.append(
             "=== importance rebalance dry-run ==="
             if dry_run else "=== importance rebalance execute ==="
         )
+        lines.append(f"confirm_token: {rebalance_token}")
         for bucket in rebalance_candidates:
             meta = bucket.get("metadata", {})
             importance = int(meta.get("importance", 0) or 0)
@@ -1172,6 +1188,12 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10) -> str:
             )
     if dry_run:
         return "\n".join(lines)
+    if rebalance_candidates:
+        rebalance_token = _importance_rebalance_token(rebalance_candidates)
+        if not hmac.compare_digest((confirm_token or "").strip(), rebalance_token):
+            return "\n".join(lines + [
+                "confirmation required: rerun dry_run and pass confirm_token to apply importance rebalance."
+            ])
 
     rebalanced_total = 0
     if not selected:
@@ -1884,11 +1906,11 @@ async def _breath_impl(
 
 
 @mcp.tool()
-async def digest(dry_run: bool = True, max_groups: int = 10) -> str:
+async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
     """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""
     await decay_engine.ensure_started()
     try:
-        return await _run_digest(dry_run=dry_run, max_groups=max_groups)
+        return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token)
     except Exception as exc:
         logger.error("Digest failed: %s", exc)
         return f"自动消化失败: {exc}"
