@@ -1975,6 +1975,21 @@ async def asset_render_probe() -> CallToolResult:
 
 
 @mcp.tool()
+async def asset_export_probe() -> str:
+    """Phase-0 export probe. Caller should decode data_base64 to a file, verify decoded_bytes and sha256, then present it as a user-visible attachment."""
+    with open(ASSET_PROBE_PATH, "rb") as handle:
+        data = handle.read()
+    return _json_lib.dumps({
+        "ok": True,
+        "filename": "remember-me-probe.png",
+        "mime_type": "image/png",
+        "decoded_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
 async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
     """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""
     await decay_engine.ensure_started()

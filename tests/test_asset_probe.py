@@ -2,6 +2,7 @@ import base64
 import hashlib
 import importlib
 import json
+import re
 import struct
 import sys
 import zlib
@@ -135,3 +136,29 @@ async def test_asset_render_probe_returns_valid_png_image_block(tmp_path, monkey
     assert info["height"] == 128
     assert Path(server.ASSET_PROBE_PATH).name == "probe.png"
     assert all(image.data not in getattr(block, "text", "") for block in text_blocks)
+
+@pytest.mark.asyncio
+async def test_asset_export_probe_returns_user_visible_base64_payload(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    result_text = await server.asset_export_probe()
+    payload = json.loads(result_text)
+
+    assert payload["ok"] is True
+    assert payload["filename"] == "remember-me-probe.png"
+    assert payload["mime_type"] == "image/png"
+    decoded = base64.b64decode(payload["data_base64"], validate=True)
+    disk_bytes = Path(server.ASSET_PROBE_PATH).read_bytes()
+    assert decoded == disk_bytes
+    assert payload["decoded_bytes"] == len(disk_bytes)
+    assert payload["sha256"] == hashlib.sha256(disk_bytes).hexdigest()
+    assert _assert_valid_probe_png(decoded)["chunks"] == [b"IHDR", b"IDAT", b"IEND"]
+
+    render_result = await server.asset_render_probe()
+    render_image = next(block for block in render_result.content if getattr(block, "type", None) == "image")
+    assert base64.b64decode(render_image.data, validate=True) == decoded
+    assert str(Path.cwd()) not in result_text
+    assert str(Path.home()) not in result_text
+    assert not re.search(r"[A-Za-z]:[\\/]", result_text)
+    assert "/".join(["", "app", "assets"]) not in result_text
+    assert "data:image/" not in payload["data_base64"]
