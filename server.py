@@ -34,6 +34,8 @@
 
 import os
 import sys
+import base64
+import binascii
 import random
 import logging
 import asyncio
@@ -55,6 +57,7 @@ from pydantic import Field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
@@ -1903,6 +1906,72 @@ async def _breath_impl(
         final_text += f"\n\n还有{hidden_count}个相关桶未显示"
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return _with_emotion_timeline(final_text, emotion_trend)
+
+
+ASSET_PROBE_MAX_BASE64_CHARS = 4 * 1024 * 1024
+ASSET_PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "probe.png")
+
+
+@mcp.tool()
+async def asset_ingest_probe(
+    data_base64: str,
+    expected_sha256: str = "",
+    mime_type: str = "application/octet-stream",
+) -> str:
+    """Phase-0 transport probe: decode base64, hash it, and persist nothing."""
+    base64_chars = len(data_base64 or "")
+    if base64_chars > ASSET_PROBE_MAX_BASE64_CHARS:
+        return _json_lib.dumps({
+            "ok": False,
+            "error": "base64_too_large",
+            "base64_chars": base64_chars,
+            "max_base64_chars": ASSET_PROBE_MAX_BASE64_CHARS,
+            "mime_type": mime_type,
+        }, ensure_ascii=False, sort_keys=True)
+
+    try:
+        raw = base64.b64decode((data_base64 or "").encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+        return _json_lib.dumps({
+            "ok": False,
+            "error": "invalid_base64",
+            "detail": str(exc),
+            "base64_chars": base64_chars,
+            "mime_type": mime_type,
+        }, ensure_ascii=False, sort_keys=True)
+
+    sha256 = hashlib.sha256(raw).hexdigest()
+    expected = (expected_sha256 or "").strip().lower()
+    hash_match = bool(expected) and hmac.compare_digest(sha256, expected)
+    return _json_lib.dumps({
+        "ok": True,
+        "base64_chars": base64_chars,
+        "decoded_bytes": len(raw),
+        "sha256": sha256,
+        "expected_sha256": expected,
+        "hash_match": hash_match,
+        "mime_type": mime_type,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+@mcp.tool()
+async def asset_render_probe() -> CallToolResult:
+    """Phase-0 transport probe: return the built-in PNG as an MCP image block."""
+    with open(ASSET_PROBE_PATH, "rb") as handle:
+        encoded = base64.b64encode(handle.read()).decode("ascii")
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="asset_render_probe: phase-0 image content block",
+            ),
+            ImageContent(
+                type="image",
+                data=encoded,
+                mimeType="image/png",
+            ),
+        ]
+    )
 
 
 @mcp.tool()

@@ -311,7 +311,7 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-11 个 MCP 工具 / 11 MCP tools:
+13 个 MCP 工具 / 13 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
@@ -324,6 +324,8 @@ breath(query="今天很累")
 | `todos` | 汇总所有未 resolved 且非 sealed 桶的 todos 字段 / Summarize todos from unresolved, non-sealed buckets |
 | `related_backfill` | 为存量桶回填语义 related，默认 dry-run，跳过 sealed 桶 / Backfill semantic related links; dry-run by default; skips sealed buckets |
 | `digest` | 自动消化低重要度旧桶，默认 dry-run；正式执行会生成沉淀桶和日志桶 / Auto-digest old low-importance buckets; dry-run by default; real runs create distilled and log buckets |
+| `asset_ingest_probe` | 阶段0实验工具：验证客户端向 MCP 传输 base64 参数；只解码、计算 SHA-256 并返回轻量元数据，不创建 asset ID，不持久化用户图片 / Phase-0 experimental tool for client-to-MCP base64 transport; decodes, hashes, returns lightweight metadata, creates no asset ID, and persists no user image |
+| `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
 
@@ -364,6 +366,12 @@ breath(query="今天很累")
 
 - `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default; real runs require `OMBRE_DIGEST_API_KEY`.
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
+
+#### `asset_ingest_probe` 与 `asset_render_probe`
+
+- `asset_ingest_probe(data_base64, expected_sha256="", mime_type="application/octet-stream")` 是阶段0实验工具，仅用于验证 Claude/客户端向 MCP 传输 base64 参数。它不写磁盘、不保留完整 base64、不创建 asset ID，只返回长度、SHA-256、hash_match 和 MIME 类型等轻量结果。
+- `asset_render_probe()` 是阶段0实验工具，仅用于验证 MCP 图片内容块能否被客户端显示。它读取仓库内置的 `assets/probe.png`，返回独立的 `image/png` content block，不把图片 base64 包在普通文本里。
+- 两者都不代表正式图片存储功能已经上线；探针不会持久化用户图片。
 
 ## 安装 / Setup
 
