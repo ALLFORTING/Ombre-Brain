@@ -41,6 +41,7 @@ import logging
 import asyncio
 import hashlib
 import hmac
+import html
 import secrets
 import time
 import threading
@@ -1921,7 +1922,13 @@ ASSET_INGEST_RECOMMENDED_CHUNK_BASE64_CHARS = 8192
 ASSET_INGEST_MAX_CHUNK_BASE64_CHARS = 16384
 _asset_ingest_uploads = {}
 _asset_ingest_lock = threading.Lock()
-
+ASSET_BROWSER_UPLOAD_TTL_SECONDS = 10 * 60
+ASSET_BROWSER_UPLOAD_MAX_UPLOADS = 100
+ASSET_BROWSER_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD = 64 * 1024
+_asset_browser_uploads = {}
+_asset_browser_upload_tokens = {}
+_asset_browser_upload_lock = threading.Lock()
 ASSET_VISION_WIDTH = 256
 ASSET_VISION_HEIGHT = 256
 ASSET_VISION_TTL_SECONDS = 10 * 60
@@ -2108,6 +2115,302 @@ def _asset_abort_ingest_upload(upload_id: str, now: float | None = None) -> str:
         _asset_cleanup_expired_ingest_uploads(current)
         aborted = _asset_ingest_uploads.pop(upload_id, None) is not None
     return _asset_ingest_response(True, upload_id=upload_id, aborted=aborted)
+
+class _AssetBrowserUploadError(Exception):
+    pass
+
+
+class _AssetBrowserUploadTooLarge(_AssetBrowserUploadError):
+    pass
+
+
+def _asset_cleanup_browser_uploads(now: float) -> None:
+    for upload_id, item in list(_asset_browser_uploads.items()):
+        if item["state"] in ("pending", "uploading") and item["expires_at"] <= now:
+            token = item.get("token", "")
+            if token:
+                _asset_browser_upload_tokens.pop(token, None)
+            item["token"] = ""
+            item["state"] = "expired"
+        if item["retire_at"] <= now:
+            token = item.get("token", "")
+            if token:
+                _asset_browser_upload_tokens.pop(token, None)
+            _asset_browser_uploads.pop(upload_id, None)
+
+
+def _asset_sanitize_mime_type(mime_type: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", "", mime_type or "").strip()
+    return (cleaned or "application/octet-stream")[:255]
+
+
+def _asset_create_browser_upload_link(
+    expected_bytes: int,
+    expected_sha256: str = "",
+    filename: str = "",
+    mime_type: str = "application/octet-stream",
+    now: float | None = None,
+) -> str:
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= ASSET_BROWSER_UPLOAD_MAX_BYTES:
+        return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=ASSET_BROWSER_UPLOAD_MAX_BYTES)
+    expected = (expected_sha256 or "").strip().lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return _asset_ingest_response(False, error="invalid_expected_sha256")
+
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        active = sum(1 for item in _asset_browser_uploads.values() if item["state"] in ("pending", "uploading"))
+        if active >= ASSET_BROWSER_UPLOAD_MAX_UPLOADS:
+            return _asset_ingest_response(False, error="upload_store_full")
+        while True:
+            upload_id = secrets.token_hex(16)
+            if upload_id not in _asset_browser_uploads:
+                break
+        while True:
+            token = secrets.token_urlsafe(32)
+            if token not in _asset_browser_upload_tokens:
+                break
+        expires_at = current + ASSET_BROWSER_UPLOAD_TTL_SECONDS
+        _asset_browser_uploads[upload_id] = {
+            "state": "pending",
+            "token": token,
+            "expected_bytes": expected_bytes,
+            "expected_sha256": expected,
+            "filename": _asset_sanitize_ingest_filename(filename),
+            "mime_type": _asset_sanitize_mime_type(mime_type),
+            "expires_at": expires_at,
+            "retire_at": expires_at + ASSET_BROWSER_UPLOAD_TTL_SECONDS,
+            "result": None,
+        }
+        _asset_browser_upload_tokens[token] = upload_id
+
+    upload_path = f"/rm/upload/{token}"
+    base_url = _asset_public_base_url()
+    return _json_lib.dumps({
+        "ok": True,
+        "upload_id": upload_id,
+        "upload_path": upload_path,
+        "upload_url": f"{base_url}{upload_path}" if base_url else "",
+        "status_path": f"/rm/upload-status/{upload_id}",
+        "expires_in_seconds": ASSET_BROWSER_UPLOAD_TTL_SECONDS,
+        "max_bytes": ASSET_BROWSER_UPLOAD_MAX_BYTES,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_browser_upload_status_payload(upload_id: str, now: float | None = None) -> str:
+    upload_id = (upload_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        return _asset_ingest_response(False, error="invalid_upload_id")
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        item = _asset_browser_uploads.get(upload_id)
+        if not item:
+            return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
+        state = "pending" if item["state"] == "uploading" else item["state"]
+        result = dict(item["result"] or {})
+        payload = {
+            "ok": True,
+            "state": state,
+            "decoded_bytes": result.get("decoded_bytes", 0),
+            "sha256": result.get("sha256", ""),
+            "expected_bytes": item["expected_bytes"],
+            "expected_sha256": item["expected_sha256"],
+            "size_match": result.get("size_match", False),
+            "hash_match": result.get("hash_match", False),
+            "filename": item["filename"],
+            "mime_type": item["mime_type"],
+        }
+    return _json_lib.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_get_browser_upload(token: str, now: float | None = None) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        upload_id = _asset_browser_upload_tokens.get(token)
+        item = _asset_browser_uploads.get(upload_id or "")
+        if not item or item["state"] != "pending":
+            return None
+        return {
+            "upload_id": upload_id,
+            "expected_bytes": item["expected_bytes"],
+            "filename": item["filename"],
+            "expires_at": item["expires_at"],
+        }
+
+
+def _asset_claim_browser_upload(token: str, now: float | None = None) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        upload_id = _asset_browser_upload_tokens.pop(token, None)
+        item = _asset_browser_uploads.get(upload_id or "")
+        if not item or item["state"] != "pending":
+            return None
+        item["state"] = "uploading"
+        return {"upload_id": upload_id, "token": token}
+
+
+def _asset_release_browser_upload(upload_id: str, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        item = _asset_browser_uploads.get(upload_id)
+        if not item or item["state"] != "uploading":
+            return
+        if item["expires_at"] <= current:
+            item["state"] = "expired"
+            item["token"] = ""
+            return
+        item["state"] = "pending"
+        _asset_browser_upload_tokens[item["token"]] = upload_id
+
+
+def _asset_complete_browser_upload(upload_id: str, decoded_bytes: int, sha256: str, now: float | None = None) -> dict | None:
+    current = time.time() if now is None else now
+    with _asset_browser_upload_lock:
+        _asset_cleanup_browser_uploads(current)
+        item = _asset_browser_uploads.get(upload_id)
+        if not item or item["state"] != "uploading" or item["expires_at"] <= current:
+            return None
+        expected_sha256 = item["expected_sha256"]
+        result = {
+            "decoded_bytes": decoded_bytes,
+            "sha256": sha256,
+            "size_match": decoded_bytes == item["expected_bytes"],
+            "hash_match": bool(expected_sha256) and hmac.compare_digest(sha256, expected_sha256),
+        }
+        item["state"] = "completed"
+        item["token"] = ""
+        item["result"] = result
+        item["retire_at"] = current + ASSET_BROWSER_UPLOAD_TTL_SECONDS
+        return dict(result)
+
+
+async def _asset_stream_browser_upload(request) -> dict:
+    from python_multipart import MultipartParser
+    from python_multipart.multipart import parse_options_header
+
+    content_type = request.headers.get("content-type", "")
+    kind, options = parse_options_header(content_type.encode("latin-1", errors="ignore"))
+    boundary = options.get(b"boundary")
+    if kind != b"multipart/form-data" or not boundary:
+        raise _AssetBrowserUploadError("invalid_multipart")
+
+    state = {
+        "headers": {},
+        "header_name": bytearray(),
+        "header_value": bytearray(),
+        "in_file": False,
+        "file_count": 0,
+        "seen_file": False,
+        "ended": False,
+        "decoded_bytes": 0,
+        "hasher": hashlib.sha256(),
+    }
+
+    def on_part_begin():
+        state["headers"] = {}
+        state["header_name"].clear()
+        state["header_value"].clear()
+        state["in_file"] = False
+
+    def on_header_field(data, start, end):
+        state["header_name"].extend(data[start:end])
+
+    def on_header_value(data, start, end):
+        state["header_value"].extend(data[start:end])
+
+    def on_header_end():
+        name = bytes(state["header_name"]).lower()
+        state["headers"][name] = bytes(state["header_value"])
+        state["header_name"].clear()
+        state["header_value"].clear()
+
+    def on_headers_finished():
+        disposition, params = parse_options_header(state["headers"].get(b"content-disposition", b""))
+        if disposition != b"form-data" or params.get(b"name") != b"file" or b"filename" not in params:
+            raise _AssetBrowserUploadError("single_file_required")
+        if state["file_count"]:
+            raise _AssetBrowserUploadError("single_file_required")
+        state["file_count"] = 1
+        state["in_file"] = True
+
+    def on_part_data(data, start, end):
+        if not state["in_file"]:
+            raise _AssetBrowserUploadError("single_file_required")
+        block = data[start:end]
+        state["decoded_bytes"] += len(block)
+        if state["decoded_bytes"] > ASSET_BROWSER_UPLOAD_MAX_BYTES:
+            raise _AssetBrowserUploadTooLarge("file_too_large")
+        state["hasher"].update(block)
+
+    def on_part_end():
+        if not state["in_file"]:
+            raise _AssetBrowserUploadError("single_file_required")
+        state["seen_file"] = True
+        state["in_file"] = False
+
+    def on_end():
+        state["ended"] = True
+
+    parser = MultipartParser(boundary, {
+        "on_part_begin": on_part_begin,
+        "on_part_data": on_part_data,
+        "on_part_end": on_part_end,
+        "on_header_field": on_header_field,
+        "on_header_value": on_header_value,
+        "on_header_end": on_header_end,
+        "on_headers_finished": on_headers_finished,
+        "on_end": on_end,
+    })
+    wire_bytes = 0
+    async for block in request.stream():
+        wire_bytes += len(block)
+        if wire_bytes > ASSET_BROWSER_UPLOAD_MAX_BYTES + ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD:
+            raise _AssetBrowserUploadTooLarge("request_too_large")
+        parser.write(block)
+    parser.finalize()
+    if not state["ended"] or not state["seen_file"] or state["file_count"] != 1:
+        raise _AssetBrowserUploadError("invalid_multipart")
+    return {
+        "decoded_bytes": state["decoded_bytes"],
+        "sha256": state["hasher"].hexdigest(),
+    }
+
+
+def _asset_browser_security_headers() -> dict:
+    return {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+    }
+
+
+def _asset_browser_upload_page(token: str, item: dict, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    filename = html.escape(item["filename"] or "Any filename")
+    action = html.escape(f"/rm/upload/{token}", quote=True)
+    expires_in = max(0, int(item["expires_at"] - current))
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remember-Me upload probe</title><style>body{{font:16px system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem}}label,input,button{{display:block;margin:.8rem 0}}code{{word-break:break-all}}</style></head>
+<body><h1>Remember-Me upload probe</h1><p>Expected file: <code>{filename}</code></p><p>Allowed size: {item["expected_bytes"]} bytes; hard limit: {ASSET_BROWSER_UPLOAD_MAX_BYTES} bytes.</p><p>Link expires in {expires_in} seconds.</p>
+<form method="post" enctype="multipart/form-data" action="{action}"><label for="file">Choose file</label><input id="file" name="file" type="file" required><button type="submit">Upload and verify</button></form></body></html>"""
+
+
+def _asset_browser_result_page(result: dict) -> str:
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload result</title></head>
+<body><h1>Upload result</h1><p>decoded_bytes: {result["decoded_bytes"]}</p><p>sha256: <code>{html.escape(result["sha256"])}</code></p><p>size_match: {str(result["size_match"]).lower()}</p><p>hash_match: {str(result["hash_match"]).lower()}</p></body></html>"""
 
 def _asset_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
@@ -2530,6 +2833,56 @@ async def asset_ingest_finish(upload_id: str) -> str:
 async def asset_ingest_abort(upload_id: str) -> str:
     """Discard a temporary Phase-0 chunked upload; repeated aborts are safe."""
     return _asset_abort_ingest_upload(upload_id)
+
+
+@mcp.tool()
+async def asset_browser_upload_link(
+    expected_bytes: int,
+    expected_sha256: str = "",
+    filename: str = "",
+    mime_type: str = "application/octet-stream",
+) -> str:
+    """Create a short-lived browser upload URL; raw file bytes never enter the model context."""
+    return _asset_create_browser_upload_link(expected_bytes, expected_sha256, filename, mime_type)
+
+
+@mcp.tool()
+async def asset_browser_upload_status(upload_id: str) -> str:
+    """Return metadata-only status for a Phase-0 browser upload."""
+    return _asset_browser_upload_status_payload(upload_id)
+
+
+@mcp.custom_route("/rm/upload/{token}", methods=["GET", "POST"])
+async def asset_browser_upload_route(request):
+    from starlette.responses import HTMLResponse, Response
+
+    token = request.path_params.get("token", "")
+    headers = _asset_browser_security_headers()
+    if request.method.upper() == "GET":
+        item = _asset_get_browser_upload(token)
+        if item is None:
+            return Response(status_code=404, headers=headers)
+        return HTMLResponse(_asset_browser_upload_page(token, item), headers=headers)
+
+    claim = _asset_claim_browser_upload(token)
+    if claim is None:
+        return Response(status_code=404, headers=headers)
+    try:
+        streamed = await _asset_stream_browser_upload(request)
+    except _AssetBrowserUploadTooLarge:
+        _asset_release_browser_upload(claim["upload_id"])
+        return Response(status_code=413, headers=headers)
+    except Exception:
+        _asset_release_browser_upload(claim["upload_id"])
+        return Response(status_code=400, headers=headers)
+
+    result = _asset_complete_browser_upload(
+        claim["upload_id"], streamed["decoded_bytes"], streamed["sha256"]
+    )
+    if result is None:
+        return Response(status_code=404, headers=headers)
+    return HTMLResponse(_asset_browser_result_page(result), headers=headers)
+
 
 @mcp.tool()
 async def asset_render_probe() -> CallToolResult:

@@ -92,6 +92,16 @@ def _download_client(server):
     return TestClient(app)
 
 
+def _browser_upload_client(server):
+    app = Starlette(routes=[
+        Route(
+            "/rm/upload/{token}",
+            server.asset_browser_upload_route,
+            methods=["GET", "POST"],
+        )
+    ])
+    return TestClient(app)
+
 def _challenge_prompt_and_png(challenge):
     prompt = json.loads(next(block.text for block in challenge.content if getattr(block, "type", None) == "text"))
     image = next(block for block in challenge.content if getattr(block, "type", None) == "image")
@@ -303,6 +313,182 @@ def test_asset_chunked_ingest_concurrent_duplicate_is_idempotent(tmp_path, monke
     finish = json.loads(server._asset_finish_ingest_upload(upload_id))
     assert finish["hash_match"] is True
     assert finish["received_chunks"] == 1
+
+@pytest.mark.parametrize("size", [64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024])
+@pytest.mark.asyncio
+async def test_asset_browser_upload_capacity_and_status(size, tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("OMBRE_PUBLIC_BASE_URL", "https://example.test/base/")
+    pattern = bytes(range(251))
+    payload = (pattern * (size // len(pattern) + 1))[:size]
+    expected = hashlib.sha256(payload).hexdigest()
+    link = json.loads(await server.asset_browser_upload_link(
+        size, expected, "upload.bin", "application/octet-stream"
+    ))
+
+    assert link["ok"] is True
+    assert link["max_bytes"] == 2 * 1024 * 1024
+    assert link["expires_in_seconds"] == 600
+    assert link["upload_url"] == f"https://example.test/base{link['upload_path']}"
+    assert "data_base64" not in link
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    with _browser_upload_client(server) as client:
+        response = client.post(
+            link["upload_path"],
+            files={"file": ("upload.bin", payload, "application/octet-stream")},
+        )
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    assert response.status_code == 200
+    assert str(size) in response.text
+    assert expected in response.text
+    status = json.loads(await server.asset_browser_upload_status(link["upload_id"]))
+    assert status["state"] == "completed"
+    assert status["decoded_bytes"] == size
+    assert status["sha256"] == expected
+    assert status["expected_bytes"] == size
+    assert status["expected_sha256"] == expected
+    assert status["size_match"] is True
+    assert status["hash_match"] is True
+    assert status["filename"] == "upload.bin"
+    assert status["mime_type"] == "application/octet-stream"
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_asset_browser_upload_empty_file_and_missing_hash(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    link = json.loads(await server.asset_browser_upload_link(0, "", "empty.bin"))
+    with _browser_upload_client(server) as client:
+        response = client.post(link["upload_path"], files={"file": ("empty.bin", b"")})
+
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    status_text = await server.asset_browser_upload_status(link["upload_id"])
+    status = json.loads(status_text)
+    assert response.status_code == 200
+    assert status["state"] == "completed"
+    assert status["decoded_bytes"] == 0
+    assert status["sha256"] == empty_hash
+    assert status["expected_sha256"] == ""
+    assert status["size_match"] is True
+    assert status["hash_match"] is False
+    assert "data_base64" not in status_text
+
+
+@pytest.mark.asyncio
+async def test_asset_browser_upload_stops_over_limit_and_keeps_no_file(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    link = json.loads(await server.asset_browser_upload_link(server.ASSET_BROWSER_UPLOAD_MAX_BYTES, ""))
+    payload = b"x" * (server.ASSET_BROWSER_UPLOAD_MAX_BYTES + 1)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    with _browser_upload_client(server) as client:
+        response = client.post(link["upload_path"], files={"file": ("too-large.bin", payload)})
+        retry_page = client.get(link["upload_path"])
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    assert response.status_code == 413
+    assert retry_page.status_code == 200
+    status = json.loads(await server.asset_browser_upload_status(link["upload_id"]))
+    assert status["state"] == "pending"
+    assert status["decoded_bytes"] == 0
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_asset_browser_upload_security_filename_and_wrong_hash(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    payload = b"browser upload metadata only"
+    marker = payload.decode("ascii")
+    wrong_hash = "0" * 64
+    link_text = await server.asset_browser_upload_link(
+        len(payload), wrong_hash, "../../private\\probe.bin", "text/plain\r\nunsafe"
+    )
+    link = json.loads(link_text)
+    assert "data_base64" not in link_text
+
+    with _browser_upload_client(server) as client:
+        page = client.get(link["upload_path"])
+        response = client.post(link["upload_path"], files={"file": ("probe.bin", payload, "text/plain")})
+
+    assert page.status_code == 200
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["x-content-type-options"] == "nosniff"
+    assert page.headers["x-frame-options"] == "DENY"
+    assert "default-src 'none'" in page.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    assert "<script" not in page.text.lower()
+    assert "http://" not in page.text and "https://" not in page.text
+    assert "../" not in page.text and "..\\" not in page.text
+    assert response.status_code == 200
+
+    status_text = await server.asset_browser_upload_status(link["upload_id"])
+    status = json.loads(status_text)
+    assert status["state"] == "completed"
+    assert status["size_match"] is True
+    assert status["hash_match"] is False
+    assert "/" not in status["filename"] and "\\" not in status["filename"] and ":" not in status["filename"]
+    assert "\r" not in status["mime_type"] and "\n" not in status["mime_type"]
+    assert marker not in status_text
+    assert "data_base64" not in status_text
+
+
+@pytest.mark.asyncio
+async def test_asset_browser_upload_rejects_forged_expired_and_reused_tokens(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    forged_path = "/rm/upload/" + "A" * 43
+    with _browser_upload_client(server) as client:
+        assert client.get(forged_path).status_code == 404
+        assert client.post(forged_path, files={"file": ("x.bin", b"x")}).status_code == 404
+
+    expired = json.loads(await server.asset_browser_upload_link(1, hashlib.sha256(b"x").hexdigest()))
+    server._asset_browser_uploads[expired["upload_id"]]["expires_at"] = 0
+    server._asset_browser_uploads[expired["upload_id"]]["retire_at"] = 10 ** 20
+    with _browser_upload_client(server) as client:
+        assert client.get(expired["upload_path"]).status_code == 404
+    expired_status = json.loads(await server.asset_browser_upload_status(expired["upload_id"]))
+    assert expired_status["state"] == "expired"
+
+    valid = json.loads(await server.asset_browser_upload_link(1, hashlib.sha256(b"x").hexdigest()))
+    with _browser_upload_client(server) as client:
+        first = client.post(valid["upload_path"], files={"file": ("x.bin", b"x")})
+        second = client.post(valid["upload_path"], files={"file": ("x.bin", b"x")})
+        after = client.get(valid["upload_path"])
+    assert first.status_code == 200
+    assert second.status_code == 404
+    assert after.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_asset_browser_upload_concurrent_token_and_active_limit(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    payload = b"z" * (256 * 1024)
+    expected = hashlib.sha256(payload).hexdigest()
+    link = json.loads(await server.asset_browser_upload_link(len(payload), expected, "parallel.bin"))
+
+    def upload_once(_):
+        with _browser_upload_client(server) as client:
+            return client.post(link["upload_path"], files={"file": ("parallel.bin", payload)}).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        statuses = list(executor.map(upload_once, range(8)))
+    assert statuses.count(200) == 1
+    assert statuses.count(404) == 7
+    completed = json.loads(await server.asset_browser_upload_status(link["upload_id"]))
+    assert completed["state"] == "completed"
+    assert completed["hash_match"] is True
+
+    monkeypatch.setattr(server, "ASSET_BROWSER_UPLOAD_MAX_UPLOADS", 2)
+    server._asset_browser_uploads.clear()
+    server._asset_browser_upload_tokens.clear()
+    first = json.loads(server._asset_create_browser_upload_link(1, expected, now=100.0))
+    second = json.loads(server._asset_create_browser_upload_link(1, expected, now=100.0))
+    full = json.loads(server._asset_create_browser_upload_link(1, expected, now=100.0))
+    assert first["ok"] is True and second["ok"] is True
+    assert full["error"] == "upload_store_full"
+    cleaned = json.loads(server._asset_create_browser_upload_link(
+        1, expected, now=100.0 + server.ASSET_BROWSER_UPLOAD_TTL_SECONDS + 1
+    ))
+    assert cleaned["ok"] is True
 
 @pytest.mark.asyncio
 async def test_asset_render_probe_returns_valid_png_image_block(tmp_path, monkeypatch):

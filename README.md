@@ -329,6 +329,8 @@ breath(query="今天很累")
 | `asset_ingest_chunk` | Phase-0 chunk receiver: strictly decodes consecutive base64 chunks, with 8192 characters recommended and 16384 maximum per chunk |
 | `asset_ingest_finish` | Phase-0 chunked upload verifier: joins decoded bytes, checks size and SHA-256, then deletes the temporary session |
 | `asset_ingest_abort` | Phase-0 cleanup tool: safely discards a temporary chunked upload session and is idempotent |
+| `asset_browser_upload_link` | Phase-0 signed browser upload probe: creates a short-lived multipart upload page so raw file bytes bypass the model context |
+| `asset_browser_upload_status` | Phase-0 metadata-only status query for pending, completed, or expired browser uploads; returns no file bytes or base64 |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
@@ -380,9 +382,10 @@ breath(query="今天很累")
 #### `asset_ingest_probe`, `asset_render_probe`, and `asset_export_probe`
 
 - `asset_ingest_probe(data_base64, expected_sha256="", mime_type="application/octet-stream")` is a Phase-0 upload probe for client-to-MCP base64 transport. It decodes, enforces the size limit, and returns SHA-256, hash_match, and MIME metadata without creating an asset ID or persisting user images.
-- The single-call `asset_ingest_probe` remains only a small-file diagnostic. Capacity testing should use `asset_ingest_begin`, consecutive `asset_ingest_chunk` calls, and `asset_ingest_finish`; `asset_ingest_abort` safely discards an unfinished session.
-- The recommended chunk size is 8192 base64 characters, with a hard per-chunk maximum of 16384 characters and a Phase-0 file maximum of 2 MiB.
-- The model must not output a complete file base64 string in chat text. Chunk payloads are transport arguments only and are neither logged nor persisted.
+- The single-call `asset_ingest_probe` and the `asset_ingest_begin` / `asset_ingest_chunk` / `asset_ingest_finish` flow remain diagnostic tools for small transport checks; model-relayed base64 is not the formal RM upload path.
+- Formal RM capacity testing uses `asset_browser_upload_link(...)` so the user browser sends the original file directly as multipart/form-data. The raw file bytes do not pass through the model chat context.
+- Browser upload links expire after 10 minutes, accept at most 2 MiB, and expose metadata-only results through `asset_browser_upload_status(upload_id)`.
+- Phase-0 browser uploads are hashed while streaming and are not persisted. The model must not copy, reconstruct, or output a complete file base64 string in chat text.
 - `asset_render_probe()` is a Phase-0 return-path probe for whether MCP `ImageContent` can enter the AI vision context. It reads the built-in `assets/probe.png` and returns a standalone `image/png` content block, not text-wrapped base64.
 - `asset_export_probe()` is a Phase-0 user-visible attachment probe. The caller decodes `data_base64`, verifies `decoded_bytes` and `sha256`, then presents the result as a user-visible attachment.
 - `asset_render_probe` and `asset_export_probe` are independently accepted paths: one checks model vision input, the other checks user-visible attachment export.
