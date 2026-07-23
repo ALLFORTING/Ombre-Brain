@@ -330,6 +330,7 @@ breath(query="今天很累")
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
 | `asset_vision_verify` | Phase-0 blind vision verifier; strictly parses answer JSON, scores fields, consumes the trial once, and never returns the correct answer |
 | `asset_vision_export` | Phase-0 file-view vision probe; exports the live trial PNG as JSON/base64 exactly once so clients can decode, SHA-check, and view the same bytes as a local file |
+| `asset_vision_upload_challenge` | Phase-0 user-upload vision control; creates the same blind trial but returns only JSON metadata so the client can export the PNG and re-upload it as a normal chat attachment |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
 
@@ -389,6 +390,8 @@ breath(query="今天很累")
 - A/B test Path A: MCP `ImageContent` goes directly into the model vision context.
 - A/B test Path B: `asset_vision_export(trial_id)` returns base64 for the same trial PNG; the client strictly decodes it to a local file, verifies SHA-256, and uses local file view.
 - Both paths use the same trial PNG and the same server-held truth. A direct ImageContent failure does not prove that the local file view path also fails.
+- A/B/C test Path C: `asset_vision_upload_challenge()` creates the same kind of trial without returning `ImageContent` or base64; the client then calls `asset_vision_export(trial_id)`, uploads the original decoded file as a normal chat attachment, and submits the answer to the same verifier.
+- Paths A, B, and C are accepted independently and do not substitute for each other.
 
 ## 安装 / Setup
 

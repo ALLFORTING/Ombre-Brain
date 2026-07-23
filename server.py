@@ -2064,6 +2064,26 @@ def _asset_vision_prompt(trial_id: str, decoded_bytes: int, sha256: str) -> str:
     }, ensure_ascii=False, sort_keys=True)
 
 
+def _asset_vision_upload_payload(trial_id: str, decoded_bytes: int, sha256: str) -> str:
+    return _json_lib.dumps({
+        "ok": True,
+        "trial_id": trial_id,
+        "decoded_bytes": decoded_bytes,
+        "sha256": sha256,
+        "answer_format": {
+            "top_left": "<color>",
+            "top_right": "<color>",
+            "bottom_left": "<color>",
+            "bottom_right": "<color>",
+            "symbol": "<symbol>",
+            "symbol_position": "<position>",
+        },
+        "allowed_colors": list(ASSET_VISION_COLORS),
+        "allowed_symbols": list(ASSET_VISION_SYMBOLS),
+        "allowed_symbol_positions": list(ASSET_VISION_POSITIONS),
+    }, ensure_ascii=False, sort_keys=True)
+
+
 def _asset_reject_vision_answer(error: str, trial_id: str = "") -> str:
     return _json_lib.dumps({
         "ok": False,
@@ -2254,6 +2274,16 @@ async def asset_vision_export(trial_id: str) -> str:
     """Phase-0 file-view vision probe: export a live challenge PNG as JSON/base64 without revealing the answer."""
     return _asset_export_vision_trial(trial_id)
 
+
+
+@mcp.tool()
+async def asset_vision_upload_challenge() -> str:
+    """Phase-0 user-upload vision control: create a blind trial without returning ImageContent or base64."""
+    trial = _asset_new_vision_trial()
+    ok, error = _asset_store_vision_trial(trial)
+    if not ok:
+        return _asset_reject_vision_answer(error)
+    return _asset_vision_upload_payload(trial["trial_id"], len(trial["png"]), trial["sha256"])
 
 
 @mcp.tool()

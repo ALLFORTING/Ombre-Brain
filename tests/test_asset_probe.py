@@ -254,6 +254,61 @@ async def test_asset_vision_export_matches_challenge_png_and_keeps_trial_verifia
 
 
 @pytest.mark.asyncio
+async def test_asset_vision_upload_challenge_exports_and_verifies_without_image_or_answer(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    result_text = await server.asset_vision_upload_challenge()
+    payload = json.loads(result_text)
+
+    assert payload["ok"] is True
+    assert set(payload) == {
+        "allowed_colors",
+        "allowed_symbol_positions",
+        "allowed_symbols",
+        "answer_format",
+        "decoded_bytes",
+        "ok",
+        "sha256",
+        "trial_id",
+    }
+    assert len(payload["trial_id"]) == 32
+    assert re.fullmatch(r"[0-9a-f]{32}", payload["trial_id"])
+    assert not hasattr(result_text, "content")
+    assert "ImageContent" not in result_text
+    assert "data_base64" not in result_text
+    assert set(payload["allowed_colors"]) == set(server.ASSET_VISION_COLORS)
+    assert set(payload["allowed_symbols"]) == set(server.ASSET_VISION_SYMBOLS)
+    assert set(payload["allowed_symbol_positions"]) == set(server.ASSET_VISION_POSITIONS)
+    assert payload["answer_format"] == {
+        "top_left": "<color>",
+        "top_right": "<color>",
+        "bottom_left": "<color>",
+        "bottom_right": "<color>",
+        "symbol": "<symbol>",
+        "symbol_position": "<position>",
+    }
+
+    trial = server._asset_vision_trials[payload["trial_id"]]
+    answer = dict(trial["answer"])
+    for position in server.ASSET_VISION_POSITIONS:
+        assert f'"{position}": "{answer[position]}"' not in result_text
+    assert f'"symbol": "{answer["symbol"]}"' not in result_text
+    assert f'"symbol_position": "{answer["symbol_position"]}"' not in result_text
+
+    export = json.loads(await server.asset_vision_export(payload["trial_id"]))
+    exported_png = base64.b64decode(export["data_base64"], validate=True)
+    verify = json.loads(await server.asset_vision_verify(payload["trial_id"], json.dumps(answer)))
+
+    assert export["ok"] is True
+    assert export["decoded_bytes"] == payload["decoded_bytes"] == len(exported_png)
+    assert export["sha256"] == payload["sha256"] == hashlib.sha256(exported_png).hexdigest()
+    assert exported_png == trial["png"]
+    assert verify["ok"] is True
+    assert verify["score"] == 6
+    assert payload["trial_id"] not in server._asset_vision_trials
+
+
+@pytest.mark.asyncio
 async def test_asset_vision_export_rejects_second_verified_expired_missing_and_invalid_trials(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     challenge = await server.asset_vision_challenge()
