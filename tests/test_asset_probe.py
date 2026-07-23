@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import importlib
 import json
@@ -10,6 +11,9 @@ import zlib
 from pathlib import Path
 
 import pytest
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -77,6 +81,21 @@ def _load_server(tmp_path, monkeypatch):
     sys.modules.pop("server", None)
     return importlib.import_module("server")
 
+def _download_client(server):
+    app = Starlette(routes=[
+        Route(
+            "/rm/vision-download/{token}",
+            server.asset_vision_download_route,
+            methods=["GET", "HEAD"],
+        )
+    ])
+    return TestClient(app)
+
+
+def _challenge_prompt_and_png(challenge):
+    prompt = json.loads(next(block.text for block in challenge.content if getattr(block, "type", None) == "text"))
+    image = next(block for block in challenge.content if getattr(block, "type", None) == "image")
+    return prompt, base64.b64decode(image.data, validate=True)
 
 @pytest.mark.asyncio
 async def test_asset_ingest_probe_accepts_base64_and_hashes_without_files(tmp_path, monkeypatch):
@@ -307,6 +326,153 @@ async def test_asset_vision_upload_challenge_exports_and_verifies_without_image_
     assert verify["score"] == 6
     assert payload["trial_id"] not in server._asset_vision_trials
 
+@pytest.mark.asyncio
+async def test_asset_vision_download_link_returns_signed_path_and_http_png(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.delenv("OMBRE_PUBLIC_BASE_URL", raising=False)
+    challenge = await server.asset_vision_challenge()
+    prompt, challenge_png = _challenge_prompt_and_png(challenge)
+    answer = server._asset_vision_trials[prompt["trial_id"]]["answer"]
+
+    result_text = await server.asset_vision_download_link(prompt["trial_id"])
+    payload = json.loads(result_text)
+    token = payload["download_path"].rsplit("/", 1)[-1]
+    repeat = json.loads(await server.asset_vision_download_link(prompt["trial_id"]))
+
+    assert payload["ok"] is True
+    assert set(payload) == {
+        "decoded_bytes",
+        "download_path",
+        "download_url",
+        "expires_in_seconds",
+        "filename",
+        "mime_type",
+        "ok",
+        "sha256",
+        "trial_id",
+    }
+    assert payload["trial_id"] == prompt["trial_id"]
+    assert payload["filename"] == f"remember-me-vision-{prompt['trial_id']}.png"
+    assert re.fullmatch(r"remember-me-vision-[0-9a-f]{32}\.png", payload["filename"])
+    assert payload["mime_type"] == "image/png"
+    assert payload["decoded_bytes"] == len(challenge_png) == prompt["decoded_bytes"]
+    assert payload["sha256"] == hashlib.sha256(challenge_png).hexdigest() == prompt["sha256"]
+    assert payload["download_url"] == ""
+    assert re.fullmatch(r"/rm/vision-download/[A-Za-z0-9_-]{43,128}", payload["download_path"])
+    assert prompt["trial_id"] not in token
+    assert repeat["download_path"] == payload["download_path"]
+    assert 0 <= repeat["expires_in_seconds"] <= payload["expires_in_seconds"] <= server.ASSET_VISION_DOWNLOAD_TTL_SECONDS
+    assert "data_base64" not in result_text
+    assert "ImageContent" not in result_text
+    for position in server.ASSET_VISION_POSITIONS:
+        assert f'"{position}": "{answer[position]}"' not in result_text
+    assert f'"symbol": "{answer["symbol"]}"' not in result_text
+    assert f'"symbol_position": "{answer["symbol_position"]}"' not in result_text
+
+    response = _download_client(server).get(payload["download_path"])
+
+    assert response.status_code == 200
+    assert response.content == challenge_png
+    assert response.headers["content-length"] == str(payload["decoded_bytes"])
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-disposition"] == f'attachment; filename="{payload["filename"]}"'
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_download_head_and_get_limit(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    challenge = await server.asset_vision_challenge()
+    prompt, challenge_png = _challenge_prompt_and_png(challenge)
+    payload = json.loads(await server.asset_vision_download_link(prompt["trial_id"]))
+    token = payload["download_path"].rsplit("/", 1)[-1]
+    client = _download_client(server)
+
+    head = client.head(payload["download_path"])
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers["content-length"] == str(len(challenge_png))
+    assert server._asset_vision_download_tokens[token]["get_count"] == 0
+
+    responses = [client.get(payload["download_path"]) for _ in range(server.ASSET_VISION_DOWNLOAD_MAX_GETS)]
+    fourth = client.get(payload["download_path"])
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert all(response.content == challenge_png for response in responses)
+    assert fourth.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_download_rejects_invalid_expired_and_verified_tokens(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _download_client(server)
+    assert client.get("/rm/vision-download/not-a-valid-token").status_code == 404
+    assert client.get("/rm/vision-download/../escape").status_code == 404
+    assert client.get("/rm/vision-download/" + "a" * 43).status_code == 404
+
+    expired = server._asset_new_vision_trial(now=100.0)
+    assert server._asset_store_vision_trial(expired, now=100.0) == (True, "")
+    expired_link = json.loads(server._asset_create_vision_download_link(expired["trial_id"], now=100.0))
+    monkeypatch.setattr(server.time, "time", lambda: 100.0 + server.ASSET_VISION_DOWNLOAD_TTL_SECONDS + 1)
+    assert client.get(expired_link["download_path"]).status_code == 404
+
+    monkeypatch.setattr(server.time, "time", lambda: 200.0)
+    trial = server._asset_new_vision_trial(now=200.0)
+    assert server._asset_store_vision_trial(trial, now=200.0) == (True, "")
+    link = json.loads(server._asset_create_vision_download_link(trial["trial_id"], now=200.0))
+    verified = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])))
+    assert verified["ok"] is True
+    assert client.get(link["download_path"]).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_download_public_base_url_and_store_limit_cleanup(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("OMBRE_PUBLIC_BASE_URL", "https://example.test/base/")
+    first = server._asset_new_vision_trial(now=100.0)
+    assert server._asset_store_vision_trial(first, now=100.0) == (True, "")
+    first_link = json.loads(server._asset_create_vision_download_link(first["trial_id"], now=100.0))
+    assert first_link["download_url"] == f"https://example.test/base{first_link['download_path']}"
+
+    monkeypatch.setattr(server, "ASSET_VISION_MAX_DOWNLOAD_TOKENS", 1)
+    second = server._asset_new_vision_trial(now=110.0)
+    assert server._asset_store_vision_trial(second, now=110.0) == (True, "")
+    full = json.loads(server._asset_create_vision_download_link(second["trial_id"], now=110.0))
+    assert full == {"ok": False, "trial_id": second["trial_id"], "error": "download_store_full"}
+
+    third = server._asset_new_vision_trial(now=100.0 + server.ASSET_VISION_DOWNLOAD_TTL_SECONDS + 1)
+    assert server._asset_store_vision_trial(third, now=100.0 + server.ASSET_VISION_DOWNLOAD_TTL_SECONDS + 1) == (True, "")
+    cleaned = json.loads(server._asset_create_vision_download_link(third["trial_id"], now=100.0 + server.ASSET_VISION_DOWNLOAD_TTL_SECONDS + 1))
+    assert cleaned["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_download_concurrent_link_and_get_are_limited(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    trial = server._asset_new_vision_trial()
+    assert server._asset_store_vision_trial(trial) == (True, "")
+
+    def create_link():
+        return json.loads(server._asset_create_vision_download_link(trial["trial_id"]))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        links = list(executor.map(lambda _: create_link(), range(8)))
+
+    paths = {link["download_path"] for link in links if link.get("ok") is True}
+    assert len(paths) == 1
+    path = next(iter(paths))
+    token = path.rsplit("/", 1)[-1]
+    assert len(server._asset_vision_download_tokens) == 1
+    assert token in server._asset_vision_download_tokens
+
+    client = _download_client(server)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        statuses = list(executor.map(lambda _: client.get(path).status_code, range(8)))
+
+    assert statuses.count(200) == server.ASSET_VISION_DOWNLOAD_MAX_GETS
+    assert statuses.count(404) == 8 - server.ASSET_VISION_DOWNLOAD_MAX_GETS
 
 @pytest.mark.asyncio
 async def test_asset_vision_export_rejects_second_verified_expired_missing_and_invalid_trials(tmp_path, monkeypatch):

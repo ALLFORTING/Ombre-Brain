@@ -330,7 +330,8 @@ breath(query="今天很累")
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
 | `asset_vision_verify` | Phase-0 blind vision verifier; strictly parses answer JSON, scores fields, consumes the trial once, and never returns the correct answer |
 | `asset_vision_export` | Phase-0 file-view vision probe; exports the live trial PNG as JSON/base64 exactly once so clients can decode, SHA-check, and view the same bytes as a local file |
-| `asset_vision_upload_challenge` | Phase-0 user-upload vision control; creates the same blind trial but returns only JSON metadata so the client can export the PNG and re-upload it as a normal chat attachment |
+| `asset_vision_upload_challenge` | Phase-0 user-upload vision control; creates the same blind trial but returns only JSON metadata so the client can request a signed download and re-upload it as a normal chat attachment |
+| `asset_vision_download_link` | Phase-0 signed short-lived HTTP download path for a live vision trial PNG; returns no base64 or ImageContent and is not a formal asset download system |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
 
@@ -390,7 +391,9 @@ breath(query="今天很累")
 - A/B test Path A: MCP `ImageContent` goes directly into the model vision context.
 - A/B test Path B: `asset_vision_export(trial_id)` returns base64 for the same trial PNG; the client strictly decodes it to a local file, verifies SHA-256, and uses local file view.
 - Both paths use the same trial PNG and the same server-held truth. A direct ImageContent failure does not prove that the local file view path also fails.
-- A/B/C test Path C: `asset_vision_upload_challenge()` creates the same kind of trial without returning `ImageContent` or base64; the client then calls `asset_vision_export(trial_id)`, uploads the original decoded file as a normal chat attachment, and submits the answer to the same verifier.
+- A/B/C test Path C: `asset_vision_upload_challenge()` creates the same kind of trial without returning `ImageContent` or base64; the client then calls `asset_vision_download_link(trial_id)`, lets the user browser download the short-lived PNG, re-uploads that original file as a normal chat attachment, and submits the answer to the same verifier.
+- `asset_vision_export(trial_id)` remains a diagnostic base64 export path, but the model should not copy or reconstruct long base64 strings for Path C file delivery.
+- The short-lived URL is only a Phase-0 probe. Formal Remember-Me private asset downloads need a fuller authentication and authorization design.
 - Paths A, B, and C are accepted independently and do not substitute for each other.
 
 ## 安装 / Setup

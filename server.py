@@ -50,6 +50,7 @@ import re
 import json as _json_lib
 import httpx
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from typing import Union
 from typing_extensions import Annotated, Literal
 from pydantic import Field
@@ -1919,6 +1920,9 @@ ASSET_VISION_WIDTH = 256
 ASSET_VISION_HEIGHT = 256
 ASSET_VISION_TTL_SECONDS = 10 * 60
 ASSET_VISION_MAX_TRIALS = 100
+ASSET_VISION_DOWNLOAD_TTL_SECONDS = 5 * 60
+ASSET_VISION_MAX_DOWNLOAD_TOKENS = 100
+ASSET_VISION_DOWNLOAD_MAX_GETS = 3
 ASSET_VISION_COLORS = {
     "red": (220, 38, 38),
     "green": (34, 197, 94),
@@ -1931,6 +1935,7 @@ ASSET_VISION_SYMBOLS = ("circle", "triangle", "square")
 ASSET_VISION_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
 _ASSET_VISION_RNG = secrets.SystemRandom()
 _asset_vision_trials = {}
+_asset_vision_download_tokens = {}
 _asset_vision_lock = threading.Lock()
 
 
@@ -2024,7 +2029,19 @@ def _asset_new_vision_trial(now: float | None = None) -> dict:
 def _asset_cleanup_expired_trials(now: float) -> None:
     expired = [trial_id for trial_id, trial in _asset_vision_trials.items() if trial["expires_at"] <= now]
     for trial_id in expired:
-        _asset_vision_trials.pop(trial_id, None)
+        trial = _asset_vision_trials.pop(trial_id, None)
+        token = trial.get("download_token") if trial else ""
+        if token:
+            _asset_vision_download_tokens.pop(token, None)
+
+
+def _asset_cleanup_expired_vision_downloads(now: float) -> None:
+    expired = [token for token, item in _asset_vision_download_tokens.items() if item["expires_at"] <= now]
+    for token in expired:
+        item = _asset_vision_download_tokens.pop(token, None)
+        trial = _asset_vision_trials.get(item.get("trial_id", "")) if item else None
+        if trial and trial.get("download_token") == token:
+            trial["download_token"] = ""
 
 
 def _asset_store_vision_trial(trial: dict, now: float | None = None) -> tuple[bool, str]:
@@ -2040,6 +2057,7 @@ def _asset_store_vision_trial(trial: dict, now: float | None = None) -> tuple[bo
             "png": png,
             "sha256": hashlib.sha256(png).hexdigest(),
             "exported": False,
+            "download_token": "",
         }
     return True, ""
 
@@ -2118,11 +2136,114 @@ def _asset_export_vision_trial(trial_id: str, now: float | None = None) -> str:
     }, ensure_ascii=False, sort_keys=True)
 
 
+def _asset_vision_filename(trial_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", trial_id or ""):
+        raise ValueError("invalid_trial_id")
+    return f"remember-me-vision-{trial_id}.png"
+
+
+def _asset_public_base_url() -> str:
+    raw = os.environ.get("OMBRE_PUBLIC_BASE_URL", "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return raw.rstrip("/")
+
+
+def _asset_vision_download_payload(trial_id: str, png: bytes, sha256: str, token: str, expires_at: float, now: float) -> str:
+    download_path = f"/rm/vision-download/{token}"
+    base_url = _asset_public_base_url()
+    return _json_lib.dumps({
+        "ok": True,
+        "trial_id": trial_id,
+        "filename": _asset_vision_filename(trial_id),
+        "mime_type": "image/png",
+        "decoded_bytes": len(png),
+        "sha256": sha256,
+        "download_path": download_path,
+        "download_url": f"{base_url}{download_path}" if base_url else "",
+        "expires_in_seconds": max(0, int(expires_at - now)),
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_create_vision_download_link(trial_id: str, now: float | None = None) -> str:
+    trial_id = (trial_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", trial_id):
+        return _asset_reject_vision_answer("invalid_trial_id")
+    current = time.time() if now is None else now
+    with _asset_vision_lock:
+        _asset_cleanup_expired_trials(current)
+        _asset_cleanup_expired_vision_downloads(current)
+        trial = _asset_vision_trials.get(trial_id)
+        if not trial:
+            return _asset_reject_vision_answer("trial_unavailable", trial_id)
+
+        token = trial.get("download_token") or ""
+        token_item = _asset_vision_download_tokens.get(token) if token else None
+        if token_item and token_item["expires_at"] > current:
+            expires_at = min(token_item["expires_at"], trial["expires_at"])
+            return _asset_vision_download_payload(trial_id, bytes(trial["png"]), str(trial["sha256"]), token, expires_at, current)
+
+        if token:
+            _asset_vision_download_tokens.pop(token, None)
+            trial["download_token"] = ""
+        if len(_asset_vision_download_tokens) >= ASSET_VISION_MAX_DOWNLOAD_TOKENS:
+            return _asset_reject_vision_answer("download_store_full", trial_id)
+
+        while True:
+            token = secrets.token_urlsafe(32)
+            if token not in _asset_vision_download_tokens:
+                break
+        expires_at = current + ASSET_VISION_DOWNLOAD_TTL_SECONDS
+        trial["download_token"] = token
+        _asset_vision_download_tokens[token] = {
+            "trial_id": trial_id,
+            "expires_at": expires_at,
+            "get_count": 0,
+        }
+        return _asset_vision_download_payload(trial_id, bytes(trial["png"]), str(trial["sha256"]), token, min(expires_at, trial["expires_at"]), current)
+
+
+def _asset_read_vision_download(token: str, method: str, now: float | None = None) -> tuple[bytes, dict] | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _asset_vision_lock:
+        _asset_cleanup_expired_trials(current)
+        _asset_cleanup_expired_vision_downloads(current)
+        item = _asset_vision_download_tokens.get(token)
+        if not item:
+            return None
+        trial = _asset_vision_trials.get(item["trial_id"])
+        if not trial or trial["expires_at"] <= current:
+            _asset_vision_download_tokens.pop(token, None)
+            return None
+        if method.upper() == "GET":
+            if item["get_count"] >= ASSET_VISION_DOWNLOAD_MAX_GETS:
+                return None
+            item["get_count"] += 1
+        png = bytes(trial["png"])
+        filename = _asset_vision_filename(item["trial_id"])
+    return png, {
+        "Content-Type": "image/png",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Length": str(len(png)),
+    }
+
+
 def _asset_pop_vision_trial(trial_id: str, now: float | None = None) -> tuple[dict | None, str]:
     current = time.time() if now is None else now
     with _asset_vision_lock:
         _asset_cleanup_expired_trials(current)
         trial = _asset_vision_trials.pop((trial_id or "").strip(), None)
+        token = trial.get("download_token") if trial else ""
+        if token:
+            _asset_vision_download_tokens.pop(token, None)
     if not trial:
         return None, "trial_unavailable"
     if trial["expires_at"] <= current:
@@ -2274,6 +2395,23 @@ async def asset_vision_export(trial_id: str) -> str:
     """Phase-0 file-view vision probe: export a live challenge PNG as JSON/base64 without revealing the answer."""
     return _asset_export_vision_trial(trial_id)
 
+
+@mcp.tool()
+async def asset_vision_download_link(trial_id: str) -> str:
+    """Phase-0 signed download path for a live vision trial PNG; returns no base64 or ImageContent."""
+    return _asset_create_vision_download_link(trial_id)
+
+
+@mcp.custom_route("/rm/vision-download/{token}", methods=["GET", "HEAD"])
+async def asset_vision_download_route(request):
+    from starlette.responses import Response
+
+    result = _asset_read_vision_download(request.path_params.get("token", ""), request.method)
+    if result is None:
+        return Response(status_code=404)
+    png, headers = result
+    content = b"" if request.method.upper() == "HEAD" else png
+    return Response(content=content, headers=headers)
 
 
 @mcp.tool()
