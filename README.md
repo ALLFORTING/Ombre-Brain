@@ -335,7 +335,8 @@ breath(query="今天很累")
 | `rm_asset_upload_status` | Stage-1 metadata-only status for a persistent asset upload, including asset ID, hashes, size, dimensions, and deduplication result |
 | `rm_asset_get` | Return persistent asset metadata by asset ID without file bytes, base64, or disk paths |
 | `rm_asset_update_metadata` | Stage-2 transactional update for asset title, description, and normalized tags without changing file bytes or hashes |
-| `rm_asset_search` | Stage-2 local SQLite text and tag search with type, MIME, date, pagination, stable ranking, and match reasons |
+| `rm_asset_search` | Stage-2.1 hybrid asset search: local keyword/tag filtering plus optional vector semantic recall, with stable ranking and safe fallback |
+| `rm_asset_reindex_embeddings` | Explicitly backfill missing or stale asset embeddings for one asset or a bounded batch; never changes asset files or metadata |
 | `rm_asset_download_link` | Create a short-lived signed download link for a persistent asset; HEAD is free and at most three GET requests succeed |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
@@ -409,9 +410,18 @@ breath(query="今天很累")
 
 - Stage 2 adds user-managed titles, descriptions, and normalized tags. Metadata is stored in SQLite separately from persistent file bytes.
 - `rm_asset_update_metadata(...)` changes metadata transactionally and never rewrites the asset file, `stored_sha256`, or `stored_bytes`.
-- `rm_asset_search(...)` performs local SQLite-backed structured filtering plus deterministic text matching across asset ID, filename, title, description, and tags.
+- `rm_asset_search(...)` performs local SQLite-backed structured filtering and deterministic text matching across asset ID, filename, title, description, and tags.
 - English matching is case-insensitive, tag filters require every requested tag, and Chinese phrases support substring matching.
-- Stage 2 does not generate automatic image descriptions and does not provide vector semantic search or automatic chat attachment display.
+- Stage 2 does not generate automatic image descriptions or automatic chat attachment display.
+
+#### Remember-Me Stage 2.1 semantic search
+
+- RM asset search now combines the Stage-2 keyword channel with vector semantic recall using the existing OB Embedding configuration, model, text generation call, and cosine similarity implementation.
+- Asset vectors live in the independent `asset_embeddings` table inside `assets.sqlite3`; ordinary memory buckets remain in `embeddings.db`, so the two search namespaces cannot mix.
+- Only title, description, tags, original filename, kind, and MIME type are included in embedding text. Original file bytes, base64, hashes, and disk paths are never sent to the Embedding API.
+- Metadata updates refresh an asset vector when the index text or embedding model changes. Unchanged text is skipped.
+- When Embedding is disabled, unavailable, or fails, `rm_asset_search` still returns normal keyword results.
+- Existing assets require one explicit `rm_asset_reindex_embeddings(asset_id="", limit=100)` backfill. The server does not automatically batch-index production assets during startup.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

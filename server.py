@@ -67,6 +67,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import BucketManager
 from asset_store import AssetStore, AssetStoreError, InvalidAssetImage
+from asset_embedding_index import AssetEmbeddingIndex
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -186,6 +187,7 @@ async def _fire_webhook(event: str, payload: dict) -> None:
 
 # --- Initialize core components / 初始化核心组件 ---
 embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
+asset_embedding_index = AssetEmbeddingIndex(asset_store, embedding_engine)
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
@@ -3228,12 +3230,19 @@ async def rm_asset_update_metadata(
         )
     except AssetStoreError as exc:
         return _asset_ingest_response(False, error=str(exc))
+    try:
+        await asset_embedding_index.index_asset(asset)
+    except Exception as exc:
+        logger.warning(
+            "Asset embedding refresh failed asset_id=%s error=%s",
+            asset["asset_id"],
+            type(exc).__name__,
+        )
     return _json_lib.dumps(
         {"ok": True, **_rm_asset_public_metadata(asset)},
         ensure_ascii=False,
         sort_keys=True,
     )
-
 
 @mcp.tool()
 async def rm_asset_search(
@@ -3246,7 +3255,7 @@ async def rm_asset_search(
     limit: int = 20,
     offset: int = 0,
 ) -> str:
-    """Search persistent assets by local metadata, tags, type, and creation time."""
+    """Search persistent assets through keyword and optional semantic channels."""
     try:
         result = asset_store.search(
             query=query,
@@ -3259,6 +3268,46 @@ async def rm_asset_search(
             offset=offset,
         )
     except AssetStoreError as exc:
+        return _asset_ingest_response(False, error=str(exc))
+    if query.strip() and embedding_engine.enabled:
+        try:
+            semantic_scores = await asset_embedding_index.search(query)
+            if semantic_scores:
+                result = asset_store.search(
+                    query=query,
+                    tags=tags,
+                    kind=kind,
+                    mime_type=mime_type,
+                    created_from=created_from,
+                    created_to=created_to,
+                    limit=limit,
+                    offset=offset,
+                    semantic_scores=semantic_scores,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Asset semantic search fallback error=%s",
+                type(exc).__name__,
+            )
+    return _json_lib.dumps(
+        {"ok": True, **result},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+async def rm_asset_reindex_embeddings(
+    asset_id: str = "",
+    limit: int = 100,
+) -> str:
+    """Backfill missing or stale Remember-Me asset embeddings without changing assets."""
+    try:
+        result = await asset_embedding_index.reindex(
+            asset_id=(asset_id or "").strip(),
+            limit=limit,
+        )
+    except (AssetStoreError, ValueError) as exc:
         return _asset_ingest_response(False, error=str(exc))
     return _json_lib.dumps(
         {"ok": True, **result},

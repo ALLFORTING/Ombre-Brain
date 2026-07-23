@@ -425,6 +425,33 @@ class AssetStore:
         result["tags"] = [tag["tag_display"] for tag in tags]
         return result
 
+    def list_for_embedding(self, limit: int = 100) -> list[dict]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise AssetStoreError("invalid_limit")
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                """
+                SELECT * FROM assets
+                ORDER BY updated_at DESC, asset_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            tags_by_asset = self._tags_for_assets(
+                conn,
+                [row["asset_id"] for row in rows],
+            )
+        assets = []
+        for row in rows:
+            asset = dict(row)
+            asset["tags"] = [
+                tag["tag_display"]
+                for tag in tags_by_asset[row["asset_id"]]
+            ]
+            assets.append(asset)
+        return assets
+
     def update_metadata(
         self,
         asset_id: str,
@@ -527,6 +554,7 @@ class AssetStore:
         created_to: str = "",
         limit: int = 20,
         offset: int = 0,
+        semantic_scores: dict[str, float] | None = None,
     ) -> dict:
         if not isinstance(query, str):
             raise AssetStoreError("invalid_query")
@@ -576,6 +604,9 @@ class AssetStore:
 
             reasons = []
             rank = 6
+            semantic_score = float(
+                (semantic_scores or {}).get(row["asset_id"], 0.0)
+            )
             if normalized_query:
                 asset_id_text = row["asset_id"].casefold()
                 filename_text = unicodedata.normalize("NFKC", row["original_filename"]).casefold()
@@ -608,6 +639,8 @@ class AssetStore:
                 if normalized_query in description_text:
                     reasons.append("description")
                     rank = min(rank, 5)
+                if semantic_score > 0:
+                    reasons.append("semantic")
                 if not reasons:
                     continue
 
@@ -630,8 +663,12 @@ class AssetStore:
                     "match_reasons": reasons,
                 },
             })
+            if semantic_score > 0:
+                matches[-1]["semantic_score"] = semantic_score
+                matches[-1]["result"]["semantic_score"] = semantic_score
         matches.sort(key=lambda item: (
             item["rank"],
+            -item.get("semantic_score", 0.0) if item["rank"] == 6 else 0.0,
             -item["created_at_dt"].timestamp(),
             item["result"]["asset_id"],
         ))
