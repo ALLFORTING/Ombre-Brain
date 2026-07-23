@@ -326,7 +326,9 @@ breath(query="今天很累")
 | `digest` | 自动消化低重要度旧桶，默认 dry-run；正式执行会生成沉淀桶和日志桶 / Auto-digest old low-importance buckets; dry-run by default; real runs create distilled and log buckets |
 | `asset_ingest_probe` | 阶段0实验工具：验证客户端向 MCP 传输 base64 参数；只解码、计算 SHA-256 并返回轻量元数据，不创建 asset ID，不持久化用户图片 / Phase-0 experimental tool for client-to-MCP base64 transport; decodes, hashes, returns lightweight metadata, creates no asset ID, and persists no user image |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
-| `asset_export_probe` | ??0??????????? PNG ? JSON/base64??????????????????????????????? ImageContent / Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
+| `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
+| `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
+| `asset_vision_verify` | Phase-0 blind vision verifier; strictly parses answer JSON, scores fields, consumes the trial once, and never returns the correct answer |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
 
@@ -368,13 +370,21 @@ breath(query="今天很累")
 - `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default; real runs require `OMBRE_DIGEST_API_KEY`.
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
 
-#### `asset_ingest_probe`?`asset_render_probe` ? `asset_export_probe`
+#### `asset_ingest_probe`, `asset_render_probe`, and `asset_export_probe`
 
-- `asset_ingest_probe(data_base64, expected_sha256="", mime_type="application/octet-stream")` ???0????????? Claude/???? MCP ?? base64 ??????????????? SHA-256?hash_match ? MIME ??????? asset ID??????????
-- `asset_render_probe()` ???0????????? MCP `ImageContent` ???? AI ????????????? `assets/probe.png`????? `image/png` content block????? base64 ???????
-- `asset_export_probe()` ???0????????????? AI ??? JSON ?? `data_base64` ????????????? `decoded_bytes` ? `sha256` ????????????????
-- `asset_render_probe` ? `asset_export_probe` ??????????????????????????????????
-- ??????????????????????????????????????????????????????
+- `asset_ingest_probe(data_base64, expected_sha256="", mime_type="application/octet-stream")` is a Phase-0 upload probe for client-to-MCP base64 transport. It decodes, enforces the size limit, and returns SHA-256, hash_match, and MIME metadata without creating an asset ID or persisting user images.
+- `asset_render_probe()` is a Phase-0 return-path probe for whether MCP `ImageContent` can enter the AI vision context. It reads the built-in `assets/probe.png` and returns a standalone `image/png` content block, not text-wrapped base64.
+- `asset_export_probe()` is a Phase-0 user-visible attachment probe. The caller decodes `data_base64`, verifies `decoded_bytes` and `sha256`, then presents the result as a user-visible attachment.
+- `asset_render_probe` and `asset_export_probe` are independently accepted paths: one checks model vision input, the other checks user-visible attachment export.
+- Model-only visibility without UI visibility is not a complete pass. These probes do not mean formal image storage is live, and they do not persist user images.
+
+#### `asset_vision_challenge` and `asset_vision_verify`
+
+- Verbal description is not evidence for the vision path. `asset_vision_challenge()` plus `asset_vision_verify(trial_id, answer_json)` uses server-held truth for automatic scoring.
+- The challenge returns answer-free instructions plus a random `ImageContent`; verify strictly parses JSON, scores each field, consumes the trial once, and never returns the correct answer.
+- Recommended procedure: run 10 independent trials. The user and Claude should not receive the correct answers until all trials are complete.
+- Recommended acceptance: at least 9/10 perfect scores, with no systematic error for the same color or position.
+- The blind-test result verifies only the current client vision path; it does not imply every MCP client supports the same behavior, and it is not formal image storage.
 
 ## 安装 / Setup
 

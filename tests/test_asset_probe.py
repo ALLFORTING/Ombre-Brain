@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import importlib
@@ -12,7 +13,7 @@ import pytest
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-PNG_METADATA_CHUNKS = {b"eXIf", b"tEXt", b"zTXt", b"iTXt"}
+PNG_METADATA_CHUNKS = {b"eXIf", b"tEXt", b"zTXt", b"iTXt", b"iCCP"}
 
 
 def _parse_png(data):
@@ -40,7 +41,7 @@ def _parse_png(data):
     return chunks
 
 
-def _assert_valid_probe_png(data):
+def _assert_valid_probe_png(data, expected_size=(128, 128), expected_color_type=None):
     chunks = _parse_png(data)
     chunk_types = [chunk_type for chunk_type, _ in chunks]
     assert b"IHDR" in chunk_types
@@ -52,9 +53,12 @@ def _assert_valid_probe_png(data):
     width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(
         ">IIBBBBB", ihdr
     )
-    assert (width, height) == (128, 128)
+    assert (width, height) == expected_size
     assert bit_depth == 8
-    assert color_type in (2, 6)
+    if expected_color_type is None:
+        assert color_type in (2, 6)
+    else:
+        assert color_type == expected_color_type
     assert compression == 0
     assert filter_method == 0
     assert interlace == 0
@@ -64,7 +68,7 @@ def _assert_valid_probe_png(data):
     channels = 3 if color_type == 2 else 4
     assert len(raw) == height * (1 + width * channels)
     assert chunks[-1][0] == b"IEND"
-    return {"width": width, "height": height, "color_type": color_type, "chunks": chunk_types}
+    return {"width": width, "height": height, "color_type": color_type, "chunks": chunk_types, "raw": raw}
 
 
 def _load_server(tmp_path, monkeypatch):
@@ -162,3 +166,182 @@ async def test_asset_export_probe_returns_user_visible_base64_payload(tmp_path, 
     assert not re.search(r"[A-Za-z]:[\\/]", result_text)
     assert "/".join(["", "app", "assets"]) not in result_text
     assert "data:image/" not in payload["data_base64"]
+
+@pytest.mark.asyncio
+async def test_asset_vision_challenge_returns_blind_text_and_png(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    result = await server.asset_vision_challenge()
+    assert isinstance(result, server.CallToolResult)
+    image_blocks = [block for block in result.content if getattr(block, "type", None) == "image"]
+    text_blocks = [block for block in result.content if getattr(block, "type", None) == "text"]
+    assert len(image_blocks) == 1
+    assert len(text_blocks) == 1
+
+    prompt = json.loads(text_blocks[0].text)
+    assert set(prompt) == {
+        "allowed_colors",
+        "allowed_symbol_positions",
+        "allowed_symbols",
+        "answer_format",
+        "submit_to",
+        "trial_id",
+    }
+    assert len(prompt["trial_id"]) == 32
+    assert prompt["answer_format"] == {
+        "top_left": "<color>",
+        "top_right": "<color>",
+        "bottom_left": "<color>",
+        "bottom_right": "<color>",
+        "symbol": "<symbol>",
+        "symbol_position": "<position>",
+    }
+    assert prompt["submit_to"] == "asset_vision_verify"
+    assert set(prompt["allowed_colors"]) == set(server.ASSET_VISION_COLORS)
+    assert set(prompt["allowed_symbols"]) == set(server.ASSET_VISION_SYMBOLS)
+    assert set(prompt["allowed_symbol_positions"]) == set(server.ASSET_VISION_POSITIONS)
+    assert prompt["trial_id"] in server._asset_vision_trials
+
+    trial_answer = server._asset_vision_trials[prompt["trial_id"]]["answer"]
+    prompt_text = text_blocks[0].text
+    for position in server.ASSET_VISION_POSITIONS:
+        assert f'"{position}": "{trial_answer[position]}"' not in prompt_text
+    assert f'"symbol": "{trial_answer["symbol"]}"' not in prompt_text
+    assert f'"symbol_position": "{trial_answer["symbol_position"]}"' not in prompt_text
+
+    image = image_blocks[0]
+    assert image.mimeType == "image/png"
+    decoded = base64.b64decode(image.data, validate=True)
+    info = _assert_valid_probe_png(decoded, expected_size=(256, 256), expected_color_type=2)
+    assert info["chunks"] == [b"IHDR", b"IDAT", b"IEND"]
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_verify_scores_correct_and_consumes_trial(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    trial = server._asset_new_vision_trial()
+    ok, error = server._asset_store_vision_trial(trial)
+    assert ok, error
+
+    result = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])))
+
+    assert result == {
+        "ok": True,
+        "trial_id": trial["trial_id"],
+        "score": 6,
+        "max_score": 6,
+        "all_correct": True,
+        "field_results": {
+            "top_left": True,
+            "top_right": True,
+            "bottom_left": True,
+            "bottom_right": True,
+            "symbol": True,
+            "symbol_position": True,
+        },
+    }
+    assert trial["trial_id"] not in server._asset_vision_trials
+    assert not set(result).intersection(set(server.ASSET_VISION_COLORS))
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_verify_scores_partial_answer(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    trial = server._asset_new_vision_trial()
+    server._asset_store_vision_trial(trial)
+    answer = dict(trial["answer"])
+    answer["top_left"] = next(color for color in server.ASSET_VISION_COLORS if color != answer["top_left"])
+
+    result = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(answer)))
+
+    assert result["ok"] is True
+    assert result["score"] == 5
+    assert result["max_score"] == 6
+    assert result["all_correct"] is False
+    assert result["field_results"]["top_left"] is False
+    assert all(result["field_results"][key] for key in result["field_results"] if key != "top_left")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_answer,expected_error",
+    [
+        ("not json", "invalid_json"),
+        (json.dumps({}), "invalid_fields"),
+        (json.dumps({"top_left": "red", "top_right": "green", "bottom_left": "blue", "bottom_right": "orange", "symbol": "circle"}), "invalid_fields"),
+        (json.dumps({"top_left": "red", "top_right": "green", "bottom_left": "blue", "bottom_right": "orange", "symbol": "circle", "symbol_position": "top_left", "extra": "no"}), "invalid_fields"),
+        (json.dumps({"top_left": 1, "top_right": "green", "bottom_left": "blue", "bottom_right": "orange", "symbol": "circle", "symbol_position": "top_left"}), "invalid_field_type"),
+        (json.dumps({"top_left": "cyan", "top_right": "green", "bottom_left": "blue", "bottom_right": "orange", "symbol": "circle", "symbol_position": "top_left"}), "invalid_enum"),
+    ],
+)
+async def test_asset_vision_verify_rejects_invalid_answers_and_consumes_trial(tmp_path, monkeypatch, bad_answer, expected_error):
+    server = _load_server(tmp_path, monkeypatch)
+    trial = server._asset_new_vision_trial()
+    server._asset_store_vision_trial(trial)
+
+    result = json.loads(await server.asset_vision_verify(trial["trial_id"], bad_answer))
+    second = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])))
+
+    assert result["ok"] is False
+    assert result["error"] == expected_error
+    assert "field_results" not in result
+    assert second["ok"] is False
+    assert second["error"] == "trial_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_verify_second_submit_expired_and_missing_fail(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    trial = server._asset_new_vision_trial()
+    server._asset_store_vision_trial(trial)
+
+    first = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])))
+    second = json.loads(await server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])))
+    expired = server._asset_new_vision_trial(now=100.0)
+    server._asset_store_vision_trial(expired, now=100.0)
+    expired_result = json.loads(server._asset_score_vision_answer(expired["trial_id"], json.dumps(expired["answer"]), now=100.0 + server.ASSET_VISION_TTL_SECONDS + 1))
+    missing = json.loads(await server.asset_vision_verify("missing-trial", json.dumps(trial["answer"])))
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["error"] == "trial_unavailable"
+    assert expired_result["ok"] is False
+    assert expired_result["error"] == "trial_unavailable"
+    assert missing["ok"] is False
+    assert missing["error"] == "trial_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_asset_vision_concurrent_create_and_verify_are_safe(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    challenges = await asyncio.gather(*(server.asset_vision_challenge() for _ in range(20)))
+    trial_ids = [json.loads(next(block.text for block in result.content if getattr(block, "type", None) == "text"))["trial_id"] for result in challenges]
+    assert len(set(trial_ids)) == 20
+
+    trial = server._asset_new_vision_trial()
+    server._asset_store_vision_trial(trial)
+    results = await asyncio.gather(*(server.asset_vision_verify(trial["trial_id"], json.dumps(trial["answer"])) for _ in range(8)))
+    parsed = [json.loads(result) for result in results]
+    assert sum(1 for result in parsed if result.get("ok") is True) == 1
+    assert sum(1 for result in parsed if result.get("error") == "trial_unavailable") == 7
+
+
+def test_asset_vision_trial_limit_and_expired_cleanup(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "ASSET_VISION_MAX_TRIALS", 2)
+    server._asset_vision_trials.clear()
+
+    first = server._asset_new_vision_trial(now=100.0)
+    second = server._asset_new_vision_trial(now=100.0)
+    third = server._asset_new_vision_trial(now=100.0)
+    assert server._asset_store_vision_trial(first, now=100.0) == (True, "")
+    assert server._asset_store_vision_trial(second, now=100.0) == (True, "")
+    assert server._asset_store_vision_trial(third, now=100.0) == (False, "trial_store_full")
+
+    server._asset_vision_trials.clear()
+    expired = server._asset_new_vision_trial(now=100.0)
+    fresh = server._asset_new_vision_trial(now=100.0 + server.ASSET_VISION_TTL_SECONDS + 1)
+    assert server._asset_store_vision_trial(expired, now=100.0) == (True, "")
+    assert server._asset_store_vision_trial(fresh, now=100.0 + server.ASSET_VISION_TTL_SECONDS + 1) == (True, "")
+    assert list(server._asset_vision_trials) == [fresh["trial_id"]]

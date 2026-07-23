@@ -43,6 +43,9 @@ import hashlib
 import hmac
 import secrets
 import time
+import threading
+import struct
+import zlib
 import re
 import json as _json_lib
 import httpx
@@ -1912,6 +1915,207 @@ ASSET_PROBE_MAX_BASE64_CHARS = 4 * 1024 * 1024
 ASSET_PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "probe.png")
 
 
+ASSET_VISION_WIDTH = 256
+ASSET_VISION_HEIGHT = 256
+ASSET_VISION_TTL_SECONDS = 10 * 60
+ASSET_VISION_MAX_TRIALS = 100
+ASSET_VISION_COLORS = {
+    "red": (220, 38, 38),
+    "green": (34, 197, 94),
+    "blue": (37, 99, 235),
+    "orange": (249, 115, 22),
+    "purple": (147, 51, 234),
+    "yellow": (250, 204, 21),
+}
+ASSET_VISION_SYMBOLS = ("circle", "triangle", "square")
+ASSET_VISION_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
+_ASSET_VISION_RNG = secrets.SystemRandom()
+_asset_vision_trials = {}
+_asset_vision_lock = threading.Lock()
+
+
+def _asset_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+
+
+def _asset_encode_rgb_png(width: int, height: int, rgb: bytes) -> bytes:
+    if len(rgb) != width * height * 3:
+        raise ValueError("rgb_size_mismatch")
+    rows = bytearray()
+    stride = width * 3
+    for y in range(height):
+        rows.append(0)
+        start = y * stride
+        rows.extend(rgb[start:start + stride])
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _asset_png_chunk(b"IHDR", ihdr) + _asset_png_chunk(b"IDAT", zlib.compress(bytes(rows))) + _asset_png_chunk(b"IEND", b"")
+
+
+def _asset_symbol_center(position: str) -> tuple[int, int]:
+    centers = {
+        "top_left": (64, 64),
+        "top_right": (192, 64),
+        "bottom_left": (64, 192),
+        "bottom_right": (192, 192),
+    }
+    return centers[position]
+
+
+def _asset_draw_symbol(rgb: bytearray, symbol: str, position: str) -> None:
+    width = ASSET_VISION_WIDTH
+    cx, cy = _asset_symbol_center(position)
+    black = b"\x00\x00\x00"
+    for y in range(cy - 34, cy + 35):
+        if y < 0 or y >= ASSET_VISION_HEIGHT:
+            continue
+        for x in range(cx - 34, cx + 35):
+            if x < 0 or x >= width:
+                continue
+            dx = x - cx
+            dy = y - cy
+            if symbol == "circle":
+                inside = dx * dx + dy * dy <= 28 * 28
+            elif symbol == "square":
+                inside = abs(dx) <= 26 and abs(dy) <= 26
+            elif symbol == "triangle":
+                top = cy - 30
+                bottom = cy + 28
+                inside = top <= y <= bottom and abs(dx) <= int((y - top) * 30 / max(1, bottom - top))
+            else:
+                inside = False
+            if inside:
+                offset = (y * width + x) * 3
+                rgb[offset:offset + 3] = black
+
+
+def _asset_generate_vision_png(answer: dict) -> bytes:
+    width = ASSET_VISION_WIDTH
+    height = ASSET_VISION_HEIGHT
+    rgb = bytearray(width * height * 3)
+    for y in range(height):
+        vertical = "top" if y < height // 2 else "bottom"
+        for x in range(width):
+            horizontal = "left" if x < width // 2 else "right"
+            position = f"{vertical}_{horizontal}"
+            color = ASSET_VISION_COLORS[answer[position]]
+            offset = (y * width + x) * 3
+            rgb[offset:offset + 3] = bytes(color)
+    _asset_draw_symbol(rgb, answer["symbol"], answer["symbol_position"])
+    return _asset_encode_rgb_png(width, height, bytes(rgb))
+
+
+def _asset_new_vision_trial(now: float | None = None) -> dict:
+    colors = _ASSET_VISION_RNG.sample(tuple(ASSET_VISION_COLORS), 4)
+    answer = dict(zip(ASSET_VISION_POSITIONS, colors))
+    answer["symbol"] = _ASSET_VISION_RNG.choice(ASSET_VISION_SYMBOLS)
+    answer["symbol_position"] = _ASSET_VISION_RNG.choice(ASSET_VISION_POSITIONS)
+    trial_id = secrets.token_hex(16)
+    created_at = time.time() if now is None else now
+    return {
+        "trial_id": trial_id,
+        "answer": answer,
+        "png": _asset_generate_vision_png(answer),
+        "expires_at": created_at + ASSET_VISION_TTL_SECONDS,
+    }
+
+
+def _asset_cleanup_expired_trials(now: float) -> None:
+    expired = [trial_id for trial_id, trial in _asset_vision_trials.items() if trial["expires_at"] <= now]
+    for trial_id in expired:
+        _asset_vision_trials.pop(trial_id, None)
+
+
+def _asset_store_vision_trial(trial: dict, now: float | None = None) -> tuple[bool, str]:
+    current = time.time() if now is None else now
+    with _asset_vision_lock:
+        _asset_cleanup_expired_trials(current)
+        if len(_asset_vision_trials) >= ASSET_VISION_MAX_TRIALS:
+            return False, "trial_store_full"
+        _asset_vision_trials[trial["trial_id"]] = {
+            "answer": dict(trial["answer"]),
+            "expires_at": trial["expires_at"],
+        }
+    return True, ""
+
+
+def _asset_vision_prompt(trial_id: str) -> str:
+    return _json_lib.dumps({
+        "trial_id": trial_id,
+        "answer_format": {
+            "top_left": "<color>",
+            "top_right": "<color>",
+            "bottom_left": "<color>",
+            "bottom_right": "<color>",
+            "symbol": "<symbol>",
+            "symbol_position": "<position>",
+        },
+        "allowed_colors": list(ASSET_VISION_COLORS),
+        "allowed_symbols": list(ASSET_VISION_SYMBOLS),
+        "allowed_symbol_positions": list(ASSET_VISION_POSITIONS),
+        "submit_to": "asset_vision_verify",
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_reject_vision_answer(error: str, trial_id: str = "") -> str:
+    return _json_lib.dumps({
+        "ok": False,
+        "trial_id": trial_id,
+        "error": error,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_pop_vision_trial(trial_id: str, now: float | None = None) -> tuple[dict | None, str]:
+    current = time.time() if now is None else now
+    with _asset_vision_lock:
+        _asset_cleanup_expired_trials(current)
+        trial = _asset_vision_trials.pop((trial_id or "").strip(), None)
+    if not trial:
+        return None, "trial_unavailable"
+    if trial["expires_at"] <= current:
+        return None, "trial_unavailable"
+    return trial, ""
+
+
+def _asset_score_vision_answer(trial_id: str, answer_json: str, now: float | None = None) -> str:
+    trial_id = (trial_id or "").strip()
+    trial, error = _asset_pop_vision_trial(trial_id, now=now)
+    if error:
+        return _asset_reject_vision_answer(error, trial_id)
+
+    try:
+        submitted = _json_lib.loads(answer_json)
+    except Exception:
+        return _asset_reject_vision_answer("invalid_json", trial_id)
+    if not isinstance(submitted, dict):
+        return _asset_reject_vision_answer("answer_must_be_object", trial_id)
+
+    expected_keys = set(ASSET_VISION_POSITIONS) | {"symbol", "symbol_position"}
+    if set(submitted) != expected_keys:
+        return _asset_reject_vision_answer("invalid_fields", trial_id)
+    if not all(isinstance(submitted[key], str) for key in expected_keys):
+        return _asset_reject_vision_answer("invalid_field_type", trial_id)
+
+    allowed_colors = set(ASSET_VISION_COLORS)
+    if any(submitted[position] not in allowed_colors for position in ASSET_VISION_POSITIONS):
+        return _asset_reject_vision_answer("invalid_enum", trial_id)
+    if submitted["symbol"] not in ASSET_VISION_SYMBOLS or submitted["symbol_position"] not in ASSET_VISION_POSITIONS:
+        return _asset_reject_vision_answer("invalid_enum", trial_id)
+
+    answer = trial["answer"]
+    field_results = {key: submitted[key] == answer[key] for key in ASSET_VISION_POSITIONS}
+    field_results["symbol"] = submitted["symbol"] == answer["symbol"]
+    field_results["symbol_position"] = submitted["symbol_position"] == answer["symbol_position"]
+    score = sum(1 for ok in field_results.values() if ok)
+    return _json_lib.dumps({
+        "ok": True,
+        "trial_id": trial_id,
+        "score": score,
+        "max_score": 6,
+        "all_correct": score == 6,
+        "field_results": field_results,
+    }, ensure_ascii=False, sort_keys=True)
+
+
 @mcp.tool()
 async def asset_ingest_probe(
     data_base64: str,
@@ -1989,6 +2193,26 @@ async def asset_export_probe() -> str:
     }, ensure_ascii=False)
 
 
+@mcp.tool()
+async def asset_vision_challenge() -> CallToolResult:
+    """Phase-0 blind vision probe: return a machine-scored ImageContent challenge without revealing the answer."""
+    trial = _asset_new_vision_trial()
+    ok, error = _asset_store_vision_trial(trial)
+    if not ok:
+        return CallToolResult(content=[TextContent(type="text", text=_asset_reject_vision_answer(error))])
+    encoded = base64.b64encode(trial["png"]).decode("ascii")
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=_asset_vision_prompt(trial["trial_id"])),
+            ImageContent(type="image", data=encoded, mimeType="image/png"),
+        ]
+    )
+
+
+@mcp.tool()
+async def asset_vision_verify(trial_id: str, answer_json: str) -> str:
+    """Phase-0 blind vision verifier: score one submitted answer without returning the correct answer."""
+    return _asset_score_vision_answer(trial_id, answer_json)
 @mcp.tool()
 async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
     """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""
