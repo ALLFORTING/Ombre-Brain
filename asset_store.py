@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import tempfile
 import threading
+import unicodedata
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,11 +45,14 @@ class AssetStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def _init_db(self) -> None:
         self.data_root.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS assets (
@@ -63,13 +67,56 @@ class AssetStore:
                     stored_bytes INTEGER NOT NULL,
                     width INTEGER NOT NULL DEFAULT 0,
                     height INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(assets)").fetchall()
+            }
+            if "title" not in columns:
+                conn.execute(
+                    "ALTER TABLE assets ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+                )
+            if "description" not in columns:
+                conn.execute(
+                    "ALTER TABLE assets ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+                )
+            if "updated_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE assets ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                "UPDATE assets SET updated_at = created_at WHERE updated_at = ''"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS asset_tags (
+                    asset_id TEXT NOT NULL,
+                    tag_normalized TEXT NOT NULL,
+                    tag_display TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (asset_id, tag_normalized),
+                    FOREIGN KEY (asset_id) REFERENCES assets(asset_id)
+                        ON DELETE CASCADE
                 )
                 """
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_stored_sha256 "
                 "ON assets(stored_sha256)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_asset_tags_asset_id "
+                "ON asset_tags(asset_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_asset_tags_normalized "
+                "ON asset_tags(tag_normalized)"
             )
 
     def create_temp_path(self, suffix: str = ".upload") -> Path:
@@ -82,6 +129,98 @@ class AssetStore:
         cleaned = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", (filename or "").strip())
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
         return cleaned[:255] or "asset.bin"
+
+    @staticmethod
+    def _clean_metadata_text(value: str, max_chars: int, field: str) -> str:
+        if not isinstance(value, str):
+            raise AssetStoreError(f"invalid_{field}")
+        normalized = unicodedata.normalize("NFKC", value)
+        cleaned = "".join(
+            " " if unicodedata.category(char) in {"Cc", "Cf"} else char
+            for char in normalized
+        ).strip()
+        if len(cleaned) > max_chars:
+            raise AssetStoreError(f"{field}_too_long")
+        return cleaned
+
+    @classmethod
+    def _normalize_tags(cls, tags: list[str]) -> list[tuple[str, str]]:
+        if not isinstance(tags, list):
+            raise AssetStoreError("invalid_tags")
+        normalized_tags = []
+        seen = set()
+        for raw_tag in tags:
+            display = re.sub(
+                r"\s+",
+                " ",
+                cls._clean_metadata_text(raw_tag, 64, "tag"),
+            ).strip()
+            if not display:
+                continue
+            normalized = display.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_tags.append((normalized, display))
+        if len(normalized_tags) > 30:
+            raise AssetStoreError("too_many_tags")
+        return normalized_tags
+
+    @staticmethod
+    def _parse_iso8601(value: str, field: str, end_of_day: bool = False):
+        if not value:
+            return None
+        if not isinstance(value, str):
+            raise AssetStoreError(f"invalid_{field}")
+        raw = value.strip()
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                parsed = datetime.fromisoformat(raw)
+                if end_of_day:
+                    parsed = parsed.replace(
+                        hour=23,
+                        minute=59,
+                        second=59,
+                        microsecond=999999,
+                    )
+            else:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise AssetStoreError(f"invalid_{field}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _row_datetime(value: str) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _tags_for_assets(
+        conn: sqlite3.Connection,
+        asset_ids: list[str],
+    ) -> dict[str, list[dict]]:
+        result = {asset_id: [] for asset_id in asset_ids}
+        if not asset_ids:
+            return result
+        for start in range(0, len(asset_ids), 500):
+            batch = asset_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"""
+                SELECT asset_id, tag_normalized, tag_display, created_at
+                FROM asset_tags
+                WHERE asset_id IN ({placeholders})
+                ORDER BY tag_normalized, tag_display
+                """,
+                batch,
+            ).fetchall()
+            for row in rows:
+                result[row["asset_id"]].append(dict(row))
+        return result
 
     @staticmethod
     def _hash_file(path: Path) -> tuple[str, int]:
@@ -212,7 +351,7 @@ class AssetStore:
                     ).fetchone()
                     if existing:
                         conn.commit()
-                        result = dict(existing)
+                        result = self.get(existing["asset_id"]) or dict(existing)
                         result["deduplicated"] = True
                         return result
 
@@ -232,8 +371,9 @@ class AssetStore:
                         INSERT INTO assets (
                             asset_id, source_sha256, stored_sha256, stored_relpath,
                             original_filename, mime_type, kind, decoded_bytes,
-                            stored_bytes, width, height, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            stored_bytes, width, height, created_at, title,
+                            description, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)
                         """,
                         (
                             asset_id,
@@ -247,6 +387,7 @@ class AssetStore:
                             stored_bytes,
                             width,
                             height,
+                            created_at,
                             created_at,
                         ),
                     )
@@ -272,11 +413,235 @@ class AssetStore:
         if not re.fullmatch(r"[0-9a-f]{32}", asset_id or ""):
             return None
         with self._connect() as conn:
+            conn.execute("BEGIN")
             row = conn.execute(
                 "SELECT * FROM assets WHERE asset_id = ?",
                 (asset_id,),
             ).fetchone()
-        return dict(row) if row else None
+            if not row:
+                return None
+            tags = self._tags_for_assets(conn, [asset_id])[asset_id]
+        result = dict(row)
+        result["tags"] = [tag["tag_display"] for tag in tags]
+        return result
+
+    def update_metadata(
+        self,
+        asset_id: str,
+        title: str | None = None,
+        description: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        asset_id = (asset_id or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise AssetStoreError("asset_unavailable")
+        clean_title = (
+            self._clean_metadata_text(title, 200, "title")
+            if title is not None
+            else None
+        )
+        clean_description = (
+            self._clean_metadata_text(description, 4000, "description")
+            if description is not None
+            else None
+        )
+        clean_tags = self._normalize_tags(tags) if tags is not None else None
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM assets WHERE asset_id = ?",
+                    (asset_id,),
+                ).fetchone()
+                if not row:
+                    raise AssetStoreError("asset_unavailable")
+                current_tags = conn.execute(
+                    """
+                    SELECT tag_normalized, tag_display
+                    FROM asset_tags
+                    WHERE asset_id = ?
+                    ORDER BY tag_normalized
+                    """,
+                    (asset_id,),
+                ).fetchall()
+                changes = {}
+                if clean_title is not None and clean_title != row["title"]:
+                    changes["title"] = clean_title
+                if clean_description is not None and clean_description != row["description"]:
+                    changes["description"] = clean_description
+                replace_tags = False
+                if clean_tags is not None:
+                    old_normalized = {item["tag_normalized"] for item in current_tags}
+                    new_normalized = {item[0] for item in clean_tags}
+                    replace_tags = old_normalized != new_normalized
+
+                if changes or replace_tags:
+                    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    if changes:
+                        assignments = ", ".join(f"{key} = ?" for key in changes)
+                        conn.execute(
+                            f"UPDATE assets SET {assignments}, updated_at = ? WHERE asset_id = ?",
+                            [*changes.values(), updated_at, asset_id],
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE assets SET updated_at = ? WHERE asset_id = ?",
+                            (updated_at, asset_id),
+                        )
+                    if replace_tags:
+                        conn.execute(
+                            "DELETE FROM asset_tags WHERE asset_id = ?",
+                            (asset_id,),
+                        )
+                        conn.executemany(
+                            """
+                            INSERT INTO asset_tags (
+                                asset_id, tag_normalized, tag_display, created_at
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            [
+                                (asset_id, normalized, display, updated_at)
+                                for normalized, display in clean_tags
+                            ],
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        result = self.get(asset_id)
+        if result is None:
+            raise AssetStoreError("asset_unavailable")
+        return result
+
+    def search(
+        self,
+        query: str = "",
+        tags: list[str] | None = None,
+        kind: str = "",
+        mime_type: str = "",
+        created_from: str = "",
+        created_to: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        if not isinstance(query, str):
+            raise AssetStoreError("invalid_query")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise AssetStoreError("invalid_limit")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise AssetStoreError("invalid_offset")
+        kind = (kind or "").strip().lower()
+        if kind not in {"", "image", "file"}:
+            raise AssetStoreError("invalid_kind")
+        mime_type = (mime_type or "").strip().lower()
+        if mime_type and mime_type not in SUPPORTED_MIME_TYPES:
+            raise AssetStoreError("invalid_mime_type")
+        filter_tags = self._normalize_tags(tags or []) if tags is not None else []
+        filter_normalized = {item[0] for item in filter_tags}
+        created_from_dt = self._parse_iso8601(created_from, "created_from")
+        created_to_dt = self._parse_iso8601(created_to, "created_to", end_of_day=True)
+        if created_from_dt and created_to_dt and created_from_dt > created_to_dt:
+            raise AssetStoreError("invalid_date_range")
+        normalized_query = unicodedata.normalize("NFKC", query).strip().casefold()
+
+        clauses = []
+        params = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if mime_type:
+            clauses.append("mime_type = ?")
+            params.append(mime_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            rows = conn.execute(f"SELECT * FROM assets {where}", params).fetchall()
+            tags_by_asset = self._tags_for_assets(conn, [row["asset_id"] for row in rows])
+
+        matches = []
+        for row in rows:
+            created_at = self._row_datetime(row["created_at"])
+            if created_from_dt and created_at < created_from_dt:
+                continue
+            if created_to_dt and created_at > created_to_dt:
+                continue
+            row_tags = tags_by_asset[row["asset_id"]]
+            row_tag_normalized = {item["tag_normalized"] for item in row_tags}
+            if filter_normalized and not filter_normalized.issubset(row_tag_normalized):
+                continue
+
+            reasons = []
+            rank = 6
+            if normalized_query:
+                asset_id_text = row["asset_id"].casefold()
+                filename_text = unicodedata.normalize("NFKC", row["original_filename"]).casefold()
+                title_text = unicodedata.normalize("NFKC", row["title"]).casefold()
+                description_text = unicodedata.normalize("NFKC", row["description"]).casefold()
+                if asset_id_text == normalized_query:
+                    reasons.append("asset_id_exact")
+                    rank = min(rank, 0)
+                elif normalized_query in asset_id_text:
+                    reasons.append("asset_id")
+                    rank = min(rank, 5)
+                if normalized_query in row_tag_normalized:
+                    reasons.append("tag_exact")
+                    rank = min(rank, 1)
+                elif any(normalized_query in item["tag_normalized"] for item in row_tags):
+                    reasons.append("tag")
+                    rank = min(rank, 5)
+                if title_text == normalized_query:
+                    reasons.append("title_exact")
+                    rank = min(rank, 2)
+                elif title_text.startswith(normalized_query):
+                    reasons.append("title_prefix")
+                    rank = min(rank, 2)
+                elif normalized_query in title_text:
+                    reasons.append("title")
+                    rank = min(rank, 5)
+                if normalized_query in filename_text:
+                    reasons.append("filename")
+                    rank = min(rank, 3)
+                if normalized_query in description_text:
+                    reasons.append("description")
+                    rank = min(rank, 5)
+                if not reasons:
+                    continue
+
+            matches.append({
+                "rank": rank,
+                "created_at_dt": created_at,
+                "result": {
+                    "asset_id": row["asset_id"],
+                    "filename": row["original_filename"],
+                    "title": row["title"],
+                    "description": row["description"],
+                    "tags": [item["tag_display"] for item in row_tags],
+                    "kind": row["kind"],
+                    "mime_type": row["mime_type"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "stored_bytes": row["stored_bytes"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "match_reasons": reasons,
+                },
+            })
+        matches.sort(key=lambda item: (
+            item["rank"],
+            -item["created_at_dt"].timestamp(),
+            item["result"]["asset_id"],
+        ))
+        total = len(matches)
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "results": [item["result"] for item in matches[offset:offset + limit]],
+        }
 
     def resolve_file(self, asset_id: str) -> tuple[dict, Path] | None:
         asset = self.get(asset_id)

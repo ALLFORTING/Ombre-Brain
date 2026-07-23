@@ -2440,6 +2440,10 @@ def _rm_asset_public_metadata(asset: dict, deduplicated: bool | None = None) -> 
         "width": asset["width"],
         "height": asset["height"],
         "created_at": asset["created_at"],
+        "title": asset.get("title", ""),
+        "description": asset.get("description", ""),
+        "tags": asset.get("tags", []),
+        "updated_at": asset.get("updated_at", asset["created_at"]),
     }
     if deduplicated is not None:
         payload["deduplicated"] = deduplicated
@@ -3206,6 +3210,61 @@ async def rm_asset_get(asset_id: str) -> str:
         return _asset_ingest_response(False, error="asset_unavailable")
     return _json_lib.dumps({"ok": True, **_rm_asset_public_metadata(asset)}, ensure_ascii=False, sort_keys=True)
 
+
+@mcp.tool()
+async def rm_asset_update_metadata(
+    asset_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Update persistent asset title, description, and tags without changing file bytes."""
+    try:
+        asset = asset_store.update_metadata(
+            asset_id,
+            title=title,
+            description=description,
+            tags=tags,
+        )
+    except AssetStoreError as exc:
+        return _asset_ingest_response(False, error=str(exc))
+    return _json_lib.dumps(
+        {"ok": True, **_rm_asset_public_metadata(asset)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+@mcp.tool()
+async def rm_asset_search(
+    query: str = "",
+    tags: list[str] | None = None,
+    kind: str = "",
+    mime_type: str = "",
+    created_from: str = "",
+    created_to: str = "",
+    limit: int = 20,
+    offset: int = 0,
+) -> str:
+    """Search persistent assets by local metadata, tags, type, and creation time."""
+    try:
+        result = asset_store.search(
+            query=query,
+            tags=tags,
+            kind=kind,
+            mime_type=mime_type,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+            offset=offset,
+        )
+    except AssetStoreError as exc:
+        return _asset_ingest_response(False, error=str(exc))
+    return _json_lib.dumps(
+        {"ok": True, **result},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 @mcp.tool()
 async def rm_asset_download_link(asset_id: str) -> str:
