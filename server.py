@@ -51,6 +51,7 @@ import re
 import json as _json_lib
 import httpx
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
 from typing_extensions import Annotated, Literal
@@ -65,6 +66,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import BucketManager
+from asset_store import AssetStore, AssetStoreError, InvalidAssetImage
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -82,6 +84,7 @@ from utils import (
 config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
+asset_store = AssetStore(config["buckets_dir"])
 
 def _apply_display_aliases(text: str) -> str:
     return apply_display_aliases(text)
@@ -1929,6 +1932,16 @@ ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD = 64 * 1024
 _asset_browser_uploads = {}
 _asset_browser_upload_tokens = {}
 _asset_browser_upload_lock = threading.Lock()
+RM_ASSET_UPLOAD_TTL_SECONDS = 10 * 60
+RM_ASSET_UPLOAD_MAX_UPLOADS = 100
+RM_ASSET_DOWNLOAD_TTL_SECONDS = 5 * 60
+RM_ASSET_DOWNLOAD_MAX_TOKENS = 100
+RM_ASSET_DOWNLOAD_MAX_GETS = 3
+_rm_asset_uploads = {}
+_rm_asset_upload_tokens = {}
+_rm_asset_upload_lock = threading.Lock()
+_rm_asset_download_tokens = {}
+_rm_asset_download_lock = threading.Lock()
 ASSET_VISION_WIDTH = 256
 ASSET_VISION_HEIGHT = 256
 ASSET_VISION_TTL_SECONDS = 10 * 60
@@ -2293,7 +2306,7 @@ def _asset_complete_browser_upload(upload_id: str, decoded_bytes: int, sha256: s
         return dict(result)
 
 
-async def _asset_stream_browser_upload(request) -> dict:
+async def _asset_stream_browser_upload(request, sink=None) -> dict:
     from python_multipart import MultipartParser
     from python_multipart.multipart import parse_options_header
 
@@ -2350,6 +2363,8 @@ async def _asset_stream_browser_upload(request) -> dict:
         if state["decoded_bytes"] > ASSET_BROWSER_UPLOAD_MAX_BYTES:
             raise _AssetBrowserUploadTooLarge("file_too_large")
         state["hasher"].update(block)
+        if sink is not None:
+            sink(block)
 
     def on_part_end():
         if not state["in_file"]:
@@ -2411,6 +2426,288 @@ def _asset_browser_upload_page(token: str, item: dict, now: float | None = None)
 def _asset_browser_result_page(result: dict) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload result</title></head>
 <body><h1>Upload result</h1><p>decoded_bytes: {result["decoded_bytes"]}</p><p>sha256: <code>{html.escape(result["sha256"])}</code></p><p>size_match: {str(result["size_match"]).lower()}</p><p>hash_match: {str(result["hash_match"]).lower()}</p></body></html>"""
+
+def _rm_asset_public_metadata(asset: dict, deduplicated: bool | None = None) -> dict:
+    payload = {
+        "asset_id": asset["asset_id"],
+        "source_sha256": asset["source_sha256"],
+        "stored_sha256": asset["stored_sha256"],
+        "decoded_bytes": asset["decoded_bytes"],
+        "stored_bytes": asset["stored_bytes"],
+        "mime_type": asset["mime_type"],
+        "filename": asset["original_filename"],
+        "kind": asset["kind"],
+        "width": asset["width"],
+        "height": asset["height"],
+        "created_at": asset["created_at"],
+    }
+    if deduplicated is not None:
+        payload["deduplicated"] = deduplicated
+    return payload
+
+
+def _rm_cleanup_asset_uploads(now: float) -> None:
+    for upload_id, item in list(_rm_asset_uploads.items()):
+        if item["state"] == "pending" and item["expires_at"] <= now:
+            token = item.get("token", "")
+            if token:
+                _rm_asset_upload_tokens.pop(token, None)
+            item["token"] = ""
+            item["state"] = "expired"
+        if item["retire_at"] <= now:
+            token = item.get("token", "")
+            if token:
+                _rm_asset_upload_tokens.pop(token, None)
+            _rm_asset_uploads.pop(upload_id, None)
+
+
+def _rm_create_asset_upload_link(
+    expected_bytes: int,
+    expected_sha256: str = "",
+    filename: str = "",
+    mime_type: str = "application/octet-stream",
+    now: float | None = None,
+) -> str:
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= ASSET_BROWSER_UPLOAD_MAX_BYTES:
+        return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=ASSET_BROWSER_UPLOAD_MAX_BYTES)
+    expected = (expected_sha256 or "").strip().lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return _asset_ingest_response(False, error="invalid_expected_sha256")
+    mime = (mime_type or "application/octet-stream").strip().lower()
+    if mime not in {"application/octet-stream", "image/jpeg", "image/png"}:
+        return _asset_ingest_response(False, error="unsupported_mime_type")
+
+    current = time.time() if now is None else now
+    with _rm_asset_upload_lock:
+        _rm_cleanup_asset_uploads(current)
+        active = sum(1 for item in _rm_asset_uploads.values() if item["state"] in ("pending", "uploading"))
+        if active >= RM_ASSET_UPLOAD_MAX_UPLOADS:
+            return _asset_ingest_response(False, error="upload_store_full")
+        while True:
+            upload_id = secrets.token_hex(16)
+            if upload_id not in _rm_asset_uploads:
+                break
+        while True:
+            token = secrets.token_urlsafe(32)
+            if token not in _rm_asset_upload_tokens:
+                break
+        expires_at = current + RM_ASSET_UPLOAD_TTL_SECONDS
+        _rm_asset_uploads[upload_id] = {
+            "state": "pending",
+            "token": token,
+            "expected_bytes": expected_bytes,
+            "expected_sha256": expected,
+            "filename": asset_store.sanitize_filename(filename),
+            "mime_type": mime,
+            "expires_at": expires_at,
+            "retire_at": expires_at + RM_ASSET_UPLOAD_TTL_SECONDS,
+            "result": None,
+        }
+        _rm_asset_upload_tokens[token] = upload_id
+
+    upload_path = f"/rm/asset-upload/{token}"
+    base_url = _asset_public_base_url()
+    return _json_lib.dumps({
+        "ok": True,
+        "upload_id": upload_id,
+        "upload_path": upload_path,
+        "upload_url": f"{base_url}{upload_path}" if base_url else "",
+        "status_path": f"/rm/asset-upload-status/{upload_id}",
+        "expires_in_seconds": RM_ASSET_UPLOAD_TTL_SECONDS,
+        "max_bytes": ASSET_BROWSER_UPLOAD_MAX_BYTES,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _rm_asset_upload_status_payload(upload_id: str, now: float | None = None) -> str:
+    upload_id = (upload_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        return _asset_ingest_response(False, error="invalid_upload_id")
+    current = time.time() if now is None else now
+    with _rm_asset_upload_lock:
+        _rm_cleanup_asset_uploads(current)
+        item = _rm_asset_uploads.get(upload_id)
+        if not item:
+            return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
+        state = "pending" if item["state"] == "uploading" else item["state"]
+        result = dict(item["result"] or {})
+        payload = {
+            "ok": True,
+            "state": state,
+            "asset_id": result.get("asset_id", ""),
+            "source_sha256": result.get("source_sha256", ""),
+            "stored_sha256": result.get("stored_sha256", ""),
+            "decoded_bytes": result.get("decoded_bytes", 0),
+            "stored_bytes": result.get("stored_bytes", 0),
+            "mime_type": result.get("mime_type", item["mime_type"]),
+            "filename": result.get("filename", item["filename"]),
+            "kind": result.get("kind", ""),
+            "width": result.get("width", 0),
+            "height": result.get("height", 0),
+            "deduplicated": result.get("deduplicated", False),
+        }
+    return _json_lib.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _rm_get_asset_upload(token: str, now: float | None = None) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _rm_asset_upload_lock:
+        _rm_cleanup_asset_uploads(current)
+        upload_id = _rm_asset_upload_tokens.get(token)
+        item = _rm_asset_uploads.get(upload_id or "")
+        if not item or item["state"] != "pending":
+            return None
+        return {
+            "upload_id": upload_id,
+            "expected_bytes": item["expected_bytes"],
+            "filename": item["filename"],
+            "expires_at": item["expires_at"],
+        }
+
+
+def _rm_claim_asset_upload(token: str, now: float | None = None) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _rm_asset_upload_lock:
+        _rm_cleanup_asset_uploads(current)
+        upload_id = _rm_asset_upload_tokens.pop(token, None)
+        item = _rm_asset_uploads.get(upload_id or "")
+        if not item or item["state"] != "pending":
+            return None
+        item["state"] = "uploading"
+        return {
+            "upload_id": upload_id,
+            "expected_bytes": item["expected_bytes"],
+            "expected_sha256": item["expected_sha256"],
+            "filename": item["filename"],
+            "mime_type": item["mime_type"],
+        }
+
+
+def _rm_release_asset_upload(upload_id: str, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    with _rm_asset_upload_lock:
+        _rm_cleanup_asset_uploads(current)
+        item = _rm_asset_uploads.get(upload_id)
+        if not item or item["state"] != "uploading":
+            return
+        if item["expires_at"] <= current:
+            item["state"] = "expired"
+            item["token"] = ""
+            return
+        item["state"] = "pending"
+        _rm_asset_upload_tokens[item["token"]] = upload_id
+
+
+def _rm_complete_asset_upload(upload_id: str, asset: dict, source_sha256: str) -> dict | None:
+    with _rm_asset_upload_lock:
+        item = _rm_asset_uploads.get(upload_id)
+        if not item or item["state"] != "uploading":
+            return None
+        result = _rm_asset_public_metadata(asset, bool(asset.get("deduplicated")))
+        result["source_sha256"] = source_sha256
+        item["state"] = "completed"
+        item["token"] = ""
+        item["result"] = result
+        item["retire_at"] = time.time() + RM_ASSET_UPLOAD_TTL_SECONDS
+        return dict(result)
+
+
+def _rm_asset_upload_page(token: str, item: dict, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    filename = html.escape(item["filename"])
+    action = html.escape(f"/rm/asset-upload/{token}", quote=True)
+    expires_in = max(0, int(item["expires_at"] - current))
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remember-Me asset upload</title><style>body{{font:16px system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem}}label,input,button{{display:block;margin:.8rem 0}}code{{word-break:break-all}}</style></head>
+<body><h1>Remember-Me asset upload</h1><p>Expected file: <code>{filename}</code></p><p>Expected size: {item["expected_bytes"]} bytes; hard limit: {ASSET_BROWSER_UPLOAD_MAX_BYTES} bytes.</p><p>Link expires in {expires_in} seconds.</p>
+<form method="post" enctype="multipart/form-data" action="{action}"><label for="file">Choose file</label><input id="file" name="file" type="file" required><button type="submit">Upload and store</button></form></body></html>"""
+
+
+def _rm_asset_result_page(result: dict) -> str:
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Asset stored</title></head>
+<body><h1>Asset stored</h1><p>asset_id: <code>{html.escape(result["asset_id"])}</code></p><p>stored_sha256: <code>{html.escape(result["stored_sha256"])}</code></p><p>stored_bytes: {result["stored_bytes"]}</p><p>deduplicated: {str(result["deduplicated"]).lower()}</p></body></html>"""
+
+
+def _rm_cleanup_asset_downloads(now: float) -> None:
+    expired = [token for token, item in _rm_asset_download_tokens.items() if item["expires_at"] <= now]
+    for token in expired:
+        _rm_asset_download_tokens.pop(token, None)
+
+
+def _rm_safe_download_filename(asset: dict) -> str:
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", asset.get("original_filename", "")).strip(" .")
+    extension = Path(asset["stored_relpath"]).suffix
+    if not name:
+        name = f"remember-me-{asset['asset_id']}{extension}"
+    elif extension and not name.lower().endswith(extension.lower()):
+        name += extension
+    return name[:180]
+
+
+def _rm_create_asset_download_link(asset_id: str, now: float | None = None) -> str:
+    resolved = asset_store.resolve_file((asset_id or "").strip())
+    if not resolved:
+        return _asset_ingest_response(False, error="asset_unavailable")
+    asset, _ = resolved
+    current = time.time() if now is None else now
+    with _rm_asset_download_lock:
+        _rm_cleanup_asset_downloads(current)
+        if len(_rm_asset_download_tokens) >= RM_ASSET_DOWNLOAD_MAX_TOKENS:
+            return _asset_ingest_response(False, error="download_store_full")
+        while True:
+            token = secrets.token_urlsafe(32)
+            if token not in _rm_asset_download_tokens:
+                break
+        _rm_asset_download_tokens[token] = {
+            "asset_id": asset["asset_id"],
+            "expires_at": current + RM_ASSET_DOWNLOAD_TTL_SECONDS,
+            "get_count": 0,
+        }
+    download_path = f"/rm/asset-download/{token}"
+    base_url = _asset_public_base_url()
+    return _json_lib.dumps({
+        "ok": True,
+        "asset_id": asset["asset_id"],
+        "filename": _rm_safe_download_filename(asset),
+        "mime_type": asset["mime_type"],
+        "stored_bytes": asset["stored_bytes"],
+        "stored_sha256": asset["stored_sha256"],
+        "download_path": download_path,
+        "download_url": f"{base_url}{download_path}" if base_url else "",
+        "expires_in_seconds": RM_ASSET_DOWNLOAD_TTL_SECONDS,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _rm_read_asset_download(token: str, method: str, now: float | None = None) -> tuple[dict, Path, dict] | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
+        return None
+    current = time.time() if now is None else now
+    with _rm_asset_download_lock:
+        _rm_cleanup_asset_downloads(current)
+        item = _rm_asset_download_tokens.get(token)
+        if not item:
+            return None
+        resolved = asset_store.resolve_file(item["asset_id"])
+        if not resolved:
+            _rm_asset_download_tokens.pop(token, None)
+            return None
+        asset, path = resolved
+        if method.upper() == "GET":
+            if item["get_count"] >= RM_ASSET_DOWNLOAD_MAX_GETS:
+                return None
+            item["get_count"] += 1
+        headers = {
+            "Content-Type": asset["mime_type"],
+            "Content-Disposition": f'attachment; filename="{_rm_safe_download_filename(asset)}"',
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(asset["stored_bytes"]),
+        }
+        return asset, path, headers
 
 def _asset_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
@@ -2883,6 +3180,107 @@ async def asset_browser_upload_route(request):
         return Response(status_code=404, headers=headers)
     return HTMLResponse(_asset_browser_result_page(result), headers=headers)
 
+
+@mcp.tool()
+async def rm_asset_upload_link(
+    expected_bytes: int,
+    expected_sha256: str = "",
+    filename: str = "",
+    mime_type: str = "application/octet-stream",
+) -> str:
+    """Create a short-lived browser upload URL for persistent Remember-Me assets."""
+    return _rm_create_asset_upload_link(expected_bytes, expected_sha256, filename, mime_type)
+
+
+@mcp.tool()
+async def rm_asset_upload_status(upload_id: str) -> str:
+    """Return metadata-only status for a persistent Remember-Me asset upload."""
+    return _rm_asset_upload_status_payload(upload_id)
+
+
+@mcp.tool()
+async def rm_asset_get(asset_id: str) -> str:
+    """Return persistent asset metadata without file bytes or disk paths."""
+    asset = asset_store.get((asset_id or "").strip())
+    if not asset:
+        return _asset_ingest_response(False, error="asset_unavailable")
+    return _json_lib.dumps({"ok": True, **_rm_asset_public_metadata(asset)}, ensure_ascii=False, sort_keys=True)
+
+
+@mcp.tool()
+async def rm_asset_download_link(asset_id: str) -> str:
+    """Create a five-minute signed download URL for one persistent asset."""
+    return _rm_create_asset_download_link(asset_id)
+
+
+@mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
+async def rm_asset_upload_route(request):
+    from starlette.responses import HTMLResponse, Response
+
+    token = request.path_params.get("token", "")
+    headers = _asset_browser_security_headers()
+    if request.method.upper() == "GET":
+        item = _rm_get_asset_upload(token)
+        if item is None:
+            return Response(status_code=404, headers=headers)
+        return HTMLResponse(_rm_asset_upload_page(token, item), headers=headers)
+
+    claim = _rm_claim_asset_upload(token)
+    if claim is None:
+        return Response(status_code=404, headers=headers)
+    temp_path = asset_store.create_temp_path()
+    try:
+        with temp_path.open("wb") as handle:
+            streamed = await _asset_stream_browser_upload(request, handle.write)
+        size_match = streamed["decoded_bytes"] == claim["expected_bytes"]
+        hash_match = not claim["expected_sha256"] or hmac.compare_digest(
+            streamed["sha256"], claim["expected_sha256"]
+        )
+        if not size_match or not hash_match:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=422, headers=headers)
+        asset = await asyncio.to_thread(
+            asset_store.persist_upload,
+            temp_path,
+            streamed["sha256"],
+            streamed["decoded_bytes"],
+            claim["filename"],
+            claim["mime_type"],
+        )
+    except _AssetBrowserUploadTooLarge:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=413, headers=headers)
+    except InvalidAssetImage:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=422, headers=headers)
+    except AssetStoreError:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=500, headers=headers)
+    except Exception:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=400, headers=headers)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    result = _rm_complete_asset_upload(claim["upload_id"], asset, streamed["sha256"])
+    if result is None:
+        return Response(status_code=500, headers=headers)
+    return HTMLResponse(_rm_asset_result_page(result), headers=headers)
+
+
+@mcp.custom_route("/rm/asset-download/{token}", methods=["GET", "HEAD"])
+async def rm_asset_download_route(request):
+    from starlette.responses import FileResponse, Response
+
+    result = _rm_read_asset_download(
+        request.path_params.get("token", ""), request.method
+    )
+    if result is None:
+        return Response(status_code=404, headers=_asset_browser_security_headers())
+    _, path, headers = result
+    if request.method.upper() == "HEAD":
+        return Response(content=b"", headers=headers)
+    return FileResponse(path, media_type=headers["Content-Type"], headers=headers)
 
 @mcp.tool()
 async def asset_render_probe() -> CallToolResult:

@@ -331,6 +331,10 @@ breath(query="今天很累")
 | `asset_ingest_abort` | Phase-0 cleanup tool: safely discards a temporary chunked upload session and is idempotent |
 | `asset_browser_upload_link` | Phase-0 signed browser upload probe: creates a short-lived multipart upload page so raw file bytes bypass the model context |
 | `asset_browser_upload_status` | Phase-0 metadata-only status query for pending, completed, or expired browser uploads; returns no file bytes or base64 |
+| `rm_asset_upload_link` | Stage-1 persistent Remember-Me upload: creates a short-lived browser upload page, safely processes the file, and stores asset bytes plus SQLite metadata |
+| `rm_asset_upload_status` | Stage-1 metadata-only status for a persistent asset upload, including asset ID, hashes, size, dimensions, and deduplication result |
+| `rm_asset_get` | Return persistent asset metadata by asset ID without file bytes, base64, or disk paths |
+| `rm_asset_download_link` | Create a short-lived signed download link for a persistent asset; HEAD is free and at most three GET requests succeed |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
@@ -390,6 +394,14 @@ breath(query="今天很累")
 - `asset_export_probe()` is a Phase-0 user-visible attachment probe. The caller decodes `data_base64`, verifies `decoded_bytes` and `sha256`, then presents the result as a user-visible attachment.
 - `asset_render_probe` and `asset_export_probe` are independently accepted paths: one checks model vision input, the other checks user-visible attachment export.
 - Model-only visibility without UI visibility is not a complete pass. These probes do not mean formal image storage is live, and they do not persist user images.
+
+#### Remember-Me Stage 1 asset storage
+
+- Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
+- Browser uploads are currently limited to 2 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
+- SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.
+- PNG and JPEG uploads are decoded with Pillow, pixel-limited, orientation-corrected, and re-encoded without EXIF, GPS, text chunks, ICC profiles, or other original metadata. Invalid claimed images are rejected rather than stored as raw files.
+- Stage 1 does not yet implement asset tags, semantic search, bucket attachments, or automatic display of chat attachments.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

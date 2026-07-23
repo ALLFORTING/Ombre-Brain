@@ -18,6 +18,9 @@ pyyaml>=6.0
 # Markdown frontmatter 解析（桶文件读写）
 python-frontmatter>=1.1.0
 
+# Remember-Me image decoding and metadata stripping
+Pillow>=11,<13
+
 # 中文分词
 jieba>=0.42.1
 
