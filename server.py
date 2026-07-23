@@ -1914,7 +1914,13 @@ async def _breath_impl(
 
 ASSET_PROBE_MAX_BASE64_CHARS = 4 * 1024 * 1024
 ASSET_PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "probe.png")
-
+ASSET_INGEST_TTL_SECONDS = 10 * 60
+ASSET_INGEST_MAX_UPLOADS = 100
+ASSET_INGEST_MAX_BYTES = 2 * 1024 * 1024
+ASSET_INGEST_RECOMMENDED_CHUNK_BASE64_CHARS = 8192
+ASSET_INGEST_MAX_CHUNK_BASE64_CHARS = 16384
+_asset_ingest_uploads = {}
+_asset_ingest_lock = threading.Lock()
 
 ASSET_VISION_WIDTH = 256
 ASSET_VISION_HEIGHT = 256
@@ -1938,6 +1944,170 @@ _asset_vision_trials = {}
 _asset_vision_download_tokens = {}
 _asset_vision_lock = threading.Lock()
 
+
+def _asset_ingest_response(ok: bool, upload_id: str = "", error: str = "", **fields) -> str:
+    payload = {"ok": ok}
+    if upload_id:
+        payload["upload_id"] = upload_id
+    if error:
+        payload["error"] = error
+    payload.update(fields)
+    return _json_lib.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_cleanup_expired_ingest_uploads(now: float) -> None:
+    expired = [upload_id for upload_id, item in _asset_ingest_uploads.items() if item["expires_at"] <= now]
+    for upload_id in expired:
+        _asset_ingest_uploads.pop(upload_id, None)
+
+
+def _asset_sanitize_ingest_filename(filename: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", (filename or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:255]
+
+
+def _asset_begin_ingest_upload(
+    expected_bytes: int,
+    expected_sha256: str,
+    mime_type: str = "application/octet-stream",
+    filename: str = "",
+    now: float | None = None,
+) -> str:
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes < 0:
+        return _asset_ingest_response(False, error="invalid_expected_bytes")
+    if expected_bytes > ASSET_INGEST_MAX_BYTES:
+        return _asset_ingest_response(False, error="file_too_large", max_bytes=ASSET_INGEST_MAX_BYTES)
+    expected = (expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return _asset_ingest_response(False, error="invalid_expected_sha256")
+
+    current = time.time() if now is None else now
+    with _asset_ingest_lock:
+        _asset_cleanup_expired_ingest_uploads(current)
+        if len(_asset_ingest_uploads) >= ASSET_INGEST_MAX_UPLOADS:
+            return _asset_ingest_response(False, error="upload_store_full")
+        while True:
+            upload_id = secrets.token_hex(16)
+            if upload_id not in _asset_ingest_uploads:
+                break
+        _asset_ingest_uploads[upload_id] = {
+            "expected_bytes": expected_bytes,
+            "expected_sha256": expected,
+            "mime_type": (mime_type or "application/octet-stream").strip() or "application/octet-stream",
+            "filename": _asset_sanitize_ingest_filename(filename),
+            "chunks": [],
+            "decoded_bytes": 0,
+            "expires_at": current + ASSET_INGEST_TTL_SECONDS,
+        }
+    return _asset_ingest_response(
+        True,
+        upload_id=upload_id,
+        recommended_chunk_base64_chars=ASSET_INGEST_RECOMMENDED_CHUNK_BASE64_CHARS,
+        max_chunk_base64_chars=ASSET_INGEST_MAX_CHUNK_BASE64_CHARS,
+        expires_in_seconds=ASSET_INGEST_TTL_SECONDS,
+    )
+
+
+def _asset_ingest_chunk_data(
+    upload_id: str,
+    chunk_index: int,
+    data_base64: str,
+    now: float | None = None,
+) -> str:
+    upload_id = (upload_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        return _asset_ingest_response(False, error="invalid_upload_id")
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
+        return _asset_ingest_response(False, upload_id=upload_id, error="invalid_chunk_index")
+    base64_chars = len(data_base64 or "")
+    if base64_chars > ASSET_INGEST_MAX_CHUNK_BASE64_CHARS:
+        return _asset_ingest_response(
+            False,
+            upload_id=upload_id,
+            error="chunk_too_large",
+            base64_chars=base64_chars,
+            max_chunk_base64_chars=ASSET_INGEST_MAX_CHUNK_BASE64_CHARS,
+        )
+    try:
+        raw = base64.b64decode((data_base64 or "").encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError):
+        return _asset_ingest_response(False, upload_id=upload_id, error="invalid_base64")
+    if not raw:
+        return _asset_ingest_response(False, upload_id=upload_id, error="empty_chunk")
+
+    current = time.time() if now is None else now
+    with _asset_ingest_lock:
+        _asset_cleanup_expired_ingest_uploads(current)
+        upload = _asset_ingest_uploads.get(upload_id)
+        if not upload:
+            return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
+        chunks = upload["chunks"]
+        if chunk_index < len(chunks):
+            if not hmac.compare_digest(chunks[chunk_index], raw):
+                return _asset_ingest_response(False, upload_id=upload_id, error="chunk_conflict")
+            return _asset_ingest_response(
+                True,
+                upload_id=upload_id,
+                decoded_bytes=upload["decoded_bytes"],
+                received_chunks=len(chunks),
+                idempotent=True,
+            )
+        if chunk_index > len(chunks):
+            return _asset_ingest_response(
+                False,
+                upload_id=upload_id,
+                error="chunk_out_of_order",
+                expected_chunk_index=len(chunks),
+            )
+        if upload["decoded_bytes"] + len(raw) > ASSET_INGEST_MAX_BYTES:
+            return _asset_ingest_response(False, upload_id=upload_id, error="file_too_large", max_bytes=ASSET_INGEST_MAX_BYTES)
+        chunks.append(raw)
+        upload["decoded_bytes"] += len(raw)
+        return _asset_ingest_response(
+            True,
+            upload_id=upload_id,
+            decoded_bytes=upload["decoded_bytes"],
+            received_chunks=len(chunks),
+            idempotent=False,
+        )
+
+
+def _asset_finish_ingest_upload(upload_id: str, now: float | None = None) -> str:
+    upload_id = (upload_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        return _asset_ingest_response(False, error="invalid_upload_id")
+    current = time.time() if now is None else now
+    with _asset_ingest_lock:
+        _asset_cleanup_expired_ingest_uploads(current)
+        upload = _asset_ingest_uploads.pop(upload_id, None)
+    if not upload:
+        return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
+
+    raw = b"".join(upload["chunks"])
+    sha256 = hashlib.sha256(raw).hexdigest()
+    expected_sha256 = upload["expected_sha256"]
+    return _asset_ingest_response(
+        True,
+        upload_id=upload_id,
+        decoded_bytes=len(raw),
+        sha256=sha256,
+        expected_sha256=expected_sha256,
+        size_match=len(raw) == upload["expected_bytes"],
+        hash_match=hmac.compare_digest(sha256, expected_sha256),
+        received_chunks=len(upload["chunks"]),
+    )
+
+
+def _asset_abort_ingest_upload(upload_id: str, now: float | None = None) -> str:
+    upload_id = (upload_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        return _asset_ingest_response(False, error="invalid_upload_id")
+    current = time.time() if now is None else now
+    with _asset_ingest_lock:
+        _asset_cleanup_expired_ingest_uploads(current)
+        aborted = _asset_ingest_uploads.pop(upload_id, None) is not None
+    return _asset_ingest_response(True, upload_id=upload_id, aborted=aborted)
 
 def _asset_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
@@ -2332,6 +2502,34 @@ async def asset_ingest_probe(
         "mime_type": mime_type,
     }, ensure_ascii=False, sort_keys=True)
 
+
+@mcp.tool()
+async def asset_ingest_begin(
+    expected_bytes: int,
+    expected_sha256: str,
+    mime_type: str = "application/octet-stream",
+    filename: str = "",
+) -> str:
+    """Begin a temporary Phase-0 chunked upload that persists nothing."""
+    return _asset_begin_ingest_upload(expected_bytes, expected_sha256, mime_type, filename)
+
+
+@mcp.tool()
+async def asset_ingest_chunk(upload_id: str, chunk_index: int, data_base64: str) -> str:
+    """Strictly decode and append one bounded base64 chunk without logging it."""
+    return _asset_ingest_chunk_data(upload_id, chunk_index, data_base64)
+
+
+@mcp.tool()
+async def asset_ingest_finish(upload_id: str) -> str:
+    """Hash a completed temporary upload, report matches, and discard its bytes."""
+    return _asset_finish_ingest_upload(upload_id)
+
+
+@mcp.tool()
+async def asset_ingest_abort(upload_id: str) -> str:
+    """Discard a temporary Phase-0 chunked upload; repeated aborts are safe."""
+    return _asset_abort_ingest_upload(upload_id)
 
 @mcp.tool()
 async def asset_render_probe() -> CallToolResult:

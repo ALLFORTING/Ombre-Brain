@@ -325,6 +325,10 @@ breath(query="今天很累")
 | `related_backfill` | 为存量桶回填语义 related，默认 dry-run，跳过 sealed 桶 / Backfill semantic related links; dry-run by default; skips sealed buckets |
 | `digest` | 自动消化低重要度旧桶，默认 dry-run；正式执行会生成沉淀桶和日志桶 / Auto-digest old low-importance buckets; dry-run by default; real runs create distilled and log buckets |
 | `asset_ingest_probe` | 阶段0实验工具：验证客户端向 MCP 传输 base64 参数；只解码、计算 SHA-256 并返回轻量元数据，不创建 asset ID，不持久化用户图片 / Phase-0 experimental tool for client-to-MCP base64 transport; decodes, hashes, returns lightweight metadata, creates no asset ID, and persists no user image |
+| `asset_ingest_begin` | Phase-0 chunked upload probe: creates a 10-minute in-memory upload session for files up to 2 MiB; persists nothing |
+| `asset_ingest_chunk` | Phase-0 chunk receiver: strictly decodes consecutive base64 chunks, with 8192 characters recommended and 16384 maximum per chunk |
+| `asset_ingest_finish` | Phase-0 chunked upload verifier: joins decoded bytes, checks size and SHA-256, then deletes the temporary session |
+| `asset_ingest_abort` | Phase-0 cleanup tool: safely discards a temporary chunked upload session and is idempotent |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
@@ -376,6 +380,9 @@ breath(query="今天很累")
 #### `asset_ingest_probe`, `asset_render_probe`, and `asset_export_probe`
 
 - `asset_ingest_probe(data_base64, expected_sha256="", mime_type="application/octet-stream")` is a Phase-0 upload probe for client-to-MCP base64 transport. It decodes, enforces the size limit, and returns SHA-256, hash_match, and MIME metadata without creating an asset ID or persisting user images.
+- The single-call `asset_ingest_probe` remains only a small-file diagnostic. Capacity testing should use `asset_ingest_begin`, consecutive `asset_ingest_chunk` calls, and `asset_ingest_finish`; `asset_ingest_abort` safely discards an unfinished session.
+- The recommended chunk size is 8192 base64 characters, with a hard per-chunk maximum of 16384 characters and a Phase-0 file maximum of 2 MiB.
+- The model must not output a complete file base64 string in chat text. Chunk payloads are transport arguments only and are neither logged nor persisted.
 - `asset_render_probe()` is a Phase-0 return-path probe for whether MCP `ImageContent` can enter the AI vision context. It reads the built-in `assets/probe.png` and returns a standalone `image/png` content block, not text-wrapped base64.
 - `asset_export_probe()` is a Phase-0 user-visible attachment probe. The caller decodes `data_base64`, verifies `decoded_bytes` and `sha256`, then presents the result as a user-visible attachment.
 - `asset_render_probe` and `asset_export_probe` are independently accepted paths: one checks model vision input, the other checks user-visible attachment export.

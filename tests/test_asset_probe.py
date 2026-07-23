@@ -140,6 +140,171 @@ async def test_asset_ingest_probe_rejects_oversized_input(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_asset_chunked_ingest_restores_64kb_payload(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    payload = bytes(range(256)) * 256
+    expected = hashlib.sha256(payload).hexdigest()
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    begin = json.loads(await server.asset_ingest_begin(
+        len(payload), expected, "application/octet-stream", "../unsafe\\probe.bin"
+    ))
+    assert begin["ok"] is True
+    assert begin["recommended_chunk_base64_chars"] == 8192
+    assert begin["max_chunk_base64_chars"] == 16384
+    assert begin["expires_in_seconds"] == 600
+    upload_id = begin["upload_id"]
+    assert re.fullmatch(r"[0-9a-f]{32}", upload_id)
+    stored_filename = server._asset_ingest_uploads[upload_id]["filename"]
+    assert "/" not in stored_filename and "\\" not in stored_filename and ":" not in stored_filename
+
+    decoded_chunk_bytes = server.ASSET_INGEST_RECOMMENDED_CHUNK_BASE64_CHARS // 4 * 3
+    chunk_count = 0
+    for chunk_index, offset in enumerate(range(0, len(payload), decoded_chunk_bytes)):
+        encoded = base64.b64encode(payload[offset:offset + decoded_chunk_bytes]).decode("ascii")
+        assert len(encoded) <= server.ASSET_INGEST_RECOMMENDED_CHUNK_BASE64_CHARS
+        chunk = json.loads(await server.asset_ingest_chunk(upload_id, chunk_index, encoded))
+        assert chunk["ok"] is True
+        assert chunk["received_chunks"] == chunk_index + 1
+        chunk_count += 1
+
+    finish = json.loads(await server.asset_ingest_finish(upload_id))
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert finish == {
+        "ok": True,
+        "upload_id": upload_id,
+        "decoded_bytes": len(payload),
+        "sha256": expected,
+        "expected_sha256": expected,
+        "size_match": True,
+        "hash_match": True,
+        "received_chunks": chunk_count,
+    }
+    assert upload_id not in server._asset_ingest_uploads
+    unavailable = json.loads(await server.asset_ingest_chunk(upload_id, chunk_count, "eA=="))
+    assert unavailable["error"] == "upload_unavailable"
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_asset_chunked_ingest_empty_and_chunk_validation(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    empty = json.loads(await server.asset_ingest_begin(0, empty_hash))
+    finished = json.loads(await server.asset_ingest_finish(empty["upload_id"]))
+    assert finished["decoded_bytes"] == 0
+    assert finished["received_chunks"] == 0
+    assert finished["size_match"] is True
+    assert finished["hash_match"] is True
+
+    begin = json.loads(await server.asset_ingest_begin(10, hashlib.sha256(b"0123456789").hexdigest()))
+    upload_id = begin["upload_id"]
+    invalid = json.loads(await server.asset_ingest_chunk(upload_id, 0, "not base64 ***"))
+    oversized = json.loads(await server.asset_ingest_chunk(
+        upload_id, 0, "A" * (server.ASSET_INGEST_MAX_CHUNK_BASE64_CHARS + 1)
+    ))
+    skipped = json.loads(await server.asset_ingest_chunk(upload_id, 1, base64.b64encode(b"abc").decode("ascii")))
+    first_data = base64.b64encode(b"abc").decode("ascii")
+    first = json.loads(await server.asset_ingest_chunk(upload_id, 0, first_data))
+    duplicate = json.loads(await server.asset_ingest_chunk(upload_id, 0, first_data))
+    conflict = json.loads(await server.asset_ingest_chunk(
+        upload_id, 0, base64.b64encode(b"xyz").decode("ascii")
+    ))
+
+    assert invalid["error"] == "invalid_base64"
+    assert oversized["error"] == "chunk_too_large"
+    assert skipped["error"] == "chunk_out_of_order"
+    assert skipped["expected_chunk_index"] == 0
+    assert first["idempotent"] is False
+    assert duplicate["ok"] is True and duplicate["idempotent"] is True
+    assert duplicate["decoded_bytes"] == 3 and duplicate["received_chunks"] == 1
+    assert conflict["error"] == "chunk_conflict"
+
+
+@pytest.mark.asyncio
+async def test_asset_chunked_ingest_enforces_two_mib_limit(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    begin = json.loads(await server.asset_ingest_begin(server.ASSET_INGEST_MAX_BYTES, "0" * 64))
+    upload_id = begin["upload_id"]
+    decoded_chunk_bytes = server.ASSET_INGEST_MAX_CHUNK_BASE64_CHARS // 4 * 3
+    remaining = server.ASSET_INGEST_MAX_BYTES
+    chunk_index = 0
+    while remaining:
+        raw = b"x" * min(remaining, decoded_chunk_bytes)
+        result = json.loads(await server.asset_ingest_chunk(
+            upload_id, chunk_index, base64.b64encode(raw).decode("ascii")
+        ))
+        assert result["ok"] is True
+        remaining -= len(raw)
+        chunk_index += 1
+
+    rejected = json.loads(await server.asset_ingest_chunk(upload_id, chunk_index, "eA=="))
+    too_large_begin = json.loads(await server.asset_ingest_begin(server.ASSET_INGEST_MAX_BYTES + 1, "0" * 64))
+    assert rejected["error"] == "file_too_large"
+    assert rejected["max_bytes"] == 2 * 1024 * 1024
+    assert too_large_begin["error"] == "file_too_large"
+    await server.asset_ingest_abort(upload_id)
+
+
+@pytest.mark.asyncio
+async def test_asset_chunked_ingest_expiry_forgery_abort_and_capacity(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    expected = hashlib.sha256(b"x").hexdigest()
+    expired = json.loads(server._asset_begin_ingest_upload(1, expected, now=100.0))
+    expired_chunk = json.loads(server._asset_ingest_chunk_data(
+        expired["upload_id"], 0, "eA==", now=100.0 + server.ASSET_INGEST_TTL_SECONDS + 1
+    ))
+    forged = "f" * 32
+    forged_finish = json.loads(await server.asset_ingest_finish(forged))
+    malformed = json.loads(await server.asset_ingest_finish("../bad"))
+
+    active = json.loads(await server.asset_ingest_begin(1, expected))
+    first_abort = json.loads(await server.asset_ingest_abort(active["upload_id"]))
+    second_abort = json.loads(await server.asset_ingest_abort(active["upload_id"]))
+    after_abort = json.loads(await server.asset_ingest_chunk(active["upload_id"], 0, "eA=="))
+
+    assert expired_chunk["error"] == "upload_unavailable"
+    assert forged_finish["error"] == "upload_unavailable"
+    assert malformed["error"] == "invalid_upload_id"
+    assert first_abort["ok"] is True and first_abort["aborted"] is True
+    assert second_abort["ok"] is True and second_abort["aborted"] is False
+    assert after_abort["error"] == "upload_unavailable"
+
+    monkeypatch.setattr(server, "ASSET_INGEST_MAX_UPLOADS", 2)
+    server._asset_ingest_uploads.clear()
+    assert json.loads(server._asset_begin_ingest_upload(1, expected, now=200.0))["ok"] is True
+    assert json.loads(server._asset_begin_ingest_upload(1, expected, now=200.0))["ok"] is True
+    assert json.loads(server._asset_begin_ingest_upload(1, expected, now=200.0))["error"] == "upload_store_full"
+    cleaned = json.loads(server._asset_begin_ingest_upload(
+        1, expected, now=200.0 + server.ASSET_INGEST_TTL_SECONDS + 1
+    ))
+    assert cleaned["ok"] is True
+    assert len(server._asset_ingest_uploads) == 1
+
+
+def test_asset_chunked_ingest_concurrent_duplicate_is_idempotent(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    raw = b"concurrent chunk"
+    expected = hashlib.sha256(raw).hexdigest()
+    begin = json.loads(server._asset_begin_ingest_upload(len(raw), expected))
+    upload_id = begin["upload_id"]
+    encoded = base64.b64encode(raw).decode("ascii")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(
+            lambda _: json.loads(server._asset_ingest_chunk_data(upload_id, 0, encoded)),
+            range(16),
+        ))
+
+    assert all(result["ok"] is True for result in results)
+    assert sum(1 for result in results if result["idempotent"] is False) == 1
+    assert all(result["decoded_bytes"] == len(raw) for result in results)
+    assert all(result["received_chunks"] == 1 for result in results)
+    finish = json.loads(server._asset_finish_ingest_upload(upload_id))
+    assert finish["hash_match"] is True
+    assert finish["received_chunks"] == 1
+
+@pytest.mark.asyncio
 async def test_asset_render_probe_returns_valid_png_image_block(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
 
