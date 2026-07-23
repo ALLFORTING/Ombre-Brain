@@ -2010,11 +2010,13 @@ def _asset_new_vision_trial(now: float | None = None) -> dict:
     answer["symbol"] = _ASSET_VISION_RNG.choice(ASSET_VISION_SYMBOLS)
     answer["symbol_position"] = _ASSET_VISION_RNG.choice(ASSET_VISION_POSITIONS)
     trial_id = secrets.token_hex(16)
+    png = _asset_generate_vision_png(answer)
     created_at = time.time() if now is None else now
     return {
         "trial_id": trial_id,
         "answer": answer,
-        "png": _asset_generate_vision_png(answer),
+        "png": png,
+        "sha256": hashlib.sha256(png).hexdigest(),
         "expires_at": created_at + ASSET_VISION_TTL_SECONDS,
     }
 
@@ -2031,16 +2033,22 @@ def _asset_store_vision_trial(trial: dict, now: float | None = None) -> tuple[bo
         _asset_cleanup_expired_trials(current)
         if len(_asset_vision_trials) >= ASSET_VISION_MAX_TRIALS:
             return False, "trial_store_full"
+        png = bytes(trial["png"])
         _asset_vision_trials[trial["trial_id"]] = {
             "answer": dict(trial["answer"]),
             "expires_at": trial["expires_at"],
+            "png": png,
+            "sha256": hashlib.sha256(png).hexdigest(),
+            "exported": False,
         }
     return True, ""
 
 
-def _asset_vision_prompt(trial_id: str) -> str:
+def _asset_vision_prompt(trial_id: str, decoded_bytes: int, sha256: str) -> str:
     return _json_lib.dumps({
         "trial_id": trial_id,
+        "decoded_bytes": decoded_bytes,
+        "sha256": sha256,
         "answer_format": {
             "top_left": "<color>",
             "top_right": "<color>",
@@ -2061,6 +2069,32 @@ def _asset_reject_vision_answer(error: str, trial_id: str = "") -> str:
         "ok": False,
         "trial_id": trial_id,
         "error": error,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _asset_export_vision_trial(trial_id: str, now: float | None = None) -> str:
+    trial_id = (trial_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", trial_id):
+        return _asset_reject_vision_answer("invalid_trial_id")
+    current = time.time() if now is None else now
+    with _asset_vision_lock:
+        _asset_cleanup_expired_trials(current)
+        trial = _asset_vision_trials.get(trial_id)
+        if not trial:
+            return _asset_reject_vision_answer("trial_unavailable", trial_id)
+        if trial.get("exported"):
+            return _asset_reject_vision_answer("already_exported", trial_id)
+        png = bytes(trial["png"])
+        sha256 = str(trial["sha256"])
+        trial["exported"] = True
+    return _json_lib.dumps({
+        "ok": True,
+        "trial_id": trial_id,
+        "filename": f"remember-me-vision-{trial_id}.png",
+        "mime_type": "image/png",
+        "decoded_bytes": len(png),
+        "sha256": sha256,
+        "data_base64": base64.b64encode(png).decode("ascii"),
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -2203,7 +2237,7 @@ async def asset_vision_challenge() -> CallToolResult:
     encoded = base64.b64encode(trial["png"]).decode("ascii")
     return CallToolResult(
         content=[
-            TextContent(type="text", text=_asset_vision_prompt(trial["trial_id"])),
+            TextContent(type="text", text=_asset_vision_prompt(trial["trial_id"], len(trial["png"]), trial["sha256"])),
             ImageContent(type="image", data=encoded, mimeType="image/png"),
         ]
     )
@@ -2213,6 +2247,15 @@ async def asset_vision_challenge() -> CallToolResult:
 async def asset_vision_verify(trial_id: str, answer_json: str) -> str:
     """Phase-0 blind vision verifier: score one submitted answer without returning the correct answer."""
     return _asset_score_vision_answer(trial_id, answer_json)
+
+
+@mcp.tool()
+async def asset_vision_export(trial_id: str) -> str:
+    """Phase-0 file-view vision probe: export a live challenge PNG as JSON/base64 without revealing the answer."""
+    return _asset_export_vision_trial(trial_id)
+
+
+
 @mcp.tool()
 async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
     """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""

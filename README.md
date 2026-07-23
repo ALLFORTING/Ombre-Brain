@@ -329,6 +329,7 @@ breath(query="今天很累")
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
 | `asset_vision_verify` | Phase-0 blind vision verifier; strictly parses answer JSON, scores fields, consumes the trial once, and never returns the correct answer |
+| `asset_vision_export` | Phase-0 file-view vision probe; exports the live trial PNG as JSON/base64 exactly once so clients can decode, SHA-check, and view the same bytes as a local file |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
 
@@ -385,6 +386,9 @@ breath(query="今天很累")
 - Recommended procedure: run 10 independent trials. The user and Claude should not receive the correct answers until all trials are complete.
 - Recommended acceptance: at least 9/10 perfect scores, with no systematic error for the same color or position.
 - The blind-test result verifies only the current client vision path; it does not imply every MCP client supports the same behavior, and it is not formal image storage.
+- A/B test Path A: MCP `ImageContent` goes directly into the model vision context.
+- A/B test Path B: `asset_vision_export(trial_id)` returns base64 for the same trial PNG; the client strictly decodes it to a local file, verifies SHA-256, and uses local file view.
+- Both paths use the same trial PNG and the same server-held truth. A direct ImageContent failure does not prove that the local file view path also fails.
 
 ## 安装 / Setup
 
