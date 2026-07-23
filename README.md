@@ -338,6 +338,7 @@ breath(query="今天很累")
 | `rm_asset_search` | Stage-2.1 hybrid asset search: local keyword/tag filtering plus optional vector semantic recall, with stable ranking and safe fallback |
 | `rm_asset_reindex_embeddings` | Explicitly backfill missing or stale asset embeddings for one asset or a bounded batch; never changes asset files or metadata |
 | `rm_asset_download_link` | Create a short-lived signed download link for a persistent asset; HEAD is free and at most three GET requests succeed |
+| `rm_asset_view` | Stage-3A MCP Apps probe: display one cleaned RM image inline, with a short-lived download-link fallback for clients without MCP Apps |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
@@ -422,6 +423,14 @@ breath(query="今天很累")
 - Metadata updates refresh an asset vector when the index text or embedding model changes. Unchanged text is skipped.
 - When Embedding is disabled, unavailable, or fails, `rm_asset_search` still returns normal keyword results.
 - Existing assets require one explicit `rm_asset_reindex_embeddings(asset_id="", limit=100)` backfill. The server does not automatically batch-index production assets during startup.
+
+#### Remember-Me Stage 3A inline asset viewer
+
+- MCP Apps-capable clients can render one RM image directly inside the conversation through `rm_asset_view(asset_id)`.
+- The viewer receives only the privacy-cleaned, re-encoded stored copy. Image bytes are placed in the tool result `_meta`, not in model-visible text or `structuredContent`.
+- Clients without MCP Apps receive a short-lived signed download link through the normal text fallback.
+- This stage provides a single-image viewer only; it is not a gallery or asset manager.
+- Actual inline rendering support still requires validation in the real Claude connector.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

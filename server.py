@@ -36,6 +36,7 @@ import os
 import sys
 import base64
 import binascii
+import io
 import random
 import logging
 import asyncio
@@ -56,6 +57,7 @@ from urllib.parse import urlparse
 from typing import Union
 from typing_extensions import Annotated, Literal
 from pydantic import Field
+from PIL import Image, UnidentifiedImageError
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -68,6 +70,13 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from bucket_manager import BucketManager
 from asset_store import AssetStore, AssetStoreError, InvalidAssetImage
 from asset_embedding_index import AssetEmbeddingIndex
+from asset_viewer import (
+    ASSET_VIEWER_HTML,
+    ASSET_VIEWER_MIME_TYPE,
+    ASSET_VIEWER_RESOURCE_META,
+    ASSET_VIEWER_TOOL_META,
+    ASSET_VIEWER_URI,
+)
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -2715,6 +2724,65 @@ def _rm_read_asset_download(token: str, method: str, now: float | None = None) -
         }
         return asset, path, headers
 
+
+def _rm_asset_view_error(error: str) -> CallToolResult:
+    messages = {
+        "asset_unavailable": "The requested Remember-Me asset is unavailable.",
+        "asset_not_image": "The requested Remember-Me asset is not an image.",
+        "invalid_image_mime": "The requested Remember-Me image type is not supported.",
+        "image_too_large": "The requested Remember-Me image exceeds the viewer limit.",
+        "image_unavailable": "The requested Remember-Me image could not be verified.",
+        "download_unavailable": "A temporary fallback download link could not be created.",
+    }
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=messages.get(error, "The Remember-Me image could not be displayed."),
+            )
+        ],
+        structuredContent={"ok": False, "error": error},
+        isError=True,
+    )
+
+
+def _rm_verified_view_image(asset_id: str) -> tuple[dict, bytes] | str:
+    asset_id = (asset_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+        return "asset_unavailable"
+    try:
+        resolved = asset_store.resolve_file(asset_id)
+    except (AssetStoreError, OSError):
+        return "image_unavailable"
+    if not resolved:
+        return "asset_unavailable"
+    asset, path = resolved
+    if asset.get("kind") != "image":
+        return "asset_not_image"
+    if asset.get("mime_type") not in {"image/jpeg", "image/png"}:
+        return "invalid_image_mime"
+    try:
+        actual_bytes = path.stat().st_size
+    except OSError:
+        return "image_unavailable"
+    if actual_bytes <= 0 or actual_bytes != asset.get("stored_bytes"):
+        return "image_unavailable"
+    if actual_bytes > ASSET_BROWSER_UPLOAD_MAX_BYTES:
+        return "image_too_large"
+    try:
+        data = path.read_bytes()
+        with Image.open(io.BytesIO(data)) as image:
+            image_format = image.format
+            image_size = image.size
+            image.verify()
+    except (OSError, ValueError, UnidentifiedImageError):
+        return "image_unavailable"
+    expected_format = "JPEG" if asset["mime_type"] == "image/jpeg" else "PNG"
+    if image_format != expected_format or image_size != (asset["width"], asset["height"]):
+        return "image_unavailable"
+    return asset, data
+
+
 def _asset_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
 
@@ -3320,6 +3388,64 @@ async def rm_asset_download_link(asset_id: str) -> str:
     """Create a five-minute signed download URL for one persistent asset."""
     return _rm_create_asset_download_link(asset_id)
 
+
+@mcp.resource(
+    ASSET_VIEWER_URI,
+    name="remember-me-asset-viewer",
+    title="Remember-Me asset viewer",
+    description="Inline viewer for one privacy-cleaned Remember-Me image.",
+    mime_type=ASSET_VIEWER_MIME_TYPE,
+    meta=ASSET_VIEWER_RESOURCE_META,
+)
+async def rm_asset_viewer_resource() -> str:
+    return ASSET_VIEWER_HTML
+
+
+@mcp.tool(meta=ASSET_VIEWER_TOOL_META)
+async def rm_asset_view(asset_id: str) -> CallToolResult:
+    """Display one cleaned Remember-Me image inline with a signed-link fallback."""
+    verified = _rm_verified_view_image(asset_id)
+    if isinstance(verified, str):
+        return _rm_asset_view_error(verified)
+    asset, data = verified
+    try:
+        download = _json_lib.loads(_rm_create_asset_download_link(asset["asset_id"]))
+    except (TypeError, ValueError, _json_lib.JSONDecodeError):
+        return _rm_asset_view_error("download_unavailable")
+    if not download.get("ok"):
+        return _rm_asset_view_error("download_unavailable")
+    fallback_url = download.get("download_url") or download.get("download_path")
+    title = asset.get("title") or asset["original_filename"]
+    structured = {
+        "asset_id": asset["asset_id"],
+        "title": asset.get("title", ""),
+        "filename": asset["original_filename"],
+        "mime_type": asset["mime_type"],
+        "width": asset["width"],
+        "height": asset["height"],
+        "tags": asset.get("tags", []),
+        "stored_bytes": asset["stored_bytes"],
+    }
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=(
+                    f"Remember-Me image: {title}\n"
+                    "If this client does not display the inline viewer, use this "
+                    f"short-lived download link: {fallback_url}"
+                ),
+            )
+        ],
+        structuredContent=structured,
+        _meta={
+            "rememberMe": {
+                "schemaVersion": 1,
+                "imageBase64": base64.b64encode(data).decode("ascii"),
+                "mimeType": asset["mime_type"],
+            }
+        },
+    )
 
 @mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
 async def rm_asset_upload_route(request):
