@@ -226,7 +226,7 @@ mcp = FastMCP(
 # First visit with no password set → forced setup wizard.
 # Sessions stored in memory (lost on restart, 7-day expiry).
 # =============================================================
-_sessions: dict[str, float] = {}  # {token: expiry_timestamp}
+_sessions: dict[str, dict] = {}  # {token: {expires_at, csrf_token}}
 
 
 def _get_auth_file() -> str:
@@ -282,19 +282,42 @@ def _verify_any_password(password: str) -> bool:
 
 def _create_session() -> str:
     token = secrets.token_urlsafe(32)
-    _sessions[token] = time.time() + 86400 * 7  # 7-day expiry
+    _sessions[token] = {
+        "expires_at": time.time() + 86400 * 7,
+        "csrf_token": secrets.token_urlsafe(32),
+    }
     return token
 
 
-def _is_authenticated(request) -> bool:
+def _session_data(request) -> dict | None:
     token = request.cookies.get("ombre_session")
     if not token:
-        return False
-    expiry = _sessions.get(token)
-    if expiry is None or time.time() > expiry:
+        return None
+    session = _sessions.get(token)
+    if not session or time.time() > session["expires_at"]:
         _sessions.pop(token, None)
-        return False
-    return True
+        return None
+    return session
+
+
+def _is_authenticated(request) -> bool:
+    return _session_data(request) is not None
+
+
+def _require_dashboard_write(request):
+    from starlette.responses import JSONResponse
+
+    session = _session_data(request)
+    if session is None:
+        return _require_auth(request)
+    supplied = request.headers.get("x-ombre-csrf", "")
+    if not supplied or not hmac.compare_digest(supplied, session["csrf_token"]):
+        return JSONResponse({"error": "csrf_required"}, status_code=403)
+    origin = request.headers.get("origin", "")
+    expected_origin = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    if not origin or origin.rstrip("/") != expected_origin.rstrip("/"):
+        return JSONResponse({"error": "same_origin_required"}, status_code=403)
+    return None
 
 
 def _require_auth(request):
@@ -311,11 +334,13 @@ def _require_auth(request):
 # --- Auth endpoints ---
 @mcp.custom_route("/auth/status", methods=["GET"])
 async def auth_status(request):
-    """Return auth state (authenticated, setup_needed)."""
+    """Return auth state plus a session-bound CSRF token when authenticated."""
     from starlette.responses import JSONResponse
+    session = _session_data(request)
     return JSONResponse({
-        "authenticated": _is_authenticated(request),
+        "authenticated": session is not None,
         "setup_needed": _is_setup_needed(),
+        "csrf_token": session["csrf_token"] if session else "",
     })
 
 
@@ -1946,9 +1971,10 @@ ASSET_BROWSER_UPLOAD_TTL_SECONDS = 10 * 60
 ASSET_BROWSER_UPLOAD_MAX_UPLOADS = 100
 ASSET_BROWSER_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD = 64 * 1024
+RM_ASSET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 asset_dashboard = AssetDashboardService(
     asset_store,
-    max_asset_bytes=ASSET_BROWSER_UPLOAD_MAX_BYTES,
+    max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
     max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
 )
 _asset_browser_uploads = {}
@@ -2430,7 +2456,13 @@ def _asset_complete_browser_upload(upload_id: str, decoded_bytes: int, sha256: s
         return dict(result)
 
 
-async def _asset_stream_browser_upload(request, sink=None) -> dict:
+async def _asset_stream_browser_upload(
+    request,
+    sink=None,
+    *,
+    max_bytes: int = ASSET_BROWSER_UPLOAD_MAX_BYTES,
+    wire_overhead: int = ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD,
+) -> dict:
     from python_multipart import MultipartParser
     from python_multipart.multipart import parse_options_header
 
@@ -2484,7 +2516,7 @@ async def _asset_stream_browser_upload(request, sink=None) -> dict:
             raise _AssetBrowserUploadError("single_file_required")
         block = data[start:end]
         state["decoded_bytes"] += len(block)
-        if state["decoded_bytes"] > ASSET_BROWSER_UPLOAD_MAX_BYTES:
+        if state["decoded_bytes"] > max_bytes:
             raise _AssetBrowserUploadTooLarge("file_too_large")
         state["hasher"].update(block)
         if sink is not None:
@@ -2512,7 +2544,7 @@ async def _asset_stream_browser_upload(request, sink=None) -> dict:
     wire_bytes = 0
     async for block in request.stream():
         wire_bytes += len(block)
-        if wire_bytes > ASSET_BROWSER_UPLOAD_MAX_BYTES + ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD:
+        if wire_bytes > max_bytes + wire_overhead:
             raise _AssetBrowserUploadTooLarge("request_too_large")
         parser.write(block)
     parser.finalize()
@@ -2596,8 +2628,8 @@ def _rm_create_asset_upload_link(
     mime_type: str = "application/octet-stream",
     now: float | None = None,
 ) -> str:
-    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= ASSET_BROWSER_UPLOAD_MAX_BYTES:
-        return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=ASSET_BROWSER_UPLOAD_MAX_BYTES)
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= RM_ASSET_MAX_UPLOAD_BYTES:
+        return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=RM_ASSET_MAX_UPLOAD_BYTES)
     expected = (expected_sha256 or "").strip().lower()
     if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
         return _asset_ingest_response(False, error="invalid_expected_sha256")
@@ -2642,7 +2674,7 @@ def _rm_create_asset_upload_link(
         "upload_url": f"{base_url}{upload_path}" if base_url else "",
         "status_path": f"/rm/asset-upload-status/{upload_id}",
         "expires_in_seconds": RM_ASSET_UPLOAD_TTL_SECONDS,
-        "max_bytes": ASSET_BROWSER_UPLOAD_MAX_BYTES,
+        "max_bytes": RM_ASSET_MAX_UPLOAD_BYTES,
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -2750,7 +2782,7 @@ def _rm_asset_upload_page(token: str, item: dict, now: float | None = None) -> s
     expires_in = max(0, int(item["expires_at"] - current))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Remember-Me asset upload</title><style>body{{font:16px system-ui;max-width:42rem;margin:3rem auto;padding:0 1rem}}label,input,button{{display:block;margin:.8rem 0}}code{{word-break:break-all}}</style></head>
-<body><h1>Remember-Me asset upload</h1><p>Expected file: <code>{filename}</code></p><p>Expected size: {item["expected_bytes"]} bytes; hard limit: {ASSET_BROWSER_UPLOAD_MAX_BYTES} bytes.</p><p>Link expires in {expires_in} seconds.</p>
+<body><h1>Remember-Me asset upload</h1><p>Expected file: <code>{filename}</code></p><p>Expected size: {item["expected_bytes"]} bytes; hard limit: {RM_ASSET_MAX_UPLOAD_BYTES} bytes.</p><p>Link expires in {expires_in} seconds.</p>
 <form method="post" enctype="multipart/form-data" action="{action}"><label for="file">Choose file</label><input id="file" name="file" type="file" required><button type="submit">Upload and store</button></form></body></html>"""
 
 
@@ -2899,7 +2931,7 @@ def _rm_verified_view_image(asset_id: str) -> tuple[dict, bytes] | str:
         return "image_unavailable"
     if actual_bytes <= 0 or actual_bytes != asset.get("stored_bytes"):
         return "image_unavailable"
-    if actual_bytes > ASSET_BROWSER_UPLOAD_MAX_BYTES:
+    if actual_bytes > RM_ASSET_MAX_UPLOAD_BYTES:
         return "image_too_large"
     try:
         data = path.read_bytes()
@@ -3705,7 +3737,11 @@ async def rm_asset_upload_route(request):
     temp_path = asset_store.create_temp_path()
     try:
         with temp_path.open("wb") as handle:
-            streamed = await _asset_stream_browser_upload(request, handle.write)
+            streamed = await _asset_stream_browser_upload(
+                request,
+                handle.write,
+                max_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+            )
         size_match = streamed["decoded_bytes"] == claim["expected_bytes"]
         hash_match = not claim["expected_sha256"] or hmac.compare_digest(
             streamed["sha256"], claim["expected_sha256"]
@@ -5072,10 +5108,31 @@ async def api_breath_debug(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@mcp.custom_route("/api/assets", methods=["GET"])
+@mcp.custom_route("/api/assets", methods=["GET", "POST"])
 async def api_assets(request):
-    """List cleaned Remember-Me image assets for the authenticated Dashboard."""
+    """List or create cleaned Remember-Me image assets for the Dashboard."""
     from starlette.responses import JSONResponse
+
+    if request.method.upper() == "POST":
+        err = _require_dashboard_write(request)
+        if err:
+            return err
+        try:
+            upload = await asset_dashboard.parse_upload(request)
+            asset = await asyncio.to_thread(asset_dashboard.create_asset, upload)
+            stored = asset_store.get(asset["asset_id"])
+            if stored:
+                try:
+                    await asset_embedding_index.index_asset(stored)
+                except Exception:
+                    logger.warning("Dashboard asset embedding refresh failed after upload")
+            return JSONResponse(asset, status_code=200 if asset["deduplicated"] else 201)
+        except AssetDashboardError as exc:
+            return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+        except Exception:
+            logger.error("Dashboard asset upload failed")
+            return JSONResponse({"error": "asset_upload_failed"}, status_code=500)
+
     err = _require_auth(request)
     if err:
         return err
@@ -5094,22 +5151,46 @@ async def api_assets(request):
         logger.error("Dashboard asset listing failed")
         return JSONResponse({"error": "asset_list_failed"}, status_code=500)
 
-
-@mcp.custom_route("/api/assets/{asset_id}", methods=["GET"])
+@mcp.custom_route("/api/assets/{asset_id}", methods=["GET", "PATCH", "DELETE"])
 async def api_asset_detail(request):
-    """Return safe metadata for one cleaned image asset."""
+    """Read, edit, or permanently delete one cleaned image asset."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+
+    asset_id = request.path_params["asset_id"]
+    method = request.method.upper()
+    if method in {"PATCH", "DELETE"}:
+        err = _require_dashboard_write(request)
+    else:
+        err = _require_auth(request)
     if err:
         return err
     try:
-        return JSONResponse(asset_dashboard.get_asset(request.path_params["asset_id"]))
+        if method == "GET":
+            return JSONResponse(asset_dashboard.get_asset(asset_id))
+        if method == "PATCH":
+            try:
+                payload = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid_json"}, status_code=400)
+            asset = await asyncio.to_thread(
+                asset_dashboard.update_asset,
+                asset_id,
+                payload,
+            )
+            stored = asset_store.get(asset_id)
+            if stored:
+                try:
+                    await asset_embedding_index.index_asset(stored)
+                except Exception:
+                    logger.warning("Dashboard asset embedding refresh failed after metadata update")
+            return JSONResponse(asset)
+        result = await asyncio.to_thread(asset_dashboard.delete_asset, asset_id)
+        return JSONResponse(result)
     except AssetDashboardError as exc:
         return JSONResponse({"error": exc.code}, status_code=exc.status_code)
     except Exception:
-        logger.error("Dashboard asset detail failed")
-        return JSONResponse({"error": "asset_detail_failed"}, status_code=500)
-
+        logger.error("Dashboard asset mutation failed")
+        return JSONResponse({"error": "asset_operation_failed"}, status_code=500)
 
 @mcp.custom_route("/api/assets/{asset_id}/thumbnail", methods=["GET"])
 async def api_asset_thumbnail(request):

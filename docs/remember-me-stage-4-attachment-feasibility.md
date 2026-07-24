@@ -107,7 +107,7 @@ Autonomy is judgment, not indiscriminate collection. Routine debugging images, a
 ## Current Limits
 
 - Official image formats: PNG and JPEG.
-- Maximum original upload: 2 MiB per image.
+- Maximum original upload: 10 MiB per image.
 - Maximum decoded dimensions: 20,000,000 pixels.
 - Over-limit images must not be silently compressed, resized, converted, or replaced. Transformation requires explicit user agreement.
 

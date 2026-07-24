@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 from PIL import Image
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -40,8 +42,8 @@ def _load_server(tmp_path, monkeypatch):
 
 def _client(server, authenticated=True):
     app = Starlette(routes=[
-        Route("/api/assets", server.api_assets, methods=["GET"]),
-        Route("/api/assets/{asset_id}", server.api_asset_detail, methods=["GET"]),
+        Route("/api/assets", server.api_assets, methods=["GET", "POST"]),
+        Route("/api/assets/{asset_id}", server.api_asset_detail, methods=["GET", "PATCH", "DELETE"]),
         Route(
             "/api/assets/{asset_id}/thumbnail",
             server.api_asset_thumbnail,
@@ -70,6 +72,10 @@ def _client(server, authenticated=True):
     if authenticated:
         token = server._create_session()
         client.cookies.set("ombre_session", token)
+        client.headers.update({
+            "Origin": "http://testserver",
+            "X-Ombre-CSRF": server._sessions[token]["csrf_token"],
+        })
     return client
 
 
@@ -251,3 +257,244 @@ def test_dashboard_static_contract_has_three_sections_and_safe_asset_ui(
     assert "base64" not in script.lower()
     assert css.status_code == 200
     assert css.headers["content-type"].startswith("text/css")
+
+
+def _jpeg(color=(90, 70, 50), size=(48, 32)):
+    output = io.BytesIO()
+    with Image.new("RGB", size, color) as image:
+        image.save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _upload(client, data, filename="upload.png", mime_type="image/png", **fields):
+    form = {
+        "title": fields.get("title", ""),
+        "description": fields.get("description", ""),
+        "tags": fields.get("tags", "[]"),
+    }
+    return client.post(
+        "/api/assets",
+        data=form,
+        files={"file": (filename, data, mime_type)},
+    )
+
+
+def test_asset_writes_require_auth_csrf_and_same_origin(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    payload = _png()
+    assert _upload(_client(server, authenticated=False), payload).status_code == 401
+
+    client = _client(server)
+    csrf = client.headers.pop("X-Ombre-CSRF")
+    response = _upload(client, payload)
+    assert response.status_code == 403
+    assert response.json() == {"error": "csrf_required"}
+
+    client.headers["X-Ombre-CSRF"] = csrf
+    client.headers.pop("Origin")
+    response = _upload(client, payload)
+    assert response.status_code == 403
+    assert response.json() == {"error": "same_origin_required"}
+
+
+def test_png_jpeg_upload_metadata_dedup_and_temp_cleanup(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+
+    png = _upload(
+        client,
+        _png(),
+        "../unsafe:name.png",
+        "image/png",
+        title="保存的图片",
+        description="安全描述",
+        tags='["旅行", "收藏"]',
+    )
+    assert png.status_code == 201
+    created = png.json()
+    assert created["filename"] == "_unsafe_name.png"
+    assert created["title"] == "保存的图片"
+    assert created["description"] == "安全描述"
+    assert created["tags"] == ["收藏", "旅行"]
+    assert created["mime_type"] == "image/png"
+    assert created["deduplicated"] is False
+
+    duplicate = _upload(client, _png(), "again.png", "image/png")
+    assert duplicate.status_code == 200
+    assert duplicate.json()["asset_id"] == created["asset_id"]
+    assert duplicate.json()["deduplicated"] is True
+    assert duplicate.json()["title"] == "保存的图片"
+
+    jpeg = _upload(client, _jpeg(), "photo.jpg", "image/jpeg")
+    assert jpeg.status_code == 201
+    assert jpeg.json()["mime_type"] == "image/jpeg"
+    assert not list(server.asset_store.temp_dir.glob("rm-*"))
+
+
+def test_upload_limits_corruption_and_mime_mismatch(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+
+    exact = _png() + b"\0" * (server.RM_ASSET_MAX_UPLOAD_BYTES - len(_png()))
+    response = _upload(client, exact)
+    assert response.status_code == 201
+
+    too_large = exact + b"x"
+    response = _upload(client, too_large)
+    assert response.status_code == 413
+    assert "file_too_large" in response.text
+
+    mismatch = _upload(client, _png(), "wrong.jpg", "image/jpeg")
+    assert mismatch.status_code == 422
+    assert mismatch.json() == {"error": "image_mime_mismatch"}
+
+    corrupt = _upload(client, b"not-an-image", "broken.png", "image/png")
+    assert corrupt.status_code == 422
+    assert "invalid_image" in corrupt.text
+
+    unsupported = _upload(client, b"plain", "plain.txt", "text/plain")
+    assert unsupported.status_code == 415
+    assert "unsupported_image" in unsupported.text
+
+
+def test_upload_rejects_pixel_limit(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    monkeypatch.setattr("asset_store.MAX_IMAGE_PIXELS", 10)
+    response = _upload(client, _png(size=(4, 3)))
+    assert response.status_code == 422
+    assert response.json() == {"error": "image_pixel_limit"}
+
+
+def test_metadata_edit_validation_and_embedding_refresh(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    created = _upload(client, _png()).json()
+    calls = []
+
+    async def fake_index(asset):
+        calls.append(asset["asset_id"])
+        return "indexed"
+
+    monkeypatch.setattr(server.asset_embedding_index, "index_asset", fake_index)
+    response = client.patch(
+        f"/api/assets/{created['asset_id']}",
+        json={"title": "新标题", "description": "新描述", "tags": ["一", "二"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["title"] == "新标题"
+    assert calls == [created["asset_id"]]
+
+    assert client.patch(
+        f"/api/assets/{created['asset_id']}", json={"filename": "nope"}
+    ).status_code == 400
+    assert client.patch(
+        f"/api/assets/{created['asset_id']}", json={"title": 123}
+    ).status_code == 400
+    assert client.patch(
+        f"/api/assets/{created['asset_id']}", json={"title": "x" * 201}
+    ).status_code == 400
+    assert client.patch(
+        "/api/assets/" + "0" * 32, json={"title": "missing"}
+    ).status_code == 404
+
+
+def test_delete_removes_file_tags_embedding_and_routes(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    created = _upload(client, _png(), tags='["delete-me"]', title="delete").json()
+    asset_id = created["asset_id"]
+    resolved = server.asset_store.resolve_file(asset_id)
+    stored_path = resolved[1]
+    with sqlite3.connect(server.asset_store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO asset_embeddings (asset_id, embedding, model, content_hash, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (asset_id, "[0.1]", "test", "hash", "2026-07-24T00:00:00+00:00"),
+        )
+
+    response = client.delete(f"/api/assets/{asset_id}")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert not stored_path.exists()
+    assert client.get(f"/api/assets/{asset_id}").status_code == 404
+    assert client.get(f"/api/assets/{asset_id}/image").status_code == 404
+    with sqlite3.connect(server.asset_store.db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM asset_tags WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM asset_embeddings WHERE asset_id = ?", (asset_id,)).fetchone()[0] == 0
+
+
+def test_delete_failure_and_traversal_do_not_claim_success(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    created = _upload(client, _png()).json()
+    asset_id = created["asset_id"]
+
+    with sqlite3.connect(server.asset_store.db_path) as conn:
+        conn.execute("UPDATE assets SET stored_relpath = ? WHERE asset_id = ?", ("../outside.png", asset_id))
+    response = client.delete(f"/api/assets/{asset_id}")
+    assert response.status_code == 409
+    assert str(tmp_path) not in response.text
+    assert server.asset_store.get(asset_id) is not None
+
+    monkeypatch.setattr(
+        server.asset_dashboard,
+        "delete_asset",
+        lambda _asset_id: (_ for _ in ()).throw(server.AssetDashboardError("asset_delete_failed", 409)),
+    )
+    response = client.delete(f"/api/assets/{asset_id}")
+    assert response.status_code == 409
+    assert response.json() == {"error": "asset_delete_failed"}
+
+
+def test_stage5b_static_contract_and_import_scope(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    html = client.get("/dashboard").text
+    script = client.get("/dashboard-assets.js").text
+
+    assert 'id="rm-asset-upload-open"' in html
+    assert "上传图片" in html
+    assert 'accept = "image/png,image/jpeg,.png,.jpg,.jpeg"' in script
+    assert "new FormData()" in script
+    assert 'method: "PATCH"' in script
+    assert 'method: "DELETE"' in script
+    assert "确认删除" in script
+    assert "删除后将从 Remember-Me 图片库中永久移除" in script
+    assert "data.append(\"file\"" in script
+    assert "base64" not in script.lower()
+    assert 'accept=".json,.txt,.md,.jsonl"' in html
+    assert 'id="import-file-input"' in html
+
+def test_invalid_upload_metadata_cleans_temp_without_persisting(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    response = _upload(client, _png(), tags='{"not": "a list"}')
+    assert response.status_code == 400
+    assert server.asset_store.search(kind="image")["total"] == 0
+    assert not list(server.asset_store.temp_dir.glob("rm-*"))
+
+    response = _upload(client, _png(), title="x" * 201)
+    assert response.status_code == 400
+    assert server.asset_store.search(kind="image")["total"] == 0
+    assert not list(server.asset_store.temp_dir.glob("rm-*"))
+
+
+def test_embedding_failure_does_not_rollback_dashboard_write(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+
+    async def fail_index(_asset):
+        raise RuntimeError("synthetic embedding failure")
+
+    monkeypatch.setattr(server.asset_embedding_index, "index_asset", fail_index)
+    uploaded = _upload(client, _png(), title="kept")
+    assert uploaded.status_code == 201
+    asset_id = uploaded.json()["asset_id"]
+    assert server.asset_store.get(asset_id)["title"] == "kept"
+
+    updated = client.patch(
+        f"/api/assets/{asset_id}",
+        json={"description": "still updated"},
+    )
+    assert updated.status_code == 200
+    assert server.asset_store.get(asset_id)["description"] == "still updated"

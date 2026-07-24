@@ -301,6 +301,9 @@ class AssetStore:
         if detected:
             if detected not in {"JPEG", "PNG"}:
                 raise InvalidAssetImage("unsupported_image_format")
+            expected_mime = "image/jpeg" if detected == "JPEG" else "image/png"
+            if claimed_mime.startswith("image/") and claimed_mime != expected_mime:
+                raise InvalidAssetImage("image_mime_mismatch")
             candidate, mime_type, extension, width, height = self._clean_image(source_path)
             return candidate, mime_type, "image", extension, width, height
         if claimed_mime in {"image/jpeg", "image/png"}:
@@ -543,6 +546,71 @@ class AssetStore:
         if result is None:
             raise AssetStoreError("asset_unavailable")
         return result
+
+    def delete(self, asset_id: str) -> dict:
+        asset_id = (asset_id or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise AssetStoreError("asset_unavailable")
+
+        with self._lock:
+            conn = self._connect()
+            quarantine_path: Path | None = None
+            original_path: Path | None = None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM assets WHERE asset_id = ?",
+                    (asset_id,),
+                ).fetchone()
+                if not row:
+                    raise AssetStoreError("asset_unavailable")
+
+                original_path = (self.data_root / row["stored_relpath"]).resolve()
+                try:
+                    original_path.relative_to(self.assets_dir.resolve())
+                except ValueError as exc:
+                    raise AssetStoreError("invalid_stored_path") from exc
+                if not original_path.is_file():
+                    raise AssetStoreError("asset_file_unavailable")
+
+                quarantine_path = self.temp_dir / (
+                    f"delete-{asset_id}-{secrets.token_hex(8)}{original_path.suffix}"
+                )
+                os.replace(original_path, quarantine_path)
+                cursor = conn.execute(
+                    "DELETE FROM assets WHERE asset_id = ?",
+                    (asset_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise AssetStoreError("asset_delete_failed")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                if (
+                    quarantine_path
+                    and original_path
+                    and quarantine_path.exists()
+                    and not original_path.exists()
+                ):
+                    try:
+                        os.replace(quarantine_path, original_path)
+                    except OSError as restore_exc:
+                        raise AssetStoreError("asset_delete_restore_failed") from restore_exc
+                raise
+            finally:
+                conn.close()
+
+        cleanup_pending = False
+        if quarantine_path:
+            try:
+                quarantine_path.unlink()
+            except OSError:
+                cleanup_pending = True
+        return {
+            "asset_id": asset_id,
+            "deleted": True,
+            "cleanup_pending": cleanup_pending,
+        }
 
     def search(
         self,

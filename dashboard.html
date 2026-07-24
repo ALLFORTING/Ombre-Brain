@@ -685,9 +685,12 @@
 
 <div class="content" id="assets-view" style="display:none">
   <div class="rm-asset-shell">
-    <div class="rm-asset-heading">
-      <h2>图片资产</h2>
-      <p>查看 Remember-Me 已完成隐私清理并持久保存的图片。</p>
+    <div class="rm-asset-heading rm-asset-heading-row">
+      <div>
+        <h2>图片资产</h2>
+        <p>查看和管理 Remember-Me 已完成隐私清理并持久保存的图片。</p>
+      </div>
+      <button id="rm-asset-upload-open" class="rm-asset-upload-button" type="button">上传图片</button>
     </div>
     <div id="rm-asset-browser"></div>
   </div>
@@ -934,10 +937,13 @@
 // ========================================
 // Auth system / 认证系统
 // ========================================
+let dashboardCsrfToken = '';
+
 async function checkAuth() {
   try {
     const resp = await fetch('/auth/status');
     const data = await resp.json();
+    dashboardCsrfToken = data.csrf_token || '';
     if (data.setup_needed) {
       document.getElementById('auth-subtitle').textContent = '首次设置';
       document.getElementById('auth-setup-form').style.display = 'block';
@@ -965,7 +971,7 @@ async function doSetup() {
   if (p1 !== p2) return showAuthError('两次密码不一致');
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
+    await checkAuth();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '设置失败');
@@ -976,7 +982,7 @@ async function doLogin() {
   const pwd = document.getElementById('auth-login-pwd').value;
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
+    await checkAuth();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '密码错误');
@@ -985,6 +991,7 @@ async function doLogin() {
 
 async function doLogout() {
   await fetch('/auth/logout', { method: 'POST' });
+  dashboardCsrfToken = '';
   document.getElementById('auth-setup-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'block';
@@ -1003,6 +1010,7 @@ async function changePassword() {
   const resp = await authFetch('/auth/change-password', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({current: currentPwd, new: newPwd}) });
   if (!resp) return;
   if (resp.ok) {
+    await checkAuth();
     msgEl.style.color = 'var(--accent)'; msgEl.textContent = '密码修改成功';
     document.getElementById('settings-current-pwd').value = '';
     document.getElementById('settings-new-pwd').value = '';
@@ -1088,10 +1096,18 @@ async function saveHostVault() {
   }
 }
 
-// authFetch: wraps fetch, shows auth overlay on 401
+// authFetch: wraps fetch, adds session CSRF for writes, shows auth overlay on 401
 async function authFetch(url, options) {
-  const resp = await fetch(url, options);
+  const requestOptions = Object.assign({}, options || {});
+  const method = String(requestOptions.method || 'GET').toUpperCase();
+  if (['POST', 'PATCH', 'DELETE'].includes(method)) {
+    const headers = new Headers(requestOptions.headers || {});
+    if (dashboardCsrfToken) headers.set('X-Ombre-CSRF', dashboardCsrfToken);
+    requestOptions.headers = headers;
+  }
+  const resp = await fetch(url, requestOptions);
   if (resp.status === 401) {
+    dashboardCsrfToken = '';
     doLogout();
     return null;
   }
@@ -1114,6 +1130,7 @@ function ensureAssetBrowser() {
       fetcher: authFetch,
       apiBase: '/api/assets',
       limit: 12,
+      uploadButton: document.getElementById('rm-asset-upload-open'),
     });
   }
   return assetBrowser;

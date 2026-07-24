@@ -221,7 +221,7 @@ async def test_rm_asset_view_rejects_bad_mime_corruption_and_oversize(
     oversized_path = server.asset_store.resolve_file(oversized["asset_id"])[1]
     oversized_path.write_bytes(
         oversized_path.read_bytes()
-        + b"x" * (server.ASSET_BROWSER_UPLOAD_MAX_BYTES + 1)
+        + b"x" * (server.RM_ASSET_MAX_UPLOAD_BYTES + 1)
     )
     actual_size = oversized_path.stat().st_size
     with sqlite3.connect(server.asset_store.db_path) as conn:

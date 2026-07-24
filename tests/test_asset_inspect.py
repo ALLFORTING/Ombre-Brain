@@ -227,7 +227,7 @@ async def test_rm_asset_inspect_rejects_corruption_and_limits(
     oversized_path = server.asset_store.resolve_file(oversized["asset_id"])[1]
     oversized_path.write_bytes(
         oversized_path.read_bytes()
-        + b"x" * (server.ASSET_BROWSER_UPLOAD_MAX_BYTES + 1)
+        + b"x" * (server.RM_ASSET_MAX_UPLOAD_BYTES + 1)
     )
     with sqlite3.connect(server.asset_store.db_path) as conn:
         conn.execute(

@@ -405,7 +405,7 @@ breath(query="今天很累")
 #### Remember-Me Stage 1 asset storage
 
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
-- Browser uploads are currently limited to 2 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
+- Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
 - SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.
 - PNG and JPEG uploads are decoded with Pillow, pixel-limited, orientation-corrected, and re-encoded without EXIF, GPS, text chunks, ICC profiles, or other original metadata. Invalid claimed images are rejected rather than stored as raw files.
 - Stage 1 does not implement bucket attachments or automatic display of chat attachments.
@@ -449,15 +449,16 @@ breath(query="今天很累")
 - Enable `Settings -> Capabilities -> Code execution and file creation -> Allow network egress`, keep the restricted domain mode, and add only the user's exact Ombre Brain hostname under `Additional allowed domains`. Do not use `All domains` or include a scheme, path, token, or signed URL.
 - Explicit save requests may proceed directly. Under standing permission Claude may autonomously save an image it genuinely wants to remember, or may ask first; neither behavior is mandatory every time, and indiscriminate collection is prohibited.
 - The real acceptance record is in [`docs/remember-me-stage-4b-acceptance.md`](docs/remember-me-stage-4b-acceptance.md). The maintained Claude Skill source is in [`skills/remember-me/`](skills/remember-me/).
-- Current image limits are PNG/JPEG, 2 MiB original bytes, and 20,000,000 decoded pixels. Over-limit images are not silently transformed without explicit user agreement.
+- Current formal image limits are PNG/JPEG, 10 MiB original bytes, and 20,000,000 decoded pixels. Stage-0 diagnostic probes remain limited to 2 MiB. Over-limit images are not silently transformed without explicit user agreement.
 
-#### Remember-Me Stage 5A Dashboard
+#### Remember-Me Stage 5 Dashboard
 
 - The Ombre Brain Dashboard now separates ordinary memory buckets, archived conversations, and Remember-Me image assets into distinct navigation entries.
-- The read-only image asset page provides bounded pagination, keyword and tag filtering, protected thumbnails, and a larger detail view using only privacy-cleaned persistent copies.
+- The image asset page provides bounded pagination, keyword and tag filtering, protected thumbnails, detail viewing, multipart upload, metadata editing, and explicit permanent deletion using only privacy-cleaned persistent copies.
 - Asset JSON and image routes remain inside the existing Dashboard authentication boundary and never expose disk paths, hashes, base64, upload/download tokens, EXIF, or GPS metadata.
 - The reusable `asset_dashboard.py`, `dashboard_assets.js`, and `dashboard_assets.css` modules do not depend on memory buckets or conversation archives. A future standalone Remember-Me shell can reuse them with only 图片库 / 上传 / 设置 navigation.
-- Stage 5A architecture, API contracts, security boundaries, and Stage 5B/5C recommendations are documented in [`docs/remember-me-stage-5-dashboard.md`](docs/remember-me-stage-5-dashboard.md).
+- Stage 5A/5B architecture, API contracts, security boundaries, and Stage 5C recommendations are documented in [`docs/remember-me-stage-5-dashboard.md`](docs/remember-me-stage-5-dashboard.md).
+- Stage 5B upload, metadata editing, deletion consistency, and CSRF details are documented in [docs/remember-me-stage-5b-assets.md](docs/remember-me-stage-5b-assets.md).
 #### `asset_vision_challenge` and `asset_vision_verify`
 
 - Verbal description is not evidence for the vision path. `asset_vision_challenge()` plus `asset_vision_verify(trial_id, answer_json)` uses server-held truth for automatic scoring.

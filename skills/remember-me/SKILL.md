@@ -185,6 +185,6 @@ Do not autonomously save merely because the user uploaded a routine image for an
 ## Current image limits
 
 - Officially supported image formats are PNG and JPEG.
-- The current maximum original upload size is 2 MiB per image.
+- The current maximum original upload size is 10 MiB per image.
 - The current maximum decoded image size is 20,000,000 pixels.
 - If an image exceeds either limit, do not silently compress, resize, convert, or substitute it. Only transform the original after the user explicitly agrees.
