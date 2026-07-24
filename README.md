@@ -440,7 +440,16 @@ breath(query="今天很累")
 - Use `rm_asset_view(asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
 - Stage 3A.2 and Stage 3B acceptance results are archived in [`docs/remember-me-stage-3-acceptance.md`](docs/remember-me-stage-3-acceptance.md).
 - The current registered-tool inventory and compatibility-first reduction plan are documented in [`docs/mcp-tool-audit.md`](docs/mcp-tool-audit.md).
-- Stage 4 attachment handoff feasibility, the safe probe procedure, and the current C conclusion are documented in [`docs/remember-me-stage-4-attachment-feasibility.md`](docs/remember-me-stage-4-attachment-feasibility.md).
+- Stage 4 attachment feasibility and the corrected standard-MCP versus Claude-container conclusion are documented in [`docs/remember-me-stage-4-attachment-feasibility.md`](docs/remember-me-stage-4-attachment-feasibility.md).
+
+#### Remember-Me Stage 4 one-upload attachment save
+
+- Stage 4B passed real Claude web acceptance: the code-execution container can read the exact current attachment and upload it through HTTPS `multipart/form-data` to the existing short-lived `rm_asset_upload_link` endpoint without a second user upload.
+- Standard MCP/FastMCP request context still does not automatically contain the chat attachment. `asset_attachment_context_probe` remains a diagnostic for that protocol boundary.
+- Enable `Settings -> Capabilities -> Code execution and file creation -> Allow network egress`, keep the restricted domain mode, and add only the user's exact Ombre Brain hostname under `Additional allowed domains`. Do not use `All domains` or include a scheme, path, token, or signed URL.
+- Explicit save requests may proceed directly. Under standing permission Claude may autonomously save an image it genuinely wants to remember, or may ask first; neither behavior is mandatory every time, and indiscriminate collection is prohibited.
+- The real acceptance record is in [`docs/remember-me-stage-4b-acceptance.md`](docs/remember-me-stage-4b-acceptance.md). The maintained Claude Skill source is in [`skills/remember-me/`](skills/remember-me/).
+- Current image limits are PNG/JPEG, 2 MiB original bytes, and 20,000,000 decoded pixels. Over-limit images are not silently transformed without explicit user agreement.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 
