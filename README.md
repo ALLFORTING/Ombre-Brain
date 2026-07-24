@@ -339,6 +339,7 @@ breath(query="今天很累")
 | `rm_asset_reindex_embeddings` | Explicitly backfill missing or stale asset embeddings for one asset or a bounded batch; never changes asset files or metadata |
 | `rm_asset_download_link` | Create a short-lived signed download link for a persistent asset; HEAD is free and at most three GET requests succeed |
 | `rm_asset_view` | Stage-3A MCP Apps probe: display one cleaned RM image inline, with a short-lived download-link fallback for clients without MCP Apps |
+| `rm_asset_inspect` | Stage-3A.2 model inspection: return the privacy-cleaned stored image as MCP ImageContent for actual visual understanding without changing metadata |
 | `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
 | `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
 | `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
@@ -433,6 +434,8 @@ breath(query="今天很累")
 - Actual inline rendering support still requires validation in the real Claude connector.
 - The embedded viewer is built with the pinned official `@modelcontextprotocol/ext-apps` browser SDK and bundled into a self-contained HTML resource with no runtime CDN dependency.
 - Loading, host connection, tool-result waiting, timeout, missing-image-data, and image-decode states are always visible; initialization failures no longer leave an empty component.
+- Use `rm_asset_inspect(asset_id)` when the model must read the actual cleaned image or text inside it. Its base64 exists only in MCP `ImageContent`; metadata updates and embedding refresh remain explicit separate operations.
+- Use `rm_asset_view(asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

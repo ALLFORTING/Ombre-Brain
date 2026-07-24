@@ -68,7 +68,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import BucketManager
-from asset_store import AssetStore, AssetStoreError, InvalidAssetImage
+from asset_store import (
+    MAX_IMAGE_PIXELS as RM_ASSET_MAX_IMAGE_PIXELS,
+    AssetStore,
+    AssetStoreError,
+    InvalidAssetImage,
+)
 from asset_embedding_index import AssetEmbeddingIndex
 from asset_viewer import (
     ASSET_VIEWER_HTML,
@@ -2746,6 +2751,25 @@ def _rm_asset_view_error(error: str) -> CallToolResult:
     )
 
 
+def _rm_asset_inspect_error(error: str) -> CallToolResult:
+    messages = {
+        "asset_unavailable": "The requested Remember-Me asset is unavailable.",
+        "asset_not_image": "The requested Remember-Me asset is not an image.",
+        "invalid_image_mime": "The requested Remember-Me image type is not supported for inspection.",
+        "image_too_large": "The requested Remember-Me image exceeds the inspection limit.",
+        "image_unavailable": "The requested Remember-Me image could not be verified.",
+    }
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=messages.get(error, "The Remember-Me image could not be inspected."),
+            )
+        ],
+        structuredContent={"ok": False, "error": error},
+        isError=True,
+    )
+
 def _rm_verified_view_image(asset_id: str) -> tuple[dict, bytes] | str:
     asset_id = (asset_id or "").strip()
     if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
@@ -3445,6 +3469,58 @@ async def rm_asset_view(asset_id: str) -> CallToolResult:
                 "mimeType": asset["mime_type"],
             }
         },
+    )
+
+@mcp.tool()
+async def rm_asset_inspect(asset_id: str) -> CallToolResult:
+    """Return the cleaned stored image for actual visual understanding.
+
+    Call rm_asset_inspect when the model needs to read the image or text inside it.
+    Call rm_asset_view when the goal is only to show the image to the user.
+    Never guess image content from metadata. This tool does not update metadata
+    or embeddings.
+    """
+    verified = _rm_verified_view_image(asset_id)
+    if isinstance(verified, str):
+        return _rm_asset_inspect_error(verified)
+    asset, data = verified
+    width = asset["width"]
+    height = asset["height"]
+    if (
+        width <= 0
+        or height <= 0
+        or width * height > RM_ASSET_MAX_IMAGE_PIXELS
+    ):
+        return _rm_asset_inspect_error("image_too_large")
+    structured = {
+        "asset_id": asset["asset_id"],
+        "title": asset.get("title", ""),
+        "filename": asset["original_filename"],
+        "mime_type": asset["mime_type"],
+        "width": width,
+        "height": height,
+        "tags": asset.get("tags", []),
+        "stored_bytes": asset["stored_bytes"],
+    }
+    encoded = base64.b64encode(data).decode("ascii")
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=(
+                    f"Remember-Me image asset {asset['asset_id']}; "
+                    f"filename: {asset['original_filename']}; "
+                    f"MIME type: {asset['mime_type']}; "
+                    f"dimensions: {width} x {height}."
+                ),
+            ),
+            ImageContent(
+                type="image",
+                data=encoded,
+                mimeType=asset["mime_type"],
+            ),
+        ],
+        structuredContent=structured,
     )
 
 @mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
