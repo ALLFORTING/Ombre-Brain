@@ -311,7 +311,7 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-35 个 MCP 工具 / 35 MCP tools:
+36 个 MCP 工具 / 36 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
@@ -325,6 +325,7 @@ breath(query="今天很累")
 | `todos` | 汇总所有未 resolved 且非 sealed 桶的 todos 字段 / Summarize todos from unresolved, non-sealed buckets |
 | `related_backfill` | 为存量桶回填语义 related，默认 dry-run，跳过 sealed 桶 / Backfill semantic related links; dry-run by default; skips sealed buckets |
 | `digest` | 自动消化低重要度旧桶，默认 dry-run；正式执行会生成沉淀桶和日志桶 / Auto-digest old low-importance buckets; dry-run by default; real runs create distilled and log buckets |
+| `asset_attachment_context_probe` | Stage-4 diagnostic: report only whether the MCP host exposes attachment reference, byte, or MIME signals; persists and logs nothing, and never returns attachment values |
 | `asset_ingest_probe` | 阶段0实验工具：验证客户端向 MCP 传输 base64 参数；只解码、计算 SHA-256 并返回轻量元数据，不创建 asset ID，不持久化用户图片 / Phase-0 experimental tool for client-to-MCP base64 transport; decodes, hashes, returns lightweight metadata, creates no asset ID, and persists no user image |
 | `asset_ingest_begin` | Phase-0 chunked upload probe: creates a 10-minute in-memory upload session for files up to 2 MiB; persists nothing |
 | `asset_ingest_chunk` | Phase-0 chunk receiver: strictly decodes consecutive base64 chunks, with 8192 characters recommended and 16384 maximum per chunk |
@@ -439,6 +440,7 @@ breath(query="今天很累")
 - Use `rm_asset_view(asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
 - Stage 3A.2 and Stage 3B acceptance results are archived in [`docs/remember-me-stage-3-acceptance.md`](docs/remember-me-stage-3-acceptance.md).
 - The current registered-tool inventory and compatibility-first reduction plan are documented in [`docs/mcp-tool-audit.md`](docs/mcp-tool-audit.md).
+- Stage 4 attachment handoff feasibility, the safe probe procedure, and the current C conclusion are documented in [`docs/remember-me-stage-4-attachment-feasibility.md`](docs/remember-me-stage-4-attachment-feasibility.md).
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

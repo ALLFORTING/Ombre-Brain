@@ -6,17 +6,17 @@ Scope: tools registered through `@mcp.tool` in `server.py`. HTTP custom routes a
 
 ## Inventory Summary
 
-The server currently registers **35 MCP tools**:
+The server currently registers **36 MCP tools**:
 
 | Category | Count | Intended audience |
 |---|---:|---|
 | Core memory and session | 9 | Ordinary users and model workflows |
 | Formal Remember-Me assets | 8 | Ordinary users and model workflows |
 | Administration and maintenance | 4 | Operators or controlled maintenance |
-| Stage 0 diagnostics | 14 | Developers and acceptance testing only |
-| **Total** | **35** | |
+| Diagnostic probes | 15 | Developers and acceptance testing only |
+| **Total** | **36** | |
 
-The count is high for a single flat tool list. The largest source of selection noise is not the formal product surface; it is the 14 Stage 0 probes registered beside normal tools. The README's older "13 MCP tools" heading is stale and is not an authoritative inventory.
+The count is high for a single flat tool list. The largest source of selection noise is not the formal product surface; it is the 15 diagnostic probes registered beside normal tools. The README tool table is a convenience view; the `@mcp.tool` registrations remain the authoritative inventory.
 
 ## Tool-by-Tool Review
 
@@ -45,6 +45,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 | `digest` | Memory maintenance | Plan or run digestion of old low-importance memories | Admin/maintenance | Maintenance | Mutating mode can be invoked despite dry-run default | Keep, but make administrator-only and workflow-confirmed |
 | `related_backfill` | Memory maintenance | Plan or write semantic related links | Admin/maintenance | Maintenance | Broad maintenance can be mistaken for search | Keep, but make administrator-only |
 | `seal_letter` | Sealed memory | Hide or unhide a handoff letter | Admin/model internal | Maintenance | Narrow implementation detail exposed at top level | Keep compatibility; move behind sealed-memory administration |
+| `asset_attachment_context_probe` | Stage 4 attachment boundary | Detect only whether a host exposes attachment reference, byte, or MIME signals | Developer diagnostics | No | A supplied parameter can be mistaken for proof of original attachment identity | Diagnostic-only; require real-client acceptance and never persist from this probe |
 | `asset_ingest_probe` | Stage 0 transport | Test one-call base64 upload and hashing | Developer diagnostics | No | Looks like real upload and moves base64 through the model | Mark deprecated; diagnostic-only, then remove |
 | `asset_ingest_begin` | Stage 0 transport | Start an in-memory chunked base64 upload | Developer diagnostics | No | Part of a four-tool state machine | Diagnostic-only; later merge into one action tool |
 | `asset_ingest_chunk` | Stage 0 transport | Submit one ordered base64 chunk | Developer diagnostics | No | Model may attempt production transfer through repeated calls | Diagnostic-only; later merge, then remove |
@@ -66,7 +67,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 
 ## Highest-Priority Issues
 
-1. **Stage 0 probes dominate the flat list.** Fourteen diagnostic tools are exposed beside production capabilities and account for 40% of all tools.
+1. **Diagnostic probes dominate the flat list.** Fifteen diagnostic tools are exposed beside production capabilities and account for about 42% of all tools.
 2. **Temporary and formal asset tools have confusingly similar names.** `asset_browser_upload_*` versus `rm_asset_upload_*`, and vision-download versus formal asset-download tools, invite incorrect selection.
 3. **Some tools are protocols rather than user intentions.** Chunked ingest, blind vision testing, startup, and session archival are better represented by workflows or prompts.
 4. **Read-only data is overrepresented as tools.** Asset metadata, todos, and status/list views are candidates for resources.

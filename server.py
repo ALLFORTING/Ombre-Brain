@@ -64,7 +64,7 @@ from PIL import Image, UnidentifiedImageError
 # --- 确保同目录下的模块能被正确导入 ---
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import BucketManager
@@ -1991,6 +1991,108 @@ def _asset_ingest_response(ok: bool, upload_id: str = "", error: str = "", **fie
     return _json_lib.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+_ATTACHMENT_CONTAINER_KEYS = {
+    "attachment",
+    "attachments",
+    "file",
+    "files",
+    "resource",
+    "resources",
+}
+_ATTACHMENT_REFERENCE_KEYS = {
+    "attachment_id",
+    "attachment_reference",
+    "attachment_url",
+    "file_id",
+    "resource_uri",
+    "uri",
+    "url",
+}
+_ATTACHMENT_BYTES_KEYS = {"blob", "bytes", "content", "data"}
+_ATTACHMENT_MIME_KEYS = {"content_type", "media_type", "mime_type", "mimetype"}
+
+
+def _attachment_probe_value_available(value) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bool(value)
+    return value is not None
+
+
+def _attachment_probe_scan(
+    value,
+    *,
+    in_attachment_scope: bool = False,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> tuple[bool, bool, bool]:
+    if value is None or depth > 4:
+        return False, False, False
+    seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return False, False, False
+    seen.add(identity)
+
+    if hasattr(value, "model_extra"):
+        value = getattr(value, "model_extra", None) or {}
+    if isinstance(value, dict):
+        reference = False
+        raw_bytes = False
+        mime_type = False
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower().replace("-", "_")
+            child_scope = in_attachment_scope or key in _ATTACHMENT_CONTAINER_KEYS
+            if child_scope and key in _ATTACHMENT_REFERENCE_KEYS:
+                reference = reference or _attachment_probe_value_available(child)
+            if child_scope and key in _ATTACHMENT_BYTES_KEYS:
+                raw_bytes = raw_bytes or _attachment_probe_value_available(child)
+            if child_scope and key in _ATTACHMENT_MIME_KEYS:
+                mime_type = mime_type or _attachment_probe_value_available(child)
+            if child_scope and isinstance(child, (dict, list, tuple)):
+                nested = _attachment_probe_scan(
+                    child,
+                    in_attachment_scope=True,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+                reference = reference or nested[0]
+                raw_bytes = raw_bytes or nested[1]
+                mime_type = mime_type or nested[2]
+        return reference, raw_bytes, mime_type
+    if isinstance(value, (list, tuple)) and in_attachment_scope:
+        reference = raw_bytes = mime_type = False
+        for child in value:
+            nested = _attachment_probe_scan(
+                child,
+                in_attachment_scope=True,
+                depth=depth + 1,
+                seen=seen,
+            )
+            reference = reference or nested[0]
+            raw_bytes = raw_bytes or nested[1]
+            mime_type = mime_type or nested[2]
+        return reference, raw_bytes, mime_type
+    return False, False, False
+
+
+def _attachment_probe_context_signals(ctx: Context | None) -> tuple[bool, bool, bool]:
+    if ctx is None:
+        return False, False, False
+    try:
+        request_context = ctx.request_context
+    except (AttributeError, LookupError, RuntimeError):
+        return False, False, False
+    meta_signals = _attachment_probe_scan(getattr(request_context, "meta", None))
+    experimental_signals = _attachment_probe_scan(
+        getattr(request_context, "experimental", None)
+    )
+    return tuple(
+        meta_signals[index] or experimental_signals[index]
+        for index in range(3)
+    )
+
 def _asset_cleanup_expired_ingest_uploads(now: float) -> None:
     expired = [upload_id for upload_id, item in _asset_ingest_uploads.items() if item["expires_at"] <= now]
     for upload_id in expired:
@@ -3158,6 +3260,62 @@ def _asset_score_vision_answer(trial_id: str, answer_json: str, now: float | Non
         "field_results": field_results,
     }, ensure_ascii=False, sort_keys=True)
 
+
+@mcp.tool()
+async def asset_attachment_context_probe(
+    ctx: Context,
+    attachment_reference: str = "",
+    attachment_mime_type: str = "",
+) -> str:
+    """Safely test whether the MCP host exposes the current chat attachment.
+
+    This Stage-4 diagnostic persists and logs nothing. Do not transcribe, OCR,
+    redraw, download, or base64-encode an image for this tool. Only provide
+    attachment_reference when the client exposes a stable machine-readable
+    reference directly. Parameter presence does not prove that it identifies
+    the original attachment.
+    """
+    received_parameter_names = []
+    explicit_reference = isinstance(attachment_reference, str) and bool(
+        attachment_reference.strip()
+    )
+    explicit_mime = isinstance(attachment_mime_type, str) and bool(
+        attachment_mime_type.strip()
+    )
+    if explicit_reference:
+        received_parameter_names.append("attachment_reference")
+    if explicit_mime:
+        received_parameter_names.append("attachment_mime_type")
+
+    context_reference, context_bytes, context_mime = (
+        _attachment_probe_context_signals(ctx)
+    )
+    reference_available = context_reference or explicit_reference
+    mime_available = context_mime or explicit_mime
+    if context_bytes:
+        source_kind = "request_context_bytes"
+    elif context_reference:
+        source_kind = "request_context_reference"
+    elif explicit_reference:
+        source_kind = "explicit_reference_parameter"
+    elif mime_available:
+        source_kind = "metadata_only"
+    else:
+        source_kind = "none"
+
+    return _json_lib.dumps(
+        {
+            "ok": True,
+            "attachment_reference_available": reference_available,
+            "attachment_bytes_available": context_bytes,
+            "mime_type_available": mime_available,
+            "source_kind": source_kind,
+            "received_parameter_names": received_parameter_names,
+            "original_attachment_identity_verified": False,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 @mcp.tool()
 async def asset_ingest_probe(
