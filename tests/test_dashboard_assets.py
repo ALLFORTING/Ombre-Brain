@@ -40,7 +40,7 @@ def _load_server(tmp_path, monkeypatch):
     return importlib.import_module("server")
 
 
-def _client(server, authenticated=True):
+def _client(server, authenticated=True, base_url="http://testserver"):
     app = Starlette(routes=[
         Route("/api/assets", server.api_assets, methods=["GET", "POST"]),
         Route("/api/assets/{asset_id}", server.api_asset_detail, methods=["GET", "PATCH", "DELETE"]),
@@ -68,12 +68,12 @@ def _client(server, authenticated=True):
             methods=["GET"],
         ),
     ])
-    client = TestClient(app)
+    client = TestClient(app, base_url=base_url)
     if authenticated:
         token = server._create_session()
         client.cookies.set("ombre_session", token)
         client.headers.update({
-            "Origin": "http://testserver",
+            "Origin": base_url.rstrip("/"),
             "X-Ombre-CSRF": server._sessions[token]["csrf_token"],
         })
     return client
@@ -290,11 +290,68 @@ def test_asset_writes_require_auth_csrf_and_same_origin(tmp_path, monkeypatch):
     assert response.status_code == 403
     assert response.json() == {"error": "csrf_required"}
 
+    client.headers["X-Ombre-CSRF"] = "wrong-token"
+    response = _upload(client, payload)
+    assert response.status_code == 403
+    assert response.json() == {"error": "csrf_required"}
+
     client.headers["X-Ombre-CSRF"] = csrf
     client.headers.pop("Origin")
     response = _upload(client, payload)
     assert response.status_code == 403
     assert response.json() == {"error": "same_origin_required"}
+
+
+def test_dashboard_write_origin_accepts_direct_and_proxy_https(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    direct = _client(server, base_url="https://direct.example")
+    assert _upload(direct, _png()).status_code == 201
+
+    proxy = _client(server)
+    proxy.headers.update({
+        "Origin": "https://public.example",
+        "Host": "public.example",
+        "X-Forwarded-Proto": "https",
+    })
+    assert _upload(proxy, _png((30, 60, 90))).status_code == 201
+
+    forwarded_host = _client(server)
+    forwarded_host.headers.update({
+        "Origin": "https://public.example",
+        "Host": "internal.service:8000",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "public.example",
+    })
+    assert _upload(forwarded_host, _png((90, 60, 30))).status_code == 201
+
+
+def test_dashboard_write_origin_rejects_mismatch_and_proxy_chains(
+    tmp_path, monkeypatch, caplog
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _client(server)
+    csrf = client.headers["X-Ombre-CSRF"]
+
+    cases = [
+        {"Origin": "https://other.example", "Host": "public.example", "X-Forwarded-Proto": "https"},
+        {"Origin": "https://public.example", "Host": "public.example", "X-Forwarded-Proto": "https, http"},
+        {"Origin": "https://public.example", "Host": "internal.service", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "public.example, other.example"},
+    ]
+    for headers in cases:
+        guarded = _client(server)
+        guarded.headers.clear()
+        guarded.headers.update(headers)
+        guarded.headers["X-Ombre-CSRF"] = csrf
+        guarded.cookies.update(client.cookies)
+        response = _upload(guarded, _png())
+        assert response.status_code == 403
+        assert response.json() == {"error": "same_origin_required"}
+
+    log_text = caplog.text
+    assert "route=/api/assets status=403 code=same_origin_required" in log_text
+    assert csrf not in log_text
+    assert "public.example" not in log_text
 
 
 def test_png_jpeg_upload_metadata_dedup_and_temp_cleanup(tmp_path, monkeypatch):
@@ -462,6 +519,11 @@ def test_stage5b_static_contract_and_import_scope(tmp_path, monkeypatch):
     assert "删除后将从 Remember-Me 图片库中永久移除" in script
     assert "data.append(\"file\"" in script
     assert "base64" not in script.lower()
+    assert "uploadErrorMessage(error.code, error.status)" in script
+    assert "登录验证已过期，请刷新页面后重试。" in script
+    assert "上传请求未通过同源安全校验，请刷新页面后重试。" in script
+    assert "服务器处理上传时出错，请稍后重试。" in script
+    assert "上传失败，请检查图片格式、大小和网络后重试。" not in script
     assert 'accept=".json,.txt,.md,.jsonl"' in html
     assert 'id="import-file-input"' in html
 

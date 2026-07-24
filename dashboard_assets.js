@@ -5,6 +5,41 @@
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
   const MAX_IMAGE_PIXELS = 20000000;
   const ALLOWED_TYPES = new Set(["image/png", "image/jpeg"]);
+  const UPLOAD_ERROR_MESSAGES = Object.freeze({
+    csrf_required: "登录验证已过期，请刷新页面后重试。",
+    same_origin_required: "上传请求未通过同源安全校验，请刷新页面后重试。",
+    file_too_large: "图片超过 10 MiB。",
+    image_pixel_limit: "图片像素超过 20,000,000。",
+    unsupported_image: "仅支持 PNG 和 JPEG。",
+    unsupported_image_format: "仅支持 PNG 和 JPEG。",
+    image_mime_mismatch: "图片格式与文件声明不一致。",
+    invalid_image: "图片已损坏或无法读取。",
+    invalid_multipart: "上传请求解析失败。",
+  });
+
+  function uploadErrorMessage(code, status) {
+    if (typeof code === "string" && UPLOAD_ERROR_MESSAGES[code]) {
+      return UPLOAD_ERROR_MESSAGES[code];
+    }
+    if (Number(status) === 401) {
+      return "登录验证已过期，请刷新页面后重试。";
+    }
+    return "服务器处理上传时出错，请稍后重试。";
+  }
+
+  async function responseError(response) {
+    let code = "";
+    try {
+      const payload = await response.json();
+      if (payload && typeof payload.error === "string") code = payload.error;
+    } catch (error) {
+      code = "";
+    }
+    const failure = new Error("request_failed");
+    failure.code = code;
+    failure.status = response.status;
+    return failure;
+  }
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -383,12 +418,13 @@
       try {
         const response = await fetcher(apiBase, { method: "POST", body: data });
         if (!response) return;
+        if (!response.ok) throw await responseError(response);
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "request_failed");
         uploadOverlay.hidden = true; resetUpload(); state.offset = 0; await load(); await openDetail(payload.asset_id);
         showToast(payload.deduplicated ? "图片已存在，已打开已有资产。" : "图片上传成功");
       } catch (error) {
-        uploadError.textContent = "上传失败，请检查图片格式、大小和网络后重试。"; uploadError.hidden = false;
+        uploadError.textContent = uploadErrorMessage(error.code, error.status);
+        uploadError.hidden = false;
       } finally { state.uploadBusy = false; cancelUpload.disabled = false; closeUploadButton.disabled = false; submitUpload.disabled = !selectedFile; submitUpload.textContent = "上传"; }
     });
 
@@ -406,5 +442,8 @@
     return { load: load, openUpload: openUpload, getState: function () { return Object.assign({}, state); } };
   }
 
-  window.RememberMeAssetBrowser = { create: createBrowser };
+  window.RememberMeAssetBrowser = {
+    create: createBrowser,
+    uploadErrorMessage: uploadErrorMessage,
+  };
 })();

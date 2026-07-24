@@ -304,19 +304,99 @@ def _is_authenticated(request) -> bool:
     return _session_data(request) is not None
 
 
-def _require_dashboard_write(request):
+def _normalize_origin(value: str) -> str | None:
+    value = (value or "").strip()
+    if not value or "," in value:
+        return None
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.casefold()
+    hostname = (parsed.hostname or "").casefold()
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return None
+    if any(char.isspace() or ord(char) < 32 for char in hostname):
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and port != (443 if scheme == "https" else 80):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _single_forwarded_header(request, name: str) -> tuple[bool, str | None]:
+    raw = request.headers.get(name)
+    if raw is None:
+        return False, None
+    value = raw.strip()
+    if not value or "," in value or any(char.isspace() for char in value):
+        return True, None
+    return True, value
+
+
+def _dashboard_external_origin(request) -> str | None:
+    """Resolve the external origin after a trusted proxy emits one header value.
+
+    Deployments must strip client-supplied X-Forwarded-* headers before adding
+    their own values. Empty or comma-separated proxy chains are rejected here.
+    """
+    proto_present, forwarded_proto = _single_forwarded_header(
+        request, "x-forwarded-proto"
+    )
+    host_present, forwarded_host = _single_forwarded_header(
+        request, "x-forwarded-host"
+    )
+    if (proto_present and forwarded_proto is None) or (
+        host_present and forwarded_host is None
+    ):
+        return None
+
+    scheme = forwarded_proto.casefold() if proto_present else request.url.scheme
+    if scheme not in {"http", "https"}:
+        return None
+    host = forwarded_host if host_present else request.headers.get("host", "")
+    if not host or "," in host:
+        return None
+    return _normalize_origin(f"{scheme}://{host}")
+
+
+def _dashboard_write_error(route: str, status_code: int, code: str):
     from starlette.responses import JSONResponse
 
+    logger.warning(
+        "Dashboard write rejected route=%s status=%d code=%s",
+        route,
+        status_code,
+        code,
+    )
+    return JSONResponse({"error": code}, status_code=status_code)
+
+
+def _require_dashboard_write(request, route: str):
     session = _session_data(request)
     if session is None:
+        logger.warning(
+            "Dashboard write rejected route=%s status=401 code=unauthorized",
+            route,
+        )
         return _require_auth(request)
     supplied = request.headers.get("x-ombre-csrf", "")
     if not supplied or not hmac.compare_digest(supplied, session["csrf_token"]):
-        return JSONResponse({"error": "csrf_required"}, status_code=403)
-    origin = request.headers.get("origin", "")
-    expected_origin = f"{request.url.scheme}://{request.headers.get('host', '')}"
-    if not origin or origin.rstrip("/") != expected_origin.rstrip("/"):
-        return JSONResponse({"error": "same_origin_required"}, status_code=403)
+        return _dashboard_write_error(route, 403, "csrf_required")
+    origin = _normalize_origin(request.headers.get("origin", ""))
+    expected_origin = _dashboard_external_origin(request)
+    if origin is None or expected_origin is None or origin != expected_origin:
+        return _dashboard_write_error(route, 403, "same_origin_required")
     return None
 
 
@@ -5114,7 +5194,8 @@ async def api_assets(request):
     from starlette.responses import JSONResponse
 
     if request.method.upper() == "POST":
-        err = _require_dashboard_write(request)
+        route = "/api/assets"
+        err = _require_dashboard_write(request, route)
         if err:
             return err
         try:
@@ -5128,9 +5209,12 @@ async def api_assets(request):
                     logger.warning("Dashboard asset embedding refresh failed after upload")
             return JSONResponse(asset, status_code=200 if asset["deduplicated"] else 201)
         except AssetDashboardError as exc:
-            return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+            return _dashboard_write_error(route, exc.status_code, exc.code)
         except Exception:
-            logger.error("Dashboard asset upload failed")
+            logger.error(
+                "Dashboard write failed route=%s status=500 code=asset_upload_failed",
+                route,
+            )
             return JSONResponse({"error": "asset_upload_failed"}, status_code=500)
 
     err = _require_auth(request)
@@ -5158,8 +5242,9 @@ async def api_asset_detail(request):
 
     asset_id = request.path_params["asset_id"]
     method = request.method.upper()
+    route = "/api/assets/{asset_id}"
     if method in {"PATCH", "DELETE"}:
-        err = _require_dashboard_write(request)
+        err = _require_dashboard_write(request, route)
     else:
         err = _require_auth(request)
     if err:
@@ -5171,7 +5256,7 @@ async def api_asset_detail(request):
             try:
                 payload = await request.json()
             except Exception:
-                return JSONResponse({"error": "invalid_json"}, status_code=400)
+                return _dashboard_write_error(route, 400, "invalid_json")
             asset = await asyncio.to_thread(
                 asset_dashboard.update_asset,
                 asset_id,
@@ -5187,9 +5272,17 @@ async def api_asset_detail(request):
         result = await asyncio.to_thread(asset_dashboard.delete_asset, asset_id)
         return JSONResponse(result)
     except AssetDashboardError as exc:
+        if method in {"PATCH", "DELETE"}:
+            return _dashboard_write_error(route, exc.status_code, exc.code)
         return JSONResponse({"error": exc.code}, status_code=exc.status_code)
     except Exception:
-        logger.error("Dashboard asset mutation failed")
+        if method in {"PATCH", "DELETE"}:
+            logger.error(
+                "Dashboard write failed route=%s status=500 code=asset_operation_failed",
+                route,
+            )
+        else:
+            logger.error("Dashboard asset detail failed")
         return JSONResponse({"error": "asset_operation_failed"}, status_code=500)
 
 @mcp.custom_route("/api/assets/{asset_id}/thumbnail", methods=["GET"])
