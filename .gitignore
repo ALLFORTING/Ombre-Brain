@@ -16,6 +16,8 @@ backup_*/
 *.db
 import_state.json
 data/
+ui/asset-viewer/node_modules/
+ui/asset-viewer/dist/
 tests/integration/
 tests/regression/
 tests/unit/

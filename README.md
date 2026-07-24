@@ -431,6 +431,8 @@ breath(query="今天很累")
 - Clients without MCP Apps receive a short-lived signed download link through the normal text fallback.
 - This stage provides a single-image viewer only; it is not a gallery or asset manager.
 - Actual inline rendering support still requires validation in the real Claude connector.
+- The embedded viewer is built with the pinned official `@modelcontextprotocol/ext-apps` browser SDK and bundled into a self-contained HTML resource with no runtime CDN dependency.
+- Loading, host connection, tool-result waiting, timeout, missing-image-data, and image-decode states are always visible; initialization failures no longer leave an empty component.
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 

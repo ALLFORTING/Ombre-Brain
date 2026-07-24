@@ -13,6 +13,7 @@ from PIL import Image
 from asset_viewer import (
     ASSET_VIEWER_HTML,
     ASSET_VIEWER_MIME_TYPE,
+    ASSET_VIEWER_PATH,
     ASSET_VIEWER_RESOURCE_META,
     ASSET_VIEWER_TOOL_META,
     ASSET_VIEWER_URI,
@@ -68,14 +69,16 @@ def test_asset_viewer_resource_is_self_contained_and_safe():
     }
     assert "*" not in json.dumps(ASSET_VIEWER_RESOURCE_META)
 
+    assert ASSET_VIEWER_PATH.is_file()
+    assert ASSET_VIEWER_HTML == ASSET_VIEWER_PATH.read_text(encoding="utf-8")
     html = ASSET_VIEWER_HTML
+    assert "Loading Remember-Me image" in html
     assert "ui/initialize" in html
     assert "ui/notifications/initialized" in html
     assert "ui/notifications/tool-result" in html
     assert "ui/notifications/size-changed" in html
-    assert "result._meta.rememberMe" in html
-    assert "rememberMe.imageBase64" in html
-    assert "data:${rememberMe.mimeType};base64," in html
+    assert "Image metadata received, but image bytes were unavailable." in html
+    assert "The viewer connection timed out." in html
     assert "structuredContent" in html
     assert ".textContent" in html
     assert "replaceChildren" in html
@@ -87,11 +90,19 @@ def test_asset_viewer_resource_is_self_contained_and_safe():
         "document.cookie",
         "window.parent.document",
         "URL.createObjectURL",
-        "http://",
-        "https://",
+        "unpkg.com",
+        "jsdelivr.net",
+        "localhost",
+        "127.0.0.1",
+        "sourceMappingURL",
+        "@vite/client",
     ):
         assert forbidden not in html
 
+    dockerfile = (ASSET_VIEWER_PATH.parent / "Dockerfile").read_text(
+        encoding="utf-8",
+    )
+    assert "COPY asset_viewer.html ." in dockerfile
 
 @pytest.mark.asyncio
 async def test_rm_asset_view_layers_clean_jpeg_and_reuses_download_token(
