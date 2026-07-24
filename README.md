@@ -311,7 +311,7 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-13 个 MCP 工具 / 13 MCP tools:
+35 个 MCP 工具 / 35 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
@@ -320,6 +320,7 @@ breath(query="今天很累")
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding，并在发现事实/日期/数字矛盾时返回 `conflict:` 警告。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, embeddings, and `conflict:` warnings for factual/date/number contradictions. `feel=True` for reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、追加/替换正文、写前快照、批量操作、双向 related、merge、sealed/dormant、删除 / Modify metadata, append/replace content with write-ahead snapshots, batch edit, bidirectional related, merge, sealed/dormant, delete |
+| `seal_letter` | Hide or restore one handoff letter by ID; a sealed-memory maintenance operation, not ordinary retrieval |
 | `archive_session` | 归档一次对话摘要，可附 highlights/mood/VA 数值和 `letter` 信箱留言 / Archive a session summary with optional highlights, mood, valence/arousal, and mailbox `letter` |
 | `todos` | 汇总所有未 resolved 且非 sealed 桶的 todos 字段 / Summarize todos from unresolved, non-sealed buckets |
 | `related_backfill` | 为存量桶回填语义 related，默认 dry-run，跳过 sealed 桶 / Backfill semantic related links; dry-run by default; skips sealed buckets |
@@ -436,6 +437,8 @@ breath(query="今天很累")
 - Loading, host connection, tool-result waiting, timeout, missing-image-data, and image-decode states are always visible; initialization failures no longer leave an empty component.
 - Use `rm_asset_inspect(asset_id)` when the model must read the actual cleaned image or text inside it. Its base64 exists only in MCP `ImageContent`; metadata updates and embedding refresh remain explicit separate operations.
 - Use `rm_asset_view(asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
+- Stage 3A.2 and Stage 3B acceptance results are archived in [`docs/remember-me-stage-3-acceptance.md`](docs/remember-me-stage-3-acceptance.md).
+- The current registered-tool inventory and compatibility-first reduction plan are documented in [`docs/mcp-tool-audit.md`](docs/mcp-tool-audit.md).
 
 #### `asset_vision_challenge` and `asset_vision_verify`
 
