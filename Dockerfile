@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files / 复制项目文件
 COPY *.py .
 COPY dashboard.html .
+COPY dashboard_assets.js .
+COPY dashboard_assets.css .
 COPY asset_viewer.html .
 COPY assets ./assets
 COPY config.example.yaml ./config.yaml

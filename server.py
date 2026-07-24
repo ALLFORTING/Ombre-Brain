@@ -74,6 +74,7 @@ from asset_store import (
     AssetStoreError,
     InvalidAssetImage,
 )
+from asset_dashboard import AssetDashboardError, AssetDashboardService
 from asset_embedding_index import AssetEmbeddingIndex
 from asset_viewer import (
     ASSET_VIEWER_HTML,
@@ -1945,6 +1946,11 @@ ASSET_BROWSER_UPLOAD_TTL_SECONDS = 10 * 60
 ASSET_BROWSER_UPLOAD_MAX_UPLOADS = 100
 ASSET_BROWSER_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD = 64 * 1024
+asset_dashboard = AssetDashboardService(
+    asset_store,
+    max_asset_bytes=ASSET_BROWSER_UPLOAD_MAX_BYTES,
+    max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
+)
 _asset_browser_uploads = {}
 _asset_browser_upload_tokens = {}
 _asset_browser_upload_lock = threading.Lock()
@@ -4800,41 +4806,99 @@ async def dream(detail_ids: str = "") -> str:
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
+def _dashboard_bucket_summary(bucket: dict) -> dict:
+    meta = bucket.get("metadata", {})
+    return {
+        "id": bucket["id"],
+        "name": meta.get("name", bucket["id"]),
+        "type": meta.get("type", "dynamic"),
+        "domain": meta.get("domain", []),
+        "tags": meta.get("tags", []),
+        "valence": meta.get("valence", 0.5),
+        "arousal": meta.get("arousal", 0.3),
+        "model_valence": meta.get("model_valence"),
+        "importance": meta.get("importance", 5),
+        "resolved": meta.get("resolved", False),
+        "pinned": meta.get("pinned", False),
+        "digested": meta.get("digested", False),
+        "created": meta.get("created", ""),
+        "last_active": meta.get("last_active", ""),
+        "activation_count": meta.get("activation_count", 1),
+        "score": decay_engine.calculate_score(meta),
+        "content_preview": strip_wikilinks(bucket.get("content", ""))[:200],
+    }
+
+
+def _is_session_archive(bucket: dict) -> bool:
+    meta = bucket.get("metadata", {})
+    domains = {
+        str(domain).strip().casefold()
+        for domain in meta.get("domain", [])
+    }
+    return meta.get("type") == "archived" and "session" in domains
+
+
+def _dashboard_pagination(request, *, default_limit: int = 20) -> tuple[int, int]:
+    return asset_dashboard.parse_pagination(
+        request.query_params.get("limit", str(default_limit)),
+        request.query_params.get("offset", "0"),
+    )
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
-    """List all buckets with metadata (no content for efficiency)."""
+    """List active memory buckets with metadata."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
-    if err: return err
+    if err:
+        return err
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=True)
-        result = []
-        for b in all_buckets:
-            meta = b.get("metadata", {})
-            result.append({
-                "id": b["id"],
-                "name": meta.get("name", b["id"]),
-                "type": meta.get("type", "dynamic"),
-                "domain": meta.get("domain", []),
-                "tags": meta.get("tags", []),
-                "valence": meta.get("valence", 0.5),
-                "arousal": meta.get("arousal", 0.3),
-                "model_valence": meta.get("model_valence"),
-                "importance": meta.get("importance", 5),
-                "resolved": meta.get("resolved", False),
-                "pinned": meta.get("pinned", False),
-                "digested": meta.get("digested", False),
-                "created": meta.get("created", ""),
-                "last_active": meta.get("last_active", ""),
-                "activation_count": meta.get("activation_count", 1),
-                "score": decay_engine.calculate_score(meta),
-                "content_preview": strip_wikilinks(b.get("content", ""))[:200],
-            })
-        result.sort(key=lambda x: x["score"], reverse=True)
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        result = [_dashboard_bucket_summary(bucket) for bucket in all_buckets]
+        result.sort(key=lambda item: item["score"], reverse=True)
         return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Dashboard bucket listing failed")
+        return JSONResponse({"error": "bucket_list_failed"}, status_code=500)
 
+
+@mcp.custom_route("/api/archives", methods=["GET"])
+async def api_archives(request):
+    """List archived conversations separately from ordinary memory buckets."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        limit, offset = _dashboard_pagination(request)
+        query = request.query_params.get("q", "").strip().casefold()
+        archives = [
+            _dashboard_bucket_summary(bucket)
+            for bucket in await bucket_mgr.list_all(include_archive=True)
+            if _is_session_archive(bucket)
+        ]
+        if query:
+            archives = [
+                item for item in archives
+                if query in item["id"].casefold()
+                or query in item["name"].casefold()
+                or query in item["content_preview"].casefold()
+                or any(query in str(tag).casefold() for tag in item["tags"])
+            ]
+        archives.sort(
+            key=lambda item: (item["last_active"] or item["created"], item["id"]),
+            reverse=True,
+        )
+        return JSONResponse({
+            "total": len(archives),
+            "offset": offset,
+            "limit": limit,
+            "results": archives[offset:offset + limit],
+        })
+    except AssetDashboardError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+    except Exception:
+        logger.exception("Dashboard archive listing failed")
+        return JSONResponse({"error": "archive_list_failed"}, status_code=500)
 
 @mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
 async def api_bucket_detail(request):
@@ -5007,6 +5071,127 @@ async def api_breath_debug(request):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
+@mcp.custom_route("/api/assets", methods=["GET"])
+async def api_assets(request):
+    """List cleaned Remember-Me image assets for the authenticated Dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        limit, offset = _dashboard_pagination(request)
+        result = asset_dashboard.list_assets(
+            query=request.query_params.get("q", ""),
+            tag=request.query_params.get("tag", ""),
+            limit=limit,
+            offset=offset,
+        )
+        return JSONResponse(result)
+    except AssetDashboardError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+    except Exception:
+        logger.error("Dashboard asset listing failed")
+        return JSONResponse({"error": "asset_list_failed"}, status_code=500)
+
+
+@mcp.custom_route("/api/assets/{asset_id}", methods=["GET"])
+async def api_asset_detail(request):
+    """Return safe metadata for one cleaned image asset."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        return JSONResponse(asset_dashboard.get_asset(request.path_params["asset_id"]))
+    except AssetDashboardError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+    except Exception:
+        logger.error("Dashboard asset detail failed")
+        return JSONResponse({"error": "asset_detail_failed"}, status_code=500)
+
+
+@mcp.custom_route("/api/assets/{asset_id}/thumbnail", methods=["GET"])
+async def api_asset_thumbnail(request):
+    """Return a bounded thumbnail generated from the cleaned stored image."""
+    from starlette.responses import JSONResponse, Response
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        image = asset_dashboard.resolve_image(
+            request.path_params["asset_id"],
+            thumbnail=True,
+        )
+        return Response(
+            image.thumbnail_bytes,
+            media_type=image.mime_type,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except AssetDashboardError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+    except Exception:
+        logger.error("Dashboard asset thumbnail failed")
+        return JSONResponse({"error": "asset_image_failed"}, status_code=500)
+
+
+@mcp.custom_route("/api/assets/{asset_id}/image", methods=["GET", "HEAD"])
+async def api_asset_image(request):
+    """Stream a cleaned stored image inside the Dashboard auth boundary."""
+    from starlette.responses import FileResponse, JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        image = asset_dashboard.resolve_image(request.path_params["asset_id"])
+        return FileResponse(
+            image.path,
+            media_type=image.mime_type,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": "inline",
+            },
+        )
+    except AssetDashboardError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status_code)
+    except Exception:
+        logger.error("Dashboard asset image failed")
+        return JSONResponse({"error": "asset_image_failed"}, status_code=500)
+
+
+@mcp.custom_route("/dashboard-assets.css", methods=["GET"])
+async def dashboard_assets_styles(request):
+    """Serve styles for the reusable read-only asset browser component."""
+    from starlette.responses import PlainTextResponse
+    style_path = os.path.join(os.path.dirname(__file__), "dashboard_assets.css")
+    try:
+        with open(style_path, "r", encoding="utf-8") as handle:
+            return PlainTextResponse(
+                handle.read(),
+                media_type="text/css",
+                headers={"Cache-Control": "no-cache"},
+            )
+    except FileNotFoundError:
+        return PlainTextResponse("", status_code=404)
+
+@mcp.custom_route("/dashboard-assets.js", methods=["GET"])
+async def dashboard_assets_script(request):
+    """Serve the reusable read-only asset browser component."""
+    from starlette.responses import PlainTextResponse
+    script_path = os.path.join(os.path.dirname(__file__), "dashboard_assets.js")
+    try:
+        with open(script_path, "r", encoding="utf-8") as handle:
+            return PlainTextResponse(
+                handle.read(),
+                media_type="application/javascript",
+                headers={"Cache-Control": "no-cache"},
+            )
+    except FileNotFoundError:
+        return PlainTextResponse("", status_code=404)
 
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard(request):

@@ -451,6 +451,13 @@ breath(query="今天很累")
 - The real acceptance record is in [`docs/remember-me-stage-4b-acceptance.md`](docs/remember-me-stage-4b-acceptance.md). The maintained Claude Skill source is in [`skills/remember-me/`](skills/remember-me/).
 - Current image limits are PNG/JPEG, 2 MiB original bytes, and 20,000,000 decoded pixels. Over-limit images are not silently transformed without explicit user agreement.
 
+#### Remember-Me Stage 5A Dashboard
+
+- The Ombre Brain Dashboard now separates ordinary memory buckets, archived conversations, and Remember-Me image assets into distinct navigation entries.
+- The read-only image asset page provides bounded pagination, keyword and tag filtering, protected thumbnails, and a larger detail view using only privacy-cleaned persistent copies.
+- Asset JSON and image routes remain inside the existing Dashboard authentication boundary and never expose disk paths, hashes, base64, upload/download tokens, EXIF, or GPS metadata.
+- The reusable `asset_dashboard.py`, `dashboard_assets.js`, and `dashboard_assets.css` modules do not depend on memory buckets or conversation archives. A future standalone Remember-Me shell can reuse them with only 图片库 / 上传 / 设置 navigation.
+- Stage 5A architecture, API contracts, security boundaries, and Stage 5B/5C recommendations are documented in [`docs/remember-me-stage-5-dashboard.md`](docs/remember-me-stage-5-dashboard.md).
 #### `asset_vision_challenge` and `asset_vision_verify`
 
 - Verbal description is not evidence for the vision path. `asset_vision_challenge()` plus `asset_vision_verify(trial_id, answer_json)` uses server-held truth for automatic scoring.

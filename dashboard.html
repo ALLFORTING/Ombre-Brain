@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ombre Brain</title>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link href="/dashboard-assets.css" rel="stylesheet">
 <style>
   :root {
     --bg: #FDFCF0;
@@ -576,6 +577,45 @@
   .flow-step.active { border-color: var(--accent); color: var(--accent); }
   .flow-arrow { color: var(--text-light); font-size: 16px; }
 
+  .section-heading {
+    margin-bottom: 22px;
+  }
+  .section-heading h2 {
+    color: var(--accent);
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 24px;
+    font-weight: 600;
+  }
+  .section-heading p {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .archive-pager {
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 22px;
+  }
+  .archive-pager button {
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface-solid);
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    padding: 8px 14px;
+  }
+  .archive-pager button:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+  .archive-pager span {
+    min-width: 110px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
   @media (max-width: 768px) {
     .header { padding: 20px; flex-wrap: wrap; }
     .header h1 { font-size: 22px; }
@@ -612,6 +652,8 @@
 
 <div class="tabs">
   <div class="tab active" data-tab="list">记忆桶</div>
+  <div class="tab" data-tab="archives">归档对话</div>
+  <div class="tab" data-tab="assets">图片资产</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
@@ -626,6 +668,30 @@
   </div>
 </div>
 
+<div class="content" id="archives-view" style="display:none">
+  <div class="section-heading">
+    <h2>归档对话</h2>
+    <p>按时间查看由会话归档流程保存的对话摘要，不与普通记忆桶混排。</p>
+  </div>
+  <div class="bucket-list" id="archive-list">
+    <div class="loading">加载中…</div>
+  </div>
+  <div class="archive-pager" id="archive-pager" style="display:none">
+    <button id="archive-prev" type="button">上一页</button>
+    <span id="archive-page-text"></span>
+    <button id="archive-next" type="button">下一页</button>
+  </div>
+</div>
+
+<div class="content" id="assets-view" style="display:none">
+  <div class="rm-asset-shell">
+    <div class="rm-asset-heading">
+      <h2>图片资产</h2>
+      <p>查看 Remember-Me 已完成隐私清理并持久保存的图片。</p>
+    </div>
+    <div id="rm-asset-browser"></div>
+  </div>
+</div>
 <div class="content" id="breath-view" style="display:none">
   <div class="breath-flow" id="breath-flow">
     <div class="flow-step" id="fs-input">① 输入<br><small>query / valence / arousal</small></div>
@@ -863,6 +929,7 @@
   </div>
 </div>
 
+<script src="/dashboard-assets.js"></script>
 <script>
 // ========================================
 // Auth system / 认证系统
@@ -1036,18 +1103,40 @@ async function authFetch(url, options) {
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+let activeDashboardTab = 'list';
+let assetBrowser = null;
+let archiveState = { offset: 0, limit: 20, total: 0, query: '' };
+
+function ensureAssetBrowser() {
+  if (!assetBrowser && window.RememberMeAssetBrowser) {
+    assetBrowser = window.RememberMeAssetBrowser.create({
+      root: document.getElementById('rm-asset-browser'),
+      fetcher: authFetch,
+      apiBase: '/api/assets',
+      limit: 12,
+    });
+  }
+  return assetBrowser;
+}
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     const target = tab.dataset.tab;
-    document.getElementById('list-view').style.display = target === 'list' ? '' : 'none';
-    document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
-    document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
-    document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
-    document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
-    document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
+    activeDashboardTab = target;
+    ['list', 'archives', 'assets', 'breath', 'network', 'config', 'import', 'settings'].forEach(view => {
+      document.getElementById(view + '-view').style.display = target === view ? '' : 'none';
+    });
+    const globalSearch = document.querySelector('.search-bar');
+    globalSearch.style.display = target === 'assets' ? 'none' : '';
+    document.getElementById('search-input').placeholder =
+      target === 'archives' ? '搜索归档对话…' : '搜索记忆…';
+    if (target === 'archives') loadArchives();
+    if (target === 'assets') {
+      const browser = ensureAssetBrowser();
+      if (browser) browser.load();
+    }
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
@@ -1056,15 +1145,20 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 let searchTimer;
-document.getElementById('search-input').addEventListener('input', (e) => {
+document.getElementById('search-input').addEventListener('input', (event) => {
   clearTimeout(searchTimer);
-  const q = e.target.value.trim();
+  const query = event.target.value.trim();
   searchTimer = setTimeout(() => {
-    if (q) searchBuckets(q);
-    else renderBuckets(allBuckets);
+    if (activeDashboardTab === 'archives') {
+      archiveState.query = query;
+      archiveState.offset = 0;
+      loadArchives();
+    } else if (activeDashboardTab === 'list') {
+      if (query) searchBuckets(query);
+      else renderBuckets(filterBuckets(allBuckets));
+    }
   }, 300);
 });
-
 async function loadBuckets() {
   try {
     const res = await fetch(BASE + '/api/buckets');
@@ -1101,7 +1195,6 @@ function buildFilters() {
     { key: 'feel', label: '🫧 Feel' },
     { key: 'unresolved', label: '⚡ 未解决' },
     { key: 'digested', label: '🌿 已消化' },
-    { key: 'archived', label: '📦 归档' },
   ];
   filters.innerHTML = types.map(function(t) {
     return '<button class="filter-btn ' + (t.key === 'all' ? 'active' : '') + '" data-filter="' + t.key + '">' + t.label + '</button>';
@@ -1125,7 +1218,6 @@ function filterBuckets(buckets) {
   if (currentFilter === 'feel') return buckets.filter(function(b) { return b.type === 'feel'; });
   if (currentFilter === 'unresolved') return buckets.filter(function(b) { return !b.resolved && b.type !== 'permanent' && !b.pinned; });
   if (currentFilter === 'digested') return buckets.filter(function(b) { return b.digested; });
-  if (currentFilter === 'archived') return buckets.filter(function(b) { return b.type === 'archived' || b.score < 0.3; });
   if (currentFilter.startsWith('domain:')) {
     var d = currentFilter.slice(7);
     return buckets.filter(function(b) { return (b.domain || []).includes(d); });
@@ -1166,6 +1258,72 @@ async function searchBuckets(query) {
   }
 }
 
+async function loadArchives() {
+  const list = document.getElementById('archive-list');
+  list.innerHTML = '<div class="loading">正在加载归档对话…</div>';
+  const params = new URLSearchParams({
+    limit: String(archiveState.limit),
+    offset: String(archiveState.offset),
+  });
+  if (archiveState.query) params.set('q', archiveState.query);
+  try {
+    const response = await authFetch('/api/archives?' + params.toString());
+    if (!response) return;
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'request_failed');
+    archiveState.total = payload.total;
+    archiveState.offset = payload.offset;
+    renderArchives(payload.results);
+    updateArchivePager();
+  } catch (error) {
+    list.innerHTML = '<div class="loading">归档对话加载失败，请稍后重试。</div>';
+    document.getElementById('archive-pager').style.display = 'none';
+  }
+}
+
+function renderArchives(archives) {
+  const list = document.getElementById('archive-list');
+  if (!archives.length) {
+    list.innerHTML = '<div class="loading">' +
+      (archiveState.query ? '没有符合搜索条件的归档对话。' : '还没有归档对话。') +
+      '</div>';
+    return;
+  }
+  list.innerHTML = archives.map(function(item) {
+    const timeAgo = formatTimeAgo(item.last_active || item.created);
+    return '<div class="bucket-row archive-row" onclick="showDetail(\'' + item.id + '\')">' +
+      '<span class="icon">▤</span>' +
+      '<span class="name" title="' + esc(item.name) + '">' + esc(item.name) + '</span>' +
+      '<span class="domain">会话归档</span>' +
+      '<span class="emotion"></span>' +
+      '<span class="score"></span>' +
+      '<span class="time">' + timeAgo + '</span>' +
+      '<span class="preview">' + esc(item.content_preview) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
+function updateArchivePager() {
+  const pager = document.getElementById('archive-pager');
+  const first = archiveState.total ? archiveState.offset + 1 : 0;
+  const last = Math.min(archiveState.offset + archiveState.limit, archiveState.total);
+  pager.style.display = archiveState.total ? 'flex' : 'none';
+  document.getElementById('archive-page-text').textContent =
+    first + '–' + last + ' / ' + archiveState.total;
+  document.getElementById('archive-prev').disabled = archiveState.offset === 0;
+  document.getElementById('archive-next').disabled =
+    archiveState.offset + archiveState.limit >= archiveState.total;
+}
+
+document.getElementById('archive-prev').addEventListener('click', function() {
+  archiveState.offset = Math.max(0, archiveState.offset - archiveState.limit);
+  loadArchives();
+});
+
+document.getElementById('archive-next').addEventListener('click', function() {
+  archiveState.offset += archiveState.limit;
+  loadArchives();
+});
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
