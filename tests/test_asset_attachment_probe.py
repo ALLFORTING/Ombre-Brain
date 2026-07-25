@@ -1,4 +1,6 @@
 import json
+import importlib
+import sys
 
 import pytest
 
@@ -22,10 +24,21 @@ class _FakeContext:
 
 
 @pytest.mark.asyncio
-async def test_attachment_probe_protocol_schema_and_empty_context():
+async def test_attachment_probe_protocol_schema_and_empty_context(
+    tmp_path,
+    monkeypatch,
+):
     from mcp.shared.memory import create_connected_server_and_client_session
 
-    async with create_connected_server_and_client_session(server.mcp) as client:
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.setenv("OMBRE_DIAG_TOOLS", "true")
+    monkeypatch.delenv("OMBRE_API_KEY", raising=False)
+    sys.modules.pop("server", None)
+    diagnostic_server = importlib.import_module("server")
+
+    async with create_connected_server_and_client_session(
+        diagnostic_server.mcp
+    ) as client:
         tools = (await client.list_tools()).tools
         tool = next(
             item for item in tools

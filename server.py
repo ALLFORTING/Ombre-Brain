@@ -217,6 +217,49 @@ mcp = FastMCP(
     port=OMBRE_PORT,
 )
 
+DIAGNOSTIC_TOOL_NAMES = frozenset({
+    "asset_attachment_context_probe",
+    "asset_ingest_probe",
+    "asset_ingest_begin",
+    "asset_ingest_chunk",
+    "asset_ingest_finish",
+    "asset_ingest_abort",
+    "asset_browser_upload_link",
+    "asset_browser_upload_status",
+    "asset_render_probe",
+    "asset_export_probe",
+    "asset_vision_challenge",
+    "asset_vision_verify",
+    "asset_vision_export",
+    "asset_vision_download_link",
+    "asset_vision_upload_challenge",
+})
+
+
+def _env_flag_enabled(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+DIAGNOSTIC_TOOLS_ENABLED = _env_flag_enabled(
+    os.environ.get("OMBRE_DIAG_TOOLS", "")
+)
+logger.info(
+    "diagnostic tools enabled"
+    if DIAGNOSTIC_TOOLS_ENABLED
+    else "diagnostic tools disabled"
+)
+
+
+def diagnostic_tool(*args, **kwargs):
+    """Register a diagnostic MCP tool only when its server profile is enabled."""
+    if DIAGNOSTIC_TOOLS_ENABLED:
+        return mcp.tool(*args, **kwargs)
+
+    def preserve_function(function):
+        return function
+
+    return preserve_function
+
 
 # =============================================================
 # Dashboard Auth — simple cookie-based session auth
@@ -3379,7 +3422,7 @@ def _asset_score_vision_answer(trial_id: str, answer_json: str, now: float | Non
     }, ensure_ascii=False, sort_keys=True)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_attachment_context_probe(
     ctx: Context,
     attachment_reference: str = "",
@@ -3435,7 +3478,7 @@ async def asset_attachment_context_probe(
         sort_keys=True,
     )
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_ingest_probe(
     data_base64: str,
     expected_sha256: str = "",
@@ -3477,7 +3520,7 @@ async def asset_ingest_probe(
     }, ensure_ascii=False, sort_keys=True)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_ingest_begin(
     expected_bytes: int,
     expected_sha256: str,
@@ -3488,25 +3531,25 @@ async def asset_ingest_begin(
     return _asset_begin_ingest_upload(expected_bytes, expected_sha256, mime_type, filename)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_ingest_chunk(upload_id: str, chunk_index: int, data_base64: str) -> str:
     """Strictly decode and append one bounded base64 chunk without logging it."""
     return _asset_ingest_chunk_data(upload_id, chunk_index, data_base64)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_ingest_finish(upload_id: str) -> str:
     """Hash a completed temporary upload, report matches, and discard its bytes."""
     return _asset_finish_ingest_upload(upload_id)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_ingest_abort(upload_id: str) -> str:
     """Discard a temporary Phase-0 chunked upload; repeated aborts are safe."""
     return _asset_abort_ingest_upload(upload_id)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_browser_upload_link(
     expected_bytes: int,
     expected_sha256: str = "",
@@ -3517,7 +3560,7 @@ async def asset_browser_upload_link(
     return _asset_create_browser_upload_link(expected_bytes, expected_sha256, filename, mime_type)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_browser_upload_status(upload_id: str) -> str:
     """Return metadata-only status for a Phase-0 browser upload."""
     return _asset_browser_upload_status_payload(upload_id)
@@ -3872,7 +3915,7 @@ async def rm_asset_download_route(request):
         return Response(content=b"", headers=headers)
     return FileResponse(path, media_type=headers["Content-Type"], headers=headers)
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_render_probe() -> CallToolResult:
     """Phase-0 transport probe: return the built-in PNG as an MCP image block."""
     with open(ASSET_PROBE_PATH, "rb") as handle:
@@ -3892,7 +3935,7 @@ async def asset_render_probe() -> CallToolResult:
     )
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_export_probe() -> str:
     """Phase-0 export probe. Caller should decode data_base64 to a file, verify decoded_bytes and sha256, then present it as a user-visible attachment."""
     with open(ASSET_PROBE_PATH, "rb") as handle:
@@ -3907,7 +3950,7 @@ async def asset_export_probe() -> str:
     }, ensure_ascii=False)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_vision_challenge() -> CallToolResult:
     """Phase-0 blind vision probe: return a machine-scored ImageContent challenge without revealing the answer."""
     trial = _asset_new_vision_trial()
@@ -3923,19 +3966,19 @@ async def asset_vision_challenge() -> CallToolResult:
     )
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_vision_verify(trial_id: str, answer_json: str) -> str:
     """Phase-0 blind vision verifier: score one submitted answer without returning the correct answer."""
     return _asset_score_vision_answer(trial_id, answer_json)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_vision_export(trial_id: str) -> str:
     """Phase-0 file-view vision probe: export a live challenge PNG as JSON/base64 without revealing the answer."""
     return _asset_export_vision_trial(trial_id)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_vision_download_link(trial_id: str) -> str:
     """Phase-0 signed download path for a live vision trial PNG; returns no base64 or ImageContent."""
     return _asset_create_vision_download_link(trial_id)
@@ -3953,7 +3996,7 @@ async def asset_vision_download_route(request):
     return Response(content=content, headers=headers)
 
 
-@mcp.tool()
+@diagnostic_tool()
 async def asset_vision_upload_challenge() -> str:
     """Phase-0 user-upload vision control: create a blind trial without returning ImageContent or base64."""
     trial = _asset_new_vision_trial()

@@ -6,17 +6,25 @@ Scope: tools registered through `@mcp.tool` in `server.py`. HTTP custom routes a
 
 ## Inventory Summary
 
-The server currently registers **36 MCP tools**:
+The server registers **21 formal MCP tools by default**. The 15 diagnostic
+tools remain implemented, but are registered only when `OMBRE_DIAG_TOOLS` is
+explicitly enabled:
 
 | Category | Count | Intended audience |
 |---|---:|---|
 | Core memory and session | 9 | Ordinary users and model workflows |
 | Formal Remember-Me assets | 8 | Ordinary users and model workflows |
 | Administration and maintenance | 4 | Operators or controlled maintenance |
-| Diagnostic probes | 15 | Developers and acceptance testing only |
-| **Total** | **36** | |
+| Diagnostic probes | 15 | Developers and acceptance testing only; disabled by default |
+| **Default total** | **21** | |
+| **Diagnostic-enabled total** | **36** | |
 
-The count is high for a single flat tool list. The largest source of selection noise is not the formal product surface; it is the 15 diagnostic probes registered beside normal tools. The README tool table is a convenience view; the `@mcp.tool` registrations remain the authoritative inventory.
+The ordinary tool surface no longer includes the diagnostic probes. Their
+functions, routes, and tests remain available for development and acceptance
+work. Set `OMBRE_DIAG_TOOLS` to `1`, `true`, `yes`, or `on` to register them;
+empty and all other values keep them disabled. Ordinary users should not
+enable this profile. The centralized `@diagnostic_tool` registrations in
+`server.py` are the authoritative diagnostic inventory.
 
 ## Tool-by-Tool Review
 
@@ -67,7 +75,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 
 ## Highest-Priority Issues
 
-1. **Diagnostic probes dominate the flat list.** Fifteen diagnostic tools are exposed beside production capabilities and account for about 42% of all tools.
+1. **Diagnostic probes previously dominated the flat list.** The 15 probes now remain disabled by default and are restored only through the explicit diagnostic profile.
 2. **Temporary and formal asset tools have confusingly similar names.** `asset_browser_upload_*` versus `rm_asset_upload_*`, and vision-download versus formal asset-download tools, invite incorrect selection.
 3. **Some tools are protocols rather than user intentions.** Chunked ingest, blind vision testing, startup, and session archival are better represented by workflows or prompts.
 4. **Read-only data is overrepresented as tools.** Asset metadata, todos, and status/list views are candidates for resources.
@@ -102,7 +110,7 @@ Do not replace the current surface in one release. The target is a smaller ordin
 
 ### Diagnostics
 
-- Hide all Stage 0 tools from ordinary Claude connections through a future server profile, capability flag, or separately authorized diagnostic endpoint.
+- Keep all Stage 0 tools hidden from ordinary Claude connections through the existing `OMBRE_DIAG_TOOLS` server profile.
 - If retained, consolidate chunked ingest into one action-based diagnostic tool and vision trials into one diagnostic workflow.
 - Deprecate base64 export probes first because accepted product paths no longer depend on model-relayed base64.
 - Preserve acceptance tests after public diagnostic registration is removed.
@@ -118,7 +126,7 @@ Do not replace the current surface in one release. The target is a smaller ordin
 
 ### Phase 2: Profiles and workflows
 
-- Introduce ordinary, asset, administrator, and diagnostic tool profiles.
+- Extend the existing diagnostic flag into ordinary, asset, and administrator profiles if later operational evidence supports it.
 - Add prompts/workflows for startup, session close, RM upload, RM visual metadata generation, and diagnostic vision trials.
 - Keep every existing tool callable for compatible clients.
 
@@ -130,7 +138,7 @@ Do not replace the current surface in one release. The target is a smaller ordin
 
 ### Phase 4: Controlled retirement
 
-- Remove diagnostic tools from the ordinary registration profile.
+- Diagnostic tools are already absent from the ordinary registration profile.
 - Retire model-relayed base64 probes after a published compatibility window.
 - Remove aliases only after usage review confirms that no supported client depends on them.
 

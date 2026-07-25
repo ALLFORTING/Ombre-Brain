@@ -311,7 +311,11 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-36 个 MCP 工具 / 36 MCP tools:
+默认注册 21 个正式 MCP 工具 / 21 formal MCP tools are registered by default:
+
+另外 15 个 Stage 0 / 调试诊断工具仍保留在代码中，但默认不注册。只有开发或验收时显式设置 `OMBRE_DIAG_TOOLS=1`（也接受 `true`、`yes`、`on`，忽略大小写和首尾空白）才恢复全部 36 个工具。普通用户不应开启该变量。MCP resource（包括 `ui://remember-me/asset-viewer.html`）不受此开关影响。
+
+The 15 Stage 0 and diagnostic tools remain in the codebase but are not registered by default. Developers and acceptance testers can explicitly set `OMBRE_DIAG_TOOLS=1` (`true`, `yes`, and `on` are also accepted, case-insensitively with surrounding whitespace ignored) to restore all 36 tools. Ordinary users should leave this variable unset. MCP resources, including `ui://remember-me/asset-viewer.html`, are unaffected.
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|

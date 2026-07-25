@@ -10,6 +10,7 @@
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 | — | 预设 Dashboard 访问密码；设置后覆盖文件存储的密码，首次访问不弹设置向导 |
+| `OMBRE_DIAG_TOOLS` | 否 | 关闭 | 仅供开发与验收临时启用 15 个 Stage 0 / 诊断 MCP 工具；只有 `1`、`true`、`yes`、`on`（忽略大小写和首尾空白）表示开启 |
 | `OMBRE_DEHYDRATION_MODEL` | 否 | `deepseek-chat` | 脱水/打标/合并/拆分用的 LLM 模型名（覆盖 `dehydration.model`） |
 | `OMBRE_DEHYDRATION_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 脱水模型的 API Base URL（覆盖 `dehydration.base_url`） |
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
@@ -21,6 +22,7 @@
 
 - `OMBRE_API_KEY` 也可在 `config.yaml` 的 `dehydration.api_key` / `embedding.api_key` 中设置，但**强烈建议**通过环境变量传入，避免密钥写入文件。
 - `OMBRE_DASHBOARD_PASSWORD` 设置后，Dashboard 的"修改密码"功能将被禁用（显示提示，建议直接修改环境变量）。未设置则密码存储在 `{buckets_dir}/.dashboard_auth.json`（SHA-256 + salt）。
+- 默认 MCP 工具面只注册 21 个正式工具。15 个诊断工具仍保留在代码和测试中，只有显式设置 `OMBRE_DIAG_TOOLS` 为开启值时才注册；普通用户不应开启。
 
 ## Webhook 推送格式 (`OMBRE_HOOK_URL`)
 
