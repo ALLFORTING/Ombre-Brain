@@ -68,6 +68,10 @@ Never expose the complete local path, complete hash, raw bytes, base64, cookies,
 
 Call `rm_asset_upload_link`.
 
+Provide only the source byte count and, when known, the filename and MIME type.
+Do not provide, complete, guess, or invent a SHA-256 argument. The server
+computes the authoritative source hash from the uploaded bytes.
+
 Use the returned short-lived upload endpoint only for the intended image.
 
 ### 4. Upload directly from code execution
@@ -98,9 +102,12 @@ Call `rm_asset_upload_status`.
 Verify:
 
 - uploaded original byte count equals the local source byte count;
-- uploaded original SHA-256 equals the local SHA-256;
+- server-computed original SHA-256 equals the locally computed SHA-256;
 - MIME type is consistent;
 - upload state is completed.
+
+The code-execution client may compare the two complete hashes internally, but
+must not print either complete hash to stdout or place it in chat text.
 
 On mismatch, stop and report the real failure. Do not continue to metadata or indexing.
 

@@ -3,6 +3,7 @@ import hashlib
 import importlib
 import io
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -206,10 +207,10 @@ def test_stored_sha_dedup_and_concurrent_upload(tmp_path):
 @pytest.mark.asyncio
 async def test_rm_asset_http_upload_get_and_download(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    payload = b"browser-to-persistent-store" * 1000
+    payload = _png_with_text()
     source_sha = hashlib.sha256(payload).hexdigest()
     link_text = await server.rm_asset_upload_link(
-        len(payload), source_sha, "../../upload\\control.bin", "application/octet-stream"
+        len(payload), "../../upload\\control.png", "image/png"
     )
     link = json.loads(link_text)
     assert link["ok"] is True
@@ -219,7 +220,7 @@ async def test_rm_asset_http_upload_get_and_download(tmp_path, monkeypatch):
         page = client.get(link["upload_path"])
         uploaded = client.post(
             link["upload_path"],
-            files={"file": ("ignored.bin", payload, "application/octet-stream")},
+            files={"file": ("ignored.png", payload, "image/png")},
         )
     assert page.status_code == 200
     assert page.headers["cache-control"] == "no-store"
@@ -230,10 +231,9 @@ async def test_rm_asset_http_upload_get_and_download(tmp_path, monkeypatch):
     assert status["state"] == "completed"
     assert status["asset_id"]
     assert status["source_sha256"] == source_sha
-    assert status["stored_sha256"] == source_sha
     assert status["decoded_bytes"] == len(payload)
-    assert status["stored_bytes"] == len(payload)
-    assert status["kind"] == "file"
+    assert status["stored_bytes"] > 0
+    assert status["kind"] == "image"
     assert status["deduplicated"] is False
     assert "/" not in status["filename"] and "\\" not in status["filename"]
     assert "stored_relpath" not in status_text
@@ -242,9 +242,9 @@ async def test_rm_asset_http_upload_get_and_download(tmp_path, monkeypatch):
     get_text = await server.rm_asset_get(status["asset_id"])
     metadata = json.loads(get_text)
     assert metadata["ok"] is True
-    assert metadata["stored_sha256"] == source_sha
+    assert metadata["source_sha256"] == source_sha
     assert "stored_relpath" not in get_text
-    assert payload.decode("ascii") not in get_text
+    assert "data_base64" not in get_text
 
     download = json.loads(await server.rm_asset_download_link(status["asset_id"]))
     assert "stored_relpath" not in json.dumps(download)
@@ -252,43 +252,163 @@ async def test_rm_asset_http_upload_get_and_download(tmp_path, monkeypatch):
         head = client.head(download["download_path"])
         gets = [client.get(download["download_path"]) for _ in range(4)]
     assert head.status_code == 200 and head.content == b""
-    assert head.headers["content-length"] == str(len(payload))
-    assert gets[0].content == payload
+    assert head.headers["content-length"] == str(status["stored_bytes"])
     assert hashlib.sha256(gets[0].content).hexdigest() == status["stored_sha256"]
     assert [response.status_code for response in gets] == [200, 200, 200, 404]
-    assert gets[0].headers["content-type"].startswith("application/octet-stream")
+    assert gets[0].headers["content-type"].startswith("image/png")
     assert gets[0].headers["cache-control"] == "no-store"
     assert gets[0].headers["x-content-type-options"] == "nosniff"
     assert str(tmp_path) not in gets[0].headers.get("content-disposition", "")
 
 
 @pytest.mark.asyncio
-async def test_rm_asset_upload_rejects_bad_image_and_hash_mismatch(tmp_path, monkeypatch):
+async def test_rm_asset_upload_rejects_bad_image_and_mime_mismatch(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bad = b"not an image"
-    digest = hashlib.sha256(bad).hexdigest()
+    png = _png_with_text()
     image_link = json.loads(await server.rm_asset_upload_link(
-        len(bad), digest, "fake.png", "image/png"
+        len(bad), "fake.png", "image/png"
     ))
-    wrong_link = json.loads(await server.rm_asset_upload_link(
-        len(bad), "0" * 64, "bad.bin", "application/octet-stream"
+    binary_link = json.loads(await server.rm_asset_upload_link(
+        len(bad), "fake.bin", "application/octet-stream"
+    ))
+    mismatch_link = json.loads(await server.rm_asset_upload_link(
+        len(png), "wrong.jpg", "image/jpeg"
     ))
 
     with _asset_client(server) as client:
         image_response = client.post(
             image_link["upload_path"], files={"file": ("fake.png", bad, "image/png")}
         )
-        wrong_response = client.post(
-            wrong_link["upload_path"], files={"file": ("bad.bin", bad)}
+        binary_response = client.post(
+            binary_link["upload_path"],
+            files={"file": ("fake.bin", bad, "application/octet-stream")},
+        )
+        mismatch_response = client.post(
+            mismatch_link["upload_path"], files={"file": ("wrong.jpg", png, "image/jpeg")}
         )
     assert image_response.status_code == 422
-    assert wrong_response.status_code == 422
+    assert binary_response.status_code == 422
+    assert mismatch_response.status_code == 422
     assert json.loads(await server.rm_asset_upload_status(image_link["upload_id"]))["state"] == "pending"
-    assert json.loads(await server.rm_asset_upload_status(wrong_link["upload_id"]))["state"] == "pending"
+    assert json.loads(await server.rm_asset_upload_status(binary_link["upload_id"]))["state"] == "pending"
+    assert json.loads(await server.rm_asset_upload_status(mismatch_link["upload_id"]))["state"] == "pending"
     assert server.asset_store.get("0" * 32) is None
     assert not list(server.asset_store.temp_dir.iterdir())
     with sqlite3.connect(server.asset_store.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_rm_asset_upload_counts_bytes_and_server_hash_without_client_sha(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    payload = _png_with_text()
+    source_sha = hashlib.sha256(payload).hexdigest()
+    link = json.loads(await server.rm_asset_upload_link(
+        len(payload), "hashless.png", "image/png"
+    ))
+    assert "expected_sha256" not in json.dumps(link)
+
+    with _asset_client(server) as client:
+        short = client.post(
+            link["upload_path"],
+            files={"file": ("short.png", payload[:-1], "image/png")},
+        )
+    assert short.status_code == 422
+    assert json.loads(await server.rm_asset_upload_status(link["upload_id"]))["state"] == "pending"
+
+    with _asset_client(server) as client:
+        exact = client.post(
+            link["upload_path"],
+            files={"file": ("exact.png", payload, "image/png")},
+        )
+    assert exact.status_code == 200
+    status = json.loads(await server.rm_asset_upload_status(link["upload_id"]))
+    assert status["state"] == "completed"
+    assert status["source_sha256"] == source_sha
+    assert source_sha not in caplog.text
+    assert re.search(r"\b[0-9a-f]{64}\b", caplog.text.lower()) is None
+
+    too_long_link = json.loads(await server.rm_asset_upload_link(
+        len(payload), "long.png", "image/png"
+    ))
+    with _asset_client(server) as client:
+        too_long = client.post(
+            too_long_link["upload_path"],
+            files={"file": ("long.png", payload + b"x", "image/png")},
+        )
+    assert too_long.status_code in {413, 422}
+    assert json.loads(
+        await server.rm_asset_upload_status(too_long_link["upload_id"])
+    )["state"] == "pending"
+
+    interrupted_link = json.loads(await server.rm_asset_upload_link(
+        len(payload), "interrupted.png", "image/png"
+    ))
+    with _asset_client(server) as client:
+        interrupted = client.post(
+            interrupted_link["upload_path"],
+            content=b"--incomplete-boundary\r\n",
+            headers={"content-type": "multipart/form-data; boundary=incomplete-boundary"},
+        )
+    assert interrupted.status_code == 400
+    assert json.loads(
+        await server.rm_asset_upload_status(interrupted_link["upload_id"])
+    )["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_rm_asset_http_image_privacy_pixel_limit_and_dedup(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    source = _png_with_text()
+
+    async def upload(payload, filename="private.png", mime_type="image/png"):
+        link = json.loads(await server.rm_asset_upload_link(
+            len(payload), filename, mime_type
+        ))
+        with _asset_client(server) as client:
+            response = client.post(
+                link["upload_path"],
+                files={"file": (filename, payload, mime_type)},
+            )
+        return link, response
+
+    first_link, first_response = await upload(source)
+    second_link, second_response = await upload(source)
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+
+    first = json.loads(await server.rm_asset_upload_status(first_link["upload_id"]))
+    second = json.loads(await server.rm_asset_upload_status(second_link["upload_id"]))
+    assert first["source_sha256"] == hashlib.sha256(source).hexdigest()
+    assert first["asset_id"] == second["asset_id"]
+    assert first["deduplicated"] is False
+    assert second["deduplicated"] is True
+
+    stored = server.asset_store.resolve_file(first["asset_id"])[1].read_bytes()
+    with Image.open(io.BytesIO(stored)) as cleaned:
+        cleaned.load()
+        assert "private-note" not in cleaned.info
+        assert "exif" not in cleaned.info
+        assert "icc_profile" not in cleaned.info
+
+    monkeypatch.setattr(asset_store_module, "MAX_IMAGE_PIXELS", 100)
+    oversized = Image.new("RGB", (11, 10), "blue")
+    output = io.BytesIO()
+    oversized.save(output, format="PNG")
+    oversized.close()
+    pixel_link, pixel_response = await upload(output.getvalue(), "large.png")
+    assert pixel_response.status_code == 422
+    assert json.loads(
+        await server.rm_asset_upload_status(pixel_link["upload_id"])
+    )["state"] == "pending"
 
 
 @pytest.mark.asyncio

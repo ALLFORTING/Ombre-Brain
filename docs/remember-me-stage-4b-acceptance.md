@@ -8,7 +8,7 @@ The following flow completed successfully:
 
 1. The user uploaded one image in a Claude web conversation.
 2. Claude's code-execution container found and read the exact current attachment bytes.
-3. `rm_asset_upload_link` returned a short-lived signed upload endpoint.
+3. `rm_asset_upload_link` received the byte count and optional file metadata, without a client-supplied hash, and returned a short-lived signed upload endpoint.
 4. With network egress limited to the user's exact Ombre Brain hostname, the container sent the original bytes through HTTPS `multipart/form-data`.
 5. The user did not select or upload the same file again.
 6. Complete base64 did not pass through model-visible text or MCP tool arguments.
@@ -36,6 +36,12 @@ failure_point: none
 ```
 
 The accepted file was a PNG measuring 370 by 250 pixels. The repository does not contain the image, its visible contents, its asset ID, its filename, its complete hash, its upload link, or any production host information.
+
+The current public upload contract does not accept `expected_sha256`. The
+server computes the authoritative `source_sha256` after receiving the file.
+Client execution code may compare that result with a local hash internally,
+but Claude must not guess a hash or print a complete hash to chat text or
+stdout.
 
 ## Metadata and Embedding Acceptance
 

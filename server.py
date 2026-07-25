@@ -2746,16 +2746,12 @@ def _rm_cleanup_asset_uploads(now: float) -> None:
 
 def _rm_create_asset_upload_link(
     expected_bytes: int,
-    expected_sha256: str = "",
     filename: str = "",
     mime_type: str = "application/octet-stream",
     now: float | None = None,
 ) -> str:
     if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= RM_ASSET_MAX_UPLOAD_BYTES:
         return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=RM_ASSET_MAX_UPLOAD_BYTES)
-    expected = (expected_sha256 or "").strip().lower()
-    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
-        return _asset_ingest_response(False, error="invalid_expected_sha256")
     mime = (mime_type or "application/octet-stream").strip().lower()
     if mime not in {"application/octet-stream", "image/jpeg", "image/png"}:
         return _asset_ingest_response(False, error="unsupported_mime_type")
@@ -2779,7 +2775,6 @@ def _rm_create_asset_upload_link(
             "state": "pending",
             "token": token,
             "expected_bytes": expected_bytes,
-            "expected_sha256": expected,
             "filename": asset_store.sanitize_filename(filename),
             "mime_type": mime,
             "expires_at": expires_at,
@@ -2863,7 +2858,6 @@ def _rm_claim_asset_upload(token: str, now: float | None = None) -> dict | None:
         return {
             "upload_id": upload_id,
             "expected_bytes": item["expected_bytes"],
-            "expected_sha256": item["expected_sha256"],
             "filename": item["filename"],
             "mime_type": item["mime_type"],
         }
@@ -3601,12 +3595,11 @@ async def asset_browser_upload_route(request):
 @mcp.tool()
 async def rm_asset_upload_link(
     expected_bytes: int,
-    expected_sha256: str = "",
     filename: str = "",
     mime_type: str = "application/octet-stream",
 ) -> str:
-    """Create a short-lived browser upload URL for persistent Remember-Me assets."""
-    return _rm_create_asset_upload_link(expected_bytes, expected_sha256, filename, mime_type)
+    """Create a short-lived browser upload URL; the server computes the file hash."""
+    return _rm_create_asset_upload_link(expected_bytes, filename, mime_type)
 
 
 @mcp.tool()
@@ -3866,10 +3859,7 @@ async def rm_asset_upload_route(request):
                 max_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
             )
         size_match = streamed["decoded_bytes"] == claim["expected_bytes"]
-        hash_match = not claim["expected_sha256"] or hmac.compare_digest(
-            streamed["sha256"], claim["expected_sha256"]
-        )
-        if not size_match or not hash_match:
+        if not size_match:
             _rm_release_asset_upload(claim["upload_id"])
             return Response(status_code=422, headers=headers)
         asset = await asyncio.to_thread(
@@ -3879,6 +3869,7 @@ async def rm_asset_upload_route(request):
             streamed["decoded_bytes"],
             claim["filename"],
             claim["mime_type"],
+            require_image=True,
         )
     except _AssetBrowserUploadTooLarge:
         _rm_release_asset_upload(claim["upload_id"])

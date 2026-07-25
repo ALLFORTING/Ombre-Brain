@@ -96,7 +96,7 @@ FORMAL_TOOL_SIGNATURES = {
         ["asset_id"],
     ),
     "rm_asset_upload_link": (
-        ["expected_bytes", "expected_sha256", "filename", "mime_type"],
+        ["expected_bytes", "filename", "mime_type"],
         ["expected_bytes"],
     ),
     "rm_asset_upload_status": (["upload_id"], ["upload_id"]),

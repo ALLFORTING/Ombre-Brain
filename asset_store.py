@@ -287,6 +287,7 @@ class AssetStore:
         self,
         source_path: Path,
         claimed_mime: str,
+        require_image: bool = False,
     ) -> tuple[Path, str, str, str, int, int]:
         try:
             with Image.open(source_path) as probe:
@@ -308,6 +309,8 @@ class AssetStore:
             return candidate, mime_type, "image", extension, width, height
         if claimed_mime in {"image/jpeg", "image/png"}:
             raise InvalidAssetImage("invalid_image")
+        if require_image:
+            raise InvalidAssetImage("invalid_image")
         return source_path, "application/octet-stream", "file", ".bin", 0, 0
 
     def persist_upload(
@@ -317,6 +320,7 @@ class AssetStore:
         decoded_bytes: int,
         original_filename: str,
         mime_type: str,
+        require_image: bool = False,
     ) -> dict:
         source = Path(source_path)
         candidate: Path | None = None
@@ -337,7 +341,7 @@ class AssetStore:
                 raise AssetStoreError("source_hash_mismatch")
 
             candidate, stored_mime, kind, extension, width, height = self._prepare_candidate(
-                source, claimed_mime
+                source, claimed_mime, require_image=require_image
             )
             stored_sha256, stored_bytes = self._hash_file(candidate)
             stored_relpath = Path("assets") / stored_sha256[:2] / f"{stored_sha256}{extension}"

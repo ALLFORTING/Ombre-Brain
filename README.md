@@ -337,7 +337,7 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 | `asset_ingest_abort` | Phase-0 cleanup tool: safely discards a temporary chunked upload session and is idempotent |
 | `asset_browser_upload_link` | Phase-0 signed browser upload probe: creates a short-lived multipart upload page so raw file bytes bypass the model context |
 | `asset_browser_upload_status` | Phase-0 metadata-only status query for pending, completed, or expired browser uploads; returns no file bytes or base64 |
-| `rm_asset_upload_link` | Stage-1 persistent Remember-Me upload: creates a short-lived browser upload page, safely processes the file, and stores asset bytes plus SQLite metadata |
+| `rm_asset_upload_link` | Stage-1 persistent Remember-Me upload: accepts expected byte count plus optional filename/MIME, creates a short-lived browser upload page, and lets the server compute the authoritative source hash before persistence |
 | `rm_asset_upload_status` | Stage-1 metadata-only status for a persistent asset upload, including asset ID, hashes, size, dimensions, and deduplication result |
 | `rm_asset_get` | Return persistent asset metadata by asset ID without file bytes, base64, or disk paths |
 | `rm_asset_update_metadata` | Stage-2 transactional update for asset title, description, and normalized tags without changing file bytes or hashes |
@@ -449,6 +449,7 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 #### Remember-Me Stage 4 one-upload attachment save
 
 - Stage 4B passed real Claude web acceptance: the code-execution container can read the exact current attachment and upload it through HTTPS `multipart/form-data` to the existing short-lived `rm_asset_upload_link` endpoint without a second user upload.
+- Call `rm_asset_upload_link(expected_bytes, filename="", mime_type="application/octet-stream")` without a SHA-256 argument. Claude must not complete, guess, or invent a hash. The server computes `source_sha256`; client execution code may compare it with a locally computed hash internally, but complete hashes must not be printed to chat text or stdout.
 - Standard MCP/FastMCP request context still does not automatically contain the chat attachment. `asset_attachment_context_probe` remains a diagnostic for that protocol boundary.
 - Enable `Settings -> Capabilities -> Code execution and file creation -> Allow network egress`, keep the restricted domain mode, and add only the user's exact Ombre Brain hostname under `Additional allowed domains`. Do not use `All domains` or include a scheme, path, token, or signed URL.
 - Explicit save requests may proceed directly. Under standing permission Claude may autonomously save an image it genuinely wants to remember, or may ask first; neither behavior is mandatory every time, and indiscriminate collection is prohibited.
