@@ -408,6 +408,11 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 
 #### Remember-Me Stage 1 asset storage
 
+- Stage 8B pins the public `peanutsuee/Remember-Me` Core at package version
+  `0.1.0.dev5` behind a lazy compatibility adapter. The adapter is not connected
+  to `server.py`; the existing tools, routes, Dashboard, Viewer, authentication,
+  Tickets, and production data behavior remain unchanged. See
+  [`docs/remember-me-integration.md`](docs/remember-me-integration.md).
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
 - Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
 - SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.

@@ -22,6 +22,9 @@ python-frontmatter>=1.1.0
 # Remember-Me image decoding and metadata stripping
 Pillow>=11,<13
 
+# Public Remember-Me Core pinned to an immutable source archive.
+remember-me @ https://github.com/peanutsuee/Remember-Me/archive/184e223c6392fd14dd5cfa73227d41f46d90e3c8.zip#sha256=cbb6419666df8d7101f4607635edb39c682105de371855acf05c8f351b822e98
+
 # 中文分词
 jieba>=0.42.1
 

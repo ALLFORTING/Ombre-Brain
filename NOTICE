@@ -1,0 +1,11 @@
+Ombre-Brain includes a pinned dependency on Remember-Me.
+
+Remember-Me was originally created by Ting.
+Ting (peanutsuee)
+Official repository: https://github.com/peanutsuee/Remember-Me
+
+The pinned Remember-Me package is licensed under CPAL-1.0 and includes
+preserved upstream MIT attribution. See the package's LICENSE, NOTICE,
+LICENSES, and source-provenance documentation for the applicable terms.
+
+Stage 8B does not modify Remember-Me source code.
