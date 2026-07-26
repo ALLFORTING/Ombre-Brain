@@ -26,13 +26,24 @@ from remember_me.core import (
 )
 
 _ASSET_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+_OB_METADATA_ERROR_CODES = {
+    "description_too_long",
+    "invalid_description",
+    "invalid_tag",
+    "invalid_tags",
+    "invalid_title",
+    "tag_too_long",
+    "title_too_long",
+    "too_many_tags",
+}
 
 
 class RememberMeCoreAdapterError(RuntimeError):
     """Stable, path-free error returned by the OB Core compatibility layer."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, ob_code: str | None = None):
         self.code = code
+        self.ob_code = ob_code
         super().__init__(code)
 
 
@@ -105,6 +116,20 @@ class RememberMeCoreAdapter:
         except AssetNotFoundError:
             return None
         except Exception as exc:
+            self._raise_mapped(exc)
+
+    def get_ob_public_metadata(self, asset_id: str) -> dict | None:
+        """Return only fields already public in the current OB MCP contract."""
+        if not self._valid_asset_id(asset_id):
+            return None
+        try:
+            asset = self._runtime.service.get_asset(
+                GetAssetRequest(asset_id.strip())
+            )
+            return self._ob_public_metadata(asset)
+        except AssetNotFoundError:
+            return None
+        except RememberMeError as exc:
             self._raise_mapped(exc)
 
     def update_metadata(
@@ -222,6 +247,27 @@ class RememberMeCoreAdapter:
         return result
 
     @staticmethod
+    def _ob_public_metadata(asset: Any) -> dict:
+        """Match the hashes and metadata already exposed by OB tools."""
+        return {
+            "asset_id": asset.asset_id,
+            "source_sha256": asset.source_sha256,
+            "stored_sha256": asset.stored_sha256,
+            "decoded_bytes": asset.decoded_bytes,
+            "stored_bytes": asset.stored_bytes,
+            "mime_type": asset.mime_type,
+            "filename": asset.original_filename,
+            "kind": asset.kind,
+            "width": asset.width,
+            "height": asset.height,
+            "created_at": _normalize_timestamp(asset.created_at),
+            "title": asset.title,
+            "description": asset.description,
+            "tags": list(asset.tags),
+            "updated_at": _normalize_timestamp(asset.updated_at),
+        }
+
+    @staticmethod
     def _valid_asset_id(asset_id: Any) -> bool:
         return (
             isinstance(asset_id, str)
@@ -241,6 +287,7 @@ class RememberMeCoreAdapter:
 
     @staticmethod
     def _raise_mapped(exc: Exception) -> None:
+        ob_code = None
         if isinstance(exc, RememberMeCoreAdapterError):
             raise exc
         if isinstance(exc, AssetFileUnavailable):
@@ -256,6 +303,12 @@ class RememberMeCoreAdapter:
         elif isinstance(exc, ImageValidationError):
             code = "invalid_image"
         elif isinstance(exc, InvalidMetadata):
+            candidate = str(exc)
+            ob_code = (
+                candidate
+                if candidate in _OB_METADATA_ERROR_CODES
+                else None
+            )
             code = "invalid_metadata"
         elif isinstance(exc, StorageConsistencyError):
             code = "repository_failure"
@@ -263,7 +316,10 @@ class RememberMeCoreAdapter:
             code = "core_failure"
         else:
             code = "repository_failure"
-        raise RememberMeCoreAdapterError(code) from exc
+        raise RememberMeCoreAdapterError(
+            code,
+            ob_code=ob_code,
+        ) from exc
 
 
 def _normalize_timestamp(value: str) -> str:
