@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from typing import Any, Protocol
+import unicodedata
 from urllib.parse import urlparse
 
 _DOWNLOAD_PATH_PREFIX = "/rm/asset-download/"
@@ -60,8 +61,10 @@ class RememberMeObDownloadLinkCollaborator:
         if (
             not callable(clock)
             or (token_factory is not None and not callable(token_factory))
+            or isinstance(ttl_seconds, bool)
             or not isinstance(ttl_seconds, int)
             or ttl_seconds <= 0
+            or isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
             or max_tokens <= 0
         ):
@@ -190,19 +193,36 @@ def _valid_public_base_url(
     raw = value() if callable(value) else value
     if not isinstance(raw, str):
         return ""
-    raw = raw.strip()
-    if not raw or any(ord(character) < 33 for character in raw):
+    if (
+        not raw
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            or unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in raw
+        )
+        or "\\" in raw
+    ):
         return ""
     try:
         parsed = urlparse(raw)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
         port = parsed.port
     except ValueError:
         return ""
     if (
         parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
+        or not parsed.netloc
+        or parsed.netloc.endswith(":")
+        or "\\" in parsed.netloc
+        or not hostname
+        or "\\" in hostname
+        or username is not None
+        or password is not None
+        or parsed.params
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}

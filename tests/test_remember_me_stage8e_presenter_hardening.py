@@ -376,12 +376,43 @@ def test_download_collaborator_preserves_ticket_and_payload_shape():
 @pytest.mark.parametrize(
     "base_url",
     [
+        "https://example.invalid",
+        "https://example.invalid/",
+        "http://localhost:8080/",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000/",
+    ],
+)
+def test_valid_public_base_url_produces_download_url(base_url):
+    collaborator = RememberMeObDownloadLinkCollaborator(
+        token_factory=lambda: TOKEN_A,
+        public_base_url=base_url,
+    )
+    assert collaborator.create_download_link(
+        PUBLIC_METADATA
+    )["download_url"] == (
+        f"{base_url.rstrip('/')}/rm/asset-download/{TOKEN_A}"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
         "",
         "ftp://example.invalid",
         "https://user@example.invalid",
+        "https://user:password@example.invalid",
+        "https://example.invalid/;unexpected",
+        "https://example.invalid\\unexpected",
+        "https:\\\\example.invalid",
         "https://example.invalid/path",
         "https://example.invalid?query=yes",
         "https://example.invalid#fragment",
+        "https://example.invalid\u00a0",
+        "https://example.invalid\u200e",
+        "https://example.invalid\n",
+        "https://example.invalid\t",
+        "https://example.invalid:",
         "not-a-url",
     ],
 )
@@ -393,6 +424,22 @@ def test_invalid_public_base_url_produces_empty_download_url(base_url):
     assert collaborator.create_download_link(
         PUBLIC_METADATA
     )["download_url"] == ""
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        {"ttl_seconds": True},
+        {"ttl_seconds": False},
+        {"max_tokens": True},
+        {"max_tokens": False},
+    ],
+)
+def test_download_collaborator_rejects_bool_limits(argument):
+    with pytest.raises(RememberMeDownloadLinkError) as caught:
+        RememberMeObDownloadLinkCollaborator(**argument)
+    assert caught.value.code == "download_unavailable"
+    assert str(caught.value) == "download_unavailable"
 
 
 def test_public_base_url_provider_is_supported():
