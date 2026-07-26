@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping
 
 from mcp.types import CallToolResult, ImageContent, TextContent
 from PIL import Image, UnidentifiedImageError
@@ -14,20 +14,18 @@ from remember_me.compat.ombre_brain import MAX_IMAGE_PIXELS, MAX_UPLOAD_BYTES
 from remember_me_core_adapter import (
     RememberMeCoreAdapterError,
 )
-
-
-class RememberMeDownloadLinkCollaborator(Protocol):
-    """OB-owned Ticket and URL creation seam."""
-
-    def create_download_link(
-        self,
-        asset: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        """Return the existing OB download-link payload."""
+from remember_me_download_links import (
+    RememberMeDownloadLinkCollaborator,
+    RememberMeDownloadLinkError,
+)
 
 
 class RememberMeMcpCompatibilityPresenterError(RuntimeError):
     """Configuration error that contains no host or asset details."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class RememberMeMcpCompatibilityPresenter:
@@ -41,7 +39,7 @@ class RememberMeMcpCompatibilityPresenter:
         required = (
             "get",
             "get_ob_public_metadata",
-            "update_metadata",
+            "update_ob_public_metadata",
             "resolve_blob",
         )
         if core_adapter is None or not all(
@@ -79,20 +77,25 @@ class RememberMeMcpCompatibilityPresenter:
     ) -> str:
         """Preserve OB omission, null, empty-string, and empty-tag semantics."""
         try:
-            self._core.update_metadata(
+            asset = self._core.update_ob_public_metadata(
                 asset_id,
                 title=title,
                 description=description,
                 tags=tags,
             )
-            asset = self._core.get_ob_public_metadata(asset_id)
         except RememberMeCoreAdapterError as exc:
             return _json_error(
                 _metadata_error_code(exc.ob_code or exc.code)
             )
-        if asset is None:
+        except Exception:
             return _json_error("asset_unavailable")
-        return _json_success(asset)
+        normalized = _normalize_public_metadata(asset)
+        if normalized is None:
+            return _json_error("asset_unavailable")
+        try:
+            return _json_success(normalized)
+        except Exception:
+            return _json_error("asset_unavailable")
 
     def rm_asset_download_link(self, asset_id: str) -> str:
         """Confirm the asset through RM, then delegate OB Ticket and URL work."""
@@ -102,17 +105,9 @@ class RememberMeMcpCompatibilityPresenter:
             return _json_error("asset_unavailable")
         if asset is None:
             return _json_error("asset_unavailable")
-        try:
-            payload = self._download_links.create_download_link(asset)
-        except RememberMeMcpCompatibilityPresenterError as exc:
-            return _json_error(_download_error_code(str(exc)))
-        if not isinstance(payload, Mapping):
-            return _json_error("download_unavailable")
-        normalized = dict(payload)
-        if normalized.get("ok") is not True:
-            return _json_error(
-                _download_error_code(normalized.get("error", ""))
-            )
+        normalized = self._create_download_payload(asset)
+        if isinstance(normalized, str):
+            return _json_error(normalized)
         return json.dumps(
             normalized,
             ensure_ascii=False,
@@ -244,15 +239,26 @@ class RememberMeMcpCompatibilityPresenter:
             asset = self._core.get_ob_public_metadata(asset_id)
             if asset is None:
                 return None
+        except Exception:
+            return None
+        payload = self._create_download_payload(asset)
+        if isinstance(payload, str):
+            return None
+        return payload
+
+    def _create_download_payload(
+        self,
+        asset: Mapping[str, Any],
+    ) -> dict[str, Any] | str:
+        try:
             payload = self._download_links.create_download_link(asset)
-        except (
-            RememberMeCoreAdapterError,
-            RememberMeMcpCompatibilityPresenterError,
-        ):
-            return None
-        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
-            return None
-        return dict(payload)
+            return _normalize_download_payload(payload)
+        except RememberMeDownloadLinkError as exc:
+            return _download_error_code(exc.code)
+        except RememberMeMcpCompatibilityPresenterError as exc:
+            return _download_error_code(exc.code)
+        except Exception:
+            return "download_unavailable"
 
 
 def _json_error(error: str) -> str:
@@ -290,6 +296,77 @@ def _download_error_code(code: Any) -> str:
     if code == "download_store_full":
         return "download_store_full"
     return "download_unavailable"
+
+
+_OB_PUBLIC_METADATA_KEYS = (
+    "asset_id",
+    "source_sha256",
+    "stored_sha256",
+    "decoded_bytes",
+    "stored_bytes",
+    "mime_type",
+    "filename",
+    "kind",
+    "width",
+    "height",
+    "created_at",
+    "title",
+    "description",
+    "tags",
+    "updated_at",
+)
+
+_DOWNLOAD_PAYLOAD_KEYS = (
+    "asset_id",
+    "filename",
+    "mime_type",
+    "stored_bytes",
+    "stored_sha256",
+    "download_path",
+    "download_url",
+    "expires_in_seconds",
+)
+
+
+def _normalize_public_metadata(asset: Any) -> dict[str, Any] | None:
+    if not isinstance(asset, Mapping):
+        return None
+    try:
+        return {key: asset[key] for key in _OB_PUBLIC_METADATA_KEYS}
+    except Exception:
+        return None
+
+
+def _normalize_download_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise RememberMeDownloadLinkError("download_unavailable")
+    try:
+        if payload["ok"] is not True:
+            raise RememberMeDownloadLinkError(payload.get("error", ""))
+        normalized = {
+            key: payload[key] for key in _DOWNLOAD_PAYLOAD_KEYS
+        }
+        if (
+            not isinstance(normalized["asset_id"], str)
+            or not isinstance(normalized["filename"], str)
+            or not isinstance(normalized["mime_type"], str)
+            or not isinstance(normalized["stored_bytes"], int)
+            or isinstance(normalized["stored_bytes"], bool)
+            or not isinstance(normalized["stored_sha256"], str)
+            or not isinstance(normalized["download_path"], str)
+            or not normalized["download_path"]
+            or not isinstance(normalized["download_url"], str)
+            or not isinstance(normalized["expires_in_seconds"], int)
+            or isinstance(normalized["expires_in_seconds"], bool)
+        ):
+            raise RememberMeDownloadLinkError("download_unavailable")
+    except RememberMeDownloadLinkError:
+        raise
+    except Exception as exc:
+        raise RememberMeDownloadLinkError(
+            "download_unavailable"
+        ) from exc
+    return {"ok": True, **normalized}
 
 
 def _flat_image_metadata(asset: Mapping[str, Any]) -> dict:

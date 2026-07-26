@@ -139,12 +139,44 @@ class RememberMeCoreAdapter:
         description: str | None = None,
         tags: list[str] | tuple[str, ...] | None = None,
     ) -> dict:
+        asset = self._update_metadata_asset(
+            asset_id,
+            title=title,
+            description=description,
+            tags=tags,
+        )
+        return self._asset_dict(asset)
+
+    def update_ob_public_metadata(
+        self,
+        asset_id: str,
+        title: str | None = None,
+        description: str | None = None,
+        tags: list[str] | tuple[str, ...] | None = None,
+    ) -> dict:
+        """Mutate once and return the current OB public metadata shape."""
+        asset = self._update_metadata_asset(
+            asset_id,
+            title=title,
+            description=description,
+            tags=tags,
+        )
+        return self._ob_public_metadata(asset)
+
+    def _update_metadata_asset(
+        self,
+        asset_id: str,
+        *,
+        title: str | None,
+        description: str | None,
+        tags: list[str] | tuple[str, ...] | None,
+    ) -> Any:
         self._require_asset_id(asset_id)
         try:
             clean_tags = (
                 None if tags is None else self._tag_tuple(tags)
             )
-            asset = self._runtime.service.update_metadata(
+            return self._runtime.service.update_metadata(
                 UpdateMetadataRequest(
                     asset_id=asset_id.strip(),
                     title=title,
@@ -152,7 +184,6 @@ class RememberMeCoreAdapter:
                     tags=clean_tags,
                 )
             )
-            return self._asset_dict(asset)
         except Exception as exc:
             self._raise_mapped(exc)
 

@@ -114,6 +114,20 @@ class FakeCoreAdapter:
             self.metadata["tags"] = list(tags)
         return deepcopy(self.metadata)
 
+    def update_ob_public_metadata(
+        self,
+        asset_id,
+        title=None,
+        description=None,
+        tags=None,
+    ):
+        return self.update_metadata(
+            asset_id,
+            title=title,
+            description=description,
+            tags=tags,
+        )
+
     def resolve_blob(self, asset_id):
         if self.error:
             raise RememberMeCoreAdapterError(self.error)

@@ -132,10 +132,40 @@ Dashboard, CSRF, Viewer metadata, branding, Ticket stores, URL rules,
 `EmbeddingEngine`, `AssetEmbeddingIndex`, dependencies, schema, or Render.
 There is no production Presenter caller.
 
-Stage 8E may build an explicit host collaborator and acceptance harness for
-one tool at a time. It still must not combine a tool-contract change, data
-format change, and runtime switch. Reverting the Stage 8D Presenter, its tests,
-the narrow Core Adapter addition, and this section fully rolls back this stage.
+Stage 8E hardens the host collaborator and acceptance harness while keeping
+them unwired. Production wiring remains deferred to Stage 8F and still must not
+combine a tool-contract change, data format change, and runtime switch.
+Reverting the Stage 8D Presenter, its tests, the narrow Core Adapter addition,
+and this section fully rolls back this stage.
+
+## Stage 8E Presenter hardening
+
+Stage 8E removes the post-mutation read from the compatibility path for
+`rm_asset_update_metadata`. `RememberMeCoreAdapter.update_ob_public_metadata()`
+performs one Remember-Me mutation and converts the returned asset directly into
+the existing OB public metadata shape. The older `update_metadata()` adapter
+contract remains unchanged for Stage 8C callers.
+
+`remember_me_download_links.py` adds a real but still unwired
+`RememberMeObDownloadLinkCollaborator`. Its Ticket store, lock, clock, token
+factory, public base URL, TTL, and capacity are explicit constructor
+dependencies. It preserves the current five-minute Ticket payload and store
+shape, URL-safe token constraints, and observable filename sanitizing,
+extension, and 180-character truncation behavior. Invalid origins produce an
+empty `download_url`; unknown collaborator failures are reduced to
+`download_unavailable` without returning exception text or host details.
+
+The collaborator and Presenter remain test-only boundaries. Stage 8E does not
+modify `server.py`, MCP registration or tool schemas, the Viewer, Dashboard,
+authentication, routes, Ticket globals, legacy `AssetStore`, or any production
+startup path. There is no production caller, second writer, feature flag, or
+runtime switch.
+
+Production wiring is deferred to Stage 8F. Before that wiring can be accepted,
+the collaborator must receive the same download Ticket store and lock consumed
+by the existing download route; creating an isolated second store would yield
+links that the route cannot redeem. Reverting the Stage 8E adapter,
+collaborator, tests, and this section fully rolls back this hardening stage.
 
 The safe MCP snapshots in `tests/fixtures/` record both nine-tool surfaces
 separately. They deliberately preserve the current output-envelope, annotation,
