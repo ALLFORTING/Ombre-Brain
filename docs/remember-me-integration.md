@@ -51,6 +51,33 @@ Production data must still be copied and accepted offline before any future
 first connection. Stage 8B never reads a real buckets directory, database, or
 image.
 
+## Stage 8C Core shadow baseline
+
+Stage 8C adds `remember_me_core_adapter.py`, a thin compatibility boundary over
+the pinned public Remember-Me Core. It translates public Core DTOs and errors
+into path-free Ombre-Brain structures without exposing source or stored hashes,
+blob keys, relative paths, the data root, or database paths.
+
+The adapter has no production caller. It is not imported by `server.py`, the
+Dashboard, MCP registration, Viewer, transfer routes, authentication, or any
+startup path. Production continues to use only the legacy `AssetStore`; there
+is no automatic double write, background shadow task, telemetry, production
+feature flag, second process, or second port. Vector search and embedding
+reindex remain owned by the existing Ombre-Brain implementation.
+
+Synthetic PNG and JPEG fixtures run the same business scenarios against
+isolated legacy and Remember-Me temporary data roots. The shadow tests compare
+privacy-cleaned bytes, stored hashes and relative paths internally, while
+normalizing asset IDs and seconds-precision UTC timestamps at the compatibility
+boundary. They also exercise sequential cross-runtime reopen behavior. The
+tests never use a real `buckets_dir`, and legacy and Remember-Me writers are
+never held open on the same data root.
+
+Stage 8D may add a per-tool compatibility presenter after separately accepting
+the preserved MCP snapshots. Stage 8C does not change either nine-tool
+contract. Its rollback is to revert the Stage 8C adapter, tests, and this
+section; no data or runtime switch is involved.
+
 The safe MCP snapshots in `tests/fixtures/` record both nine-tool surfaces
 separately. They deliberately preserve the current output-envelope, annotation,
 Viewer metadata, and Ticket differences for a future Stage 8D compatibility
