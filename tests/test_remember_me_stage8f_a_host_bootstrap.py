@@ -129,6 +129,7 @@ def test_factory_validation_fails_closed_without_details(tmp_path, kwargs):
     params = {
         "data_root": tmp_path / "runtime",
         "token_store": {},
+        "ticket_source_store": {},
         "download_lock": threading.Lock(),
         "public_base_url": "",
         "ttl_seconds": 300,
@@ -144,10 +145,12 @@ def test_factory_validation_fails_closed_without_details(tmp_path, kwargs):
 
 def test_factory_creates_bundle_and_shares_ticket_store_and_lock(tmp_path):
     token_store = {}
+    source_store = {}
     lock = CountingLock()
     bundle = create_remember_me_host_bundle(
         data_root=tmp_path / "runtime",
         token_store=token_store,
+        ticket_source_store=source_store,
         download_lock=lock,
         public_base_url="",
         ttl_seconds=300,
@@ -160,6 +163,7 @@ def test_factory_creates_bundle_and_shares_ticket_store_and_lock(tmp_path):
     assert bundle.presenter is not None
     assert bundle.host_adapter is bundle.core_adapter._host_adapter
     assert bundle.download_links._token_store is token_store
+    assert bundle.download_links._ticket_source_store is source_store
     assert bundle.download_links._lock is lock
     assert bundle.download_links._ttl_seconds == 300
     assert bundle.download_links._max_tokens == 100
@@ -176,6 +180,7 @@ def test_factory_creates_bundle_and_shares_ticket_store_and_lock(tmp_path):
     token = ticket["download_path"].rsplit("/", 1)[-1]
 
     assert token in token_store
+    assert source_store[token] == "remember_me"
     assert set(token_store[token]) == {"asset_id", "expires_at", "get_count"}
     assert token_store[token]["asset_id"] == ASSET_ID
     assert token_store[token]["get_count"] == 0
@@ -185,6 +190,7 @@ def test_factory_creates_bundle_and_shares_ticket_store_and_lock(tmp_path):
         create_remember_me_host_bundle(
             data_root=tmp_path / "runtime",
             token_store={},
+            ticket_source_store={},
             download_lock=threading.Lock(),
             public_base_url="",
             ttl_seconds=300,
@@ -259,6 +265,7 @@ print(json.dumps({
     "bundle_created": bundle is not None,
     "runtime_created": bundle.host_adapter.runtime_created,
     "same_store": links._token_store is server._rm_asset_download_tokens,
+    "same_source_store": links._ticket_source_store is server._rm_asset_download_sources,
     "same_lock": links._lock is server._rm_asset_download_lock,
     "ttl": links._ttl_seconds,
     "max_tokens": links._max_tokens,
@@ -273,6 +280,7 @@ print(json.dumps({
     assert payload["bundle_created"] is True
     assert payload["runtime_created"] is True
     assert payload["same_store"] is True
+    assert payload["same_source_store"] is True
     assert payload["same_lock"] is True
     assert payload["ttl"] == payload["server_ttl"] == 300
     assert payload["max_tokens"] == payload["server_max_tokens"] == 100

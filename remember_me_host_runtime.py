@@ -24,6 +24,7 @@ def create_remember_me_host_bundle(
     *,
     data_root: Path,
     token_store: MutableMapping[str, dict[str, Any]],
+    ticket_source_store: MutableMapping[str, str],
     download_lock: Any,
     public_base_url: str | Callable[[], str],
     ttl_seconds: int,
@@ -33,6 +34,7 @@ def create_remember_me_host_bundle(
         _validate_inputs(
             data_root=data_root,
             token_store=token_store,
+            ticket_source_store=ticket_source_store,
             download_lock=download_lock,
             public_base_url=public_base_url,
             ttl_seconds=ttl_seconds,
@@ -55,6 +57,7 @@ def create_remember_me_host_bundle(
         )
         download_links = RememberMeObDownloadLinkCollaborator(
             token_store=token_store,
+            ticket_source_store=ticket_source_store,
             lock=download_lock,
             public_base_url=public_base_url,
             ttl_seconds=ttl_seconds,
@@ -82,6 +85,7 @@ def _validate_inputs(
     *,
     data_root: Path,
     token_store: MutableMapping[str, dict[str, Any]],
+    ticket_source_store: MutableMapping[str, str],
     download_lock: Any,
     public_base_url: str | Callable[[], str],
     ttl_seconds: int,
@@ -90,6 +94,8 @@ def _validate_inputs(
     if not isinstance(data_root, Path) or not data_root.is_absolute():
         _fail()
     if not isinstance(token_store, MutableMapping):
+        _fail()
+    if not isinstance(ticket_source_store, MutableMapping):
         _fail()
     if not all(
         callable(getattr(download_lock, name, None))

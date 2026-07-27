@@ -2112,6 +2112,7 @@ _rm_asset_uploads = {}
 _rm_asset_upload_tokens = {}
 _rm_asset_upload_lock = threading.Lock()
 _rm_asset_download_tokens = {}
+_rm_asset_download_sources = {}
 _rm_asset_download_lock = threading.Lock()
 ASSET_VISION_WIDTH = 256
 ASSET_VISION_HEIGHT = 256
@@ -2908,10 +2909,19 @@ def _rm_asset_result_page(result: dict) -> str:
 <body><h1>Asset stored</h1><p>asset_id: <code>{html.escape(result["asset_id"])}</code></p><p>stored_sha256: <code>{html.escape(result["stored_sha256"])}</code></p><p>stored_bytes: {result["stored_bytes"]}</p><p>deduplicated: {str(result["deduplicated"]).lower()}</p></body></html>"""
 
 
+def _rm_retire_asset_download_locked(token: str) -> None:
+    _rm_asset_download_tokens.pop(token, None)
+    _rm_asset_download_sources.pop(token, None)
+
+
 def _rm_cleanup_asset_downloads(now: float) -> None:
-    expired = [token for token, item in _rm_asset_download_tokens.items() if item["expires_at"] <= now]
+    expired = [
+        token
+        for token, item in _rm_asset_download_tokens.items()
+        if item["expires_at"] <= now
+    ]
     for token in expired:
-        _rm_asset_download_tokens.pop(token, None)
+        _rm_retire_asset_download_locked(token)
 
 
 def _rm_safe_download_filename(asset: dict) -> str:
@@ -2922,6 +2932,25 @@ def _rm_safe_download_filename(asset: dict) -> str:
     elif extension and not name.lower().endswith(extension.lower()):
         name += extension
     return name[:180]
+
+
+def _rm_store_asset_download_ticket_locked(
+    token: str,
+    asset_id: str,
+    expires_at: float,
+    source: str,
+) -> bool:
+    try:
+        _rm_asset_download_tokens[token] = {
+            "asset_id": asset_id,
+            "expires_at": expires_at,
+            "get_count": 0,
+        }
+        _rm_asset_download_sources[token] = source
+        return True
+    except Exception:
+        _rm_retire_asset_download_locked(token)
+        return False
 
 
 def _rm_create_asset_download_link(asset_id: str, now: float | None = None) -> str:
@@ -2938,11 +2967,13 @@ def _rm_create_asset_download_link(asset_id: str, now: float | None = None) -> s
             token = secrets.token_urlsafe(32)
             if token not in _rm_asset_download_tokens:
                 break
-        _rm_asset_download_tokens[token] = {
-            "asset_id": asset["asset_id"],
-            "expires_at": current + RM_ASSET_DOWNLOAD_TTL_SECONDS,
-            "get_count": 0,
-        }
+        if not _rm_store_asset_download_ticket_locked(
+            token,
+            asset["asset_id"],
+            current + RM_ASSET_DOWNLOAD_TTL_SECONDS,
+            "legacy",
+        ):
+            return _asset_ingest_response(False, error="download_unavailable")
     download_path = f"/rm/asset-download/{token}"
     base_url = _asset_public_base_url()
     return _json_lib.dumps({
@@ -2958,7 +2989,35 @@ def _rm_create_asset_download_link(asset_id: str, now: float | None = None) -> s
     }, ensure_ascii=False, sort_keys=True)
 
 
-def _rm_read_asset_download(token: str, method: str, now: float | None = None) -> tuple[dict, Path, dict] | None:
+def _rm_asset_download_headers(asset: dict, filename: str) -> dict:
+    return {
+        "Content-Type": asset["mime_type"],
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Length": str(asset["stored_bytes"]),
+    }
+
+
+def _rm_resolve_asset_download_body(asset_id: str, source: str) -> tuple[dict, Path | bytes, str] | None:
+    if source == "legacy":
+        resolved = asset_store.resolve_file(asset_id)
+        if not resolved:
+            return None
+        asset, path = resolved
+        return asset, path, _rm_safe_download_filename(asset)
+    if source == "remember_me":
+        if remember_me_host_bundle is None:
+            return None
+        metadata, content = remember_me_host_bundle.core_adapter.resolve_ob_download(asset_id)
+        from remember_me_download_links import safe_download_filename
+
+        return metadata, content, safe_download_filename(metadata)
+    return None
+
+
+def _rm_read_asset_download(token: str, method: str, now: float | None = None) -> tuple[dict, Path | bytes, dict, str] | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token or ""):
         return None
     current = time.time() if now is None else now
@@ -2967,25 +3026,51 @@ def _rm_read_asset_download(token: str, method: str, now: float | None = None) -
         item = _rm_asset_download_tokens.get(token)
         if not item:
             return None
-        resolved = asset_store.resolve_file(item["asset_id"])
-        if not resolved:
-            _rm_asset_download_tokens.pop(token, None)
+        source = _rm_asset_download_sources.get(token, "legacy")
+        if source not in {"legacy", "remember_me"}:
+            _rm_retire_asset_download_locked(token)
             return None
-        asset, path = resolved
+        asset_id = item["asset_id"]
+
+    try:
+        resolved = _rm_resolve_asset_download_body(asset_id, source)
+    except Exception:
+        resolved = None
+    if resolved is None:
+        with _rm_asset_download_lock:
+            item = _rm_asset_download_tokens.get(token)
+            if item and item.get("asset_id") == asset_id:
+                _rm_retire_asset_download_locked(token)
+        return None
+
+    asset, body, filename = resolved
+    if isinstance(body, Path):
+        body_source = "legacy"
+    elif isinstance(body, bytes):
+        body_source = "remember_me"
+    else:
+        with _rm_asset_download_lock:
+            _rm_retire_asset_download_locked(token)
+        return None
+    if body_source != source:
+        with _rm_asset_download_lock:
+            _rm_retire_asset_download_locked(token)
+        return None
+    headers = _rm_asset_download_headers(asset, filename)
+
+    final = time.time() if now is None else now
+    with _rm_asset_download_lock:
+        _rm_cleanup_asset_downloads(final)
+        item = _rm_asset_download_tokens.get(token)
+        if not item or item.get("asset_id") != asset_id:
+            return None
+        if _rm_asset_download_sources.get(token, "legacy") != source:
+            return None
         if method.upper() == "GET":
             if item["get_count"] >= RM_ASSET_DOWNLOAD_MAX_GETS:
                 return None
             item["get_count"] += 1
-        headers = {
-            "Content-Type": asset["mime_type"],
-            "Content-Disposition": f'attachment; filename="{_rm_safe_download_filename(asset)}"',
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-            "Content-Length": str(asset["stored_bytes"]),
-        }
-        return asset, path, headers
-
+        return asset, body, headers, source
 
 def _rm_asset_view_error(error: str) -> CallToolResult:
     messages = {
@@ -3299,6 +3384,7 @@ def _bootstrap_remember_me_host():
         bundle = create_remember_me_host_bundle(
             data_root=data_root,
             token_store=_rm_asset_download_tokens,
+            ticket_source_store=_rm_asset_download_sources,
             download_lock=_rm_asset_download_lock,
             public_base_url=_asset_public_base_url,
             ttl_seconds=RM_ASSET_DOWNLOAD_TTL_SECONDS,
@@ -3938,10 +4024,12 @@ async def rm_asset_download_route(request):
     )
     if result is None:
         return Response(status_code=404, headers=_asset_browser_security_headers())
-    _, path, headers = result
+    _, body, headers, source = result
     if request.method.upper() == "HEAD":
         return Response(content=b"", headers=headers)
-    return FileResponse(path, media_type=headers["Content-Type"], headers=headers)
+    if source == "legacy":
+        return FileResponse(body, media_type=headers["Content-Type"], headers=headers)
+    return Response(content=body, media_type=headers["Content-Type"], headers=headers)
 
 @diagnostic_tool()
 async def asset_render_probe() -> CallToolResult:

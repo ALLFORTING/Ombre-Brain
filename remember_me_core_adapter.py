@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import re
 from typing import Any
@@ -236,6 +237,24 @@ class RememberMeCoreAdapter:
             )
             content = self._runtime.blob_store.read(resolved.blob_key)
             return self._asset_dict(resolved.asset), content
+        except Exception as exc:
+            self._raise_mapped(exc)
+
+    def resolve_ob_download(self, asset_id: str) -> tuple[dict, bytes]:
+        self._require_asset_id(asset_id)
+        try:
+            resolved = self._runtime.service.resolve_asset(
+                ResolveAssetRequest(asset_id.strip())
+            )
+            content = self._runtime.blob_store.read(resolved.blob_key)
+            metadata = self._ob_public_metadata(resolved.asset)
+            if not isinstance(content, bytes):
+                raise RememberMeCoreAdapterError("repository_failure")
+            if len(content) != metadata["stored_bytes"]:
+                raise RememberMeCoreAdapterError("repository_failure")
+            if hashlib.sha256(content).hexdigest() != metadata["stored_sha256"]:
+                raise RememberMeCoreAdapterError("repository_failure")
+            return metadata, bytes(content)
         except Exception as exc:
             self._raise_mapped(exc)
 

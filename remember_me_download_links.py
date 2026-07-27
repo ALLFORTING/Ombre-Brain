@@ -54,6 +54,7 @@ class RememberMeObDownloadLinkCollaborator:
         lock: Any = None,
         clock: Callable[[], float] = time.time,
         token_factory: Callable[[], str] | None = None,
+        ticket_source_store: MutableMapping[str, str] | None = None,
         public_base_url: str | Callable[[], str] = "",
         ttl_seconds: int = 300,
         max_tokens: int = 100,
@@ -67,9 +68,14 @@ class RememberMeObDownloadLinkCollaborator:
             or isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
             or max_tokens <= 0
+            or (
+                ticket_source_store is not None
+                and not isinstance(ticket_source_store, MutableMapping)
+            )
         ):
             raise RememberMeDownloadLinkError("download_unavailable")
         self._token_store = token_store if token_store is not None else {}
+        self._ticket_source_store = ticket_source_store
         self._lock = lock if lock is not None else threading.Lock()
         self._clock = clock
         self._token_factory = token_factory or (
@@ -96,11 +102,19 @@ class RememberMeObDownloadLinkCollaborator:
                         "download_store_full"
                     )
                 token = self._new_token()
-                self._token_store[token] = {
-                    "asset_id": fields["asset_id"],
-                    "expires_at": current + self._ttl_seconds,
-                    "get_count": 0,
-                }
+                try:
+                    self._token_store[token] = {
+                        "asset_id": fields["asset_id"],
+                        "expires_at": current + self._ttl_seconds,
+                        "get_count": 0,
+                    }
+                    if self._ticket_source_store is not None:
+                        self._ticket_source_store[token] = "remember_me"
+                except Exception:
+                    self._token_store.pop(token, None)
+                    if self._ticket_source_store is not None:
+                        self._ticket_source_store.pop(token, None)
+                    raise
             download_path = f"{_DOWNLOAD_PATH_PREFIX}{token}"
             return {
                 "ok": True,
@@ -130,6 +144,8 @@ class RememberMeObDownloadLinkCollaborator:
         ]
         for token in expired:
             self._token_store.pop(token, None)
+            if self._ticket_source_store is not None:
+                self._ticket_source_store.pop(token, None)
 
     def _new_token(self) -> str:
         for _ in range(_MAX_TOKEN_ATTEMPTS):

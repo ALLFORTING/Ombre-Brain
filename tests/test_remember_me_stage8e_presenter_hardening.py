@@ -671,16 +671,14 @@ def test_known_download_store_full_error_is_preserved():
 
 def test_stage8e_modules_remain_outside_production_import_paths():
     root = Path(__file__).resolve().parent.parent
-    forbidden_imports = (
-        "remember_me_mcp_presenter",
-        "remember_me_download_links",
-    )
+    server_source = (root / "server.py").read_text(encoding="utf-8")
+    assert "remember_me_mcp_presenter" not in server_source
+
     for relative in (
-        "server.py",
         "asset_dashboard.py",
         "asset_viewer.py",
         "asset_embedding_index.py",
     ):
         source = (root / relative).read_text(encoding="utf-8")
-        for module_name in forbidden_imports:
-            assert module_name not in source
+        assert "remember_me_mcp_presenter" not in source
+        assert "remember_me_download_links" not in source

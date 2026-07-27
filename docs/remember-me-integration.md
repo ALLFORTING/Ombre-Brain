@@ -207,6 +207,37 @@ download route, touch Dashboard, Viewer, embedding search, Render, or real
 production data. Rollback is to remove the host bootstrap module, the `server.py`
 bootstrap assignment, tests, and this documentation.
 
+## Stage 8F-B Download Resolver Abstraction
+
+Stage 8F-B keeps the public download Ticket shape frozen at the same three
+fields: `asset_id`, `expires_at`, and `get_count`. It adds only an in-process
+source side table keyed by token. That table is guarded by the same download
+lock, accepts only `legacy` or `remember_me`, and is never persisted or exposed
+through MCP payloads, HTTP headers, logs, structured content, Dashboard, Viewer,
+database rows, or files.
+
+The `/rm/asset-download/{token}` route now resolves a Ticket according to that
+internal source. A legacy Ticket can only use the existing `AssetStore` file
+resolver. A Remember-Me Ticket can only use the Stage 8F-A host bundle's Core
+Adapter to resolve clean bytes from Remember-Me Core. Missing legacy source rows
+remain compatible and are treated as legacy. Unknown source rows fail closed and
+retire the Ticket. There is no fallback across sources: RM failures do not try
+`AssetStore`, and legacy failures do not try Remember-Me Core.
+
+Default-off production behavior remains the same because the public MCP
+`rm_asset_download_link` handler still creates legacy Tickets, `rm_asset_view`
+still calls the legacy helper, and all nine image handlers continue to use the
+old implementations. The upload route, Dashboard, Viewer, and embedding index
+also remain on the old `AssetStore` path. The RM route capability can currently
+be accepted only through isolated tests or a bundle-created internal RM Ticket;
+no user-facing handler has switched to the Presenter.
+
+Stage 8F-C may consider switching the first read-only handler after this route
+resolver is accepted. Rollback is to remove the source side table, restore the
+single legacy download resolver, remove `resolve_ob_download()`, remove the
+collaborator source-store injection, and revert the Stage 8F-B tests and this
+documentation. No data migration, double write, sync, Render change, or
+production data access is involved.
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed
