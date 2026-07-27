@@ -3873,48 +3873,53 @@ async def rm_asset_viewer_resource() -> str:
 @mcp.tool(meta=ASSET_VIEWER_TOOL_META)
 async def rm_asset_view(asset_id: str) -> CallToolResult:
     """Display one cleaned Remember-Me image inline with a signed-link fallback."""
-    verified = _rm_verified_view_image(asset_id)
-    if isinstance(verified, str):
-        return _rm_asset_view_error(verified)
-    asset, data = verified
+    if remember_me_host_bundle is None:
+        verified = _rm_verified_view_image(asset_id)
+        if isinstance(verified, str):
+            return _rm_asset_view_error(verified)
+        asset, data = verified
+        try:
+            download = _json_lib.loads(_rm_create_asset_download_link(asset["asset_id"]))
+        except (TypeError, ValueError, _json_lib.JSONDecodeError):
+            return _rm_asset_view_error("download_unavailable")
+        if not download.get("ok"):
+            return _rm_asset_view_error("download_unavailable")
+        fallback_url = download.get("download_url") or download.get("download_path")
+        title = asset.get("title") or asset["original_filename"]
+        structured = {
+            "asset_id": asset["asset_id"],
+            "title": asset.get("title", ""),
+            "filename": asset["original_filename"],
+            "mime_type": asset["mime_type"],
+            "width": asset["width"],
+            "height": asset["height"],
+            "tags": asset.get("tags", []),
+            "stored_bytes": asset["stored_bytes"],
+        }
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Remember-Me image: {title}\n"
+                        "If this client does not display the inline viewer, use this "
+                        f"short-lived download link: {fallback_url}"
+                    ),
+                )
+            ],
+            structuredContent=structured,
+            _meta={
+                "rememberMe": {
+                    "schemaVersion": 1,
+                    "imageBase64": base64.b64encode(data).decode("ascii"),
+                    "mimeType": asset["mime_type"],
+                }
+            },
+        )
     try:
-        download = _json_lib.loads(_rm_create_asset_download_link(asset["asset_id"]))
-    except (TypeError, ValueError, _json_lib.JSONDecodeError):
-        return _rm_asset_view_error("download_unavailable")
-    if not download.get("ok"):
-        return _rm_asset_view_error("download_unavailable")
-    fallback_url = download.get("download_url") or download.get("download_path")
-    title = asset.get("title") or asset["original_filename"]
-    structured = {
-        "asset_id": asset["asset_id"],
-        "title": asset.get("title", ""),
-        "filename": asset["original_filename"],
-        "mime_type": asset["mime_type"],
-        "width": asset["width"],
-        "height": asset["height"],
-        "tags": asset.get("tags", []),
-        "stored_bytes": asset["stored_bytes"],
-    }
-    return CallToolResult(
-        content=[
-            TextContent(
-                type="text",
-                text=(
-                    f"Remember-Me image: {title}\n"
-                    "If this client does not display the inline viewer, use this "
-                    f"short-lived download link: {fallback_url}"
-                ),
-            )
-        ],
-        structuredContent=structured,
-        _meta={
-            "rememberMe": {
-                "schemaVersion": 1,
-                "imageBase64": base64.b64encode(data).decode("ascii"),
-                "mimeType": asset["mime_type"],
-            }
-        },
-    )
+        return remember_me_host_bundle.presenter.rm_asset_view(asset_id)
+    except Exception:
+        return _rm_asset_view_error("image_unavailable")
 
 @mcp.tool()
 async def rm_asset_inspect(asset_id: str) -> CallToolResult:

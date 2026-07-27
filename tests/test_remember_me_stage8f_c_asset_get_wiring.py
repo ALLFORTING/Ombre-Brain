@@ -284,7 +284,6 @@ def test_public_contracts_and_stage8fb_isolation_remain(tmp_path):
         "rm_asset_update_metadata",
         "rm_asset_search",
         "rm_asset_reindex_embeddings",
-        "rm_asset_view",
         "rm_asset_inspect",
     ):
         start = server_text.index(f"async def {handler}")
@@ -299,7 +298,10 @@ def test_public_contracts_and_stage8fb_isolation_remain(tmp_path):
     assert "return _rm_create_asset_download_link(asset_id)" in server_text
     view_start = server_text.index("async def rm_asset_view(")
     inspect_start = server_text.index("async def rm_asset_inspect")
-    assert "_rm_verified_view_image" in server_text[view_start:inspect_start]
+    view_block = server_text[view_start:inspect_start]
+    assert "remember_me_host_bundle.presenter.rm_asset_view" in view_block
+    assert "_rm_verified_view_image" in view_block
+    assert "_rm_create_asset_download_link" in view_block
     assert "asset_store.persist_upload" in server_text
     assert server_text.count("@mcp.custom_route") == 37
     assert "OMBRE_RM_DOWNLOAD" not in server_text

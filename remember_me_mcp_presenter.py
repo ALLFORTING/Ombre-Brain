@@ -135,7 +135,16 @@ class RememberMeMcpCompatibilityPresenter:
         if isinstance(verified, str):
             return _image_error(verified, inspect=False)
         asset, data = verified
-        download = self._download_payload(asset_id)
+        try:
+            encoded = base64.b64encode(data).decode("ascii")
+            structured = _flat_image_metadata(asset)
+            title = asset.get("title") or asset["original_filename"]
+        except Exception:
+            return _image_error("image_unavailable", inspect=False)
+        download = self._download_payload(
+            asset_id,
+            expected_asset=asset,
+        )
         if download is None:
             return _image_error("download_unavailable", inspect=False)
         fallback_url = (
@@ -144,7 +153,6 @@ class RememberMeMcpCompatibilityPresenter:
         )
         if not isinstance(fallback_url, str) or not fallback_url:
             return _image_error("download_unavailable", inspect=False)
-        title = asset.get("title") or asset["original_filename"]
         return CallToolResult(
             content=[
                 TextContent(
@@ -157,11 +165,11 @@ class RememberMeMcpCompatibilityPresenter:
                     ),
                 )
             ],
-            structuredContent=_flat_image_metadata(asset),
+            structuredContent=structured,
             _meta={
                 "rememberMe": {
                     "schemaVersion": 1,
-                    "imageBase64": base64.b64encode(data).decode("ascii"),
+                    "imageBase64": encoded,
                     "mimeType": asset["mime_type"],
                 }
             },
@@ -207,7 +215,7 @@ class RememberMeMcpCompatibilityPresenter:
         asset_id: str,
     ) -> tuple[dict, bytes] | str:
         try:
-            asset, data = self._core.resolve_blob(asset_id)
+            resolved = self._core.resolve_blob(asset_id)
         except RememberMeCoreAdapterError as exc:
             if exc.code in {
                 "asset_not_found",
@@ -215,50 +223,124 @@ class RememberMeMcpCompatibilityPresenter:
                 "invalid_asset_id",
             }:
                 return "asset_unavailable"
+            if exc.code == "pixel_limit":
+                return "image_too_large"
             return "image_unavailable"
-        if asset.get("kind") != "image":
-            return "asset_not_image"
-        mime_type = asset.get("mime_type")
-        if mime_type not in {"image/jpeg", "image/png"}:
-            return "invalid_image_mime"
-        if (
-            not isinstance(data, bytes)
-            or not data
-            or len(data) != asset.get("stored_bytes")
-        ):
+        except Exception:
             return "image_unavailable"
-        if len(data) > MAX_UPLOAD_BYTES:
-            return "image_too_large"
         try:
+            if not isinstance(resolved, tuple) or len(resolved) != 2:
+                return "image_unavailable"
+            raw_asset, data = resolved
+            if not isinstance(raw_asset, Mapping):
+                return "image_unavailable"
+            if not isinstance(data, bytes) or not data:
+                return "image_unavailable"
+            normalized = {
+                "asset_id": raw_asset["asset_id"],
+                "original_filename": raw_asset["original_filename"],
+                "mime_type": raw_asset["mime_type"],
+                "kind": raw_asset["kind"],
+                "stored_bytes": raw_asset["stored_bytes"],
+                "width": raw_asset["width"],
+                "height": raw_asset["height"],
+                "title": raw_asset["title"],
+                "tags": raw_asset["tags"],
+            }
+            if (
+                not isinstance(normalized["asset_id"], str)
+                or len(normalized["asset_id"]) != 32
+                or normalized["asset_id"].lower() != normalized["asset_id"]
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in normalized["asset_id"]
+                )
+            ):
+                return "image_unavailable"
+            for key in (
+                "original_filename",
+                "mime_type",
+                "kind",
+                "title",
+            ):
+                if not isinstance(normalized[key], str):
+                    return "image_unavailable"
+            tags = normalized["tags"]
+            if (
+                not isinstance(tags, (list, tuple))
+                or any(not isinstance(tag, str) for tag in tags)
+            ):
+                return "image_unavailable"
+            normalized["tags"] = list(tags)
+            for key in ("stored_bytes", "width", "height"):
+                value = normalized[key]
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
+                ):
+                    return "image_unavailable"
+            if normalized["kind"] != "image":
+                return "asset_not_image"
+            mime_type = normalized["mime_type"]
+            if mime_type not in {"image/jpeg", "image/png"}:
+                return "invalid_image_mime"
+            if len(data) != normalized["stored_bytes"]:
+                return "image_unavailable"
+            if len(data) > MAX_UPLOAD_BYTES:
+                return "image_too_large"
             with Image.open(io.BytesIO(data)) as image:
                 image_format = image.format
                 image_size = image.size
                 image.verify()
         except (OSError, ValueError, UnidentifiedImageError):
             return "image_unavailable"
-        expected_format = (
-            "JPEG" if mime_type == "image/jpeg" else "PNG"
-        )
+        except Exception:
+            return "image_unavailable"
+        expected_format = "JPEG" if mime_type == "image/jpeg" else "PNG"
         if (
             image_format != expected_format
-            or image_size != (asset.get("width"), asset.get("height"))
+            or image_size != (normalized["width"], normalized["height"])
         ):
             return "image_unavailable"
-        return asset, data
+        return normalized, bytes(data)
 
     def _download_payload(
         self,
         asset_id: str,
+        *,
+        expected_asset: Mapping[str, Any] | None = None,
     ) -> dict | None:
         try:
             asset = self._core.get_ob_public_metadata(asset_id)
-            if asset is None:
-                return None
         except Exception:
             return None
-        payload = self._create_download_payload(asset)
+        normalized = _normalize_public_metadata(asset)
+        if normalized is None:
+            return None
+        if expected_asset is not None:
+            try:
+                if (
+                    normalized["asset_id"] != expected_asset["asset_id"]
+                    or normalized["mime_type"] != expected_asset["mime_type"]
+                    or normalized["stored_bytes"] != expected_asset["stored_bytes"]
+                ):
+                    return None
+            except Exception:
+                return None
+        payload = self._create_download_payload(normalized)
         if isinstance(payload, str):
             return None
+        if expected_asset is not None:
+            try:
+                if (
+                    payload["asset_id"] != expected_asset["asset_id"]
+                    or payload["mime_type"] != expected_asset["mime_type"]
+                    or payload["stored_bytes"] != expected_asset["stored_bytes"]
+                ):
+                    return None
+            except Exception:
+                return None
         return payload
 
     def _create_download_payload(

@@ -314,6 +314,59 @@ hardening, Stage 8F-D tests, related static test updates, and this section. No
 data migration, copy, double write, shadow write, sync, Render change, or
 production data access is involved.
 
+## Stage 8F-E Wire rm_asset_view Only
+
+Stage 8F-E switches only the third read-only MCP handler, `rm_asset_view`.
+With the Remember-Me runtime flag absent or disabled, the handler keeps the full
+legacy Viewer behavior: it verifies bytes through the old `AssetStore` path,
+creates the existing legacy fallback download Ticket, preserves the Viewer tool
+metadata and static HTML resource, and ignores any invalid Remember-Me data-root
+configuration without importing or creating the runtime.
+
+When the host runtime is explicitly enabled and bootstrapped, `rm_asset_view`
+uses only the Stage 8F-A bundle Presenter, Core `resolve_blob()` result, Core
+public metadata, and the OB download-link collaborator. The inline image bytes
+come from Remember-Me Core, are base64-encoded into the existing MCP Apps Viewer
+`_meta.rememberMe` envelope, and the fallback Ticket source is `remember_me` in
+the internal side table only. The public Ticket body remains exactly
+`asset_id`, `expires_at`, and `get_count`; the source is not exposed in MCP
+payloads, headers, logs, structured content, Dashboard, Viewer HTML, database
+rows, or files.
+
+The Stage 8F-B download route redeems the Viewer fallback Ticket through the
+Remember-Me resolver and returns the Core-validated bytes. `HEAD` does not
+increase `get_count`; `GET` returns bytes whose SHA-256 matches the asset
+metadata and then increases `get_count`. There is still no fallback across
+sources: enabled Viewer misses, Core failures, malformed image or metadata,
+collaborator failures, source-store write failures, and unexpected exceptions
+return only stable Viewer errors and never call legacy helpers or `AssetStore`.
+
+The Presenter hardening keeps `resolve_blob()`, public metadata lookup, and
+collaborator creation to one call each on the success path. It validates image
+kind, MIME, dimensions, byte length, Pillow format, tags, and public metadata
+without returning paths, blob keys, stored relative paths, data roots, source
+markers, hashes, or exception text in the Viewer contract. Viewer
+`download_store_full` collaborator failures are intentionally flattened to
+`download_unavailable` because the Viewer error contract has no separate store
+capacity code.
+
+At the end of this stage, `rm_asset_get`, `rm_asset_download_link`, and
+`rm_asset_view` are wired. The remaining six image handlers stay on the old
+implementation: `rm_asset_upload_link`, `rm_asset_upload_status`,
+`rm_asset_update_metadata`, `rm_asset_search`, `rm_asset_reindex_embeddings`,
+and `rm_asset_inspect`. `rm_asset_inspect` still uses the legacy verified image
+helper. Upload, Inspect, Search, Update, Reindex, Dashboard, embedding, schema
+snapshots, tool counts, route counts, upload route behavior, Viewer static HTML,
+and Viewer tool meta are otherwise unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is not a complete public migration release because uploads,
+Inspect, Search, Update, Reindex, and embedding remain legacy. Rollback is to
+restore the `rm_asset_view` handler, revert the Presenter hardening, Stage 8F-E
+tests, related static test updates, and this section. No data migration, copy,
+double write, shadow write, sync, Render change, or production data access is
+involved.
+
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed

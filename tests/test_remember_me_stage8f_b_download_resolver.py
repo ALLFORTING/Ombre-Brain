@@ -517,7 +517,6 @@ def test_resolver_lifecycle_and_concurrency(tmp_path, monkeypatch):
 def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     for handler in (
-        "rm_asset_view",
         "rm_asset_upload_link",
         "rm_asset_upload_status",
         "rm_asset_update_metadata",
@@ -533,6 +532,13 @@ def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
         assert "remember_me_host_bundle" not in block
         assert "RememberMeMcpCompatibilityPresenter" not in block
         assert "RememberMeCoreAdapter" not in block
+
+    view_start = server_text.index("async def rm_asset_view(")
+    inspect_start = server_text.index("async def rm_asset_inspect")
+    view_block = server_text[view_start:inspect_start]
+    assert "remember_me_host_bundle.presenter.rm_asset_view" in view_block
+    assert "_rm_verified_view_image" in view_block
+    assert "_rm_create_asset_download_link" in view_block
 
     assert "return _rm_create_asset_download_link(asset_id)" in server_text
     assert "asset_store.persist_upload" in server_text
