@@ -367,6 +367,48 @@ tests, related static test updates, and this section. No data migration, copy,
 double write, shadow write, sync, Render change, or production data access is
 involved.
 
+## Stage 8F-F Wire rm_asset_inspect Only
+
+Stage 8F-F switches only the fourth read-only MCP handler,
+`rm_asset_inspect`. With the Remember-Me runtime flag absent or disabled, the
+handler keeps the full legacy Inspect behavior: it verifies bytes through the
+old `AssetStore` path, applies the existing pixel-count guard, returns the
+same TextContent plus ImageContent contract, and ignores invalid Remember-Me
+data-root configuration without importing or creating the runtime.
+
+When the host runtime is explicitly enabled and bootstrapped,
+`rm_asset_inspect` uses only the Stage 8F-A bundle Presenter and Core
+`resolve_blob()` path. Inspect bytes come from Remember-Me Core, are encoded
+into the existing ImageContent response, and decode exactly to the Core clean
+bytes. Inspect does not query public metadata, does not create a download
+Ticket, does not expose or use a fallback URL, and never falls back to legacy
+helpers in enabled mode.
+
+The Presenter reuses the Stage 8F-E `_verified_image()` hardening for kind,
+MIME, dimensions, byte length, Pillow format, tags, malformed mappings, Core
+adapter errors, and unexpected exceptions. Inspect adds only output-envelope
+hardening around base64 encoding, flattened structured metadata, TextContent,
+ImageContent, and field access; envelope failures return the existing stable
+`image_unavailable` Inspect error without leaking paths, tokens, data roots,
+hashes, bytes, or exception text.
+
+At the end of this stage, `rm_asset_get`, `rm_asset_download_link`,
+`rm_asset_view`, and `rm_asset_inspect` are wired. The remaining five handlers
+stay on the old implementation: `rm_asset_upload_link`,
+`rm_asset_upload_status`, `rm_asset_update_metadata`, `rm_asset_search`, and
+`rm_asset_reindex_embeddings`. Viewer resource HTML, Viewer fallback behavior,
+the Stage 8F-B download route, upload route, Ticket three-field public shape,
+source side table, schema snapshots, tool counts, route counts, Dashboard, and
+embedding behavior are unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is still not a complete public migration release because
+uploads, Search, Update, Reindex, and embedding remain legacy. Rollback is to
+restore the `rm_asset_inspect` handler, revert the Presenter envelope
+hardening, Stage 8F-F tests, related static test updates, and this section. No
+data migration, copy, double write, shadow write, sync, Render change, or
+production data access is involved.
+
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed

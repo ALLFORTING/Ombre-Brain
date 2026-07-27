@@ -388,7 +388,6 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
         "rm_asset_update_metadata",
         "rm_asset_reindex_embeddings",
         "rm_asset_search",
-        "rm_asset_inspect",
         "rm_asset_download_route",
         "rm_asset_upload_route",
     ]

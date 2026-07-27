@@ -3930,48 +3930,53 @@ async def rm_asset_inspect(asset_id: str) -> CallToolResult:
     Never guess image content from metadata. This tool does not update metadata
     or embeddings.
     """
-    verified = _rm_verified_view_image(asset_id)
-    if isinstance(verified, str):
-        return _rm_asset_inspect_error(verified)
-    asset, data = verified
-    width = asset["width"]
-    height = asset["height"]
-    if (
-        width <= 0
-        or height <= 0
-        or width * height > RM_ASSET_MAX_IMAGE_PIXELS
-    ):
-        return _rm_asset_inspect_error("image_too_large")
-    structured = {
-        "asset_id": asset["asset_id"],
-        "title": asset.get("title", ""),
-        "filename": asset["original_filename"],
-        "mime_type": asset["mime_type"],
-        "width": width,
-        "height": height,
-        "tags": asset.get("tags", []),
-        "stored_bytes": asset["stored_bytes"],
-    }
-    encoded = base64.b64encode(data).decode("ascii")
-    return CallToolResult(
-        content=[
-            TextContent(
-                type="text",
-                text=(
-                    f"Remember-Me image asset {asset['asset_id']}; "
-                    f"filename: {asset['original_filename']}; "
-                    f"MIME type: {asset['mime_type']}; "
-                    f"dimensions: {width} x {height}."
+    if remember_me_host_bundle is None:
+        verified = _rm_verified_view_image(asset_id)
+        if isinstance(verified, str):
+            return _rm_asset_inspect_error(verified)
+        asset, data = verified
+        width = asset["width"]
+        height = asset["height"]
+        if (
+            width <= 0
+            or height <= 0
+            or width * height > RM_ASSET_MAX_IMAGE_PIXELS
+        ):
+            return _rm_asset_inspect_error("image_too_large")
+        structured = {
+            "asset_id": asset["asset_id"],
+            "title": asset.get("title", ""),
+            "filename": asset["original_filename"],
+            "mime_type": asset["mime_type"],
+            "width": width,
+            "height": height,
+            "tags": asset.get("tags", []),
+            "stored_bytes": asset["stored_bytes"],
+        }
+        encoded = base64.b64encode(data).decode("ascii")
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Remember-Me image asset {asset['asset_id']}; "
+                        f"filename: {asset['original_filename']}; "
+                        f"MIME type: {asset['mime_type']}; "
+                        f"dimensions: {width} x {height}."
+                    ),
                 ),
-            ),
-            ImageContent(
-                type="image",
-                data=encoded,
-                mimeType=asset["mime_type"],
-            ),
-        ],
-        structuredContent=structured,
-    )
+                ImageContent(
+                    type="image",
+                    data=encoded,
+                    mimeType=asset["mime_type"],
+                ),
+            ],
+            structuredContent=structured,
+        )
+    try:
+        return remember_me_host_bundle.presenter.rm_asset_inspect(asset_id)
+    except Exception:
+        return _rm_asset_inspect_error("image_unavailable")
 
 @mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
 async def rm_asset_upload_route(request):

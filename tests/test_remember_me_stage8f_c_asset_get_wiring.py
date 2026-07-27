@@ -284,7 +284,6 @@ def test_public_contracts_and_stage8fb_isolation_remain(tmp_path):
         "rm_asset_update_metadata",
         "rm_asset_search",
         "rm_asset_reindex_embeddings",
-        "rm_asset_inspect",
     ):
         start = server_text.index(f"async def {handler}")
         stop = server_text.find("\n@mcp.", start + 1)

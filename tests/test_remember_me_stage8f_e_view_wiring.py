@@ -830,7 +830,6 @@ def test_public_contracts_and_stage8fe_isolation_remain(tmp_path):
         "rm_asset_update_metadata",
         "rm_asset_search",
         "rm_asset_reindex_embeddings",
-        "rm_asset_inspect",
     ):
         start = server_text.index(f"async def {handler}")
         stop = server_text.find("\n@mcp.", start + 1)
@@ -847,7 +846,15 @@ def test_public_contracts_and_stage8fe_isolation_remain(tmp_path):
         inspect_stop = len(server_text)
     inspect_block = server_text[inspect_start:inspect_stop]
     assert "_rm_verified_view_image" in inspect_block
-    assert "remember_me_host_bundle" not in inspect_block
+    assert "remember_me_host_bundle is None" in inspect_block
+    assert "remember_me_host_bundle.presenter.rm_asset_inspect" in inspect_block
+    inspect_enabled = inspect_block[
+        inspect_block.index("try:"):
+        inspect_block.index("except Exception:")
+    ]
+    assert "_rm_verified_view_image" not in inspect_enabled
+    assert "asset_store.get" not in inspect_enabled
+    assert "asset_store.resolve_file" not in inspect_enabled
     assert "asset_store.persist_upload" in server_text
     assert server_text.count("@mcp.custom_route") == 37
     assert "OMBRE_RM_DOWNLOAD" not in server_text

@@ -522,7 +522,6 @@ def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
         "rm_asset_update_metadata",
         "rm_asset_reindex_embeddings",
         "rm_asset_search",
-        "rm_asset_inspect",
     ):
         start = server_text.index(f"async def {handler}")
         stop = server_text.find("\n@mcp.", start + 1)

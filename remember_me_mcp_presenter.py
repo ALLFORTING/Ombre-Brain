@@ -189,26 +189,30 @@ class RememberMeMcpCompatibilityPresenter:
             or width * height > MAX_IMAGE_PIXELS
         ):
             return _image_error("image_too_large", inspect=True)
-        encoded = base64.b64encode(data).decode("ascii")
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=(
-                        f"Remember-Me image asset {asset['asset_id']}; "
-                        f"filename: {asset['original_filename']}; "
-                        f"MIME type: {asset['mime_type']}; "
-                        f"dimensions: {width} x {height}."
+        try:
+            encoded = base64.b64encode(data).decode("ascii")
+            structured = _flat_image_metadata(asset)
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"Remember-Me image asset {asset['asset_id']}; "
+                            f"filename: {asset['original_filename']}; "
+                            f"MIME type: {asset['mime_type']}; "
+                            f"dimensions: {width} x {height}."
+                        ),
                     ),
-                ),
-                ImageContent(
-                    type="image",
-                    data=encoded,
-                    mimeType=asset["mime_type"],
-                ),
-            ],
-            structuredContent=_flat_image_metadata(asset),
-        )
+                    ImageContent(
+                        type="image",
+                        data=encoded,
+                        mimeType=asset["mime_type"],
+                    ),
+                ],
+                structuredContent=structured,
+            )
+        except Exception:
+            return _image_error("image_unavailable", inspect=True)
 
     def _verified_image(
         self,
