@@ -64,9 +64,15 @@ class RememberMeMcpCompatibilityPresenter:
             asset = self._core.get_ob_public_metadata(asset_id)
         except RememberMeCoreAdapterError:
             return _json_error("asset_unavailable")
-        if asset is None:
+        except Exception:
             return _json_error("asset_unavailable")
-        return _json_success(asset)
+        normalized = _normalize_public_metadata(asset)
+        if normalized is None:
+            return _json_error("asset_unavailable")
+        try:
+            return _json_success(normalized)
+        except Exception:
+            return _json_error("asset_unavailable")
 
     def rm_asset_update_metadata(
         self,

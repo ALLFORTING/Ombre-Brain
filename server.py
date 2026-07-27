@@ -3734,6 +3734,11 @@ async def rm_asset_upload_status(upload_id: str) -> str:
 @mcp.tool()
 async def rm_asset_get(asset_id: str) -> str:
     """Return persistent asset metadata without file bytes or disk paths."""
+    if remember_me_host_bundle is not None:
+        try:
+            return remember_me_host_bundle.presenter.rm_asset_get(asset_id)
+        except Exception:
+            return _asset_ingest_response(False, error="asset_unavailable")
     asset = asset_store.get((asset_id or "").strip())
     if not asset:
         return _asset_ingest_response(False, error="asset_unavailable")

@@ -238,6 +238,38 @@ single legacy download resolver, remove `resolve_ob_download()`, remove the
 collaborator source-store injection, and revert the Stage 8F-B tests and this
 documentation. No data migration, double write, sync, Render change, or
 production data access is involved.
+
+## Stage 8F-C Wire rm_asset_get Only
+
+Stage 8F-C switches only the read-only MCP `rm_asset_get` handler. With
+the Remember-Me runtime flag absent or disabled, `rm_asset_get` continues
+to use the existing `AssetStore` metadata path and keeps the legacy JSON
+envelope. When the host runtime is explicitly enabled and bootstrapped,
+`rm_asset_get` calls only the Stage 8F-A bundle Presenter and Core Adapter.
+
+The enabled path is strict: a Remember-Me miss or failure returns the stable
+`asset_unavailable` envelope and never falls back to the legacy `AssetStore`.
+The Presenter normalizes the same public metadata fields and suppresses
+malformed metadata, Core Adapter errors, JSON failures, and unknown
+exceptions without exposing paths, blob keys, stored relative paths, data
+roots, or exception text.
+
+The other eight image handlers remain on the old implementation:
+`rm_asset_upload_link`, `rm_asset_upload_status`,
+`rm_asset_update_metadata`, `rm_asset_search`,
+`rm_asset_reindex_embeddings`, `rm_asset_download_link`, `rm_asset_view`,
+and `rm_asset_inspect`. Upload, download-link creation, Viewer, Inspect,
+Search, Update, Dashboard, embedding, the Stage 8F-B download resolver,
+Ticket shape, and source side table behavior are unchanged.
+
+The current production Render environment must still keep the RM runtime
+flag disabled. This stage is not a complete public migration release because
+only one read-only handler is wired and no write, download-link, Viewer, or
+search path has moved. Rollback is to restore the legacy `rm_asset_get`
+handler and revert the Presenter hardening, Stage 8F-C tests, and this
+documentation. Stage 8F-C performs no data migration, double write, shadow
+write, sync, Render change, or production data access.
+
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed

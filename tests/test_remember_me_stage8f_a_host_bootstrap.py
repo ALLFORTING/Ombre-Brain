@@ -385,7 +385,6 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
     forbidden_functions = [
         "rm_asset_upload_link",
         "rm_asset_upload_status",
-        "rm_asset_get",
         "rm_asset_update_metadata",
         "rm_asset_reindex_embeddings",
         "rm_asset_search",
