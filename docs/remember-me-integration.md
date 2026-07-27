@@ -270,6 +270,50 @@ handler and revert the Presenter hardening, Stage 8F-C tests, and this
 documentation. Stage 8F-C performs no data migration, double write, shadow
 write, sync, Render change, or production data access.
 
+
+## Stage 8F-D Wire rm_asset_download_link Only
+
+Stage 8F-D switches only the second read-only MCP handler,
+`rm_asset_download_link`. With the Remember-Me runtime flag absent or disabled,
+the handler continues to call the existing legacy download-link creator, keeping
+legacy `AssetStore` behavior, Ticket TTL, filename handling, response fields,
+and legacy Ticket source unchanged. When the host runtime is explicitly enabled
+and bootstrapped, the handler calls only the Stage 8F-A bundle Presenter, Core
+metadata lookup, and OB download-link collaborator.
+
+The enabled path creates Remember-Me source Tickets in the existing in-process
+source side table. The public Ticket body remains the same three fields:
+`asset_id`, `expires_at`, and `get_count`; the source value is never returned in
+MCP payloads, HTTP headers, logs, structured content, Dashboard, Viewer,
+database rows, or files. The Stage 8F-B download route redeems those
+Remember-Me Tickets through Core validation and returns the verified clean
+bytes. `HEAD` checks do not increase `get_count`; `GET` returns bytes whose
+SHA-256 matches `stored_sha256` and then increases `get_count`.
+
+There is still no fallback across sources. Enabled misses, Core failures,
+malformed metadata, collaborator failures, or handler exceptions return stable
+`asset_unavailable`, `download_unavailable`, or `download_store_full` envelopes
+and never call the legacy creator or `AssetStore`. The Presenter performs one
+Core public-metadata query and one collaborator call on the success path, does
+not read blobs, and does not expose paths, blob keys, stored relative paths,
+source markers, data roots, or exception text.
+
+At the end of this stage, `rm_asset_get` and `rm_asset_download_link` are wired.
+The remaining seven image handlers stay on the old implementation:
+`rm_asset_upload_link`, `rm_asset_upload_status`,
+`rm_asset_update_metadata`, `rm_asset_search`,
+`rm_asset_reindex_embeddings`, `rm_asset_view`, and `rm_asset_inspect`.
+Upload, Viewer, Inspect, Search, Update, Reindex, Dashboard, embedding,
+schema snapshots, tool counts, route counts, and the upload route are unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is not a complete public migration release because uploads,
+Viewer, Inspect, Search, Update, Reindex, and embedding remain legacy. Rollback
+is to restore the `rm_asset_download_link` handler, revert the Presenter
+hardening, Stage 8F-D tests, related static test updates, and this section. No
+data migration, copy, double write, shadow write, sync, Render change, or
+production data access is involved.
+
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed

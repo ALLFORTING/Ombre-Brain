@@ -109,16 +109,25 @@ class RememberMeMcpCompatibilityPresenter:
             asset = self._core.get_ob_public_metadata(asset_id)
         except RememberMeCoreAdapterError:
             return _json_error("asset_unavailable")
-        if asset is None:
+        except Exception:
             return _json_error("asset_unavailable")
-        normalized = self._create_download_payload(asset)
-        if isinstance(normalized, str):
-            return _json_error(normalized)
-        return json.dumps(
-            normalized,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        normalized = _normalize_public_metadata(asset)
+        if normalized is None:
+            return _json_error("asset_unavailable")
+        try:
+            payload = self._create_download_payload(normalized)
+        except Exception:
+            return _json_error("download_unavailable")
+        if isinstance(payload, str):
+            return _json_error(payload)
+        try:
+            return json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            return _json_error("download_unavailable")
 
     def rm_asset_view(self, asset_id: str) -> CallToolResult:
         """Return the existing OB MCP Apps viewer result and fallback link."""

@@ -517,7 +517,6 @@ def test_resolver_lifecycle_and_concurrency(tmp_path, monkeypatch):
 def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     for handler in (
-        "rm_asset_download_link",
         "rm_asset_view",
         "rm_asset_upload_link",
         "rm_asset_upload_status",

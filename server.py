@@ -3850,7 +3850,12 @@ async def rm_asset_reindex_embeddings(
 @mcp.tool()
 async def rm_asset_download_link(asset_id: str) -> str:
     """Create a five-minute signed download URL for one persistent asset."""
-    return _rm_create_asset_download_link(asset_id)
+    if remember_me_host_bundle is None:
+        return _rm_create_asset_download_link(asset_id)
+    try:
+        return remember_me_host_bundle.presenter.rm_asset_download_link(asset_id)
+    except Exception:
+        return _asset_ingest_response(False, error="download_unavailable")
 
 
 @mcp.resource(
