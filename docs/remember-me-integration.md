@@ -170,7 +170,42 @@ collaborator, tests, and this section fully rolls back this hardening stage.
 The safe MCP snapshots in `tests/fixtures/` record both nine-tool surfaces
 separately. They deliberately preserve the current output-envelope, annotation,
 Viewer metadata, and Ticket differences for a future Stage 8D compatibility
-presenter. Both upload-link schemas omit `expected_sha256`.
+presenter. Both upload-link schemas omit the expected SHA-256 upload field.
+
+## Stage 8F-A Host Runtime Bootstrap
+
+Stage 8F-A adds only a default-off host bundle bootstrap in `server.py`. The
+bundle can hold one Remember-Me runtime owner, a `RememberMeCoreAdapter`, the
+compatibility Presenter, and an OB download-link collaborator. No MCP handler
+or HTTP route calls the bundle in this stage.
+
+`OMBRE_RM_RUNTIME_ENABLED` defaults to disabled. When disabled, startup returns
+`None` for the host bundle, does not import `remember_me_host_runtime`, does not
+read `OMBRE_RM_DATA_ROOT`, and does not create a Remember-Me runtime, data
+directory, database, file, or lock. `OMBRE_RM_DATA_ROOT` has no default value,
+and `config["buckets_dir"]` must not be used implicitly as a Remember-Me data
+root.
+
+When explicitly enabled, `OMBRE_RM_DATA_ROOT` must be present and absolute. A
+missing, empty, invalid, relative, or failing runtime bootstrap fails closed and
+prevents service startup. Startup logs only the stable texts
+`remember-me runtime disabled`, `remember-me runtime enabled`, or
+`remember-me runtime bootstrap failed`; it must not log the data root, exception
+details, tokens, production domains, or user data.
+
+The Stage 8F-A download collaborator receives the existing OB download Ticket
+store and lock. The current `/rm/asset-download/{token}` route still redeems
+Tickets through the old `AssetStore.resolve_file()` path. Sharing only the
+Ticket store and lock is not sufficient to complete Remember-Me downloads:
+before Stage 8F-B can switch `rm_asset_download_link` or `rm_asset_view`, the
+download route must first abstract its asset resolver so an RM Ticket can be
+resolved to the real RM Core blob.
+
+Stage 8F-A does not deploy, migrate data, double write, shadow write, sync data,
+change MCP schemas, add tools, add routes, switch the nine handlers, switch the
+download route, touch Dashboard, Viewer, embedding search, Render, or real
+production data. Rollback is to remove the host bootstrap module, the `server.py`
+bootstrap assignment, tests, and this documentation.
 
 ## Rollback
 

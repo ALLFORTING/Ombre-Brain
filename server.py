@@ -3277,6 +3277,43 @@ def _asset_public_base_url() -> str:
     return raw.rstrip("/")
 
 
+def _bootstrap_remember_me_host():
+    if not _env_flag_enabled(os.environ.get("OMBRE_RM_RUNTIME_ENABLED", "")):
+        logger.info("remember-me runtime disabled")
+        return None
+
+    try:
+        raw_data_root = os.environ.get("OMBRE_RM_DATA_ROOT")
+        if (
+            raw_data_root is None
+            or not raw_data_root.strip()
+            or "\x00" in raw_data_root
+        ):
+            raise RuntimeError("remember_me_host_bootstrap_failed")
+        data_root = Path(raw_data_root.strip())
+        if not data_root.is_absolute():
+            raise RuntimeError("remember_me_host_bootstrap_failed")
+
+        from remember_me_host_runtime import create_remember_me_host_bundle
+
+        bundle = create_remember_me_host_bundle(
+            data_root=data_root,
+            token_store=_rm_asset_download_tokens,
+            download_lock=_rm_asset_download_lock,
+            public_base_url=_asset_public_base_url,
+            ttl_seconds=RM_ASSET_DOWNLOAD_TTL_SECONDS,
+            max_tokens=RM_ASSET_DOWNLOAD_MAX_TOKENS,
+        )
+    except Exception:
+        logger.error("remember-me runtime bootstrap failed")
+        raise RuntimeError("remember_me_host_bootstrap_failed") from None
+
+    logger.info("remember-me runtime enabled")
+    return bundle
+
+
+remember_me_host_bundle = _bootstrap_remember_me_host()
+
 def _asset_vision_download_payload(trial_id: str, png: bytes, sha256: str, token: str, expires_at: float, now: float) -> str:
     download_path = f"/rm/vision-download/{token}"
     base_url = _asset_public_base_url()
