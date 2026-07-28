@@ -14,6 +14,7 @@ from remember_me.compat.ombre_brain import MAX_IMAGE_PIXELS, MAX_UPLOAD_BYTES
 
 from remember_me_core_adapter import (
     RememberMeCoreAdapterError,
+    RememberMeReindexResult,
 )
 from remember_me_download_links import (
     RememberMeDownloadLinkCollaborator,
@@ -108,7 +109,7 @@ class RememberMeMcpCompatibilityPresenter:
         except Exception:
             return _json_error("asset_unavailable")
 
-    def rm_asset_search(
+    async def rm_asset_search(
         self,
         query: str = "",
         tags: list[str] | None = None,
@@ -121,7 +122,7 @@ class RememberMeMcpCompatibilityPresenter:
     ) -> str:
         """Present current OB search JSON without private fields."""
         try:
-            result = self._core.search(
+            result = await self._core.search(
                 query=query,
                 tags=tags,
                 kind=kind,
@@ -150,6 +151,47 @@ class RememberMeMcpCompatibilityPresenter:
             )
         except Exception:
             return _json_error("search_unavailable")
+
+    async def rm_asset_reindex_embeddings(
+        self,
+        asset_id: str = "",
+        limit: int = 100,
+    ) -> str:
+        """Present RM reindex counters using the legacy OB JSON envelope."""
+        try:
+            result = await self._core.reindex_embeddings(
+                asset_id=asset_id,
+                limit=limit,
+            )
+        except RememberMeCoreAdapterError as exc:
+            code = (
+                "invalid_limit"
+                if exc.code == "invalid_limit"
+                else "asset_unavailable"
+            )
+            return _json_error(code)
+        except Exception:
+            return _json_error("asset_unavailable")
+        try:
+            counters = RememberMeReindexResult(
+                scanned=result.scanned,
+                indexed=result.indexed,
+                skipped=result.skipped,
+                failed=result.failed,
+            )
+            return json.dumps(
+                {
+                    "ok": True,
+                    "scanned": counters.scanned,
+                    "indexed": counters.indexed,
+                    "skipped": counters.skipped,
+                    "failed": counters.failed,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            return _json_error("asset_unavailable")
 
     def rm_asset_download_link(self, asset_id: str) -> str:
         """Confirm the asset through RM, then delegate OB Ticket and URL work."""

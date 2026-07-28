@@ -32,9 +32,6 @@ SEARCH_ITEM_KEYS = {
     "updated_at",
     "match_reasons",
 }
-LEGACY_HANDLERS = (
-    "rm_asset_reindex_embeddings",
-)
 SEARCH_ERRORS = (
     "invalid_query",
     "invalid_limit",
@@ -173,7 +170,7 @@ class CountingCore:
         self.get_calls = 0
         self.update_calls = 0
 
-    def search(self, **kwargs):
+    async def search(self, **kwargs):
         self.search_calls.append(kwargs)
         if self.error is not None:
             raise self.error
@@ -304,12 +301,13 @@ async def test_enabled_search_calls_presenter_once_and_never_legacy(tmp_path, mo
     assert server._rm_asset_download_sources == {}
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("code", SEARCH_ERRORS)
-def test_presenter_search_maps_allowlisted_errors_without_collaborators(code):
+async def test_presenter_search_maps_allowlisted_errors_without_collaborators(code):
     core = CountingCore(error=RememberMeCoreAdapterError(code))
     links = NullDownloadLinks()
 
-    raw = _presenter(core, links).rm_asset_search()
+    raw = await _presenter(core, links).rm_asset_search()
 
     _assert_error(raw, code)
     assert len(core.search_calls) == 1
@@ -321,17 +319,19 @@ def test_presenter_search_maps_allowlisted_errors_without_collaborators(code):
     assert core.update_calls == 0
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [RememberMeCoreAdapterError("blob_missing"), RuntimeError("boom C:/secret")],
 )
-def test_presenter_search_unknown_errors_are_unavailable_without_leakage(error):
+async def test_presenter_search_unknown_errors_are_unavailable_without_leakage(error):
     core = CountingCore(error=error)
-    raw = _presenter(core).rm_asset_search()
+    raw = await _presenter(core).rm_asset_search()
     _assert_error(raw, "search_unavailable")
     assert len(core.search_calls) == 1
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "result",
     [
@@ -371,21 +371,22 @@ def test_presenter_search_unknown_errors_are_unavailable_without_leakage(error):
         _search_result(results=[_search_item(match_reasons=["semantic"], semantic_score=1.1)]),
     ],
 )
-def test_presenter_search_rejects_malformed_results(result):
+async def test_presenter_search_rejects_malformed_results(result):
     core = CountingCore(result=result)
-    raw = _presenter(core).rm_asset_search()
+    raw = await _presenter(core).rm_asset_search()
     _assert_error(raw, "search_unavailable")
     assert len(core.search_calls) == 1
 
 
-def test_presenter_search_crops_private_fields_and_preserves_order_without_mutation():
+@pytest.mark.asyncio
+async def test_presenter_search_crops_private_fields_and_preserves_order_without_mutation():
     first = _search_item(asset_id=ASSET_ID, match_reasons=["semantic"], semantic_score=1)
     second = _search_item(asset_id=SECOND_ASSET_ID, filename="second.bin", kind="file", mime_type="application/octet-stream", width=0, height=0, match_reasons=[])
     result = _search_result(total=2, results=[first, second])
     original = deepcopy(result)
     core = CountingCore(result=result)
 
-    payload = _payload(_presenter(core).rm_asset_search())
+    payload = _payload(await _presenter(core).rm_asset_search())
 
     assert payload["ok"] is True
     assert payload["total"] == 2
@@ -424,7 +425,7 @@ async def test_enabled_handler_unknown_presenter_exception_returns_stable_error(
     class Presenter:
         calls = 0
 
-        def rm_asset_search(self, **kwargs):
+        async def rm_asset_search(self, **kwargs):
             self.calls += 1
             raise RuntimeError("boom C:/secret")
 
@@ -439,9 +440,10 @@ async def test_enabled_handler_unknown_presenter_exception_returns_stable_error(
     assert server._rm_asset_download_sources == {}
 
 
-def test_core_adapter_preserves_allowlisted_search_errors():
+@pytest.mark.asyncio
+async def test_core_adapter_preserves_allowlisted_search_errors():
     class Service:
-        def search_assets(self, request):
+        async def search_assets(self, request):
             raise ValueError("invalid_limit")
 
     runtime = type("Runtime", (), {"service": Service(), "repository": object(), "blob_store": object()})()
@@ -449,7 +451,7 @@ def test_core_adapter_preserves_allowlisted_search_errors():
 
     adapter = RememberMeCoreAdapter(runtime)
     with pytest.raises(RememberMeCoreAdapterError) as caught:
-        adapter.search(limit=0)
+        await adapter.search(limit=0)
     assert caught.value.code == "invalid_limit"
 
 
@@ -486,12 +488,20 @@ def test_public_contracts_and_stage8fh_isolation_remain(tmp_path):
             stop = len(server_text)
         assert "remember_me_host_bundle.presenter" in server_text[start:stop]
 
-    for handler in LEGACY_HANDLERS:
-        start = server_text.index(f"async def {handler}(")
-        stop = server_text.find("\n@mcp.", start + 1)
-        if stop == -1:
-            stop = len(server_text)
-        block = server_text[start:stop]
-        assert "remember_me_host_bundle" not in block
-        assert "RememberMeMcpCompatibilityPresenter" not in block
-        assert "RememberMeCoreAdapter" not in block
+    reindex_start = server_text.index("async def rm_asset_reindex_embeddings(")
+    reindex_stop = server_text.index("async def rm_asset_download_link", reindex_start)
+    reindex_block = server_text[reindex_start:reindex_stop]
+    presenter_call = (
+        "await remember_me_host_bundle.presenter."
+        "rm_asset_reindex_embeddings"
+    )
+    assert presenter_call in reindex_block
+    assert reindex_block.index(presenter_call) < reindex_block.index(
+        "await asset_embedding_index.reindex"
+    )
+    enabled_reindex = reindex_block[:reindex_block.index(
+        "    try:\n        result = await asset_embedding_index.reindex"
+    )]
+    assert "asset_embedding_index" not in enabled_reindex
+    assert "RememberMeCoreAdapter" not in reindex_block
+    assert "RememberMeMcpCompatibilityPresenter" not in reindex_block

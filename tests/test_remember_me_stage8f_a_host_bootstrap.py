@@ -377,7 +377,7 @@ def test_server_enabled_runtime_exception_fails_closed_without_details(tmp_path,
     assert str(tmp_path) not in combined
 
 
-def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
+def test_stage8f_a_bootstrap_surface_remains_compatible_after_later_wiring():
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     production_modules = [
         ROOT / "asset_dashboard.py",
@@ -385,7 +385,6 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
         ROOT / "asset_embedding_index.py",
     ]
     forbidden_functions = [
-        "rm_asset_reindex_embeddings",
         "rm_asset_download_route",
     ]
 
@@ -396,6 +395,15 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
         candidates = [item for item in (end, next_route) if item != -1]
         stop = min(candidates) if candidates else len(server_text)
         assert "remember_me_host_bundle" not in server_text[start:stop]
+
+    reindex_start = server_text.index("async def rm_asset_reindex_embeddings")
+    reindex_stop = server_text.find("\n@mcp.", reindex_start + 1)
+    reindex_block = server_text[reindex_start:reindex_stop]
+    assert (
+        "await remember_me_host_bundle.presenter."
+        "rm_asset_reindex_embeddings"
+    ) in reindex_block
+    assert "await asset_embedding_index.reindex" in reindex_block
 
     assert server_text.count("@mcp.custom_route") == 37
     assert "asset_store = AssetStore(config[\"buckets_dir\"])" in server_text

@@ -19,10 +19,14 @@ from remember_me_adapter import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_COMMIT = "184e223c6392fd14dd5cfa73227d41f46d90e3c8"
+EXPECTED_COMMIT = "5c430d3f265be059198fe230c1a0682e23e89e32"
 EXPECTED_ARCHIVE_SHA256 = (
-    "cbb6419666df8d7101f4607635edb39c682105de371855acf05c8f351b822e98"
+    "6038543368836b9e57ed618e918fdbaa0d8230aeeee938a7f3d4da331f1fd3fd"
 )
+EXPECTED_ARCHIVE_URL = (
+    "https://api.github.com/repos/peanutsuee/Remember-Me/tarball/{}"
+).format(EXPECTED_COMMIT)
+OLD_COMMIT = "184e223c6392fd14dd5cfa73227d41f46d90e3c8"
 
 
 def _requirement_line():
@@ -39,11 +43,13 @@ def test_dependency_is_commit_and_digest_pinned_without_extras_or_git():
     line = _requirement_line()
 
     assert EXPECTED_COMMIT in line
+    assert EXPECTED_ARCHIVE_URL in line
     assert len(EXPECTED_COMMIT) == 40
     assert "#sha256={}".format(EXPECTED_ARCHIVE_SHA256) in line
     assert "git+" not in line
     assert "remember-me[" not in line
     assert "/main" not in line
+    assert OLD_COMMIT not in line
 
 
 def test_adapter_import_has_no_storage_or_protocol_side_effects(tmp_path):

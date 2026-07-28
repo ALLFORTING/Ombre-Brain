@@ -408,10 +408,11 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 
 #### Remember-Me Stage 1 asset storage
 
-- Stage 8B pins the public `peanutsuee/Remember-Me` Core at package version
-  `0.1.0.dev5` behind a lazy compatibility adapter. The adapter is not connected
-  to `server.py`; the existing tools, routes, Dashboard, Viewer, authentication,
-  Tickets, and production data behavior remain unchanged. See
+- Ombre-Brain pins the public `peanutsuee/Remember-Me` Core at commit
+  `5c430d3f265be059198fe230c1a0682e23e89e32` and package version
+  `0.1.0.dev5`. Stage 8F-J completes RM-enabled Core ownership for all nine
+  `rm_asset_*` tools while the default-off path retains the existing legacy
+  handlers, routes, Dashboard, Viewer, authentication, and Tickets. See
   [`docs/remember-me-integration.md`](docs/remember-me-integration.md).
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
 - Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
@@ -429,12 +430,14 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 
 #### Remember-Me Stage 2.1 semantic search
 
-- RM asset search now combines the Stage-2 keyword channel with vector semantic recall using the existing OB Embedding configuration, model, text generation call, and cosine similarity implementation.
-- Asset vectors live in the independent `asset_embeddings` table inside `assets.sqlite3`; ordinary memory buckets remain in `embeddings.db`, so the two search namespaces cannot mix.
-- Only title, description, tags, original filename, kind, and MIME type are included in embedding text. Original file bytes, base64, hashes, and disk paths are never sent to the Embedding API.
-- Metadata updates refresh an asset vector when the index text or embedding model changes. Unchanged text is skipped.
-- When Embedding is disabled, unavailable, or fails, `rm_asset_search` still returns normal keyword results.
-- Existing assets require one explicit `rm_asset_reindex_embeddings(asset_id="", limit=100)` backfill. The server does not automatically batch-index production assets during startup.
+- With the RM runtime enabled, Search and Reindex share one Host-injected async vector provider. OB owns endpoint configuration and network calls; RM Core owns canonical index text, content hashes, staleness, vector persistence, cosine scoring, and ranking.
+- The provider model identity uses an endpoint fingerprint plus backend and model. It never exposes the raw endpoint, credentials, query, fragment, or API key.
+- RM vectors live in the `asset_embeddings` table inside the RM `assets.sqlite3`. Default-off legacy vectors remain in the separate legacy asset database, and ordinary memory buckets remain in `embeddings.db`. These stores are not migrated, copied, dual-written, or shadow-written.
+- RM-enabled bootstrap rejects a Remember-Me data root that resolves to the legacy OB asset root, so the two `assets.sqlite3` files cannot be accidentally collapsed into one store.
+- Only title, description, tags, original filename, kind, and MIME type are included in RM embedding text. Original file bytes, base64, hashes, and disk paths are never sent to the Embedding API.
+- `rm_asset_reindex_embeddings(...)` rebuilds missing or stale RM vectors. Current rows are skipped; metadata or model identity changes rebuild them; empty index metadata removes the RM vector.
+- When the provider is disabled or query embedding is unavailable, RM Search preserves keyword-only results. The default standalone Remember-Me runtime still uses `NullVectorProvider`; the real provider is supplied only by the OB Host.
+- Existing legacy vectors are retained but are not visible to RM-enabled Search. After switching to RM-enabled operation, users must explicitly call `rm_asset_reindex_embeddings(asset_id="", limit=100)` before semantic recall exists for RM assets. No startup backfill or production migration is performed.
 
 #### Remember-Me Stage 3A inline asset viewer
 

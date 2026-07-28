@@ -109,17 +109,24 @@ class RememberMeAdapter:
     def __init__(self) -> None:
         self._runtime = None
         self._data_root: Path | None = None
+        self._vector_provider = None
 
     @property
     def runtime_created(self) -> bool:
         return self._runtime is not None
 
-    def create_runtime(self, data_root: Path):
+    def create_runtime(self, data_root: Path, vector_provider=None):
         if not isinstance(data_root, Path):
             raise RememberMeAdapterError("remember_me_data_root_must_be_path")
         normalized_root = data_root.expanduser().resolve()
         if self._runtime is not None:
-            if normalized_root == self._data_root:
+            if (
+                normalized_root == self._data_root
+                and (
+                    vector_provider is None
+                    or vector_provider is self._vector_provider
+                )
+            ):
                 return self._runtime
             raise RememberMeAdapterError("remember_me_runtime_already_created")
 
@@ -135,13 +142,17 @@ class RememberMeAdapter:
             from remember_me.factory import create_local_runtime
 
             try:
-                runtime = create_local_runtime(normalized_root)
+                runtime = create_local_runtime(
+                    normalized_root,
+                    vector_provider=vector_provider,
+                )
             except Exception as exc:
                 raise RememberMeAdapterError(
                     "remember_me_runtime_creation_failed"
                 ) from exc
             self._runtime = runtime
             self._data_root = normalized_root
+            self._vector_provider = vector_provider
             _RUNTIME_OWNERS[normalized_root] = weakref.ref(self)
             return runtime
 

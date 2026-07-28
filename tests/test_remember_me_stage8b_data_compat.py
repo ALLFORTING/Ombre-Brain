@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from PIL import ExifTags, Image, PngImagePlugin
+import pytest
 
 from asset_store import AssetStore
 from remember_me.core import (
@@ -90,7 +91,8 @@ def _blob_inventory(root):
     }
 
 
-def test_ob_and_public_rm_read_write_the_same_copied_data(tmp_path):
+@pytest.mark.asyncio
+async def test_ob_and_public_rm_read_write_the_same_copied_data(tmp_path):
     ob_root = tmp_path / "ob"
     ob_store = AssetStore(ob_root)
     png = _png_fixture()
@@ -141,7 +143,7 @@ def test_ob_and_public_rm_read_write_the_same_copied_data(tmp_path):
             tags=("compat", "synthetic"),
         )
     )
-    result = runtime.service.search_assets(
+    result = await runtime.service.search_assets(
         SearchAssetsRequest(query="Stage 8B")
     )
     assert updated.asset_id == fetched.asset_id

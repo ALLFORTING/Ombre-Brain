@@ -186,7 +186,7 @@ class UploadCore:
         self.metadata_calls += 1
         return dict(self.asset)
 
-    def search(self, **kwargs):
+    async def search(self, **kwargs):
         self.search_calls += 1
         item = {
             key: self.asset[key]
@@ -481,4 +481,20 @@ def test_public_contract_static_scope_and_counts_remain_unchanged(tmp_path, monk
     assert "core_adapter.ingest_image" not in text[text.index("async def rm_asset_upload_route"):text.index("@mcp.custom_route(\"/rm/asset-download/{token}\"")]
     assert "_rm_asset_upload_sources" in text
     assert "async def rm_asset_reindex_embeddings" in text
+    upload_link = text[
+        text.index("async def rm_asset_upload_link"):
+        text.index("async def rm_asset_upload_status")
+    ]
+    upload_status = text[
+        text.index("async def rm_asset_upload_status"):
+        text.index("async def rm_asset_get")
+    ]
+    upload_route = text[
+        text.index("async def rm_asset_upload_route"):
+        text.index("@mcp.custom_route(\"/rm/asset-download/{token}\"")
+    ]
+    for block in (upload_link, upload_status, upload_route):
+        assert "RememberMeVectorProviderAdapter" not in block
+        assert "embedding_engine" not in block
+        assert ".embed(" not in block
     assert server.mcp is not None

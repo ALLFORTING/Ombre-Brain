@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -11,12 +12,14 @@ from typing import Any
 from remember_me.core import (
     AssetFileUnavailable,
     AssetNotFoundError,
+    AssetUnavailable,
     DeleteAssetRequest,
     GetAssetRequest,
     ImagePixelLimitExceeded,
     ImageValidationError,
     IngestImageRequest,
     InvalidMetadata,
+    ReindexEmbeddingsRequest,
     RememberMeError,
     ResolveAssetRequest,
     SearchAssetsRequest,
@@ -62,6 +65,29 @@ class RememberMeCoreAdapterError(RuntimeError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class RememberMeReindexResult:
+    scanned: int
+    indexed: int
+    skipped: int
+    failed: int
+
+    def __post_init__(self) -> None:
+        counters = (
+            self.scanned,
+            self.indexed,
+            self.skipped,
+            self.failed,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in counters
+        ) or self.scanned != self.indexed + self.skipped + self.failed:
+            raise ValueError("invalid_reindex_counters")
+
+
 class RememberMeCoreAdapter:
     """Translate public Remember-Me Core operations into OB-safe structures."""
 
@@ -75,12 +101,21 @@ class RememberMeCoreAdapter:
         self._host_adapter = host_adapter
 
     @classmethod
-    def from_host_adapter(cls, host_adapter: Any, data_root: Path):
+    def from_host_adapter(
+        cls,
+        host_adapter: Any,
+        data_root: Path,
+        *,
+        vector_provider: Any = None,
+    ):
         """Explicitly create one RM runtime through the Stage 8B host owner."""
         if not isinstance(data_root, Path):
             raise RememberMeCoreAdapterError("invalid_data_root")
         try:
-            runtime = host_adapter.create_runtime(data_root)
+            runtime = host_adapter.create_runtime(
+                data_root,
+                vector_provider=vector_provider,
+            )
         except Exception as exc:
             code = str(exc)
             if code == "remember_me_data_root_already_owned":
@@ -232,7 +267,7 @@ class RememberMeCoreAdapter:
         except Exception as exc:
             self._raise_mapped(exc)
 
-    def search(
+    async def search(
         self,
         query: str = "",
         tags: list[str] | tuple[str, ...] | None = None,
@@ -245,7 +280,7 @@ class RememberMeCoreAdapter:
     ) -> dict:
         try:
             clean_tags = self._tag_tuple(tags or ())
-            result = self._runtime.service.search_assets(
+            result = await self._runtime.service.search_assets(
                 SearchAssetsRequest(
                     query=query,
                     tags=clean_tags,
@@ -275,6 +310,33 @@ class RememberMeCoreAdapter:
             if candidate in _OB_SEARCH_ERROR_CODES:
                 raise RememberMeCoreAdapterError(candidate) from exc
             self._raise_mapped(exc)
+
+    async def reindex_embeddings(
+        self,
+        asset_id: str = "",
+        limit: int = 100,
+    ) -> RememberMeReindexResult:
+        try:
+            result = await self._runtime.service.reindex_embeddings(
+                ReindexEmbeddingsRequest(
+                    asset_id=(asset_id or "").strip(),
+                    limit=limit,
+                )
+            )
+            return RememberMeReindexResult(
+                scanned=result.scanned,
+                indexed=result.indexed,
+                skipped=result.skipped,
+                failed=result.failed,
+            )
+        except InvalidMetadata as exc:
+            if str(exc) == "invalid_limit":
+                raise RememberMeCoreAdapterError("invalid_limit") from exc
+            raise RememberMeCoreAdapterError("asset_unavailable") from exc
+        except AssetUnavailable as exc:
+            raise RememberMeCoreAdapterError("asset_unavailable") from exc
+        except Exception as exc:
+            raise RememberMeCoreAdapterError("asset_unavailable") from exc
 
     def resolve_blob(self, asset_id: str) -> tuple[dict, bytes]:
         self._require_asset_id(asset_id)
@@ -433,4 +495,5 @@ def _normalize_timestamp(value: str) -> str:
 __all__ = [
     "RememberMeCoreAdapter",
     "RememberMeCoreAdapterError",
+    "RememberMeReindexResult",
 ]

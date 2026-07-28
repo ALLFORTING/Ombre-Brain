@@ -3529,9 +3529,14 @@ def _bootstrap_remember_me_host():
         data_root = Path(raw_data_root.strip())
         if not data_root.is_absolute():
             raise RuntimeError("remember_me_host_bootstrap_failed")
+        data_root = data_root.expanduser().resolve()
+        if data_root == asset_store.data_root:
+            raise RuntimeError("remember_me_host_bootstrap_failed")
 
         from remember_me_host_runtime import create_remember_me_host_bundle
+        from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
+        vector_provider = RememberMeVectorProviderAdapter(embedding_engine)
         bundle = create_remember_me_host_bundle(
             data_root=data_root,
             token_store=_rm_asset_download_tokens,
@@ -3540,6 +3545,7 @@ def _bootstrap_remember_me_host():
             public_base_url=_asset_public_base_url,
             ttl_seconds=RM_ASSET_DOWNLOAD_TTL_SECONDS,
             max_tokens=RM_ASSET_DOWNLOAD_MAX_TOKENS,
+            vector_provider=vector_provider,
         )
     except Exception:
         logger.error("remember-me runtime bootstrap failed")
@@ -3953,7 +3959,7 @@ async def rm_asset_search(
     """Search persistent assets through keyword and optional semantic channels."""
     if remember_me_host_bundle is not None:
         try:
-            return remember_me_host_bundle.presenter.rm_asset_search(
+            return await remember_me_host_bundle.presenter.rm_asset_search(
                 query=query,
                 tags=tags,
                 kind=kind,
@@ -4014,6 +4020,14 @@ async def rm_asset_reindex_embeddings(
     limit: int = 100,
 ) -> str:
     """Backfill missing or stale Remember-Me asset embeddings without changing assets."""
+    if remember_me_host_bundle is not None:
+        try:
+            return await remember_me_host_bundle.presenter.rm_asset_reindex_embeddings(
+                asset_id=asset_id,
+                limit=limit,
+            )
+        except Exception:
+            return _asset_ingest_response(False, error="asset_unavailable")
     try:
         result = await asset_embedding_index.reindex(
             asset_id=(asset_id or "").strip(),

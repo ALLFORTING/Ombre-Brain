@@ -29,6 +29,7 @@ def create_remember_me_host_bundle(
     public_base_url: str | Callable[[], str],
     ttl_seconds: int,
     max_tokens: int,
+    vector_provider: Any = None,
 ) -> RememberMeHostBundle:
     try:
         _validate_inputs(
@@ -54,6 +55,7 @@ def create_remember_me_host_bundle(
         core_adapter = RememberMeCoreAdapter.from_host_adapter(
             host_adapter,
             data_root,
+            vector_provider=vector_provider,
         )
         download_links = RememberMeObDownloadLinkCollaborator(
             token_store=token_store,

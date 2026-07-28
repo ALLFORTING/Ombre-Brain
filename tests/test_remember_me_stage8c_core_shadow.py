@@ -306,7 +306,8 @@ def test_same_data_root_rejects_a_second_runtime_owner(tmp_path):
     assert str(tmp_path) not in str(caught.value)
 
 
-def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
+@pytest.mark.asyncio
+async def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
     legacy_root = tmp_path / "legacy"
     rm_root = tmp_path / "rm"
     legacy = LegacyFacade(legacy_root)
@@ -413,7 +414,7 @@ def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
     ]
     for query in queries:
         old_search = legacy.search(query=query)
-        new_search = rm.search(query=query)
+        new_search = await rm.search(query=query)
         assert old_search["total"] == new_search["total"]
         old_items = sorted(
             (
@@ -436,10 +437,10 @@ def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
     ] == ["plain.png", "needle-file.jpg"]
     assert [
         item["filename"]
-        for item in rm.search(query="needle")["results"]
+        for item in (await rm.search(query="needle"))["results"]
     ] == ["plain.png", "needle-file.jpg"]
     assert legacy.search(query="missing")["results"] == []
-    assert rm.search(query="missing")["results"] == []
+    assert (await rm.search(query="missing"))["results"] == []
 
     assert legacy.get("bad-id") is None
     assert rm.get("bad-id") is None

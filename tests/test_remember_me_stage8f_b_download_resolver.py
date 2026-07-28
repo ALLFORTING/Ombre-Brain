@@ -516,17 +516,21 @@ def test_resolver_lifecycle_and_concurrency(tmp_path, monkeypatch):
 
 def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
-    for handler in (
-        "rm_asset_reindex_embeddings",
-    ):
-        start = server_text.index(f"async def {handler}")
-        stop = server_text.find("\n@mcp.", start + 1)
-        if stop == -1:
-            stop = len(server_text)
-        block = server_text[start:stop]
-        assert "remember_me_host_bundle" not in block
-        assert "RememberMeMcpCompatibilityPresenter" not in block
-        assert "RememberMeCoreAdapter" not in block
+    reindex_start = server_text.index("async def rm_asset_reindex_embeddings")
+    reindex_stop = server_text.find("\n@mcp.", reindex_start + 1)
+    reindex_block = server_text[reindex_start:reindex_stop]
+    presenter_call = (
+        "await remember_me_host_bundle.presenter."
+        "rm_asset_reindex_embeddings"
+    )
+    legacy_call = "await asset_embedding_index.reindex"
+    assert presenter_call in reindex_block
+    assert legacy_call in reindex_block
+    assert reindex_block.index(presenter_call) < reindex_block.index(legacy_call)
+    enabled_reindex = reindex_block[:reindex_block.index(
+        "    try:\n        result = await asset_embedding_index.reindex"
+    )]
+    assert "asset_embedding_index" not in enabled_reindex
 
     view_start = server_text.index("async def rm_asset_view(")
     inspect_start = server_text.index("async def rm_asset_inspect")

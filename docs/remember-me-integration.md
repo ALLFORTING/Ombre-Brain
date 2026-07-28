@@ -5,7 +5,8 @@
 Ombre-Brain pins the public Remember-Me Core to:
 
 - official repository: `peanutsuee/Remember-Me`;
-- commit: `184e223c6392fd14dd5cfa73227d41f46d90e3c8`;
+- current commit: `5c430d3f265be059198fe230c1a0682e23e89e32`;
+- archive SHA-256: `6038543368836b9e57ed618e918fdbaa0d8230aeeee938a7f3d4da331f1fd3fd`;
 - distribution: `remember-me`;
 - package version: `0.1.0.dev5`;
 - data compatibility: `ombre-brain-assets-v1`;
@@ -104,8 +105,8 @@ exposed.
 | `rm_asset_upload_status` | OB source-aware upload Ticket lifecycle | Implemented by Stage 8F-I route flow | Yes | Pending/uploading/completed state and status envelope | Status remains source-isolated over the upload Ticket result | Restore Stage 8F-I files |
 | `rm_asset_get` | OB handler over legacy `AssetStore` | Implemented and test-only | Yes | Tool registration and JSON transport | Replace handler body with Presenter call after acceptance | Remove Stage 8D files |
 | `rm_asset_update_metadata` | OB handler plus embedding refresh | Implemented and test-only | Yes | Tool registration and `AssetEmbeddingIndex.index_asset` side effect | OB handler calls Presenter, then retains embedding refresh | Remove Stage 8D files |
-| `rm_asset_reindex_embeddings` | OB `AssetEmbeddingIndex` | Not implemented | No | Provider, model, stale detection and counters | Revisit only after vector ownership is migrated | Remove Stage 8D files |
-| `rm_asset_search` | OB keyword/vector fusion | Implemented and test-only | Yes | `EmbeddingEngine`, semantic scores, fusion, sorting and fallback | OB handler calls Presenter/Core search after acceptance | Remove Stage 8D files |
+| `rm_asset_reindex_embeddings` | RM-enabled Presenter/Core; default-off legacy `AssetEmbeddingIndex` | Implemented by Stage 8F-J | Yes | Host provider configuration and exact four-counter MCP envelope | Presenter maps RM counters; enabled path never accesses the legacy index | Revert Stage 8F-J files |
+| `rm_asset_search` | RM-enabled async Presenter/Core; default-off legacy fusion | Implemented by Stage 8F-H/J | Yes | Host provider configuration and exact public search envelope | RM Core performs query embedding, cosine, ranking and keyword fallback | Revert Stage 8F-H/J files |
 | `rm_asset_download_link` | OB download Ticket store | Implemented with an injected seam | Yes | Five-minute download TTL, three-GET limit, Ticket, URL, authentication and headers | Inject a thin wrapper over the existing OB Ticket/URL helper | Remove Stage 8D files |
 | `rm_asset_view` | OB handler and Viewer metadata | Implemented and test-only | Yes | Tool registration, `ASSET_VIEWER_TOOL_META`, resource URI and branding | Inject OB download collaborator and retain current registration | Remove Stage 8D files |
 | `rm_asset_inspect` | OB handler over verified stored bytes | Implemented and test-only | Yes | Tool registration and external description | Replace handler body only after exact result acceptance | Remove Stage 8D files |
@@ -559,6 +560,50 @@ route source dispatch, upload source side table, host upload result hardening,
 Stage 8F-I tests, related static test updates, and this section. No data
 migration, copy, double write, shadow write, sync, Render change, or production
 data access is involved.
+
+## Stage 8F-J RM Reindex and Semantic Provider Wiring
+
+Stage 8F-J updates the immutable Remember-Me dependency pin to
+`5c430d3f265be059198fe230c1a0682e23e89e32` and completes 9/9
+RM-enabled Core ownership. The Python RM Search API is async, so the OB
+CoreAdapter, Presenter, and server handler now await it end to end without a
+synchronous wrapper, event-loop bridge, or worker thread.
+
+OB creates one process-lifetime `RememberMeVectorProviderAdapter` over the
+existing `EmbeddingEngine` and passes that exact instance into the RM runtime
+factory. Search and Reindex therefore use the same provider and model identity.
+The adapter calls the public `EmbeddingEngine.embed_text()` entry once. Its
+model identity contains a normalized backend label, a short SHA-256 fingerprint
+of the normalized endpoint, and the stripped model name. Raw endpoints, user
+information, passwords, query strings, fragments, API keys, and tokens are not
+placed in the identity or public errors. The default standalone RM factory still
+constructs `NullVectorProvider` when no Host provider is supplied.
+
+When RM is enabled, `rm_asset_reindex_embeddings` calls the Presenter and Core
+once. RM Core owns canonical text, content hashes, current/stale decisions,
+provider calls, per-item isolation, and embedding persistence. Presenter hides
+RM's internal `enabled` and `model_id` fields and preserves the existing sorted
+four-counter JSON and stable `invalid_limit` / `asset_unavailable` envelopes.
+Cancellation propagates through provider, Search, Reindex, CoreAdapter,
+Presenter, and handler boundaries.
+
+Default-off or unavailable runtime behavior remains on the legacy handlers. In
+normal RM-enabled Search and Reindex, the old `AssetEmbeddingIndex`, legacy
+asset database, provider loop, cosine code, and legacy vector rows are not
+accessed. The legacy and RM embedding stores remain separate. This stage performs
+no migration, copy, schema merge, dual write, shadow write, background backfill,
+or deletion of old vectors. Bootstrap fails closed if the configured RM data
+root resolves to the legacy OB asset root, preventing both stores from sharing
+one `assets.sqlite3`. Existing legacy vectors remain intact but are not visible
+to RM-enabled Search. A user who enables RM must explicitly run Reindex to create
+vectors in the RM database; those new vectors are immediately consumed by Search
+through the same runtime.
+
+The nine tool names, registration order, input schemas, public Search fields,
+Reindex counters, error envelopes, upload behavior, Viewer behavior, Tickets,
+and default-off behavior remain unchanged. No Render deployment, production
+configuration change, production data migration, or automatic backfill is part
+of this stage.
 
 ## Rollback
 

@@ -109,6 +109,10 @@ class EmbeddingEngine:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
+    async def embed_text(self, text: str) -> list[float]:
+        """Generate one embedding through the existing Host provider path."""
+        return await self._generate_embedding(text)
+
     async def _generate_embedding(self, text: str) -> list[float]:
         """Call API to generate embedding vector."""
         # Truncate to avoid token limits
