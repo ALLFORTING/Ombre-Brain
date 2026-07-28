@@ -519,7 +519,6 @@ def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
     for handler in (
         "rm_asset_upload_link",
         "rm_asset_upload_status",
-        "rm_asset_update_metadata",
         "rm_asset_reindex_embeddings",
         "rm_asset_search",
     ):

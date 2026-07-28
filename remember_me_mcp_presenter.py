@@ -95,7 +95,10 @@ class RememberMeMcpCompatibilityPresenter:
             )
         except Exception:
             return _json_error("asset_unavailable")
-        normalized = _normalize_public_metadata(asset)
+        normalized = _normalize_updated_public_metadata(
+            asset,
+            requested_asset_id=asset_id,
+        )
         if normalized is None:
             return _json_error("asset_unavailable")
         try:
@@ -436,6 +439,70 @@ def _normalize_public_metadata(asset: Any) -> dict[str, Any] | None:
         return {key: asset[key] for key in _OB_PUBLIC_METADATA_KEYS}
     except Exception:
         return None
+
+
+def _is_lower_hex(value: str, *, length: int) -> bool:
+    return (
+        len(value) == length
+        and value.lower() == value
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _normalize_updated_public_metadata(
+    asset: Any,
+    *,
+    requested_asset_id: str,
+) -> dict[str, Any] | None:
+    try:
+        normalized = _normalize_public_metadata(asset)
+        requested = (requested_asset_id or "").strip()
+    except Exception:
+        return None
+    if normalized is None:
+        return None
+    if (
+        not isinstance(normalized["asset_id"], str)
+        or not _is_lower_hex(normalized["asset_id"], length=32)
+        or normalized["asset_id"] != requested
+        or not isinstance(normalized["source_sha256"], str)
+        or not _is_lower_hex(normalized["source_sha256"], length=64)
+        or not isinstance(normalized["stored_sha256"], str)
+        or not _is_lower_hex(normalized["stored_sha256"], length=64)
+    ):
+        return None
+    for key in (
+        "decoded_bytes",
+        "stored_bytes",
+    ):
+        value = normalized[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+    for key in (
+        "filename",
+        "mime_type",
+        "kind",
+        "created_at",
+        "title",
+        "description",
+        "updated_at",
+    ):
+        if not isinstance(normalized[key], str):
+            return None
+    for key in ("width", "height"):
+        value = normalized[key]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            return None
+    tags = normalized["tags"]
+    if (
+        not isinstance(tags, (list, tuple))
+        or any(not isinstance(tag, str) for tag in tags)
+    ):
+        return None
+    normalized["tags"] = list(tags)
+    return normalized
 
 
 def _normalize_download_payload(payload: Any) -> dict[str, Any]:

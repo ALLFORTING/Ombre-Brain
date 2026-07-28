@@ -33,7 +33,6 @@ INSPECT_KEYS = {
 LEGACY_HANDLERS = (
     "rm_asset_upload_link",
     "rm_asset_upload_status",
-    "rm_asset_update_metadata",
     "rm_asset_search",
     "rm_asset_reindex_embeddings",
 )

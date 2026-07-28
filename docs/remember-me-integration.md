@@ -409,6 +409,49 @@ hardening, Stage 8F-F tests, related static test updates, and this section. No
 data migration, copy, double write, shadow write, sync, Render change, or
 production data access is involved.
 
+## Stage 8F-G Wire rm_asset_update_metadata Only
+
+Stage 8F-G switches only `rm_asset_update_metadata`. It is the fifth wired
+MCP handler and the first write operation in the Remember-Me integration. With
+the Remember-Me runtime flag absent or disabled, the handler keeps the complete
+legacy AssetStore metadata update path, including the best-effort legacy
+embedding refresh. A legacy embedding refresh failure does not roll back the
+metadata update.
+
+When the host runtime is explicitly enabled and bootstrapped,
+`rm_asset_update_metadata` calls only the Stage 8F-A bundle Presenter and the
+Remember-Me Core metadata mutation. The enabled path performs exactly one Core
+mutation, performs no post-mutation read, does not read blob bytes, does not
+create a download Ticket, does not update the old AssetStore, does not refresh
+the old embedding index, and never falls back to legacy. `None` preserves a
+field, an empty string clears text fields, and an empty list clears tags; Core
+remains the authority for validation and normalization.
+
+The mutation may change only `title`, `description`, `tags`, and, when Core
+decides the update is effective, `updated_at`. Blob bytes and immutable public
+metadata such as asset id, hashes, byte counts, filename, MIME type, kind,
+dimensions, and creation time remain unchanged. RM Search and Reindex are
+still not wired, and enabled metadata updates intentionally do not shadow-write
+to the legacy embedding index.
+
+At the end of this stage, `rm_asset_get`, `rm_asset_download_link`,
+`rm_asset_view`, `rm_asset_inspect`, and `rm_asset_update_metadata` are wired.
+The remaining four handlers stay on the old implementation:
+`rm_asset_upload_link`, `rm_asset_upload_status`, `rm_asset_search`, and
+`rm_asset_reindex_embeddings`. Viewer, Inspect, the download route, upload
+route, Ticket three-field public shape, source side table, schema snapshots,
+tool counts, route counts, Dashboard, and static Viewer resources are
+unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is still not a complete public migration release because
+uploads, Search, Reindex, and the RM embedding path remain separate follow-up
+work. Rollback is to restore the `rm_asset_update_metadata` handler, revert the
+Presenter hardening, Stage 8F-G tests, related static test updates, and this
+section. No data migration, copy, double write, shadow write, sync, Render
+change, or production data access is involved.
+
+
 ## Rollback
 
 Stage 8B has no runtime switch to undo. Reverting its commit removes the fixed

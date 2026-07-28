@@ -24,8 +24,8 @@ ASSET_ID = "a" * 32
 MISSING_ID = "f" * 32
 PUBLIC_METADATA = {
     "asset_id": ASSET_ID,
-    "source_sha256": "<source-sha256>",
-    "stored_sha256": "<stored-sha256>",
+    "source_sha256": "1" * 64,
+    "stored_sha256": "2" * 64,
     "decoded_bytes": 123,
     "stored_bytes": 91,
     "mime_type": "image/png",
@@ -278,7 +278,7 @@ def test_download_link_matches_ob_payload_and_delegates_ticket_ownership():
         "filename": "sample.png",
         "mime_type": "image/png",
         "stored_bytes": 91,
-        "stored_sha256": "<stored-sha256>",
+        "stored_sha256": "2" * 64,
         "download_path": "/rm/asset-download/fake-ticket",
         "download_url": (
             "https://example.invalid/rm/asset-download/fake-ticket"

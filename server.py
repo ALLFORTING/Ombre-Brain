@@ -3753,6 +3753,16 @@ async def rm_asset_update_metadata(
     tags: list[str] | None = None,
 ) -> str:
     """Update persistent asset title, description, and tags without changing file bytes."""
+    if remember_me_host_bundle is not None:
+        try:
+            return remember_me_host_bundle.presenter.rm_asset_update_metadata(
+                asset_id,
+                title=title,
+                description=description,
+                tags=tags,
+            )
+        except Exception:
+            return _asset_ingest_response(False, error="asset_unavailable")
     try:
         asset = asset_store.update_metadata(
             asset_id,

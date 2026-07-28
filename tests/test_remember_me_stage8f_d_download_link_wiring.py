@@ -514,7 +514,6 @@ def test_public_contracts_and_stage8fd_isolation_remain(tmp_path):
     for handler in (
         "rm_asset_upload_link",
         "rm_asset_upload_status",
-        "rm_asset_update_metadata",
         "rm_asset_search",
         "rm_asset_reindex_embeddings",
     ):

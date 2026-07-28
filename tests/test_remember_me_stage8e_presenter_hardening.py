@@ -24,8 +24,8 @@ from remember_me_mcp_presenter import (
 )
 
 ASSET_ID = "a" * 32
-STORED_SHA = "<stored-sha256>"
-SOURCE_SHA = "<source-sha256>"
+STORED_SHA = "1" * 64
+SOURCE_SHA = "2" * 64
 TOKEN_A = "A" * 43
 TOKEN_B = "B" * 43
 PUBLIC_METADATA = {
