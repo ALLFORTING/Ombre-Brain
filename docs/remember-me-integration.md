@@ -100,8 +100,8 @@ exposed.
 
 | Tool | Current production implementation | Stage 8D Presenter | RM Core | OB-retained capability | Future seam | Rollback |
 | --- | --- | --- | --- | --- | --- | --- |
-| `rm_asset_upload_link` | OB handler and upload Ticket store | Not implemented | No | Authentication, 10-minute upload TTL, URL and expected-byte validation | Call RM ingest only after OB accepts and completes the upload | Remove Stage 8D files |
-| `rm_asset_upload_status` | OB upload Ticket lifecycle | Not implemented | No | Pending/uploading/completed state and status envelope | None until the OB upload lifecycle is deliberately migrated | Remove Stage 8D files |
+| `rm_asset_upload_link` | OB handler and source-aware upload Ticket store | Implemented by Stage 8F-I route flow | Yes | Authentication, 10-minute upload TTL, URL and expected-byte validation | Link creates a source-aware Ticket; route calls RM ingest only after browser upload is accepted | Restore Stage 8F-I files |
+| `rm_asset_upload_status` | OB source-aware upload Ticket lifecycle | Implemented by Stage 8F-I route flow | Yes | Pending/uploading/completed state and status envelope | Status remains source-isolated over the upload Ticket result | Restore Stage 8F-I files |
 | `rm_asset_get` | OB handler over legacy `AssetStore` | Implemented and test-only | Yes | Tool registration and JSON transport | Replace handler body with Presenter call after acceptance | Remove Stage 8D files |
 | `rm_asset_update_metadata` | OB handler plus embedding refresh | Implemented and test-only | Yes | Tool registration and `AssetEmbeddingIndex.index_asset` side effect | OB handler calls Presenter, then retains embedding refresh | Remove Stage 8D files |
 | `rm_asset_reindex_embeddings` | OB `AssetEmbeddingIndex` | Not implemented | No | Provider, model, stale detection and counters | Revisit only after vector ownership is migrated | Remove Stage 8D files |
@@ -493,6 +493,72 @@ the `rm_asset_search` handler, revert Presenter Search hardening, the optional
 Core Adapter search-only error mapping, Stage 8F-H tests, related static test
 updates, and this section. No data migration, copy, double write, shadow
 write, sync, Render change, or production data access is involved.
+
+## Stage 8F-I Wire Atomic RM Browser Upload Flow
+
+Stage 8F-I switches `rm_asset_upload_link`, `rm_asset_upload_status`, and
+`/rm/asset-upload/{token}` together as one atomic upload flow. The link creates
+the upload Ticket, the browser route consumes that same Ticket and persists the
+file, and status reads the same Ticket result. Switching only one part would
+split the source of truth for a single upload lifecycle.
+
+When the RM runtime is disabled, upload link, status, and browser POST keep the
+complete legacy behavior: legacy validation, URL/path/TTL/max-bytes contracts,
+legacy AssetStore filename sanitizer, `asset_store.create_temp_path`,
+`asset_store.persist_upload`, image validation, deduplication, status payloads,
+HTML pages, and error status codes remain unchanged. The disabled path does not
+import the RM runtime, read `OMBRE_RM_DATA_ROOT`, or create RM runtime files.
+
+When the RM runtime is enabled, link creates a `remember_me` source upload
+Ticket. The source is stored only in an internal side table guarded by the same
+upload lock as the existing upload item and token stores. The public link JSON,
+status JSON, and HTML never include the source. Historical in-memory Tickets
+without a source side-table entry are treated as legacy for compatibility;
+unknown sources fail closed and are retired.
+
+The upload route dispatches strictly by Ticket source, not by the current flag
+alone. A legacy source writes only the old AssetStore. A `remember_me` source
+uses a host-owned system temporary file, verifies streamed byte count and SHA-256
+against the bytes read back from that temporary file, then calls RM Core through
+`RememberMeCoreAdapter.ingest_ob_public_metadata()` exactly once. It does not
+call `ingest_image`, Core get, metadata read, Search, update, blob/download
+resolution, the old AssetStore, the old embedding index, or any download Ticket
+collaborator. Temporary upload files are not placed in the repository, legacy
+AssetStore data root, or RM data root, and are deleted after success or failure.
+
+RM upload mutation results are normalized before status completion. The route
+accepts only public OB metadata fields plus a strict boolean `deduplicated`,
+requires 32-character lowercase hex asset IDs, 64-character lowercase hex source
+and stored hashes, exact source-hash and decoded-byte matches, image kind,
+PNG/JPEG MIME, positive dimensions, string timestamps/title/description, and
+string-only tags. Private repository fields such as blob keys, stored relative
+paths, backend/source markers, data roots, paths, download fields, and embedding
+fields are cropped and never stored in the public status result.
+
+Public contracts remain unchanged. Upload link still returns only `ok`,
+`upload_id`, `upload_path`, `upload_url`, `status_path`, `expires_in_seconds`,
+and `max_bytes`. Upload status still returns only the existing pending/completed
+envelope fields. GET returns the existing upload HTML with the same security
+headers. POST keeps the existing public success page with `asset_id`,
+`stored_sha256`, `stored_bytes`, and `deduplicated`; errors return only HTTP
+status codes and never expose source, paths, hashes, bytes, tokens, data roots,
+or exception text.
+
+At the end of this stage, `rm_asset_upload_link`, `rm_asset_upload_status`,
+`rm_asset_get`, `rm_asset_download_link`, `rm_asset_view`, `rm_asset_inspect`,
+`rm_asset_update_metadata`, and `rm_asset_search` are wired. Only
+`rm_asset_reindex_embeddings` remains on the legacy implementation. The Viewer
+resource, Viewer fallback, download route and Ticket side table, Dashboard,
+diagnostic upload routes, schema snapshots, tool counts, route counts, and all
+environment variables remain unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is still not a complete public migration release because Reindex
+remains follow-up work. Rollback is to restore the upload link/status handlers,
+route source dispatch, upload source side table, host upload result hardening,
+Stage 8F-I tests, related static test updates, and this section. No data
+migration, copy, double write, shadow write, sync, Render change, or production
+data access is involved.
 
 ## Rollback
 

@@ -25,8 +25,6 @@ SOURCE_SHA = "1" * 64
 STORED_SHA = "2" * 64
 UPDATE_KEYS = {"ok", *_OB_PUBLIC_METADATA_KEYS}
 LEGACY_HANDLERS = (
-    "rm_asset_upload_link",
-    "rm_asset_upload_status",
     "rm_asset_reindex_embeddings",
 )
 

@@ -515,8 +515,6 @@ def test_public_contracts_and_stage8fd_isolation_remain(tmp_path):
     assert "asset_store.resolve_file" not in download_block
 
     for handler in (
-        "rm_asset_upload_link",
-        "rm_asset_upload_status",
         "rm_asset_reindex_embeddings",
     ):
         start = server_text.index(f"async def {handler}")

@@ -8,12 +8,20 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import ExifTags, Image, PngImagePlugin
 
 from asset_store import AssetStore, AssetStoreError
 from remember_me_adapter import RememberMeAdapter
+from remember_me.core import (
+    ImagePixelLimitExceeded,
+    ImageValidationError,
+    StorageConsistencyError,
+    UploadSizeMismatch,
+    UploadTooLarge,
+)
 from remember_me_core_adapter import (
     RememberMeCoreAdapter,
     RememberMeCoreAdapterError,
@@ -600,3 +608,174 @@ def test_production_modules_do_not_import_stage8c_adapter():
         assert "remember_me_core_adapter" not in (
             root / relative
         ).read_text(encoding="utf-8")
+
+
+OB_PUBLIC_UPLOAD_FIELDS = {
+    "asset_id",
+    "source_sha256",
+    "stored_sha256",
+    "decoded_bytes",
+    "stored_bytes",
+    "mime_type",
+    "filename",
+    "kind",
+    "width",
+    "height",
+    "created_at",
+    "title",
+    "description",
+    "tags",
+    "updated_at",
+    "deduplicated",
+}
+
+
+class _FakeObIngestService:
+    def __init__(self, *, error=None, deduplicated=True):
+        self.error = error
+        self.deduplicated = deduplicated
+        self.ingest_calls = []
+        self.get_asset_calls = 0
+        self.search_assets_calls = 0
+        self.resolve_asset_calls = 0
+        self.update_metadata_calls = 0
+
+    def ingest_image(self, request):
+        self.ingest_calls.append(request)
+        if self.error is not None:
+            raise self.error
+        asset = SimpleNamespace(
+            asset_id="a" * 32,
+            source_sha256="1" * 64,
+            stored_sha256="2" * 64,
+            original_filename="clean.png",
+            mime_type="image/png",
+            kind="image",
+            decoded_bytes=request.expected_bytes,
+            stored_bytes=request.expected_bytes - 1,
+            width=3,
+            height=2,
+            created_at="2026-01-02T03:04:05Z",
+            updated_at="2026-01-02T03:04:06Z",
+            title=request.title,
+            description=request.description,
+            tags=list(request.tags),
+        )
+        return SimpleNamespace(asset=asset, deduplicated=self.deduplicated)
+
+    def get_asset(self, _request):
+        self.get_asset_calls += 1
+        raise AssertionError("post-read get_asset is forbidden")
+
+    def search_assets(self, _request):
+        self.search_assets_calls += 1
+        raise AssertionError("post-read search_assets is forbidden")
+
+    def resolve_asset(self, _request):
+        self.resolve_asset_calls += 1
+        raise AssertionError("post-read resolve_asset is forbidden")
+
+    def update_metadata(self, _request):
+        self.update_metadata_calls += 1
+        raise AssertionError("post-read update_metadata is forbidden")
+
+
+class _FakeObIngestRuntime:
+    def __init__(self, service):
+        self.service = service
+        self.repository = object()
+        self.blob_store = object()
+
+
+def test_ingest_ob_public_metadata_uses_single_mutation_result_contract():
+    service = _FakeObIngestService(deduplicated=True)
+    adapter = RememberMeCoreAdapter(_FakeObIngestRuntime(service))
+
+    result = adapter.ingest_ob_public_metadata(
+        b"content",
+        7,
+        "clean.png",
+        "image/png",
+        title="Title",
+        description="Description",
+        tags=["one", "two"],
+    )
+
+    assert len(service.ingest_calls) == 1
+    assert set(result) == OB_PUBLIC_UPLOAD_FIELDS
+    assert result["source_sha256"] == "1" * 64
+    assert result["stored_sha256"] == "2" * 64
+    assert result["filename"] == "clean.png"
+    assert "original_filename" not in result
+    assert result["deduplicated"] is True
+    assert service.get_asset_calls == 0
+    assert service.search_assets_calls == 0
+    assert service.resolve_asset_calls == 0
+    assert service.update_metadata_calls == 0
+
+
+def test_ingest_ob_public_metadata_passes_request_arguments_exactly():
+    service = _FakeObIngestService(deduplicated=False)
+    adapter = RememberMeCoreAdapter(_FakeObIngestRuntime(service))
+    content = b"abc"
+
+    result = adapter.ingest_ob_public_metadata(
+        content,
+        3,
+        "photo.png",
+        "image/png",
+        title="T",
+        description="D",
+        tags=("x", "y"),
+    )
+
+    assert result["deduplicated"] is False
+    assert len(service.ingest_calls) == 1
+    request = service.ingest_calls[0]
+    assert request.content is content
+    assert request.expected_bytes == 3
+    assert request.filename == "photo.png"
+    assert request.mime_type == "image/png"
+    assert request.title == "T"
+    assert request.description == "D"
+    assert request.tags == ("x", "y")
+
+
+@pytest.mark.parametrize(
+    ("exc", "code"),
+    [
+        (UploadTooLarge("private path"), "upload_too_large"),
+        (UploadSizeMismatch("private path"), "upload_size_mismatch"),
+        (ImagePixelLimitExceeded("private path"), "pixel_limit"),
+        (ImageValidationError("private path"), "invalid_image"),
+        (StorageConsistencyError("private path"), "repository_failure"),
+        (RuntimeError("private path"), "repository_failure"),
+    ],
+)
+def test_ingest_ob_public_metadata_error_mapping_is_safe(exc, code, tmp_path):
+    service = _FakeObIngestService(error=exc)
+    adapter = RememberMeCoreAdapter(_FakeObIngestRuntime(service))
+
+    with pytest.raises(RememberMeCoreAdapterError) as caught:
+        adapter.ingest_ob_public_metadata(b"x", 1, "secret.png", "image/png")
+
+    assert len(service.ingest_calls) == 1
+    assert caught.value.code == code
+    assert "private path" not in str(caught.value)
+    assert "secret.png" not in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_existing_ingest_image_contract_is_unchanged_for_original_filename():
+    service = _FakeObIngestService(deduplicated=True)
+    adapter = RememberMeCoreAdapter(_FakeObIngestRuntime(service))
+
+    result = adapter.ingest_image(b"content", 7, "clean.png", "image/png")
+
+    assert len(service.ingest_calls) == 1
+    assert set(result) == SAFE_FIELDS
+    assert result["original_filename"] == "clean.png"
+    assert "filename" not in result
+    assert "source_sha256" not in result
+    assert "stored_sha256" not in result
+    assert result["deduplicated"] is True

@@ -385,11 +385,8 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
         ROOT / "asset_embedding_index.py",
     ]
     forbidden_functions = [
-        "rm_asset_upload_link",
-        "rm_asset_upload_status",
         "rm_asset_reindex_embeddings",
         "rm_asset_download_route",
-        "rm_asset_upload_route",
     ]
 
     for name in forbidden_functions:

@@ -31,8 +31,6 @@ INSPECT_KEYS = {
     "stored_bytes",
 }
 LEGACY_HANDLERS = (
-    "rm_asset_upload_link",
-    "rm_asset_upload_status",
     "rm_asset_reindex_embeddings",
 )
 

@@ -282,8 +282,6 @@ def test_public_contracts_and_stage8fb_isolation_remain(tmp_path):
     assert "asset_store.get" in get_block
 
     for handler in (
-        "rm_asset_upload_link",
-        "rm_asset_upload_status",
         "rm_asset_reindex_embeddings",
     ):
         start = server_text.index(f"async def {handler}")

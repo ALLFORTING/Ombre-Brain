@@ -120,6 +120,36 @@ class RememberMeCoreAdapter:
         except Exception as exc:
             self._raise_mapped(exc)
 
+    def ingest_ob_public_metadata(
+        self,
+        content: bytes,
+        expected_bytes: int,
+        filename: str,
+        mime_type: str = "application/octet-stream",
+        *,
+        title: str = "",
+        description: str = "",
+        tags: list[str] | tuple[str, ...] = (),
+    ) -> dict:
+        try:
+            clean_tags = self._tag_tuple(tags)
+            result = self._runtime.service.ingest_image(
+                IngestImageRequest(
+                    content=content,
+                    expected_bytes=expected_bytes,
+                    filename=filename,
+                    mime_type=mime_type,
+                    title=title,
+                    description=description,
+                    tags=clean_tags,
+                )
+            )
+            asset = self._ob_public_metadata(result.asset)
+            asset["deduplicated"] = bool(result.deduplicated)
+            return asset
+        except Exception as exc:
+            self._raise_mapped(exc)
+
     def get(self, asset_id: str) -> dict | None:
         if not self._valid_asset_id(asset_id):
             return None

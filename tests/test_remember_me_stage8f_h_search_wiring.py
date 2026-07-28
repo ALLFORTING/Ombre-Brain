@@ -33,8 +33,6 @@ SEARCH_ITEM_KEYS = {
     "match_reasons",
 }
 LEGACY_HANDLERS = (
-    "rm_asset_upload_link",
-    "rm_asset_upload_status",
     "rm_asset_reindex_embeddings",
 )
 SEARCH_ERRORS = (

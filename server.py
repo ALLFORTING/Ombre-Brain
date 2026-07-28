@@ -46,6 +46,7 @@ import html
 import secrets
 import time
 import threading
+import tempfile
 import struct
 import zlib
 import re
@@ -2110,6 +2111,7 @@ RM_ASSET_DOWNLOAD_MAX_TOKENS = 100
 RM_ASSET_DOWNLOAD_MAX_GETS = 3
 _rm_asset_uploads = {}
 _rm_asset_upload_tokens = {}
+_rm_asset_upload_sources = {}
 _rm_asset_upload_lock = threading.Lock()
 _rm_asset_download_tokens = {}
 _rm_asset_download_sources = {}
@@ -2730,8 +2732,43 @@ def _rm_asset_public_metadata(asset: dict, deduplicated: bool | None = None) -> 
     return payload
 
 
+def _rm_retire_asset_upload_locked(upload_id: str) -> None:
+    item = _rm_asset_uploads.get(upload_id)
+    token = item.get("token", "") if item else ""
+    if token:
+        _rm_asset_upload_tokens.pop(token, None)
+    _rm_asset_uploads.pop(upload_id, None)
+    _rm_asset_upload_sources.pop(upload_id, None)
+
+
+def _rm_asset_upload_source_locked(upload_id: str) -> str:
+    source = _rm_asset_upload_sources.get(upload_id, "legacy")
+    if source in {"legacy", "remember_me"}:
+        return source
+    _rm_retire_asset_upload_locked(upload_id)
+    return ""
+
+
+def _rm_store_asset_upload_locked(upload_id: str, token: str, item: dict, source: str) -> bool:
+    if source not in {"legacy", "remember_me"}:
+        return False
+    try:
+        _rm_asset_uploads[upload_id] = item
+        _rm_asset_upload_tokens[token] = upload_id
+        _rm_asset_upload_sources[upload_id] = source
+        return True
+    except Exception:
+        _rm_retire_asset_upload_locked(upload_id)
+        _rm_asset_upload_tokens.pop(token, None)
+        return False
+
+
 def _rm_cleanup_asset_uploads(now: float) -> None:
     for upload_id, item in list(_rm_asset_uploads.items()):
+        source = _rm_asset_upload_sources.get(upload_id, "legacy")
+        if source not in {"legacy", "remember_me"}:
+            _rm_retire_asset_upload_locked(upload_id)
+            continue
         if item["state"] == "pending" and item["expires_at"] <= now:
             token = item.get("token", "")
             if token:
@@ -2739,10 +2776,30 @@ def _rm_cleanup_asset_uploads(now: float) -> None:
             item["token"] = ""
             item["state"] = "expired"
         if item["retire_at"] <= now:
-            token = item.get("token", "")
-            if token:
-                _rm_asset_upload_tokens.pop(token, None)
-            _rm_asset_uploads.pop(upload_id, None)
+            _rm_retire_asset_upload_locked(upload_id)
+
+
+def _rm_host_sanitize_upload_filename(filename: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", filename or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        cleaned = "asset.bin"
+    return cleaned[:255]
+
+
+def _rm_create_upload_temp_path() -> Path:
+    fd, name = tempfile.mkstemp(prefix="ombre-rm-upload-", suffix=".tmp")
+    os.close(fd)
+    return Path(name)
+
+
+def _rm_delete_upload_temp_path(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _rm_create_asset_upload_link(
@@ -2750,7 +2807,11 @@ def _rm_create_asset_upload_link(
     filename: str = "",
     mime_type: str = "application/octet-stream",
     now: float | None = None,
+    *,
+    source: str = "legacy",
 ) -> str:
+    if source not in {"legacy", "remember_me"}:
+        return _asset_ingest_response(False, error="upload_unavailable")
     if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or not 0 <= expected_bytes <= RM_ASSET_MAX_UPLOAD_BYTES:
         return _asset_ingest_response(False, error="invalid_expected_bytes", max_bytes=RM_ASSET_MAX_UPLOAD_BYTES)
     mime = (mime_type or "application/octet-stream").strip().lower()
@@ -2758,6 +2819,7 @@ def _rm_create_asset_upload_link(
         return _asset_ingest_response(False, error="unsupported_mime_type")
 
     current = time.time() if now is None else now
+    safe_filename = asset_store.sanitize_filename(filename) if source == "legacy" else _rm_host_sanitize_upload_filename(filename)
     with _rm_asset_upload_lock:
         _rm_cleanup_asset_uploads(current)
         active = sum(1 for item in _rm_asset_uploads.values() if item["state"] in ("pending", "uploading"))
@@ -2772,17 +2834,18 @@ def _rm_create_asset_upload_link(
             if token not in _rm_asset_upload_tokens:
                 break
         expires_at = current + RM_ASSET_UPLOAD_TTL_SECONDS
-        _rm_asset_uploads[upload_id] = {
+        item = {
             "state": "pending",
             "token": token,
             "expected_bytes": expected_bytes,
-            "filename": asset_store.sanitize_filename(filename),
+            "filename": safe_filename,
             "mime_type": mime,
             "expires_at": expires_at,
             "retire_at": expires_at + RM_ASSET_UPLOAD_TTL_SECONDS,
             "result": None,
         }
-        _rm_asset_upload_tokens[token] = upload_id
+        if not _rm_store_asset_upload_locked(upload_id, token, item, source):
+            return _asset_ingest_response(False, error="upload_unavailable")
 
     upload_path = f"/rm/asset-upload/{token}"
     base_url = _asset_public_base_url()
@@ -2797,15 +2860,20 @@ def _rm_create_asset_upload_link(
     }, ensure_ascii=False, sort_keys=True)
 
 
-def _rm_asset_upload_status_payload(upload_id: str, now: float | None = None) -> str:
+def _rm_asset_upload_status_payload(upload_id: str, now: float | None = None, *, expected_source: str = "legacy") -> str:
     upload_id = (upload_id or "").strip()
     if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
         return _asset_ingest_response(False, error="invalid_upload_id")
+    if expected_source not in {"legacy", "remember_me"}:
+        return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
     current = time.time() if now is None else now
     with _rm_asset_upload_lock:
         _rm_cleanup_asset_uploads(current)
         item = _rm_asset_uploads.get(upload_id)
         if not item:
+            return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
+        source = _rm_asset_upload_source_locked(upload_id)
+        if not source or source != expected_source:
             return _asset_ingest_response(False, upload_id=upload_id, error="upload_unavailable")
         state = "pending" if item["state"] == "uploading" else item["state"]
         result = dict(item["result"] or {})
@@ -2837,11 +2905,15 @@ def _rm_get_asset_upload(token: str, now: float | None = None) -> dict | None:
         item = _rm_asset_uploads.get(upload_id or "")
         if not item or item["state"] != "pending":
             return None
+        source = _rm_asset_upload_source_locked(upload_id)
+        if not source:
+            return None
         return {
             "upload_id": upload_id,
             "expected_bytes": item["expected_bytes"],
             "filename": item["filename"],
             "expires_at": item["expires_at"],
+            "source": source,
         }
 
 
@@ -2855,12 +2927,16 @@ def _rm_claim_asset_upload(token: str, now: float | None = None) -> dict | None:
         item = _rm_asset_uploads.get(upload_id or "")
         if not item or item["state"] != "pending":
             return None
+        source = _rm_asset_upload_source_locked(upload_id)
+        if not source:
+            return None
         item["state"] = "uploading"
         return {
             "upload_id": upload_id,
             "expected_bytes": item["expected_bytes"],
             "filename": item["filename"],
             "mime_type": item["mime_type"],
+            "source": source,
         }
 
 
@@ -2871,6 +2947,9 @@ def _rm_release_asset_upload(upload_id: str, now: float | None = None) -> None:
         item = _rm_asset_uploads.get(upload_id)
         if not item or item["state"] != "uploading":
             return
+        source = _rm_asset_upload_source_locked(upload_id)
+        if not source:
+            return
         if item["expires_at"] <= current:
             item["state"] = "expired"
             item["token"] = ""
@@ -2879,13 +2958,87 @@ def _rm_release_asset_upload(upload_id: str, now: float | None = None) -> None:
         _rm_asset_upload_tokens[item["token"]] = upload_id
 
 
-def _rm_complete_asset_upload(upload_id: str, asset: dict, source_sha256: str) -> dict | None:
+def _rm_normalize_remember_me_upload_result(result, expected_bytes: int, source_sha256: str) -> dict:
+    from collections.abc import Mapping
+
+    def require_str(value) -> str:
+        if not isinstance(value, str):
+            raise ValueError("invalid_upload_result")
+        return value
+
+    def require_hex(value, length: int) -> str:
+        text = require_str(value)
+        if not re.fullmatch(rf"[0-9a-f]{{{length}}}", text):
+            raise ValueError("invalid_upload_result")
+        return text
+
+    def require_int(value, *, positive: bool) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("invalid_upload_result")
+        if positive and value <= 0:
+            raise ValueError("invalid_upload_result")
+        if not positive and value < 0:
+            raise ValueError("invalid_upload_result")
+        return value
+
+    if not isinstance(result, Mapping):
+        raise ValueError("invalid_upload_result")
+    asset_id = require_hex(result["asset_id"], 32)
+    result_source_sha256 = require_hex(result["source_sha256"], 64)
+    stored_sha256 = require_hex(result["stored_sha256"], 64)
+    if not hmac.compare_digest(result_source_sha256, source_sha256):
+        raise ValueError("invalid_upload_result")
+    decoded_bytes = require_int(result["decoded_bytes"], positive=False)
+    if decoded_bytes != expected_bytes:
+        raise ValueError("invalid_upload_result")
+    stored_bytes = require_int(result["stored_bytes"], positive=False)
+    filename = require_str(result["filename"])
+    mime_type = require_str(result["mime_type"])
+    if mime_type not in {"image/png", "image/jpeg"}:
+        raise ValueError("invalid_upload_result")
+    kind = require_str(result["kind"])
+    if kind != "image":
+        raise ValueError("invalid_upload_result")
+    width = require_int(result["width"], positive=True)
+    height = require_int(result["height"], positive=True)
+    require_str(result["created_at"])
+    require_str(result["updated_at"])
+    require_str(result["title"])
+    require_str(result["description"])
+    tags = result["tags"]
+    if not isinstance(tags, (list, tuple)) or any(not isinstance(tag, str) for tag in tags):
+        raise ValueError("invalid_upload_result")
+    deduplicated = result["deduplicated"]
+    if not isinstance(deduplicated, bool):
+        raise ValueError("invalid_upload_result")
+    return {
+        "asset_id": asset_id,
+        "source_sha256": result_source_sha256,
+        "stored_sha256": stored_sha256,
+        "decoded_bytes": decoded_bytes,
+        "stored_bytes": stored_bytes,
+        "mime_type": mime_type,
+        "filename": filename,
+        "kind": kind,
+        "width": width,
+        "height": height,
+        "deduplicated": deduplicated,
+    }
+
+
+def _rm_complete_asset_upload(upload_id: str, asset: dict, source_sha256: str, *, expected_source: str = "legacy") -> dict | None:
+    if expected_source not in {"legacy", "remember_me"}:
+        return None
     with _rm_asset_upload_lock:
         item = _rm_asset_uploads.get(upload_id)
         if not item or item["state"] != "uploading":
             return None
-        result = _rm_asset_public_metadata(asset, bool(asset.get("deduplicated")))
-        result["source_sha256"] = source_sha256
+        source = _rm_asset_upload_source_locked(upload_id)
+        if source != expected_source:
+            return None
+        result = dict(asset)
+        if not hmac.compare_digest(str(result.get("source_sha256", "")), source_sha256):
+            return None
         item["state"] = "completed"
         item["token"] = ""
         item["result"] = result
@@ -3722,13 +3875,15 @@ async def rm_asset_upload_link(
     mime_type: str = "application/octet-stream",
 ) -> str:
     """Create a short-lived browser upload URL; the server computes the file hash."""
-    return _rm_create_asset_upload_link(expected_bytes, filename, mime_type)
+    source = "remember_me" if remember_me_host_bundle is not None else "legacy"
+    return _rm_create_asset_upload_link(expected_bytes, filename, mime_type, source=source)
 
 
 @mcp.tool()
 async def rm_asset_upload_status(upload_id: str) -> str:
     """Return metadata-only status for a persistent Remember-Me asset upload."""
-    return _rm_asset_upload_status_payload(upload_id)
+    source = "remember_me" if remember_me_host_bundle is not None else "legacy"
+    return _rm_asset_upload_status_payload(upload_id, expected_source=source)
 
 
 @mcp.tool()
@@ -4005,6 +4160,72 @@ async def rm_asset_inspect(asset_id: str) -> CallToolResult:
     except Exception:
         return _rm_asset_inspect_error("image_unavailable")
 
+
+_RM_UPLOAD_CORE_ERROR_STATUS = {
+    "upload_too_large": 413,
+    "upload_size_mismatch": 422,
+    "pixel_limit": 422,
+    "invalid_image": 422,
+    "invalid_metadata": 422,
+    "invalid_asset_id": 422,
+    "repository_failure": 500,
+    "core_failure": 500,
+    "runtime_unavailable": 503,
+}
+
+
+def _rm_core_upload_error_status(exc: Exception) -> int:
+    return _RM_UPLOAD_CORE_ERROR_STATUS.get(str(getattr(exc, "code", "")), 500)
+
+
+async def _rm_persist_remember_me_upload(request, claim: dict) -> tuple[int, dict | None]:
+    if remember_me_host_bundle is None:
+        return 503, None
+    temp_path = _rm_create_upload_temp_path()
+    try:
+        try:
+            with temp_path.open("wb") as handle:
+                streamed = await _asset_stream_browser_upload(
+                    request,
+                    handle.write,
+                    max_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+                )
+        except _AssetBrowserUploadTooLarge:
+            return 413, None
+        except Exception:
+            return 400, None
+        if streamed["decoded_bytes"] != claim["expected_bytes"]:
+            return 422, None
+        try:
+            content = await asyncio.to_thread(temp_path.read_bytes)
+        except Exception:
+            return 500, None
+        if len(content) != streamed["decoded_bytes"]:
+            return 500, None
+        if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), streamed["sha256"]):
+            return 500, None
+        try:
+            raw_result = await asyncio.to_thread(
+                remember_me_host_bundle.core_adapter.ingest_ob_public_metadata,
+                content,
+                claim["expected_bytes"],
+                claim["filename"],
+                claim["mime_type"],
+                title="",
+                description="",
+                tags=(),
+            )
+            result = _rm_normalize_remember_me_upload_result(
+                raw_result,
+                claim["expected_bytes"],
+                streamed["sha256"],
+            )
+        except Exception as exc:
+            return _rm_core_upload_error_status(exc), None
+        return 200, result
+    finally:
+        _rm_delete_upload_temp_path(temp_path)
+
 @mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
 async def rm_asset_upload_route(request):
     from starlette.responses import HTMLResponse, Response
@@ -4020,43 +4241,62 @@ async def rm_asset_upload_route(request):
     claim = _rm_claim_asset_upload(token)
     if claim is None:
         return Response(status_code=404, headers=headers)
-    temp_path = asset_store.create_temp_path()
-    try:
-        with temp_path.open("wb") as handle:
-            streamed = await _asset_stream_browser_upload(
-                request,
-                handle.write,
-                max_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+
+    source = claim.get("source")
+    if source == "legacy":
+        temp_path = asset_store.create_temp_path()
+        try:
+            with temp_path.open("wb") as handle:
+                streamed = await _asset_stream_browser_upload(
+                    request,
+                    handle.write,
+                    max_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+                )
+            size_match = streamed["decoded_bytes"] == claim["expected_bytes"]
+            if not size_match:
+                _rm_release_asset_upload(claim["upload_id"])
+                return Response(status_code=422, headers=headers)
+            asset = await asyncio.to_thread(
+                asset_store.persist_upload,
+                temp_path,
+                streamed["sha256"],
+                streamed["decoded_bytes"],
+                claim["filename"],
+                claim["mime_type"],
+                require_image=True,
             )
-        size_match = streamed["decoded_bytes"] == claim["expected_bytes"]
-        if not size_match:
+            result_asset = _rm_asset_public_metadata(asset, bool(asset.get("deduplicated")))
+            result_asset["source_sha256"] = streamed["sha256"]
+        except _AssetBrowserUploadTooLarge:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=413, headers=headers)
+        except InvalidAssetImage:
             _rm_release_asset_upload(claim["upload_id"])
             return Response(status_code=422, headers=headers)
-        asset = await asyncio.to_thread(
-            asset_store.persist_upload,
-            temp_path,
-            streamed["sha256"],
-            streamed["decoded_bytes"],
-            claim["filename"],
-            claim["mime_type"],
-            require_image=True,
-        )
-    except _AssetBrowserUploadTooLarge:
+        except AssetStoreError:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=500, headers=headers)
+        except Exception:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=400, headers=headers)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    elif source == "remember_me":
+        status_code, result_asset = await _rm_persist_remember_me_upload(request, claim)
+        if status_code != 200 or result_asset is None:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=status_code, headers=headers)
+        streamed = {"sha256": result_asset["source_sha256"]}
+    else:
         _rm_release_asset_upload(claim["upload_id"])
-        return Response(status_code=413, headers=headers)
-    except InvalidAssetImage:
-        _rm_release_asset_upload(claim["upload_id"])
-        return Response(status_code=422, headers=headers)
-    except AssetStoreError:
-        _rm_release_asset_upload(claim["upload_id"])
-        return Response(status_code=500, headers=headers)
-    except Exception:
-        _rm_release_asset_upload(claim["upload_id"])
-        return Response(status_code=400, headers=headers)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        return Response(status_code=404, headers=headers)
 
-    result = _rm_complete_asset_upload(claim["upload_id"], asset, streamed["sha256"])
+    result = _rm_complete_asset_upload(
+        claim["upload_id"],
+        result_asset,
+        streamed["sha256"],
+        expected_source=source,
+    )
     if result is None:
         return Response(status_code=500, headers=headers)
     return HTMLResponse(_rm_asset_result_page(result), headers=headers)
