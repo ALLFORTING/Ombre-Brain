@@ -155,6 +155,9 @@ class CountingCore:
         self.resolve_ob_download_calls += 1
         raise AssertionError("resolve_ob_download must not be used")
 
+    def search(self, *args, **kwargs):
+        raise AssertionError("search must not be used")
+
 
 class CountingDownloadLinks:
     def __init__(self, payload=None, error=None):
@@ -514,7 +517,6 @@ def test_public_contracts_and_stage8fd_isolation_remain(tmp_path):
     for handler in (
         "rm_asset_upload_link",
         "rm_asset_upload_status",
-        "rm_asset_search",
         "rm_asset_reindex_embeddings",
     ):
         start = server_text.index(f"async def {handler}")
@@ -571,7 +573,9 @@ async def main():
 asyncio.run(main())
 """
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(ROOT), os.environ.get("PYTHONPATH", "")) if item
+    )
     env["OMBRE_BUCKETS_DIR"] = str(tmp_path / "buckets")
     env.pop("OMBRE_RM_RUNTIME_ENABLED", None)
     env.pop("OMBRE_RM_DATA_ROOT", None)
@@ -620,7 +624,9 @@ print(json.dumps({
 }))
 """
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(ROOT), os.environ.get("PYTHONPATH", "")) if item
+    )
     env["OMBRE_BUCKETS_DIR"] = str(tmp_path / "buckets")
     env.pop("OMBRE_API_KEY", None)
     completed = subprocess.run(

@@ -171,6 +171,9 @@ class PresenterCore:
             self.blob,
         )
 
+    def search(self, *args, **kwargs):
+        raise AssertionError("search must not be used")
+
 
 class FixedDownloadLinks:
     def create_download_link(self, asset):

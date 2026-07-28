@@ -264,6 +264,8 @@ def test_core_adapter_import_has_no_side_effects(tmp_path):
         if key in os.environ
     }
     environment["OMBRE_BUCKETS_DIR"] = str(sentinel)
+    if os.environ.get("PYTHONPATH"):
+        environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
     completed = subprocess.run(
         [
             sys.executable,

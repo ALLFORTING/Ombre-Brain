@@ -33,7 +33,6 @@ INSPECT_KEYS = {
 LEGACY_HANDLERS = (
     "rm_asset_upload_link",
     "rm_asset_upload_status",
-    "rm_asset_search",
     "rm_asset_reindex_embeddings",
 )
 
@@ -133,6 +132,9 @@ class CountingCore:
     def update_ob_public_metadata(self, *args, **kwargs):
         self.update_calls += 1
         raise AssertionError("core update must not be used by inspect")
+
+    def search(self, *args, **kwargs):
+        raise AssertionError("search must not be used by inspect")
 
 
 class CountingLinks:

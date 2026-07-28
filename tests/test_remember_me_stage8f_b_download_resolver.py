@@ -520,7 +520,6 @@ def test_public_contracts_and_isolation_remain_unchanged(tmp_path):
         "rm_asset_upload_link",
         "rm_asset_upload_status",
         "rm_asset_reindex_embeddings",
-        "rm_asset_search",
     ):
         start = server_text.index(f"async def {handler}")
         stop = server_text.find("\n@mcp.", start + 1)
@@ -569,7 +568,11 @@ asyncio.run(main())
 """
     env = {
         **__import__("os").environ,
-        "PYTHONPATH": str(ROOT),
+        "PYTHONPATH": __import__("os").pathsep.join(
+            item
+            for item in (str(ROOT), __import__("os").environ.get("PYTHONPATH", ""))
+            if item
+        ),
         "OMBRE_BUCKETS_DIR": str(tmp_path / "buckets"),
     }
     env.pop("OMBRE_RM_RUNTIME_ENABLED", None)

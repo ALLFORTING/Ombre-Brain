@@ -105,7 +105,7 @@ exposed.
 | `rm_asset_get` | OB handler over legacy `AssetStore` | Implemented and test-only | Yes | Tool registration and JSON transport | Replace handler body with Presenter call after acceptance | Remove Stage 8D files |
 | `rm_asset_update_metadata` | OB handler plus embedding refresh | Implemented and test-only | Yes | Tool registration and `AssetEmbeddingIndex.index_asset` side effect | OB handler calls Presenter, then retains embedding refresh | Remove Stage 8D files |
 | `rm_asset_reindex_embeddings` | OB `AssetEmbeddingIndex` | Not implemented | No | Provider, model, stale detection and counters | Revisit only after vector ownership is migrated | Remove Stage 8D files |
-| `rm_asset_search` | OB keyword/vector fusion | Not implemented | No | `EmbeddingEngine`, semantic scores, fusion, sorting and fallback | Migrate search as one accepted contract, never half-switch | Remove Stage 8D files |
+| `rm_asset_search` | OB keyword/vector fusion | Implemented and test-only | Yes | `EmbeddingEngine`, semantic scores, fusion, sorting and fallback | OB handler calls Presenter/Core search after acceptance | Remove Stage 8D files |
 | `rm_asset_download_link` | OB download Ticket store | Implemented with an injected seam | Yes | Five-minute download TTL, three-GET limit, Ticket, URL, authentication and headers | Inject a thin wrapper over the existing OB Ticket/URL helper | Remove Stage 8D files |
 | `rm_asset_view` | OB handler and Viewer metadata | Implemented and test-only | Yes | Tool registration, `ASSET_VIEWER_TOOL_META`, resource URI and branding | Inject OB download collaborator and retain current registration | Remove Stage 8D files |
 | `rm_asset_inspect` | OB handler over verified stored bytes | Implemented and test-only | Yes | Tool registration and external description | Replace handler body only after exact result acceptance | Remove Stage 8D files |
@@ -451,6 +451,48 @@ Presenter hardening, Stage 8F-G tests, related static test updates, and this
 section. No data migration, copy, double write, shadow write, sync, Render
 change, or production data access is involved.
 
+## Stage 8F-H Wire rm_asset_search Only
+
+Stage 8F-H switches only `rm_asset_search`. It is the sixth wired handler.
+When the RM runtime is disabled, the handler keeps the complete legacy Search
+implementation: lexical AssetStore search, optional legacy embedding semantic
+fallback, semantic scores, paging, filters, and legacy fallback behavior remain
+unchanged. The disabled path does not import the RM runtime, read
+`OMBRE_RM_DATA_ROOT`, or create RM runtime files.
+
+When the RM runtime is enabled, `rm_asset_search` calls only the Stage 8F-A
+bundle Presenter and RM Core Search once. Enabled Search does not call the old
+AssetStore, old embedding index, per-item `get`, metadata read or update,
+`resolve_blob`, `resolve_ob_download`, or any download collaborator. It creates
+no Ticket, reads or writes no Ticket store, performs no embedding write, and
+never falls back to legacy results. RM Core results are the only enabled Search
+source.
+
+Presenter Search returns only the existing public search envelope: top-level
+`ok`, `total`, `offset`, `limit`, and `results`. Each result is cropped to the
+public fields accepted by the current OB contract. Private fields such as
+decoded bytes, hashes, blob keys, relative paths, data roots, backend/source
+markers, download URLs, and internal repository fields are not exposed.
+`semantic_score` is retained only when it is finite, between 0 and 1, and paired
+with the `semantic` match reason; otherwise the whole Search result is rejected
+with the stable Search error envelope.
+
+At the end of this stage, `rm_asset_get`, `rm_asset_download_link`,
+`rm_asset_view`, `rm_asset_inspect`, `rm_asset_update_metadata`, and
+`rm_asset_search` are wired. The remaining three handlers stay on the old
+implementation: `rm_asset_upload_link`, `rm_asset_upload_status`, and
+`rm_asset_reindex_embeddings`. Viewer, Inspect, metadata update, download and
+upload routes, Viewer fallback, Ticket three-field public shape, source side
+table, schema snapshots, tool counts, route counts, Dashboard, static Viewer
+resources, and the legacy Reindex path are unchanged.
+
+The current production Render environment must still keep the RM runtime flag
+disabled. This is still not a complete public migration release because upload
+link/status and Reindex remain separate follow-up work. Rollback is to restore
+the `rm_asset_search` handler, revert Presenter Search hardening, the optional
+Core Adapter search-only error mapping, Stage 8F-H tests, related static test
+updates, and this section. No data migration, copy, double write, shadow
+write, sync, Render change, or production data access is involved.
 
 ## Rollback
 

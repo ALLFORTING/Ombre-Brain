@@ -27,7 +27,6 @@ UPDATE_KEYS = {"ok", *_OB_PUBLIC_METADATA_KEYS}
 LEGACY_HANDLERS = (
     "rm_asset_upload_link",
     "rm_asset_upload_status",
-    "rm_asset_search",
     "rm_asset_reindex_embeddings",
 )
 
@@ -142,6 +141,9 @@ class UpdateCore:
     def get(self, asset_id):
         self.get_calls += 1
         raise AssertionError("core get must not be used by update")
+
+    def search(self, *args, **kwargs):
+        raise AssertionError("search must not be used by update")
 
 
 class HostileMapping(dict):
@@ -462,6 +464,7 @@ def test_public_contracts_and_stage8fg_isolation_remain(tmp_path):
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     get_block = server_text[server_text.index("async def rm_asset_get"):server_text.index("async def rm_asset_update_metadata")]
     update_block = server_text[server_text.index("async def rm_asset_update_metadata"):server_text.index("async def rm_asset_search")]
+    search_block = server_text[server_text.index("async def rm_asset_search"):server_text.index("async def rm_asset_reindex_embeddings")]
     download_block = server_text[server_text.index("async def rm_asset_download_link"):server_text.index("@mcp.resource", server_text.index("async def rm_asset_download_link"))]
     view_block = server_text[server_text.index("async def rm_asset_view("):server_text.index("async def rm_asset_inspect")]
     inspect_block = server_text[server_text.index("async def rm_asset_inspect"):server_text.index("@mcp.custom_route", server_text.index("async def rm_asset_inspect"))]
@@ -470,8 +473,11 @@ def test_public_contracts_and_stage8fg_isolation_remain(tmp_path):
     assert "remember_me_host_bundle.presenter.rm_asset_view" in view_block
     assert "remember_me_host_bundle.presenter.rm_asset_inspect" in inspect_block
     assert "remember_me_host_bundle.presenter.rm_asset_update_metadata" in update_block
+    assert "remember_me_host_bundle.presenter.rm_asset_search" in search_block
     assert "asset_store.update_metadata" in update_block
     assert "asset_embedding_index.index_asset" in update_block
+    assert "asset_store.search" in search_block
+    assert "asset_embedding_index.search" in search_block
     enabled_block = update_block[:update_block.index("try:", update_block.index("except Exception:"))]
     assert "asset_store.update_metadata" not in enabled_block
     assert "asset_embedding_index.index_asset" not in enabled_block

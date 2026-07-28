@@ -148,6 +148,9 @@ class FakeCoreAdapter:
             self.blob,
         )
 
+    def search(self, *args, **kwargs):
+        raise AssertionError("search must not be used")
+
 
 class FakeDownloadLinks:
     def __init__(self):

@@ -36,7 +36,9 @@ class CountingLock:
 
 def _env(tmp_path, **values):
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT)
+    pythonpath = env.get("PYTHONPATH")
+    paths = [str(ROOT), *(pythonpath.split(os.pathsep) if pythonpath else [])]
+    env["PYTHONPATH"] = os.pathsep.join(paths)
     env["OMBRE_BUCKETS_DIR"] = str(tmp_path / "buckets")
     env.pop("OMBRE_RM_RUNTIME_ENABLED", None)
     env.pop("OMBRE_RM_DATA_ROOT", None)
@@ -386,7 +388,6 @@ def test_stage8f_a_keeps_handlers_routes_and_public_surface_unwired():
         "rm_asset_upload_link",
         "rm_asset_upload_status",
         "rm_asset_reindex_embeddings",
-        "rm_asset_search",
         "rm_asset_download_route",
         "rm_asset_upload_route",
     ]

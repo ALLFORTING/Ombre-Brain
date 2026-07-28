@@ -37,6 +37,20 @@ _OB_METADATA_ERROR_CODES = {
     "title_too_long",
     "too_many_tags",
 }
+_OB_SEARCH_ERROR_CODES = {
+    "invalid_query",
+    "invalid_limit",
+    "invalid_offset",
+    "invalid_kind",
+    "invalid_mime_type",
+    "invalid_created_from",
+    "invalid_created_to",
+    "invalid_date_range",
+    "invalid_tags",
+    "invalid_tag",
+    "tag_too_long",
+    "too_many_tags",
+}
 
 
 class RememberMeCoreAdapterError(RuntimeError):
@@ -227,6 +241,9 @@ class RememberMeCoreAdapter:
                 "results": items,
             }
         except Exception as exc:
+            candidate = str(exc)
+            if candidate in _OB_SEARCH_ERROR_CODES:
+                raise RememberMeCoreAdapterError(candidate) from exc
             self._raise_mapped(exc)
 
     def resolve_blob(self, asset_id: str) -> tuple[dict, bytes]:

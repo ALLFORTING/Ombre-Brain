@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 from typing import Any, Mapping
 
 from mcp.types import CallToolResult, ImageContent, TextContent
@@ -29,7 +30,7 @@ class RememberMeMcpCompatibilityPresenterError(RuntimeError):
 
 
 class RememberMeMcpCompatibilityPresenter:
-    """Present RM Core results using the five current OB MCP envelopes."""
+    """Present RM Core results using the six current OB MCP envelopes."""
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class RememberMeMcpCompatibilityPresenter:
             "get_ob_public_metadata",
             "update_ob_public_metadata",
             "resolve_blob",
+            "search",
         )
         if core_adapter is None or not all(
             callable(getattr(core_adapter, name, None))
@@ -105,6 +107,49 @@ class RememberMeMcpCompatibilityPresenter:
             return _json_success(normalized)
         except Exception:
             return _json_error("asset_unavailable")
+
+    def rm_asset_search(
+        self,
+        query: str = "",
+        tags: list[str] | None = None,
+        kind: str = "",
+        mime_type: str = "",
+        created_from: str = "",
+        created_to: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> str:
+        """Present current OB search JSON without private fields."""
+        try:
+            result = self._core.search(
+                query=query,
+                tags=tags,
+                kind=kind,
+                mime_type=mime_type,
+                created_from=created_from,
+                created_to=created_to,
+                limit=limit,
+                offset=offset,
+            )
+        except RememberMeCoreAdapterError as exc:
+            return _json_error(_search_error_code(exc.ob_code or exc.code))
+        except Exception:
+            return _json_error("search_unavailable")
+        normalized = _normalize_search_result(
+            result,
+            requested_limit=limit,
+            requested_offset=offset,
+        )
+        if normalized is None:
+            return _json_error("search_unavailable")
+        try:
+            return json.dumps(
+                {"ok": True, **normalized},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            return _json_error("search_unavailable")
 
     def rm_asset_download_link(self, asset_id: str) -> str:
         """Confirm the asset through RM, then delegate OB Ticket and URL work."""
@@ -402,6 +447,12 @@ def _download_error_code(code: Any) -> str:
     return "download_unavailable"
 
 
+def _search_error_code(code: Any) -> str:
+    if code in _SEARCH_ERROR_CODES:
+        return code
+    return "search_unavailable"
+
+
 _OB_PUBLIC_METADATA_KEYS = (
     "asset_id",
     "source_sha256",
@@ -430,6 +481,50 @@ _DOWNLOAD_PAYLOAD_KEYS = (
     "download_url",
     "expires_in_seconds",
 )
+
+_SEARCH_RESULT_KEYS = (
+    "asset_id",
+    "filename",
+    "title",
+    "description",
+    "tags",
+    "kind",
+    "mime_type",
+    "width",
+    "height",
+    "stored_bytes",
+    "created_at",
+    "updated_at",
+    "match_reasons",
+)
+
+_SEARCH_ERROR_CODES = {
+    "invalid_query",
+    "invalid_limit",
+    "invalid_offset",
+    "invalid_kind",
+    "invalid_mime_type",
+    "invalid_created_from",
+    "invalid_created_to",
+    "invalid_date_range",
+    "invalid_tags",
+    "invalid_tag",
+    "tag_too_long",
+    "too_many_tags",
+}
+
+_SEARCH_MATCH_REASONS = {
+    "asset_id_exact",
+    "asset_id",
+    "tag_exact",
+    "tag",
+    "title_exact",
+    "title_prefix",
+    "title",
+    "filename",
+    "description",
+    "semantic",
+}
 
 
 def _normalize_public_metadata(asset: Any) -> dict[str, Any] | None:
@@ -502,6 +597,119 @@ def _normalize_updated_public_metadata(
     ):
         return None
     normalized["tags"] = list(tags)
+    return normalized
+
+
+def _normalize_search_result(
+    result: Any,
+    *,
+    requested_limit: int,
+    requested_offset: int,
+) -> dict[str, Any] | None:
+    if not isinstance(result, Mapping):
+        return None
+    try:
+        total = result["total"]
+        offset = result["offset"]
+        limit = result["limit"]
+        items = result["results"]
+    except Exception:
+        return None
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total < 0
+        or not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 0
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 1
+        or limit > 50
+        or offset != requested_offset
+        or limit != requested_limit
+        or not isinstance(items, (list, tuple))
+        or len(items) > limit
+    ):
+        return None
+    normalized_items = []
+    for item in items:
+        normalized = _normalize_search_item(item)
+        if normalized is None:
+            return None
+        normalized_items.append(normalized)
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": normalized_items,
+    }
+
+
+def _normalize_search_item(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, Mapping):
+        return None
+    try:
+        normalized = {key: item[key] for key in _SEARCH_RESULT_KEYS}
+        semantic_score = item.get("semantic_score", None)
+    except Exception:
+        return None
+    if (
+        not isinstance(normalized["asset_id"], str)
+        or not _is_lower_hex(normalized["asset_id"], length=32)
+    ):
+        return None
+    for key in (
+        "filename",
+        "title",
+        "description",
+        "kind",
+        "mime_type",
+        "created_at",
+        "updated_at",
+    ):
+        if not isinstance(normalized[key], str):
+            return None
+    if normalized["kind"] not in {"image", "file"}:
+        return None
+    if normalized["mime_type"] not in {
+        "application/octet-stream",
+        "image/jpeg",
+        "image/png",
+    }:
+        return None
+    for key in ("width", "height", "stored_bytes"):
+        value = normalized[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+    for key in ("tags", "match_reasons"):
+        value = normalized[key]
+        if (
+            not isinstance(value, (list, tuple))
+            or any(not isinstance(entry, str) for entry in value)
+        ):
+            return None
+        normalized[key] = list(value)
+    if any(
+        reason not in _SEARCH_MATCH_REASONS
+        for reason in normalized["match_reasons"]
+    ):
+        return None
+    has_semantic = "semantic" in normalized["match_reasons"]
+    if semantic_score is None:
+        if has_semantic:
+            return None
+    else:
+        if (
+            not has_semantic
+            or not isinstance(semantic_score, (int, float))
+            or isinstance(semantic_score, bool)
+            or not math.isfinite(float(semantic_score))
+            or float(semantic_score) < 0.0
+            or float(semantic_score) > 1.0
+        ):
+            return None
+        normalized["semantic_score"] = float(semantic_score)
     return normalized
 
 

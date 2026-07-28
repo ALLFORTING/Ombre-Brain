@@ -3798,6 +3798,23 @@ async def rm_asset_search(
     offset: int = 0,
 ) -> str:
     """Search persistent assets through keyword and optional semantic channels."""
+    if remember_me_host_bundle is not None:
+        try:
+            return remember_me_host_bundle.presenter.rm_asset_search(
+                query=query,
+                tags=tags,
+                kind=kind,
+                mime_type=mime_type,
+                created_from=created_from,
+                created_to=created_to,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception:
+            return _asset_ingest_response(
+                False,
+                error="search_unavailable",
+            )
     try:
         result = asset_store.search(
             query=query,
