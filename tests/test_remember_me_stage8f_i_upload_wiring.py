@@ -386,6 +386,93 @@ async def test_rm_upload_result_hardening_releases_ticket_without_fallback(tmp_p
     assert not server._rm_asset_download_tokens
 
 
+
+
+@pytest.mark.asyncio
+async def test_host_upload_filename_sanitizer_matches_legacy_and_enabled_does_not_call_legacy(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    values = [
+        "",
+        "   ",
+        ". .",
+        "\tname.png\n",
+        "\x00name.png\x7f",
+        "../a\\b:c.png",
+        "a   b.png",
+        "x" * 300 + ".png",
+    ]
+    for value in values:
+        assert server._rm_host_sanitize_upload_filename(value) == server.asset_store.sanitize_filename(value)
+
+    core = UploadCore()
+    _enable_fake_rm(server, core)
+    monkeypatch.setattr(
+        server.asset_store,
+        "sanitize_filename",
+        lambda name: (_ for _ in ()).throw(AssertionError("legacy sanitizer")),
+    )
+    link = _payload(await server.rm_asset_upload_link(1, "../a\\b:c.png", "image/png"))
+    assert link["ok"] is True
+    assert server._rm_asset_uploads[link["upload_id"]]["filename"] == "_a_b_c.png"
+
+
+@pytest.mark.asyncio
+async def test_rm_temp_path_creation_failure_releases_ticket_without_fallback(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    core = UploadCore()
+    _enable_fake_rm(server, core)
+    data = _png_bytes()
+    link = _payload(await server.rm_asset_upload_link(len(data), "temp.png", "image/png"))
+    before_download_tokens = dict(server._rm_asset_download_tokens)
+    before_download_sources = dict(server._rm_asset_download_sources)
+    monkeypatch.setattr(
+        server,
+        "_rm_create_upload_temp_path",
+        lambda: (_ for _ in ()).throw(OSError("private C:/secret/temp path")),
+    )
+    monkeypatch.setattr(server.asset_store, "create_temp_path", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy temp")))
+    monkeypatch.setattr(server.asset_store, "persist_upload", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy persist")))
+
+    with _asset_client(server) as client:
+        response = client.post(link["upload_path"], files={"file": ("temp.png", data, "image/png")})
+        retry_page = client.get(link["upload_path"])
+
+    assert response.status_code == 500
+    assert "private" not in response.text
+    assert "C:/secret" not in response.text
+    assert _payload(await server.rm_asset_upload_status(link["upload_id"]))["state"] == "pending"
+    assert retry_page.status_code == 200
+    assert len(core.ingest_ob_public_metadata_calls) == 0
+    assert core.ingest_image_calls == 0
+    assert server._rm_asset_download_tokens == before_download_tokens
+    assert server._rm_asset_download_sources == before_download_sources
+
+
+@pytest.mark.asyncio
+async def test_rm_complete_none_releases_ticket_without_fallback(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    core = UploadCore()
+    _enable_fake_rm(server, core)
+    data = _png_bytes()
+    link = _payload(await server.rm_asset_upload_link(len(data), "complete.png", "image/png"))
+    before_download_tokens = dict(server._rm_asset_download_tokens)
+    before_download_sources = dict(server._rm_asset_download_sources)
+    monkeypatch.setattr(server, "_rm_complete_asset_upload", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server.asset_store, "persist_upload", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy fallback")))
+
+    with _asset_client(server) as client:
+        response = client.post(link["upload_path"], files={"file": ("complete.png", data, "image/png")})
+        retry_page = client.get(link["upload_path"])
+
+    assert response.status_code == 500
+    assert _payload(await server.rm_asset_upload_status(link["upload_id"]))["state"] == "pending"
+    assert retry_page.status_code == 200
+    assert len(core.ingest_ob_public_metadata_calls) == 1
+    assert core.ingest_image_calls == 0
+    assert server._rm_asset_download_tokens == before_download_tokens
+    assert server._rm_asset_download_sources == before_download_sources
+
+
 def test_public_contract_static_scope_and_counts_remain_unchanged(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server_text = (server.ROOT if hasattr(server, "ROOT") else None)

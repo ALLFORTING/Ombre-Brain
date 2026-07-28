@@ -2780,11 +2780,9 @@ def _rm_cleanup_asset_uploads(now: float) -> None:
 
 
 def _rm_host_sanitize_upload_filename(filename: str) -> str:
-    cleaned = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", filename or "")
+    cleaned = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", (filename or "").strip())
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    if not cleaned:
-        cleaned = "asset.bin"
-    return cleaned[:255]
+    return cleaned[:255] or "asset.bin"
 
 
 def _rm_create_upload_temp_path() -> Path:
@@ -4181,7 +4179,10 @@ def _rm_core_upload_error_status(exc: Exception) -> int:
 async def _rm_persist_remember_me_upload(request, claim: dict) -> tuple[int, dict | None]:
     if remember_me_host_bundle is None:
         return 503, None
-    temp_path = _rm_create_upload_temp_path()
+    try:
+        temp_path = _rm_create_upload_temp_path()
+    except Exception:
+        return 500, None
     try:
         try:
             with temp_path.open("wb") as handle:
@@ -4298,6 +4299,7 @@ async def rm_asset_upload_route(request):
         expected_source=source,
     )
     if result is None:
+        _rm_release_asset_upload(claim["upload_id"])
         return Response(status_code=500, headers=headers)
     return HTMLResponse(_rm_asset_result_page(result), headers=headers)
 
