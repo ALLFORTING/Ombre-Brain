@@ -10,7 +10,7 @@ import weakref
 
 
 EXPECTED_DISTRIBUTION = "remember-me"
-EXPECTED_PACKAGE_VERSION = "0.1.0.dev5"
+EXPECTED_PACKAGE_VERSION = "0.1.0.dev6"
 EXPECTED_DATA_COMPATIBILITY = "ombre-brain-assets-v1"
 EXPECTED_SANITIZER_ID = "remember-me-pillow-v1"
 EXPECTED_PILLOW_RANGE = "Pillow>=10.4,<13"

@@ -5,10 +5,10 @@
 Ombre-Brain pins the public Remember-Me Core to:
 
 - official repository: `peanutsuee/Remember-Me`;
-- current commit: `5c430d3f265be059198fe230c1a0682e23e89e32`;
-- archive SHA-256: `6038543368836b9e57ed618e918fdbaa0d8230aeeee938a7f3d4da331f1fd3fd`;
+- current commit: `67240f5aa359ba94130b737b357f2f54190e6c3c`;
+- archive SHA-256: `8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053`;
 - distribution: `remember-me`;
-- package version: `0.1.0.dev5`;
+- package version: `0.1.0.dev6`;
 - data compatibility: `ombre-brain-assets-v1`;
 - sanitizer: `remember-me-pillow-v1`.
 
@@ -31,6 +31,20 @@ or import `remember_me.standalone`. A caller must explicitly provide a `Path`
 before one local runtime can be created. Stage 8C may use that boundary for
 temporary runtime dual-run tests; Stage 8B does not connect it to production
 configuration or data.
+
+Stage 8G-B updates the immutable dependency to the public Stage 7H-A import
+contract. `remember_me_import_adapter.py` is a local-fixture-only Host boundary
+for one legacy image at a time. It calls only `RememberMeCore.import_asset()`;
+it does not import RM repository or storage internals, wire a public MCP tool,
+enable a runtime, execute Reindex, create Tickets or URLs, modify legacy data,
+or implement production migration, dual-write, or shadow-write. The legacy
+store exposes a read-only import record so tag timestamps are preserved while
+the existing contained `resolve_file()` path remains the only blob locator. The
+Stage 8G-B single-asset adapter is a local fixture utility and does not provide
+a unified migration snapshot if another writer mutates legacy metadata between
+`get_import_record()` and `resolve_file()`. Local fixture use must run without
+concurrent legacy writes; any future production batch must solve this separately
+with a write freeze, a single-transaction snapshot, or version checks.
 
 ## Compatibility evidence
 

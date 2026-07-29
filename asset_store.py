@@ -432,6 +432,29 @@ class AssetStore:
         result["tags"] = [tag["tag_display"] for tag in tags]
         return result
 
+    def get_import_record(self, asset_id: str) -> dict | None:
+        """Return one legacy record with tag timestamps for trusted Host import."""
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id or ""):
+            return None
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT * FROM assets WHERE asset_id = ?",
+                (asset_id,),
+            ).fetchone()
+            if not row:
+                return None
+            tags = self._tags_for_assets(conn, [asset_id])[asset_id]
+        result = dict(row)
+        result["tags"] = [
+            {
+                "value": tag["tag_display"],
+                "created_at": tag["created_at"],
+            }
+            for tag in tags
+        ]
+        return result
+
     def list_for_embedding(self, limit: int = 100) -> list[dict]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
             raise AssetStoreError("invalid_limit")

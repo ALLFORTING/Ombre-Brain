@@ -19,9 +19,9 @@ from remember_me_adapter import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_COMMIT = "5c430d3f265be059198fe230c1a0682e23e89e32"
+EXPECTED_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
 EXPECTED_ARCHIVE_SHA256 = (
-    "6038543368836b9e57ed618e918fdbaa0d8230aeeee938a7f3d4da331f1fd3fd"
+    "8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053"
 )
 EXPECTED_ARCHIVE_URL = (
     "https://api.github.com/repos/peanutsuee/Remember-Me/tarball/{}"

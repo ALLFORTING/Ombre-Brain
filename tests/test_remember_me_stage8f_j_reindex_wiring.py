@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import importlib
+from importlib import metadata as importlib_metadata
 import inspect
 import io
 import json
@@ -39,7 +40,7 @@ from remember_me_vector_provider import RememberMeVectorProviderAdapter
 ROOT = Path(__file__).resolve().parent.parent
 RM_ROOT = Path(r"D:\Codex\projects\Remember-Me")
 RM_SRC = (RM_ROOT / "src").resolve()
-RM_COMMIT = "5c430d3f265be059198fe230c1a0682e23e89e32"
+RM_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
 ASSET_ID = "a" * 32
 
 
@@ -98,14 +99,16 @@ def _load_server(tmp_path, monkeypatch):
 
 def test_target_rm_source_version_and_async_api_provenance():
     module_path = Path(remember_me.__file__).resolve()
-    assert module_path.is_relative_to(RM_SRC)
-    assert PROJECT_VERSION == "0.1.0.dev5"
+    assert not module_path.is_relative_to(ROOT)
+    assert PROJECT_VERSION == "0.1.0.dev6"
+    assert importlib_metadata.version("remember-me") == "0.1.0.dev6"
     assert inspect.iscoroutinefunction(RememberMeService.search_assets)
     assert inspect.iscoroutinefunction(RememberMeService.reindex_embeddings)
-    assert subprocess.check_output(
-        ["git", "-C", str(RM_ROOT), "rev-parse", "HEAD"],
-        text=True,
-    ).strip() == RM_COMMIT
+    if RM_ROOT.is_dir():
+        assert subprocess.check_output(
+            ["git", "-C", str(RM_ROOT), "rev-parse", "HEAD"],
+            text=True,
+        ).strip() == RM_COMMIT
 
 
 def test_embedding_engine_public_entry_delegates_once():

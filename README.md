@@ -409,11 +409,17 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 #### Remember-Me Stage 1 asset storage
 
 - Ombre-Brain pins the public `peanutsuee/Remember-Me` Core at commit
-  `5c430d3f265be059198fe230c1a0682e23e89e32` and package version
-  `0.1.0.dev5`. Stage 8F-J completes RM-enabled Core ownership for all nine
+  `67240f5aa359ba94130b737b357f2f54190e6c3c` and package version
+  `0.1.0.dev6`. Stage 8F-J completes RM-enabled Core ownership for all nine
   `rm_asset_*` tools while the default-off path retains the existing legacy
   handlers, routes, Dashboard, Viewer, authentication, and Tickets. See
   [`docs/remember-me-integration.md`](docs/remember-me-integration.md).
+- Stage 8G-B adds a local-only, single-asset Host import adapter over the public
+  `RememberMeCore.import_asset()` contract. It preserves legacy image IDs,
+  cleaned bytes, metadata, asset timestamps, and tag timestamps. It is not
+  wired into server startup or MCP, does not enable the RM runtime, and never
+  performs migration batches, Reindex, dual-write, shadow-write, or legacy
+  deletion.
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
 - Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
 - SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.
