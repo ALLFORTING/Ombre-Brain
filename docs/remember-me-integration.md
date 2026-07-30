@@ -138,11 +138,16 @@ tag values.
 The pinned public Core does not expose persisted tag creation timestamps,
 complete target inventory enumeration, unexpected or duplicate target
 detection, a target-wide consistent snapshot, or cleaned blob bytes through
-this trusted read contract. Each distinct check is explicitly listed as
-unsupported in the structured report; it is never counted as passed. A
-mismatch makes the result failed even when other checks are unsupported.
-Stored hash metadata is compared, but the report does not claim byte-level
-blob verification. Reports
+this trusted read contract. Stage 8G-D enforces these as a fixed unsupported
+set. An Adapter declaration may add limitations but cannot remove a fixed
+limitation; a declaration is not verification evidence. Each distinct check
+is explicitly listed as unsupported in the structured report. A mismatch makes
+the result failed even when other checks are unsupported. When all supported
+fields match, the result remains `unsupported`: this stage has no reachable
+`passed` result. Stored hash metadata is compared, but
+`blob_verified_count` remains zero and the report does not claim byte-level
+blob verification. Without target inventory enumeration,
+`unexpected_target_count` remains unavailable rather than zero. Reports
 contain bounded stable mismatch codes and counters, never image bytes, tokens,
 raw database errors, internal objects, or filesystem paths.
 
@@ -150,13 +155,21 @@ Recovery diagnostics open existing state read-only and do not create a missing
 database, clear an expired lease, or update any state. They
 distinguish absent, resumable, active/expired lease, blocked, failed,
 uncertain-source, changed-source, identity-incompatible, completed-unverified,
-partially verified, and completed-verified conditions and return stable
-recommended action codes. A completed checkpoint is unverified without a
-matching structured report. Only a current, identity/generation/checkpoint-
-bound report whose overall result is `passed` is fully verified; an
-`unsupported` report is only partially verified, never fully verified.
+and partially verified conditions and return stable recommended action codes.
+A completed checkpoint is unverified without a matching structured report.
+A current, identity/generation/checkpoint-bound `unsupported` report is only
+partially verified. Stage 8G-D does not produce `completed_verified`; even a
+structurally consistent, manually constructed `passed` report is unsupported
+as provenance and requires manual review.
 They do not reset or delete checkpoints, clear uncertainty, force-release
 leases, skip rejected assets, alter generation, or mark migration complete.
+
+Opening `passed` and `completed_verified` in a future report contract requires
+actual public read evidence for complete target inventory, unexpected and
+duplicate detection, cleaned blob bytes, persisted tag creation timestamps,
+and target snapshot consistency. It also requires a new report
+contract/version that records the executed checks. Stage 8G-D does not claim
+an attestation mechanism or a full-capability fake reader.
 
 Stage 8G-D adds no production migration wiring and is not connected to server
 startup, MCP, HTTP, the Dashboard, a CLI, or an environment-variable automatic

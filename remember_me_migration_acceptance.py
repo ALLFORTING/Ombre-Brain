@@ -32,7 +32,7 @@ from remember_me_migration_runner import (
 REPORT_VERSION = 1
 MAX_COORDINATOR_BATCHES = 10_000
 DEFAULT_MISMATCH_LIMIT = 100
-_DEFAULT_UNSUPPORTED_TARGET_CHECKS = (
+STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS = (
     "target_blob_bytes",
     "target_duplicate_asset_detection",
     "target_full_inventory",
@@ -393,8 +393,16 @@ class LegacyRmReconciler:
         verified = matched = missing = 0
         cursor: str | None = None
         source_count = 0
-        unsupported = _normalized_unsupported_checks(
-            self._adapter.target_reconciliation_unsupported_checks()
+        # Adapter declarations may add limitations, but declarations are not
+        # verification evidence and cannot clear Stage 8G-D's fixed gaps.
+        unsupported = tuple(
+            sorted(
+                set(STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS).union(
+                    _normalized_unsupported_checks(
+                        self._adapter.target_reconciliation_unsupported_checks()
+                    )
+                )
+            )
         )
         while True:
             self._state.renew_freeze(
@@ -469,20 +477,12 @@ class LegacyRmReconciler:
                 MigrationMismatch(None, "source_inventory_count_mismatch"),
             )
         total_mismatches = sum(summary.values())
-        unexpected_count = (
-            None
-            if "target_unexpected_asset_detection" in unsupported
-            else 0
-        )
-        blob_verified = (
-            0
-            if "target_blob_bytes" in unsupported
-            else verified
-        )
+        unexpected_count = None
+        blob_verified = 0
         overall = (
             "failed"
             if total_mismatches
-            else ("unsupported" if unsupported else "passed")
+            else "unsupported"
         )
         completed = _timestamp(self._clock)
         return LocalMigrationAcceptanceReport(
@@ -535,7 +535,7 @@ class LegacyRmReconciler:
             checkpoint.imported_count if checkpoint else 0,
             checkpoint.skipped_idempotent_count if checkpoint else 0,
             0, 0, 0, 0, None, 0,
-            _DEFAULT_UNSUPPORTED_TARGET_CHECKS,
+            STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS,
             (), (), 0, started, _timestamp(self._clock), overall, error,
         )
 
@@ -660,30 +660,26 @@ class MigrationRecoveryDiagnostics:
             )
             return _diagnostic(
                 (
-                    "completed_verified"
-                    if report_status == "passed"
-                    else (
-                        "completed_partially_verified"
-                        if report_status == "unsupported"
-                        else "completed_unverified"
-                    )
+                    "completed_partially_verified"
+                    if report_status == "unsupported"
+                    else "completed_unverified"
                 ),
                 checkpoint,
                 False,
-                report_status != "passed",
-                report_status not in {None, "passed", "unsupported"},
+                True,
+                report_status not in {None, "unsupported"},
                 (
-                    "no_action_completed"
-                    if report_status == "passed"
+                    "review_unsupported_checks"
+                    if report_status == "unsupported"
                     else (
-                        "review_unsupported_checks"
-                        if report_status == "unsupported"
+                        "incompatible_state_manual_review"
+                        if report_status == "acceptance_pass_not_supported"
                         else "run_reconciliation"
                     )
                 ),
                 (
                     None
-                    if report_status in {None, "passed", "unsupported"}
+                    if report_status in {None, "unsupported"}
                     else report_status
                 ),
                 state.generation,
@@ -1048,24 +1044,17 @@ def _validate_acceptance_report(
     ):
         return "acceptance_report_incompatible"
     if report.overall_result == "passed":
-        if (
-            report.unsupported_checks
-            or mismatch_count
-            or report.mismatched_asset_count
-            or report.missing_target_count
-            or report.unexpected_target_count not in {0}
-            or report.processed_count != report.expected_asset_count
-            or report.verified_asset_count != report.expected_asset_count
-            or report.matched_asset_count != report.expected_asset_count
-            or report.blob_verified_count != report.expected_asset_count
-        ):
-            return "acceptance_report_incompatible"
-        return "passed"
+        return "acceptance_pass_not_supported"
     if report.overall_result == "unsupported":
         if (
             not report.unsupported_checks
+            or not set(STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS).issubset(
+                report.unsupported_checks
+            )
             or mismatch_count
             or report.mismatched_asset_count
+            or report.unexpected_target_count is not None
+            or report.blob_verified_count != 0
         ):
             return "acceptance_report_incompatible"
         return "unsupported"

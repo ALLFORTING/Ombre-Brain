@@ -1,7 +1,7 @@
 import hashlib
 import io
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -311,6 +311,7 @@ def test_real_fixture_reconciliation_matches_supported_fields(tmp_path):
     }
     assert report.unsupported_checks == tuple(sorted(report.unsupported_checks))
     assert report.unexpected_target_count is None
+    assert report.blob_verified_count == 0
     json.dumps(report.to_dict())
     serialized = repr(asdict(report))
     assert "PNG" not in serialized
@@ -349,6 +350,7 @@ def test_reconciliation_detects_stable_mismatch_codes_and_truncates(
     assert codes["stored_bytes_mismatch"] == 1
     assert codes["title_mismatch"] == 1
     assert codes["tags_mismatch"] == 1
+    assert "target_blob_bytes" in report.unsupported_checks
     assert len(report.mismatches) == 2
     assert report.truncated_mismatch_count == 2
     assert tuple(report.mismatches) == tuple(
@@ -407,7 +409,7 @@ def test_reconciliation_classifies_target_read_failures(
     fixture.close()
 
 
-def test_reconciliation_full_capability_fake_can_pass(
+def test_empty_unsupported_declaration_cannot_produce_passed(
     tmp_path, monkeypatch
 ):
     fixture, state, store, adapter, _, assets = _fixture(tmp_path, ("red",))
@@ -418,10 +420,65 @@ def test_reconciliation_full_capability_fake_can_pass(
         lambda: (),
     )
     report = _reconciler(state, store, adapter).reconcile()
-    assert report.overall_result == "passed"
-    assert report.unsupported_checks == ()
-    assert report.unexpected_target_count == 0
-    assert report.blob_verified_count == len(assets)
+    assert report.overall_result == "unsupported"
+    assert set(report.unsupported_checks) == {
+        "target_blob_bytes",
+        "target_duplicate_asset_detection",
+        "target_full_inventory",
+        "target_snapshot_consistency",
+        "target_tag_created_at",
+        "target_unexpected_asset_detection",
+    }
+    assert report.unexpected_target_count is None
+    assert report.blob_verified_count == 0
+    fixture.close()
+
+
+def test_adapter_subclass_cannot_clear_fixed_unsupported_checks(tmp_path):
+    fixture, state, store, adapter, runtime, _ = _fixture(tmp_path, ("red",))
+    assert _coordinator(state, store, adapter).run().completed
+
+    class EmptyDeclarationAdapter(LegacyAssetImportAdapter):
+        def target_reconciliation_unsupported_checks(self):
+            return ()
+
+    subclass_adapter = EmptyDeclarationAdapter(
+        legacy_store=store,
+        core=runtime.service,
+        fixture_context=fixture,
+    )
+    report = _reconciler(state, store, subclass_adapter).reconcile()
+    assert report.overall_result == "unsupported"
+    assert "target_blob_bytes" in report.unsupported_checks
+    assert "target_full_inventory" in report.unsupported_checks
+    assert report.unexpected_target_count is None
+    assert report.blob_verified_count == 0
+    fixture.close()
+
+
+def test_adapter_declaration_can_only_add_unsupported_checks(
+    tmp_path, monkeypatch
+):
+    fixture, state, store, adapter, _, _ = _fixture(tmp_path, ("red",))
+    assert _coordinator(state, store, adapter).run().completed
+    monkeypatch.setattr(
+        adapter,
+        "target_reconciliation_unsupported_checks",
+        lambda: ("future_public_check", "target_blob_bytes"),
+    )
+
+    report = _reconciler(state, store, adapter).reconcile()
+    assert report.overall_result == "unsupported"
+    assert report.unsupported_checks == tuple(sorted(report.unsupported_checks))
+    assert set(report.unsupported_checks) == {
+        "future_public_check",
+        "target_blob_bytes",
+        "target_duplicate_asset_detection",
+        "target_full_inventory",
+        "target_snapshot_consistency",
+        "target_tag_created_at",
+        "target_unexpected_asset_detection",
+    }
     fixture.close()
 
 
@@ -614,7 +671,7 @@ def test_reconciliation_lease_takeover_invalidates_old_scan(
 
 
 def test_recovery_diagnostics_are_read_only_for_core_states(tmp_path):
-    fixture, state, store, adapter, _, _ = _fixture(tmp_path, ("red",))
+    fixture, state, store, adapter, _, assets = _fixture(tmp_path, ("red",))
     diagnostics = MigrationRecoveryDiagnostics(
         state,
         source_identity=state.source_identity,
@@ -646,11 +703,41 @@ def test_recovery_diagnostics_are_read_only_for_core_states(tmp_path):
         blob_verified_count=report.expected_asset_count,
     )
     verified = diagnostics.inspect(acceptance_report=passed_report)
-    assert verified.diagnostic_code == "completed_verified"
-    assert verified.recommended_action_code == "no_action_completed"
+    assert verified.diagnostic_code == "completed_unverified"
+    assert verified.recommended_action_code == "incompatible_state_manual_review"
+    assert verified.requires_operator_investigation is True
+    assert verified.error_code == "acceptance_pass_not_supported"
+
+    directly_constructed = LocalMigrationAcceptanceReport(
+        **asdict(passed_report)
+    )
+    direct = diagnostics.inspect(acceptance_report=directly_constructed)
+    assert direct.diagnostic_code == "completed_unverified"
+    assert direct.error_code == "acceptance_pass_not_supported"
 
     forged = diagnostics.inspect(acceptance_report=True)
     assert forged.diagnostic_code == "completed_unverified"
+    assert diagnostics.inspect(
+        acceptance_report=passed_report.to_dict()
+    ).diagnostic_code == "completed_unverified"
+
+    @dataclass(frozen=True)
+    class LookalikeReport:
+        overall_result: str = "passed"
+
+    assert diagnostics.inspect(
+        acceptance_report=LookalikeReport()
+    ).diagnostic_code == "completed_unverified"
+
+    failed_report = replace(
+        report,
+        overall_result="failed",
+        error_code="target_record_unavailable",
+    )
+    failed = diagnostics.inspect(acceptance_report=failed_report)
+    assert failed.diagnostic_code == "completed_unverified"
+    assert failed.requires_operator_investigation is True
+
     incompatible = diagnostics.inspect(
         acceptance_report=replace(
             passed_report,
@@ -659,6 +746,14 @@ def test_recovery_diagnostics_are_read_only_for_core_states(tmp_path):
     )
     assert incompatible.diagnostic_code == "completed_unverified"
     assert incompatible.error_code == "acceptance_report_incompatible"
+
+    store.update_metadata(
+        assets[0]["asset_id"],
+        title="changed-after-report",
+    )
+    changed = diagnostics.inspect(acceptance_report=report)
+    assert changed.diagnostic_code == "blocked_source_changed"
+    assert changed.error_code == "source_changed_since_checkpoint"
     fixture.close()
 
 
@@ -944,3 +1039,5 @@ def test_stage8gd_static_architecture_boundaries():
     assert "run_migration_batch" in source
     assert "adapter.import_asset" not in source
     assert "sqlite3" not in source
+    assert '"completed_verified"' not in source
+    assert 'else ("unsupported" if unsupported else "passed")' not in source

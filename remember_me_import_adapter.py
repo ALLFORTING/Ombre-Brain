@@ -396,7 +396,7 @@ class LegacyAssetImportAdapter:
         return projected
 
     def target_reconciliation_unsupported_checks(self) -> tuple[str, ...]:
-        """Describe checks unavailable from this bound public-Core view."""
+        """Declare additional gaps; this is not verification evidence."""
         self._fixture_context._validate_for_adapter(
             legacy_store=self._legacy_store,
             core=self._core,
