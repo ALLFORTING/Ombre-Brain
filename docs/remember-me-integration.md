@@ -108,6 +108,76 @@ It provides no command-line entry point for real data. Production migration,
 runtime enablement, cutover, and removal of the legacy implementation remain
 future stages and require separate acceptance.
 
+## Stage 8G-D local migration acceptance
+
+Stage 8G-D adds local migration acceptance, reconciliation, and recovery
+diagnostics on top of the Stage 8G-C batch core. It remains restricted to
+factory-created Stage 8G-B fixtures and synthetic data. The production
+Remember-Me runtime remains disabled, and the legacy `AssetStore` remains the
+only production image implementation.
+
+The run-to-completion coordinator repeatedly invokes the existing bounded
+Stage 8G-C runner. It has validated batch and maximum-batch limits, releases
+the runner's freeze between batches, detects no progress, and stops on
+completed, blocked, failed, uncertain-source, changed-source, lease, or bounded
+limit outcomes. It neither calls the single-asset Adapter nor changes the
+checkpoint state machine.
+
+Reconciliation starts only for a completed checkpoint whose canonical source
+and target identities match the exact write-gated legacy store and the
+Adapter's trusted fixture RM root. It acquires a short acceptance freeze,
+then reads the checkpoint and source generation, pages the fixed legacy
+snapshot by `asset_id`, and compares records obtained through the Adapter's
+public-Core read contract. The lease is renewed during the scan and ownership
+is checked after every target read and before the final result. Lease loss or
+cleanup failure cannot produce a successful acceptance conclusion.
+The public contract verifies IDs, source and stored hash metadata, filename,
+MIME, kind, byte counts, dimensions, asset timestamps, title, description, and
+tag values.
+
+The pinned public Core does not expose persisted tag creation timestamps,
+complete target inventory enumeration, unexpected or duplicate target
+detection, a target-wide consistent snapshot, or cleaned blob bytes through
+this trusted read contract. Stage 8G-D enforces these as a fixed unsupported
+set. An Adapter declaration may add limitations but cannot remove a fixed
+limitation; a declaration is not verification evidence. Each distinct check
+is explicitly listed as unsupported in the structured report. A mismatch makes
+the result failed even when other checks are unsupported. When all supported
+fields match, the result remains `unsupported`: this stage has no reachable
+`passed` result. Stored hash metadata is compared, but
+`blob_verified_count` remains zero and the report does not claim byte-level
+blob verification. Without target inventory enumeration,
+`unexpected_target_count` remains unavailable rather than zero. Reports
+contain bounded stable mismatch codes and counters, never image bytes, tokens,
+raw database errors, internal objects, or filesystem paths.
+
+Recovery diagnostics open existing state read-only and do not create a missing
+database, clear an expired lease, or update any state. They
+distinguish absent, resumable, active/expired lease, blocked, failed,
+uncertain-source, changed-source, identity-incompatible, completed-unverified,
+and partially verified conditions and return stable recommended action codes.
+A completed checkpoint is unverified without a matching structured report.
+A current, identity/generation/checkpoint-bound `unsupported` report is only
+partially verified. Stage 8G-D does not produce `completed_verified`; even a
+structurally consistent, manually constructed `passed` report is unsupported
+as provenance and requires manual review.
+They do not reset or delete checkpoints, clear uncertainty, force-release
+leases, skip rejected assets, alter generation, or mark migration complete.
+
+Opening `passed` and `completed_verified` in a future report contract requires
+actual public read evidence for complete target inventory, unexpected and
+duplicate detection, cleaned blob bytes, persisted tag creation timestamps,
+and target snapshot consistency. It also requires a new report
+contract/version that records the executed checks. Stage 8G-D does not claim
+an attestation mechanism or a full-capability fake reader.
+
+Stage 8G-D adds no production migration wiring and is not connected to server
+startup, MCP, HTTP, the Dashboard, a CLI, or an environment-variable automatic
+path. It does not access Render, migrate production images, run Reindex,
+dual-write, shadow-write, clean up, or delete legacy data. Production
+migration, runtime enablement, cutover, and legacy removal remain separate
+future stages.
+
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP

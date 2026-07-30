@@ -431,6 +431,22 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
   remains the sole production image implementation, and no production image
   migration, Reindex, dual-write/shadow-write, or legacy deletion is
   performed.
+- Stage 8G-D adds local-fixture migration acceptance on top of that bounded
+  core: a capped run-to-completion coordinator, deterministic source/target
+  reconciliation, structured reports, and read-only recovery diagnostics.
+  Reconciliation uses the Adapter's trusted public-Core target view and reports
+  unavailable tag timestamps, complete/unexpected/duplicate target inventory,
+  target snapshot consistency, and blob-byte checks as unsupported rather than
+  passed. That fixed unsupported set cannot be cleared by an Adapter
+  declaration: capability declarations are limitations, not verification
+  evidence. Stage 8G-D therefore produces `unsupported`, not `passed`, when all
+  currently supported fields match. Recovery diagnostics classify such a
+  report as `completed_partially_verified`; they do not produce
+  `completed_verified`, and a constructed `passed` report requires manual
+  review. Reconciliation uses a renewable short coordination freeze. It adds
+  no server, MCP, HTTP, Dashboard, CLI, startup, production,
+  runtime-enablement, Reindex, dual-write, shadow-write, cleanup, or
+  legacy-deletion path.
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
 - Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
 - SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.

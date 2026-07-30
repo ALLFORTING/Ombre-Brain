@@ -273,8 +273,10 @@ def test_writer_and_freeze_have_no_check_then_act_window(
     writer_may_finish = threading.Event()
     writer_done = threading.Event()
     freeze_done = threading.Event()
+    freeze_entered_coordination = threading.Event()
     order = []
     original_create = store._create_temp_path_unchecked
+    original_connect = state._connect
 
     def held_create(suffix=".upload"):
         writer_entered.set()
@@ -284,6 +286,26 @@ def test_writer_and_freeze_have_no_check_then_act_window(
         return path
 
     monkeypatch.setattr(store, "_create_temp_path_unchecked", held_create)
+
+    class SignalingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *args):
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                freeze_entered_coordination.set()
+            return self._connection.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def signaling_connect():
+        connection = original_connect()
+        if threading.current_thread().name == "stage8gc-freezer":
+            return SignalingConnection(connection)
+        return connection
+
+    monkeypatch.setattr(state, "_connect", signaling_connect)
 
     def writer():
         path = store.create_temp_path()
@@ -299,11 +321,15 @@ def test_writer_and_freeze_have_no_check_then_act_window(
         freeze_done.set()
 
     writer_thread = threading.Thread(target=writer)
-    freeze_thread = threading.Thread(target=freezer)
+    freeze_thread = threading.Thread(
+        target=freezer,
+        name="stage8gc-freezer",
+    )
     writer_thread.start()
     assert writer_entered.wait(5)
     freeze_thread.start()
-    assert not freeze_done.wait(0.2)
+    assert freeze_entered_coordination.wait(5)
+    assert not freeze_done.is_set()
     writer_may_finish.set()
     assert writer_done.wait(5)
     assert freeze_done.wait(5)
@@ -445,6 +471,24 @@ def test_keyset_pagination_is_strict_validated_and_deterministic(tmp_path):
             store.list_asset_ids_for_migration(
                 last_asset_id=bad,
                 upper_bound_asset_id=upper,
+                batch_size=1,
+            )
+    for bad_upper in (
+        "A" * 32,
+        "a" * 31,
+        "a" * 33,
+        "g" * 32,
+        "",
+        True,
+        1,
+    ):
+        with pytest.raises(
+            AssetStoreError,
+            match="invalid_migration_upper_bound",
+        ):
+            store.list_asset_ids_for_migration(
+                last_asset_id=None,
+                upper_bound_asset_id=bad_upper,
                 batch_size=1,
             )
     for bad_limit in (True, 0, 501, "1"):

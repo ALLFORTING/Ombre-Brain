@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
 import os
 from pathlib import Path
@@ -14,9 +15,11 @@ from typing import Any, Protocol
 
 from asset_store import AssetStoreError
 from remember_me.core import (
+    AssetNotFoundError,
     AssetIdConflict,
     ImageMimeMismatch,
     ImageValidationError,
+    GetAssetRequest,
     ImportAssetDisposition,
     ImportAssetRequest,
     ImportAssetTag,
@@ -57,6 +60,14 @@ _REQUIRED_RECORD_FIELDS = (
 _FIXTURE_MARKER_NAME = ".ombre-stage8g-b-fixture"
 _FIXTURE_PREFIX = "ombre-stage8g-b-"
 _FIXTURE_FACTORY_TOKEN = object()
+_TARGET_RECONCILIATION_UNSUPPORTED_CHECKS = (
+    "target_blob_bytes",
+    "target_duplicate_asset_detection",
+    "target_full_inventory",
+    "target_snapshot_consistency",
+    "target_tag_created_at",
+    "target_unexpected_asset_detection",
+)
 
 
 class LegacyAssetImportDisposition(str, Enum):
@@ -111,6 +122,27 @@ class LegacyAssetImportResult:
         if self.rm_disposition:
             payload["rm_disposition"] = self.rm_disposition
         return payload
+
+
+@dataclass(frozen=True)
+class LegacyAssetTargetRecord:
+    """Safe public-Core projection used by local acceptance checks."""
+
+    asset_id: str
+    source_sha256: str
+    stored_sha256: str
+    original_filename: str
+    mime_type: str
+    kind: str
+    decoded_bytes: int
+    stored_bytes: int
+    width: int
+    height: int
+    created_at: str
+    updated_at: str
+    title: str
+    description: str
+    tags: tuple[str, ...]
 
 
 class LegacyAssetImportFixtureContext(AbstractContextManager):
@@ -308,6 +340,68 @@ class LegacyAssetImportAdapter:
             )
         except (OSError, RuntimeError, TypeError):
             return False
+
+    def get_target_record(
+        self,
+        asset_id: str,
+    ) -> LegacyAssetTargetRecord | None:
+        """Read one bound fixture target through the public Core contract."""
+        self._fixture_context._validate_for_adapter(
+            legacy_store=self._legacy_store,
+            core=self._core,
+        )
+        if (
+            not isinstance(asset_id, str)
+            or _ASSET_ID_PATTERN.fullmatch(asset_id) is None
+        ):
+            raise LegacyAssetImportAdapterError("invalid_asset_id")
+        try:
+            record = self._core.get_asset(GetAssetRequest(asset_id=asset_id))
+        except AssetNotFoundError:
+            return None
+        except RememberMeError as exc:
+            raise LegacyAssetImportAdapterError(
+                "rm_target_read_unavailable"
+            ) from exc
+        except Exception as exc:
+            raise LegacyAssetImportAdapterError(
+                "rm_target_read_unavailable"
+            ) from exc
+        try:
+            projected = LegacyAssetTargetRecord(
+                asset_id=record.asset_id,
+                source_sha256=record.source_sha256,
+                stored_sha256=record.stored_sha256,
+                original_filename=record.original_filename,
+                mime_type=record.mime_type,
+                kind=record.kind,
+                decoded_bytes=record.decoded_bytes,
+                stored_bytes=record.stored_bytes,
+                width=record.width,
+                height=record.height,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+                title=record.title,
+                description=record.description,
+                tags=record.tags,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise LegacyAssetImportAdapterError(
+                "rm_target_record_invalid"
+            ) from exc
+        if not _valid_target_record(projected, asset_id):
+            raise LegacyAssetImportAdapterError(
+                "rm_target_record_invalid"
+            )
+        return projected
+
+    def target_reconciliation_unsupported_checks(self) -> tuple[str, ...]:
+        """Declare additional gaps; this is not verification evidence."""
+        self._fixture_context._validate_for_adapter(
+            legacy_store=self._legacy_store,
+            core=self._core,
+        )
+        return _TARGET_RECONCILIATION_UNSUPPORTED_CHECKS
 
     def import_asset(
         self,
@@ -600,6 +694,50 @@ def _is_strict_within(root: Path, candidate: Path) -> bool:
     return candidate != root and _is_within(root, candidate)
 
 
+def _valid_target_record(
+    record: LegacyAssetTargetRecord,
+    asset_id: str,
+) -> bool:
+    text_fields = (
+        record.original_filename,
+        record.mime_type,
+        record.kind,
+        record.title,
+        record.description,
+    )
+    integer_fields = (
+        record.decoded_bytes,
+        record.stored_bytes,
+        record.width,
+        record.height,
+    )
+    return (
+        isinstance(record.asset_id, str)
+        and record.asset_id == asset_id
+        and _ASSET_ID_PATTERN.fullmatch(record.asset_id) is not None
+        and isinstance(record.source_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", record.source_sha256) is not None
+        and isinstance(record.stored_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", record.stored_sha256) is not None
+        and all(isinstance(value, str) for value in text_fields)
+        and all(type(value) is int and value >= 0 for value in integer_fields)
+        and _valid_public_timestamp(record.created_at)
+        and _valid_public_timestamp(record.updated_at)
+        and isinstance(record.tags, tuple)
+        and all(isinstance(value, str) for value in record.tags)
+    )
+
+
+def _valid_public_timestamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+
+
 def _is_filesystem_root(path: Path) -> bool:
     resolved = path.resolve()
     return resolved == resolved.parent
@@ -678,5 +816,6 @@ __all__ = [
     "LegacyAssetImportErrorCode",
     "LegacyAssetImportRequest",
     "LegacyAssetImportResult",
+    "LegacyAssetTargetRecord",
     "create_legacy_asset_import_fixture_context",
 ]
