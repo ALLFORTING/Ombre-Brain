@@ -420,6 +420,17 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
   wired into server startup or MCP, does not enable the RM runtime, and never
   performs migration batches, Reindex, dual-write, shadow-write, or legacy
   deletion.
+- Stage 8G-C adds only an explicitly constructed local Host migration core. Its
+  independent `migration.sqlite3` provides a persistent write-freeze lease,
+  legacy source generation, versioned checkpoint, and deterministic
+  `asset_id` keyset pagination. Each runner invocation is a bounded batch and
+  calls only the Stage 8G-B `LegacyAssetImportAdapter`. A legacy source change
+  between batches, or an uncertain write-generation finalize, fails closed
+  instead of silently continuing. Nothing is wired to server startup, MCP, the
+  Dashboard, or production configuration; RM remains default-off, legacy
+  remains the sole production image implementation, and no production image
+  migration, Reindex, dual-write/shadow-write, or legacy deletion is
+  performed.
 - Stage-0 `asset_*` probes remain temporary transport diagnostics. Stage-1 `rm_asset_*` tools persist assets and return stable, metadata-only asset IDs and signed download links.
 - Formal Remember-Me uploads are currently limited to 10 MiB. Raw bytes bypass the model context and are stored under the configured persistent data root in content-addressed `assets/<prefix>/<sha256>.<ext>` paths.
 - SQLite stores asset identity, hashes, filenames, MIME/kind, byte counts, dimensions, and timestamps. File bytes are never stored in Markdown, SQLite text fields, or base64.

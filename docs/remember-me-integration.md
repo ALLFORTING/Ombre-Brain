@@ -46,6 +46,68 @@ a unified migration snapshot if another writer mutates legacy metadata between
 concurrent legacy writes; any future production batch must solve this separately
 with a write freeze, a single-transaction snapshot, or version checks.
 
+## Stage 8G-C local migration batch core
+
+Stage 8G-C adds only the local Host core needed to run one explicitly invoked,
+bounded legacy `AssetStore` migration batch. It does not wire migration into
+`server.py`, server startup, MCP, HTTP, the Dashboard, or production
+configuration. The Remember-Me runtime remains default-off, no production image
+has been migrated, and the legacy `AssetStore` remains the only production image
+implementation.
+
+Migration coordination lives in a separately and explicitly constructed
+`migration.sqlite3`; it is never added to legacy `assets.sqlite3`, a
+Remember-Me database, or a production configuration file. The state database
+holds:
+
+- one expiring, renewable, owner-token write-freeze lease;
+- a monotonic legacy source generation;
+- a versioned checkpoint bound to canonical source and target identities;
+- a fixed initial upper-bound asset ID and cumulative migration counts.
+
+An optional `AssetStore` write gate serializes each public legacy write with
+freeze acquisition through `BEGIN IMMEDIATE` on the migration database. Before
+touching legacy storage, a writer first commits a persistent
+`write_uncertain` marker, then reacquires and retains the coordination
+transaction through its complete legacy write lifecycle. Freeze acquisition
+cannot claim safety while that transaction is active; if it races in the small
+reacquisition interval, it sees the committed uncertainty marker and fails
+closed. Once freeze acquisition commits, new
+`create_temp_path`, `persist_upload`, `update_metadata`, and `delete` calls fail
+closed. Legacy reads continue to work. Default `AssetStore(data_root)`
+construction has no gate, creates no migration database, reads no migration
+environment variable, and retains its existing behavior.
+
+For a confirmed persistent legacy change, generation advancement and clearing
+`write_uncertain` occur in the same migration-state commit. If the process
+crashes, generation finalization fails, or that commit has an uncertain
+outcome, the previously committed marker remains unless the generation advance
+also committed. A later freeze or runner therefore stops with
+`source_generation_uncertain` instead of trusting an old checkpoint. Known
+no-op writes and failures that occur before any legacy mutation safely clear
+the marker without advancing generation.
+
+The runner pages strictly by `asset_id` using keyset pagination up to the
+checkpoint's fixed upper bound. Each invocation processes at most its validated
+batch size. It migrates an asset only by calling the Stage 8G-B
+`LegacyAssetImportAdapter.import_asset()` with `dry_run=False`; it does not
+construct the public Core request mapping itself or access Remember-Me
+repository, storage, or database internals.
+
+`imported` and `skipped_idempotent` results advance and persist the checkpoint
+one asset at a time. A rejected asset blocks without advancing its cursor, and
+an unexpected failure retains all earlier per-asset progress without advancing
+the failed asset. A completed checkpoint is idempotent. If a legacy write
+changes the persistent source generation between bounded batches, resume fails
+closed with `source_changed_since_checkpoint`: it does not call the Adapter,
+silently replace the snapshot generation, extend the upper bound, reset the
+checkpoint, or restart from the beginning.
+
+Stage 8G-C performs no Reindex, dual-write, shadow-write, or legacy deletion.
+It provides no command-line entry point for real data. Production migration,
+runtime enablement, cutover, and removal of the legacy implementation remain
+future stages and require separate acceptance.
+
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP

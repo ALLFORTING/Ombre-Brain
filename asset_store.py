@@ -14,6 +14,12 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from asset_migration_state import (
+    AssetWriteGuard,
+    HostMigrationState,
+    HostMigrationStateError,
+)
+
 
 MAX_IMAGE_PIXELS = 20_000_000
 SUPPORTED_MIME_TYPES = {
@@ -31,9 +37,36 @@ class InvalidAssetImage(AssetStoreError):
     pass
 
 
+class _NoopAssetWriteGuard:
+    def __enter__(self) -> "_NoopAssetWriteGuard":
+        return self
+
+    def mark_changed(self) -> None:
+        return None
+
+    def mark_unchanged(self) -> None:
+        return None
+
+    def mark_rolled_back(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+
 class AssetStore:
-    def __init__(self, data_root: str):
+    def __init__(
+        self,
+        data_root: str,
+        write_gate: HostMigrationState | None = None,
+    ):
         self.data_root = Path(data_root).resolve()
+        if write_gate is not None and (
+            not isinstance(write_gate, HostMigrationState)
+            or not write_gate.validate_legacy_root(self.data_root)
+        ):
+            raise AssetStoreError("asset_write_gate_unavailable")
+        self._write_gate = write_gate
         self.assets_dir = self.data_root / "assets"
         self.temp_dir = self.assets_dir / ".tmp"
         self.db_path = self.data_root / "assets.sqlite3"
@@ -119,10 +152,40 @@ class AssetStore:
                 "ON asset_tags(tag_normalized)"
             )
 
-    def create_temp_path(self, suffix: str = ".upload") -> Path:
+    @property
+    def migration_write_gate(self) -> HostMigrationState | None:
+        return self._write_gate
+
+    def _asset_write_guard(
+        self,
+    ) -> AssetWriteGuard | _NoopAssetWriteGuard:
+        if self._write_gate is None:
+            return _NoopAssetWriteGuard()
+        return self._write_gate.write_guard()
+
+    @staticmethod
+    def _translate_write_gate_error(exc: HostMigrationStateError) -> AssetStoreError:
+        if exc.code == "asset_write_frozen":
+            return AssetStoreError("asset_write_frozen")
+        return AssetStoreError("asset_write_gate_unavailable")
+
+    def _create_temp_path_unchecked(self, suffix: str = ".upload") -> Path:
         fd, raw_path = tempfile.mkstemp(prefix="rm-", suffix=suffix, dir=self.temp_dir)
         os.close(fd)
         return Path(raw_path)
+
+    def create_temp_path(self, suffix: str = ".upload") -> Path:
+        try:
+            with self._asset_write_guard() as write_guard:
+                try:
+                    path = self._create_temp_path_unchecked(suffix)
+                except Exception:
+                    write_guard.mark_rolled_back()
+                    raise
+                write_guard.mark_unchanged()
+                return path
+        except HostMigrationStateError as exc:
+            raise self._translate_write_gate_error(exc) from exc
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
@@ -253,7 +316,7 @@ class AssetStore:
                     converted = oriented.convert(mode)
                     clean = Image.new(mode, converted.size)
                     clean.paste(converted)
-                    output_path = self.create_temp_path(extension)
+                    output_path = self._create_temp_path_unchecked(extension)
                     if output_format == "PNG":
                         clean.save(output_path, format="PNG", optimize=True)
                     else:
@@ -322,16 +385,43 @@ class AssetStore:
         mime_type: str,
         require_image: bool = False,
     ) -> dict:
+        try:
+            with self._asset_write_guard() as write_guard:
+                return self._persist_upload_unchecked(
+                    source_path=source_path,
+                    source_sha256=source_sha256,
+                    decoded_bytes=decoded_bytes,
+                    original_filename=original_filename,
+                    mime_type=mime_type,
+                    require_image=require_image,
+                    write_guard=write_guard,
+                )
+        except HostMigrationStateError as exc:
+            raise self._translate_write_gate_error(exc) from exc
+
+    def _persist_upload_unchecked(
+        self,
+        *,
+        source_path: str | Path,
+        source_sha256: str,
+        decoded_bytes: int,
+        original_filename: str,
+        mime_type: str,
+        require_image: bool,
+        write_guard: AssetWriteGuard | _NoopAssetWriteGuard,
+    ) -> dict:
         source = Path(source_path)
         candidate: Path | None = None
         destination: Path | None = None
         moved_new_file = False
+        mutation_started = False
+        commit_attempted = False
+        outcome_marked = False
         claimed_mime = (mime_type or "application/octet-stream").strip().lower()
-        if claimed_mime not in SUPPORTED_MIME_TYPES:
-            source.unlink(missing_ok=True)
-            raise AssetStoreError("unsupported_mime_type")
 
         try:
+            if claimed_mime not in SUPPORTED_MIME_TYPES:
+                raise AssetStoreError("unsupported_mime_type")
             actual_source_sha, actual_source_bytes = self._hash_file(source)
             if actual_source_bytes != decoded_bytes:
                 raise AssetStoreError("source_size_mismatch")
@@ -358,10 +448,13 @@ class AssetStore:
                     ).fetchone()
                     if existing:
                         conn.commit()
+                        write_guard.mark_unchanged()
+                        outcome_marked = True
                         result = self.get(existing["asset_id"]) or dict(existing)
                         result["deduplicated"] = True
                         return result
 
+                    mutation_started = True
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if destination.exists():
                         existing_sha, _ = self._hash_file(destination)
@@ -398,7 +491,10 @@ class AssetStore:
                             created_at,
                         ),
                     )
+                    commit_attempted = True
                     conn.commit()
+                    write_guard.mark_changed()
+                    outcome_marked = True
                     result = self.get(asset_id)
                     if result is None:
                         raise AssetStoreError("asset_insert_failed")
@@ -406,11 +502,19 @@ class AssetStore:
                     return result
                 except Exception:
                     conn.rollback()
-                    if moved_new_file and destination:
+                    if (
+                        moved_new_file
+                        and destination
+                        and not commit_attempted
+                    ):
                         destination.unlink(missing_ok=True)
                     raise
                 finally:
                     conn.close()
+        except Exception:
+            if not mutation_started and not outcome_marked:
+                write_guard.mark_rolled_back()
+            raise
         finally:
             source.unlink(missing_ok=True)
             if candidate and candidate != destination:
@@ -455,6 +559,85 @@ class AssetStore:
         ]
         return result
 
+    @staticmethod
+    def _validate_migration_asset_id(
+        value: str | None,
+        error_code: str,
+    ) -> None:
+        if value is not None and (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{32}", value) is None
+        ):
+            raise AssetStoreError(error_code)
+
+    def get_migration_snapshot_bounds(self) -> tuple[str | None, int]:
+        """Return the fixed maximum asset ID and row count in one read snapshot."""
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT MAX(asset_id) AS upper_bound_asset_id,
+                       COUNT(*) AS asset_count
+                FROM assets
+                """
+            ).fetchone()
+        return row["upper_bound_asset_id"], int(row["asset_count"])
+
+    def list_asset_ids_for_migration(
+        self,
+        *,
+        last_asset_id: str | None,
+        upper_bound_asset_id: str | None,
+        batch_size: int,
+    ) -> list[str]:
+        """Read one deterministic keyset page for the Host migration runner."""
+        self._validate_migration_asset_id(
+            last_asset_id,
+            "invalid_migration_cursor",
+        )
+        self._validate_migration_asset_id(
+            upper_bound_asset_id,
+            "invalid_migration_upper_bound",
+        )
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= 500
+        ):
+            raise AssetStoreError("invalid_migration_batch_size")
+        if upper_bound_asset_id is None:
+            return []
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            if last_asset_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT asset_id
+                    FROM assets
+                    WHERE asset_id <= ?
+                    ORDER BY asset_id ASC
+                    LIMIT ?
+                    """,
+                    (upper_bound_asset_id, batch_size),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT asset_id
+                    FROM assets
+                    WHERE asset_id > ?
+                      AND asset_id <= ?
+                    ORDER BY asset_id ASC
+                    LIMIT ?
+                    """,
+                    (
+                        last_asset_id,
+                        upper_bound_asset_id,
+                        batch_size,
+                    ),
+                ).fetchall()
+        return [row["asset_id"] for row in rows]
+
     def list_for_embedding(self, limit: int = 100) -> list[dict]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
             raise AssetStoreError("invalid_limit")
@@ -489,20 +672,47 @@ class AssetStore:
         description: str | None = None,
         tags: list[str] | None = None,
     ) -> dict:
-        asset_id = (asset_id or "").strip()
-        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
-            raise AssetStoreError("asset_unavailable")
-        clean_title = (
-            self._clean_metadata_text(title, 200, "title")
-            if title is not None
-            else None
-        )
-        clean_description = (
-            self._clean_metadata_text(description, 4000, "description")
-            if description is not None
-            else None
-        )
-        clean_tags = self._normalize_tags(tags) if tags is not None else None
+        try:
+            with self._asset_write_guard() as write_guard:
+                return self._update_metadata_unchecked(
+                    asset_id=asset_id,
+                    title=title,
+                    description=description,
+                    tags=tags,
+                    write_guard=write_guard,
+                )
+        except HostMigrationStateError as exc:
+            raise self._translate_write_gate_error(exc) from exc
+
+    def _update_metadata_unchecked(
+        self,
+        *,
+        asset_id: str,
+        title: str | None,
+        description: str | None,
+        tags: list[str] | None,
+        write_guard: AssetWriteGuard | _NoopAssetWriteGuard,
+    ) -> dict:
+        try:
+            asset_id = (asset_id or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+                raise AssetStoreError("asset_unavailable")
+            clean_title = (
+                self._clean_metadata_text(title, 200, "title")
+                if title is not None
+                else None
+            )
+            clean_description = (
+                self._clean_metadata_text(description, 4000, "description")
+                if description is not None
+                else None
+            )
+            clean_tags = self._normalize_tags(tags) if tags is not None else None
+        except Exception:
+            write_guard.mark_rolled_back()
+            raise
+        changed = False
+        mutation_started = False
 
         with self._lock:
             conn = self._connect()
@@ -535,6 +745,8 @@ class AssetStore:
                     replace_tags = old_normalized != new_normalized
 
                 if changes or replace_tags:
+                    changed = True
+                    mutation_started = True
                     updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     if changes:
                         assignments = ", ".join(f"{key} = ?" for key in changes)
@@ -564,8 +776,14 @@ class AssetStore:
                             ],
                         )
                 conn.commit()
+                if changed:
+                    write_guard.mark_changed()
+                else:
+                    write_guard.mark_unchanged()
             except Exception:
                 conn.rollback()
+                if not mutation_started:
+                    write_guard.mark_rolled_back()
                 raise
             finally:
                 conn.close()
@@ -575,10 +793,30 @@ class AssetStore:
         return result
 
     def delete(self, asset_id: str) -> dict:
-        asset_id = (asset_id or "").strip()
-        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
-            raise AssetStoreError("asset_unavailable")
+        try:
+            with self._asset_write_guard() as write_guard:
+                return self._delete_unchecked(
+                    asset_id=asset_id,
+                    write_guard=write_guard,
+                )
+        except HostMigrationStateError as exc:
+            raise self._translate_write_gate_error(exc) from exc
 
+    def _delete_unchecked(
+        self,
+        *,
+        asset_id: str,
+        write_guard: AssetWriteGuard | _NoopAssetWriteGuard,
+    ) -> dict:
+        try:
+            asset_id = (asset_id or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+                raise AssetStoreError("asset_unavailable")
+        except Exception:
+            write_guard.mark_rolled_back()
+            raise
+
+        mutation_started = False
         with self._lock:
             conn = self._connect()
             quarantine_path: Path | None = None
@@ -603,6 +841,7 @@ class AssetStore:
                 quarantine_path = self.temp_dir / (
                     f"delete-{asset_id}-{secrets.token_hex(8)}{original_path.suffix}"
                 )
+                mutation_started = True
                 os.replace(original_path, quarantine_path)
                 cursor = conn.execute(
                     "DELETE FROM assets WHERE asset_id = ?",
@@ -611,8 +850,11 @@ class AssetStore:
                 if cursor.rowcount != 1:
                     raise AssetStoreError("asset_delete_failed")
                 conn.commit()
+                write_guard.mark_changed()
             except Exception:
                 conn.rollback()
+                if not mutation_started:
+                    write_guard.mark_rolled_back()
                 if (
                     quarantine_path
                     and original_path
