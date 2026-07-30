@@ -145,6 +145,7 @@ class LegacyAssetImportFixtureContext(AbstractContextManager):
         self._nonce = secrets.token_hex(16)
         self._legacy_store_id: int | None = None
         self._core_id: int | None = None
+        self._core_target_root: Path | None = None
         self._active = True
         self.legacy_root.mkdir(exist_ok=True)
         self.rm_root.mkdir(exist_ok=True)
@@ -177,12 +178,15 @@ class LegacyAssetImportFixtureContext(AbstractContextManager):
             adapter = RememberMeAdapter()
         runtime = adapter.create_runtime(self.rm_root)
         self._core_id = id(runtime.service)
+        self._core_target_root = self.rm_root
         return runtime
 
     def bind_core(self, core: RememberMeCore) -> RememberMeCore:
         self._validate_active()
         if not callable(getattr(core, "import_asset", None)):
             raise LegacyAssetImportAdapterError("rm_import_unavailable")
+        if self._core_id != id(core):
+            self._core_target_root = None
         self._core_id = id(core)
         return core
 
@@ -281,6 +285,29 @@ class LegacyAssetImportAdapter:
         self._fixture_root = root
         self._legacy_root = legacy_root
         self._fixture_context = fixture_context
+
+    def is_bound_to_legacy_store(
+        self,
+        legacy_store: LegacyAssetImportSource,
+    ) -> bool:
+        """Return whether this capability is bound to the exact source object."""
+        return self._legacy_store is legacy_store
+
+    def is_bound_to_target_root(self, target_root: Path) -> bool:
+        """Return whether this capability's fixture owns the target root."""
+        self._fixture_context._validate_for_adapter(
+            legacy_store=self._legacy_store,
+            core=self._core,
+        )
+        try:
+            return (
+                self._fixture_context._core_target_root
+                == self._fixture_context.rm_root
+                and Path(target_root).resolve()
+                == self._fixture_context._core_target_root
+            )
+        except (OSError, RuntimeError, TypeError):
+            return False
 
     def import_asset(
         self,
