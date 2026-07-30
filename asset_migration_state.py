@@ -55,6 +55,16 @@ class MigrationCheckpoint:
     completed_at: str | None
 
 
+@dataclass(frozen=True)
+class MigrationStateInspection:
+    """Read-only state summary that never exposes lease or writer tokens."""
+
+    generation: int
+    write_uncertain: bool
+    lease_state: str
+    checkpoint: MigrationCheckpoint | None
+
+
 class AssetWriteGuard(AbstractContextManager):
     """A serialized write permission with a persistent uncertainty marker."""
 
@@ -710,6 +720,26 @@ class HostMigrationState:
                 "migration_state_unavailable"
             ) from exc
 
+    def inspect(self, migration_key: str) -> MigrationStateInspection:
+        """Return a non-mutating recovery snapshot without ownership secrets."""
+        _validate_migration_key(migration_key)
+        try:
+            now = self._now()
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                self._assert_runtime_schema(connection)
+                return _inspect_connection(
+                    connection,
+                    migration_key=migration_key,
+                    now=now,
+                )
+        except HostMigrationStateError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise HostMigrationStateError(
+                "migration_state_unavailable"
+            ) from exc
+
     def create_checkpoint(
         self,
         *,
@@ -1018,6 +1048,90 @@ class HostMigrationState:
                 "source_generation_uncertain"
             )
         return int(row["legacy_generation"])
+
+
+def inspect_existing_migration_state(
+    db_path: str | Path,
+    *,
+    migration_key: str,
+    clock: Callable[[], datetime] | None = None,
+) -> MigrationStateInspection | None:
+    """Inspect an existing migration DB in read-only mode without creating it."""
+    _validate_migration_key(migration_key)
+    try:
+        path = Path(db_path).resolve(strict=False)
+        if not path.is_file():
+            return None
+        now = (clock or (lambda: datetime.now(timezone.utc)))()
+        if not isinstance(now, datetime):
+            raise HostMigrationStateError("migration_clock_unavailable")
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN")
+            HostMigrationState._assert_runtime_schema(connection)
+            return _inspect_connection(
+                connection,
+                migration_key=migration_key,
+                now=now.astimezone(timezone.utc),
+            )
+        finally:
+            connection.close()
+    except HostMigrationStateError:
+        raise
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise HostMigrationStateError("migration_state_unavailable") from exc
+
+
+def _inspect_connection(
+    connection: sqlite3.Connection,
+    *,
+    migration_key: str,
+    now: datetime,
+) -> MigrationStateInspection:
+    meta = connection.execute(
+        """
+        SELECT legacy_generation, write_uncertain
+        FROM migration_meta
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    lease = connection.execute(
+        """
+        SELECT expires_at
+        FROM freeze_lease
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    row = connection.execute(
+        """
+        SELECT *
+        FROM migration_checkpoints
+        WHERE migration_key = ?
+        """,
+        (migration_key,),
+    ).fetchone()
+    if meta is None:
+        raise HostMigrationStateError("migration_state_unavailable")
+    lease_state = "none"
+    if lease is not None:
+        lease_state = (
+            "active"
+            if _parse_timestamp(lease["expires_at"]) > now
+            else "expired"
+        )
+    return MigrationStateInspection(
+        generation=int(meta["legacy_generation"]),
+        write_uncertain=bool(meta["write_uncertain"]),
+        lease_state=lease_state,
+        checkpoint=_checkpoint_from_row(row) if row is not None else None,
+    )
 
 
 def _parse_timestamp(value: str) -> datetime:
