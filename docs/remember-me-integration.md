@@ -23,10 +23,10 @@ automatically generated Source code archives are not pin targets. The pin does
 not use a branch URL, Git checkout, Standalone extra, submodule, vendored
 source, or sibling working tree.
 
-Stage 8H-C updates dependency provenance only. It does not execute migration,
-Reindex, production switching, or production access. The new public asset
-verification API is present in the pinned package; a later Ombre-Brain
-acceptance stage must integrate it explicitly.
+Stage 8H-C updated dependency provenance only. Stage 8H-D now uses the pinned
+public asset verification API for local migration acceptance. Neither stage
+executes a production migration, Reindex, production switch, or production
+access.
 
 Remember-Me is the long-term single public source for the image Core. Remember-Me
 was originally created by Ting. The original creator is Ting (`peanutsuee`).
@@ -122,75 +122,63 @@ It provides no command-line entry point for real data. Production migration,
 runtime enablement, cutover, and removal of the legacy implementation remain
 future stages and require separate acceptance.
 
-## Stage 8G-D local migration acceptance
+## Stage 8G-D and Stage 8H-D local migration acceptance
 
-Stage 8G-D adds local migration acceptance, reconciliation, and recovery
-diagnostics on top of the Stage 8G-C batch core. It remains restricted to
-factory-created Stage 8G-B fixtures and synthetic data. The production
-Remember-Me runtime remains disabled, and the legacy `AssetStore` remains the
-only production image implementation.
+Stage 8G-D added local migration acceptance, reconciliation, and recovery
+diagnostics on top of the Stage 8G-C batch core. Stage 8H-D retains that sole
+acceptance entry, checkpoint state machine, report boundary, write freeze, and
+stable errors while replacing the historical unsupported target checks with
+evidence from the Remember-Me `0.1.0.dev7` public verification API. The flow
+remains restricted to factory-created fixtures and synthetic data. The
+production Remember-Me runtime remains disabled, and the legacy `AssetStore`
+remains the production image implementation.
 
-The run-to-completion coordinator repeatedly invokes the existing bounded
-Stage 8G-C runner. It has validated batch and maximum-batch limits, releases
-the runner's freeze between batches, detects no progress, and stops on
-completed, blocked, failed, uncertain-source, changed-source, lease, or bounded
-limit outcomes. It neither calls the single-asset Adapter nor changes the
-checkpoint state machine.
+The run-to-completion coordinator is unchanged. Reconciliation starts only for
+a completed checkpoint whose canonical source and target identities match the
+exact write-gated legacy store and trusted fixture RM root. It freezes the
+legacy source, reads the fixed legacy inventory, and preserves the existing
+public metadata comparison before starting target verification.
 
-Reconciliation starts only for a completed checkpoint whose canonical source
-and target identities match the exact write-gated legacy store and the
-Adapter's trusted fixture RM root. It acquires a short acceptance freeze,
-then reads the checkpoint and source generation, pages the fixed legacy
-snapshot by `asset_id`, and compares records obtained through the Adapter's
-public-Core read contract. The lease is renewed during the scan and ownership
-is checked after every target read and before the final result. Lease loss or
-cleanup failure cannot produce a successful acceptance conclusion.
-The public contract verifies IDs, source and stored hash metadata, filename,
-MIME, kind, byte counts, dimensions, asset timestamps, title, description, and
-tag values.
+Stage 8H-D calls `begin_asset_verification`, pages the generation-guarded
+inventory with `list_asset_verification_page`, verifies every stored blob with
+`verify_asset_blob`, and finalizes with `complete_asset_verification`. All four
+calls are forwarded through the same Adapter and the same in-process
+`RememberMeService` instance. The fixed page size is 500, the public API
+maximum. Acceptance detects count differences, missing or extra assets,
+duplicate or out-of-order identities, repeated or non-progressing cursors, and
+malformed page results. It never assumes the inventory fits on one page.
 
-The pinned public Core does not expose persisted tag creation timestamps,
-complete target inventory enumeration, unexpected or duplicate target
-detection, a target-wide consistent snapshot, or cleaned blob bytes through
-this trusted read contract. Stage 8G-D enforces these as a fixed unsupported
-set. An Adapter declaration may add limitations but cannot remove a fixed
-limitation; a declaration is not verification evidence. Each distinct check
-is explicitly listed as unsupported in the structured report. A mismatch makes
-the result failed even when other checks are unsupported. When all supported
-fields match, the result remains `unsupported`: this stage has no reachable
-`passed` result. Stored hash metadata is compared, but
-`blob_verified_count` remains zero and the report does not claim byte-level
-blob verification. Without target inventory enumeration,
-`unexpected_target_count` remains unavailable rather than zero. Reports
-contain bounded stable mismatch codes and counters, never image bytes, tokens,
-raw database errors, internal objects, or filesystem paths.
+Each public verification record is compared with the frozen legacy expectation
+for asset identity, source and stored SHA-256, stored byte count, filename,
+MIME type, kind, title, description, dimensions, timestamps, and tags including
+tag creation time. The Host supplies exact legacy bytes through its existing
+contained read capability, without exposing a path, so Core verifies checksum,
+size, and byte equality against the currently stored target blob.
 
-Recovery diagnostics open existing state read-only and do not create a missing
-database, clear an expired lease, or update any state. They
-distinguish absent, resumable, active/expired lease, blocked, failed,
-uncertain-source, changed-source, identity-incompatible, completed-unverified,
-and partially verified conditions and return stable recommended action codes.
-A completed checkpoint is unverified without a matching structured report.
-A current, identity/generation/checkpoint-bound `unsupported` report is only
-partially verified. Stage 8G-D does not produce `completed_verified`; even a
-structurally consistent, manually constructed `passed` report is unsupported
-as provenance and requires manual review.
-They do not reset or delete checkpoints, clear uncertainty, force-release
-leases, skip rejected assets, alter generation, or mark migration complete.
+`complete_asset_verification` must attest that the generation is unchanged,
+every inventory record and blob was scanned, and no duplicate asset or stored
+hash ownership exists. Remember-Me performs a fresh inventory and blob rescan
+during completion. Only a valid completion can produce report version 2
+`passed` and recovery state `completed_verified`; any snapshot, cursor,
+inventory, blob, or completion failure is fail-closed.
 
-Opening `passed` and `completed_verified` in a future report contract requires
-actual public read evidence for complete target inventory, unexpected and
-duplicate detection, cleaned blob bytes, persisted tag creation timestamps,
-and target snapshot consistency. It also requires a new report
-contract/version that records the executed checks. Stage 8G-D does not claim
-an attestation mechanism or a full-capability fake reader.
+The verification snapshot is generation-guarded, not a filesystem freeze.
+Direct writes to either data root still require a maintenance window and a
+single-writer boundary. Snapshot IDs and cursors remain process-local and are
+never written to the migration database, report, log, or public exception.
+Reports contain only bounded stable codes and counters; they do not contain
+image bytes, filesystem paths, SQLite details, storage locators, or internal
+Remember-Me objects. Ordinary public Core failures are mapped to stable Host
+codes, while cancellation, `KeyboardInterrupt`, `SystemExit`, and other
+`BaseException` values still propagate.
 
-Stage 8G-D adds no production migration wiring and is not connected to server
-startup, MCP, HTTP, the Dashboard, a CLI, or an environment-variable automatic
-path. It does not access Render, migrate production images, run Reindex,
-dual-write, shadow-write, clean up, or delete legacy data. Production
-migration, runtime enablement, cutover, and legacy removal remain separate
-future stages.
+This acceptance path uses no Remember-Me private repository, SQLite table,
+blob locator, Search, or Reindex API. It does not change migration writes,
+rollback, dual-read or dual-write state, Dashboard behavior, MCP contracts,
+production configuration, or the legacy `AssetStore`. Passing local
+verification does not mean a production migration has run. Production
+migration, Reindex, runtime cutover, and legacy removal remain separate future
+operations.
 
 ## Compatibility evidence
 
@@ -210,8 +198,9 @@ repository construction. Initialization may add only:
 - `idx_asset_embeddings_model`.
 
 The verification state table belongs to the pinned public Core's bounded asset
-verification session contract. This provenance update does not call that API
-or treat the table's presence as Ombre-Brain migration acceptance evidence.
+verification session contract. Stage 8H-D uses only the public service API; it
+does not query that table directly or treat table presence as acceptance
+evidence.
 
 Production data must still be copied and accepted offline before any future
 first connection. Stage 8B never reads a real buckets directory, database, or

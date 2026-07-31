@@ -8,6 +8,14 @@ from datetime import datetime, timezone
 import re
 from typing import Callable
 
+from remember_me.core import (
+    AssetBlobVerificationResult,
+    AssetVerificationCompletion,
+    AssetVerificationPage,
+    AssetVerificationRecord,
+    AssetVerificationSnapshot,
+    AssetVerificationTag,
+)
 from asset_migration_state import (
     HostMigrationState,
     HostMigrationStateError,
@@ -29,17 +37,11 @@ from remember_me_migration_runner import (
 )
 
 
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 MAX_COORDINATOR_BATCHES = 10_000
 DEFAULT_MISMATCH_LIMIT = 100
-STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS = (
-    "target_blob_bytes",
-    "target_duplicate_asset_detection",
-    "target_full_inventory",
-    "target_snapshot_consistency",
-    "target_tag_created_at",
-    "target_unexpected_asset_detection",
-)
+VERIFICATION_PAGE_SIZE = 500
+STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -390,11 +392,11 @@ class LegacyRmReconciler:
     ) -> LocalMigrationAcceptanceReport:
         summary: Counter[str] = Counter()
         details: list[MigrationMismatch] = []
-        verified = matched = missing = 0
+        verified = missing = 0
+        matched_ids: set[str] = set()
         cursor: str | None = None
         source_count = 0
-        # Adapter declarations may add limitations, but declarations are not
-        # verification evidence and cannot clear Stage 8G-D's fixed gaps.
+        source_records: dict[str, dict] = {}
         unsupported = tuple(
             sorted(
                 set(STAGE_8G_D_FIXED_UNSUPPORTED_CHECKS).union(
@@ -430,6 +432,7 @@ class LegacyRmReconciler:
                         MigrationMismatch(asset_id, "source_record_unavailable"),
                     )
                     continue
+                source_records[asset_id] = record
                 self._state.renew_freeze(
                     owner,
                     ttl_seconds=self._lease_ttl_seconds,
@@ -466,7 +469,7 @@ class LegacyRmReconciler:
                     self._mismatch_limit,
                 )
                 if sum(summary.values()) == before:
-                    matched += 1
+                    matched_ids.add(asset_id)
             cursor = asset_ids[-1]
         self._state.assert_freeze_owner(owner)
         if self._state.current_generation() != checkpoint.snapshot_generation:
@@ -476,13 +479,24 @@ class LegacyRmReconciler:
                 summary, details, self._mismatch_limit,
                 MigrationMismatch(None, "source_inventory_count_mismatch"),
             )
+        verification = self._verify_target(
+            source_records,
+            summary,
+            details,
+            owner,
+        )
+        missing = max(missing, verification["missing"])
+        unexpected_count = verification["unexpected"]
+        blob_verified = verification["blob_verified"]
+        error_code = verification["error_code"]
+        matched = len(
+            matched_ids.difference(verification["mismatched_ids"])
+        )
         total_mismatches = sum(summary.values())
-        unexpected_count = None
-        blob_verified = 0
         overall = (
             "failed"
-            if total_mismatches
-            else "unsupported"
+            if total_mismatches or error_code
+            else ("unsupported" if unsupported else "passed")
         )
         completed = _timestamp(self._clock)
         return LocalMigrationAcceptanceReport(
@@ -511,7 +525,225 @@ class LegacyRmReconciler:
             started,
             completed,
             overall,
+            error_code,
         )
+
+    def _verify_target(
+        self,
+        source_records: dict[str, dict],
+        summary: Counter[str],
+        details: list[MigrationMismatch],
+        owner: str,
+    ) -> dict[str, object]:
+        expected_ids = set(source_records)
+        seen_ids: set[str] = set()
+        unexpected = blob_verified = 0
+        mismatched_ids: set[str] = set()
+        try:
+            snapshot = self._adapter.begin_target_verification()
+            if type(snapshot) is not AssetVerificationSnapshot:
+                raise LegacyAssetImportAdapterError(
+                    "rm_target_verification_result_invalid"
+                )
+            if (
+                type(snapshot.snapshot_id) is not str
+                or not snapshot.snapshot_id
+                or type(snapshot.generation) is not int
+                or snapshot.generation < 0
+                or snapshot.kind != "image"
+                or type(snapshot.total_count) is not int
+                or snapshot.total_count < 0
+                or type(snapshot.target_identity) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    snapshot.target_identity,
+                ) is None
+            ):
+                raise LegacyAssetImportAdapterError(
+                    "rm_target_verification_result_invalid"
+                )
+            if snapshot.total_count != len(expected_ids):
+                _add_mismatch(
+                    summary,
+                    details,
+                    self._mismatch_limit,
+                    MigrationMismatch(None, "target_inventory_count_mismatch"),
+                )
+            page_cursor = ""
+            used_cursors = {page_cursor}
+            previous_asset_id: str | None = None
+            maximum_pages = max(
+                1,
+                (
+                    snapshot.total_count + VERIFICATION_PAGE_SIZE - 1
+                ) // VERIFICATION_PAGE_SIZE,
+            )
+            pages_read = 0
+            while True:
+                pages_read += 1
+                if pages_read > maximum_pages:
+                    raise LegacyAssetImportAdapterError(
+                        "rm_target_verification_cursor_invalid"
+                    )
+                self._state.renew_freeze(
+                    owner,
+                    ttl_seconds=self._lease_ttl_seconds,
+                )
+                page = self._adapter.list_target_verification_page(
+                    snapshot_id=snapshot.snapshot_id,
+                    cursor=page_cursor,
+                    limit=VERIFICATION_PAGE_SIZE,
+                )
+                if type(page) is not AssetVerificationPage:
+                    raise LegacyAssetImportAdapterError(
+                        "rm_target_verification_result_invalid"
+                    )
+                if (
+                    page.snapshot_id != snapshot.snapshot_id
+                    or page.generation != snapshot.generation
+                    or page.total_count != snapshot.total_count
+                    or type(page.records) is not tuple
+                    or len(page.records) > VERIFICATION_PAGE_SIZE
+                    or type(page.has_more) is not bool
+                    or type(page.next_cursor) is not str
+                    or (
+                        page.has_more
+                        and len(page.records) != VERIFICATION_PAGE_SIZE
+                    )
+                ):
+                    raise LegacyAssetImportAdapterError(
+                        "rm_target_verification_result_invalid"
+                    )
+                for target in page.records:
+                    if (
+                        type(target) is not AssetVerificationRecord
+                        or not _valid_verification_record(target)
+                        or (
+                            previous_asset_id is not None
+                            and target.asset_id <= previous_asset_id
+                        )
+                        or target.asset_id in seen_ids
+                    ):
+                        raise LegacyAssetImportAdapterError(
+                            "rm_target_verification_duplicate_asset"
+                        )
+                    previous_asset_id = target.asset_id
+                    seen_ids.add(target.asset_id)
+                    source = source_records.get(target.asset_id)
+                    if source is None:
+                        unexpected += 1
+                        _add_mismatch(
+                            summary,
+                            details,
+                            self._mismatch_limit,
+                            MigrationMismatch(
+                                target.asset_id,
+                                "unexpected_target_asset",
+                            ),
+                        )
+                        return {
+                            "missing": len(expected_ids - seen_ids),
+                            "unexpected": unexpected,
+                            "blob_verified": blob_verified,
+                            "error_code": "target_verification_incomplete",
+                            "mismatched_ids": mismatched_ids,
+                        }
+                    before = sum(summary.values())
+                    _compare_verification_record(
+                        target.asset_id,
+                        source,
+                        target,
+                        summary,
+                        details,
+                        self._mismatch_limit,
+                    )
+                    if sum(summary.values()) != before:
+                        mismatched_ids.add(target.asset_id)
+                    expected_bytes = (
+                        self._adapter.get_legacy_verification_bytes(
+                            target.asset_id
+                        )
+                    )
+                    result = self._adapter.verify_target_blob(
+                        snapshot_id=snapshot.snapshot_id,
+                        asset_id=target.asset_id,
+                        expected_sha256=source["stored_sha256"],
+                        expected_size=source["stored_bytes"],
+                        expected_bytes=expected_bytes,
+                    )
+                    if (
+                        type(result) is not AssetBlobVerificationResult
+                        or result.snapshot_id != snapshot.snapshot_id
+                        or result.asset_id != target.asset_id
+                        or result.generation != snapshot.generation
+                        or not result.readable
+                        or not result.matches_expected_sha256
+                        or not result.matches_expected_size
+                        or result.matches_expected_bytes is not True
+                        or result.actual_sha256 != source["stored_sha256"]
+                        or result.actual_size != source["stored_bytes"]
+                    ):
+                        raise LegacyAssetImportAdapterError(
+                            "rm_target_verification_result_invalid"
+                        )
+                    blob_verified += 1
+                if not page.has_more:
+                    if page.next_cursor != "":
+                        raise LegacyAssetImportAdapterError(
+                            "rm_target_verification_cursor_invalid"
+                        )
+                    break
+                if (
+                    not page.next_cursor
+                    or page.next_cursor in used_cursors
+                ):
+                    raise LegacyAssetImportAdapterError(
+                        "rm_target_verification_cursor_invalid"
+                    )
+                page_cursor = page.next_cursor
+                used_cursors.add(page_cursor)
+            if (
+                len(seen_ids) != snapshot.total_count
+                or seen_ids != expected_ids
+            ):
+                raise LegacyAssetImportAdapterError(
+                    "rm_target_verification_incomplete"
+                )
+            completion = self._adapter.complete_target_verification(
+                snapshot_id=snapshot.snapshot_id
+            )
+            if (
+                type(completion) is not AssetVerificationCompletion
+                or completion.snapshot_id != snapshot.snapshot_id
+                or completion.target_identity != snapshot.target_identity
+                or completion.generation != snapshot.generation
+                or completion.total_count != snapshot.total_count
+                or completion.scanned_count != snapshot.total_count
+                or completion.blob_verified_count != snapshot.total_count
+                or completion.duplicate_asset_count != 0
+                or completion.duplicate_stored_sha_count != 0
+                or not completion.unchanged
+                or not completion.complete
+            ):
+                raise LegacyAssetImportAdapterError(
+                    "rm_target_verification_completion_invalid"
+                )
+        except LegacyAssetImportAdapterError as exc:
+            return {
+                "missing": len(expected_ids - seen_ids),
+                "unexpected": unexpected,
+                "blob_verified": blob_verified,
+                "error_code": _verification_error_code(exc.code),
+                "mismatched_ids": mismatched_ids,
+            }
+        self._state.assert_freeze_owner(owner)
+        return {
+            "missing": len(expected_ids - seen_ids),
+            "unexpected": unexpected,
+            "blob_verified": blob_verified,
+            "error_code": None,
+            "mismatched_ids": mismatched_ids,
+        }
 
     def _empty_report(
         self,
@@ -660,26 +892,30 @@ class MigrationRecoveryDiagnostics:
             )
             return _diagnostic(
                 (
-                    "completed_partially_verified"
-                    if report_status == "unsupported"
-                    else "completed_unverified"
+                    "completed_verified"
+                    if report_status == "passed"
+                    else (
+                        "completed_partially_verified"
+                        if report_status == "unsupported"
+                        else "completed_unverified"
+                    )
                 ),
                 checkpoint,
                 False,
-                True,
-                report_status not in {None, "unsupported"},
+                report_status != "passed",
+                report_status not in {None, "unsupported", "passed"},
                 (
-                    "review_unsupported_checks"
-                    if report_status == "unsupported"
+                    "review_verified_migration"
+                    if report_status == "passed"
                     else (
-                        "incompatible_state_manual_review"
-                        if report_status == "acceptance_pass_not_supported"
+                        "review_unsupported_checks"
+                        if report_status == "unsupported"
                         else "run_reconciliation"
                     )
                 ),
                 (
                     None
-                    if report_status in {None, "unsupported"}
+                    if report_status in {None, "unsupported", "passed"}
                     else report_status
                 ),
                 state.generation,
@@ -749,6 +985,115 @@ def _compare_record(
             summary, details, limit,
             MigrationMismatch(asset_id, "tags_mismatch", "tags"),
         )
+
+
+def _compare_verification_record(
+    asset_id: str,
+    source: dict,
+    target: AssetVerificationRecord,
+    summary: Counter[str],
+    details: list[MigrationMismatch],
+    limit: int,
+) -> None:
+    comparisons = (
+        ("asset_id", "target_record_unavailable"),
+        ("source_sha256", "source_sha_mismatch"),
+        ("stored_sha256", "stored_sha_mismatch"),
+        ("original_filename", "filename_mismatch"),
+        ("mime_type", "mime_mismatch"),
+        ("kind", "kind_mismatch"),
+        ("decoded_bytes", "decoded_bytes_mismatch"),
+        ("stored_bytes", "stored_bytes_mismatch"),
+        ("created_at", "created_at_mismatch"),
+        ("updated_at", "updated_at_mismatch"),
+        ("title", "title_mismatch"),
+        ("description", "description_mismatch"),
+    )
+    for field, code in comparisons:
+        source_value = source.get(field)
+        target_value = getattr(target, field)
+        if type(source_value) is not type(target_value) or source_value != target_value:
+            _add_mismatch(
+                summary,
+                details,
+                limit,
+                MigrationMismatch(asset_id, code, field),
+            )
+    if (
+        type(source.get("width")) is not int
+        or type(source.get("height")) is not int
+        or (source.get("width"), source.get("height"))
+        != (target.width, target.height)
+    ):
+        _add_mismatch(
+            summary,
+            details,
+            limit,
+            MigrationMismatch(asset_id, "dimensions_mismatch", "width_height"),
+        )
+    source_tags = tuple(
+        sorted(
+            (tag.get("value"), tag.get("created_at"))
+            for tag in source.get("tags", ())
+        )
+    )
+    target_tags = tuple(
+        sorted((tag.value, tag.created_at) for tag in target.tags)
+    )
+    if source_tags != target_tags:
+        _add_mismatch(
+            summary,
+            details,
+            limit,
+            MigrationMismatch(asset_id, "tags_mismatch", "tags"),
+        )
+
+
+def _valid_verification_record(record: AssetVerificationRecord) -> bool:
+    string_fields = (
+        record.source_sha256,
+        record.stored_sha256,
+        record.original_filename,
+        record.mime_type,
+        record.kind,
+        record.created_at,
+        record.updated_at,
+        record.title,
+        record.description,
+    )
+    if (
+        type(record.asset_id) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", record.asset_id) is None
+        or any(type(value) is not str for value in string_fields)
+        or re.fullmatch(r"[0-9a-f]{64}", record.source_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", record.stored_sha256) is None
+        or record.kind != "image"
+        or type(record.decoded_bytes) is not int
+        or record.decoded_bytes < 0
+        or type(record.stored_bytes) is not int
+        or record.stored_bytes < 0
+        or type(record.width) is not int
+        or record.width <= 0
+        or type(record.height) is not int
+        or record.height <= 0
+        or type(record.tags) is not tuple
+    ):
+        return False
+    return all(
+        type(tag) is AssetVerificationTag
+        and type(tag.value) is str
+        and type(tag.created_at) is str
+        for tag in record.tags
+    )
+
+
+def _verification_error_code(code: str) -> str:
+    prefix = "rm_target_"
+    if isinstance(code, str) and code.startswith(prefix):
+        suffix = code[len(prefix):]
+        if re.fullmatch(r"[a-z0-9_]{1,96}", suffix):
+            return "target_{}".format(suffix)
+    return "target_verification_internal_error"
 
 
 def _binding_error(store, adapter, state, source_identity, target_identity):
@@ -1044,7 +1389,18 @@ def _validate_acceptance_report(
     ):
         return "acceptance_report_incompatible"
     if report.overall_result == "passed":
-        return "acceptance_pass_not_supported"
+        if (
+            report.unsupported_checks
+            or mismatch_count
+            or report.mismatched_asset_count
+            or report.missing_target_count
+            or report.unexpected_target_count != 0
+            or report.verified_asset_count != report.expected_asset_count
+            or report.matched_asset_count != report.expected_asset_count
+            or report.blob_verified_count != report.expected_asset_count
+        ):
+            return "acceptance_report_incompatible"
+        return "passed"
     if report.overall_result == "unsupported":
         if (
             not report.unsupported_checks
