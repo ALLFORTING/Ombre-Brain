@@ -5,6 +5,7 @@ from importlib import metadata as importlib_metadata
 import inspect
 import io
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -25,7 +26,7 @@ from remember_me.core import (
 from remember_me.metadata import PROJECT_VERSION
 from remember_me.search import NullVectorProvider
 
-from embedding_engine import EmbeddingEngine
+from embedding_engine import EmbeddingEngine, _sanitize_request_url
 from remember_me_adapter import RememberMeAdapter
 from remember_me_core_adapter import (
     RememberMeCoreAdapter,
@@ -42,6 +43,26 @@ RM_ROOT = Path(r"D:\Codex\projects\Remember-Me")
 RM_SRC = (RM_ROOT / "src").resolve()
 RM_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
 ASSET_ID = "a" * 32
+DIAGNOSTIC_SECRETS = (
+    "url-user-secret",
+    "url-password-secret",
+    "url-query-secret",
+    "fragment-secret",
+    "bearer-header-secret",
+    "exception-message-secret",
+    "response-body-secret",
+    "response-json-token-secret",
+    "metaclass-secret",
+)
+SECRET_REQUEST_URL = (
+    "https://url-user-secret:url-password-secret@api.example.invalid:443"
+    "/v1/embeddings?api_key=url-query-secret#fragment-secret"
+)
+PATH_SECRET_REQUEST_URL = (
+    "https://url-user-secret:url-password-secret@api.example.invalid:443"
+    "/v1/path-secret-token/signed-value"
+    "?api_key=url-query-secret#fragment-secret"
+)
 
 
 class FakeEngine:
@@ -69,6 +90,171 @@ class FakeEngine:
 class NullLinks:
     def create_download_link(self, asset):
         raise AssertionError("reindex/search must not create download links")
+
+
+class SyntheticHttpError(RuntimeError):
+    def __init__(self, *, status_code=502, request_url=SECRET_REQUEST_URL):
+        message = " ".join(
+            (
+                "exception-message-secret",
+                request_url,
+                "Authorization: Bearer bearer-header-secret",
+                "response-body-secret",
+            )
+        )
+        super().__init__(message)
+        request = SimpleNamespace(url=request_url)
+        self.request = request
+        self.response = SimpleNamespace(
+            request=request,
+            status_code=status_code,
+            text=(
+                '{"error":"response-body-secret",'
+                '"token":"response-json-token-secret"}'
+            ),
+        )
+
+
+class RaisingEmbeddings:
+    def __init__(self, error):
+        self._error = error
+
+    async def create(self, **_kwargs):
+        raise self._error
+
+
+def _diagnostic_engine(error):
+    engine = object.__new__(EmbeddingEngine)
+    engine.enabled = True
+    engine.base_url = "https://api.example.invalid/v1"
+    engine.model = "model-a"
+    engine.api_key = "bearer-header-secret"
+    engine.client = SimpleNamespace(embeddings=RaisingEmbeddings(error))
+    engine.last_error = ""
+    engine.last_error_details = {}
+    return engine
+
+
+def _assert_diagnostics_redacted(engine, *extra_values):
+    serialized = (
+        engine.last_error,
+        json.dumps(engine.last_error_details, sort_keys=True),
+        repr(engine.last_error_details),
+        str(engine.last_error_details),
+        *(str(value) for value in extra_values),
+    )
+    combined = "\n".join(serialized)
+    for secret in DIAGNOSTIC_SECRETS:
+        assert secret not in combined
+
+
+def _assert_json_safe_diagnostics(engine):
+    assert all(
+        type(value) in {str, int} or value is None
+        for value in engine.last_error_details.values()
+    )
+    json.dumps(engine.last_error_details, sort_keys=True)
+
+
+class _HostileBodyMixin:
+    def _record_and_raise(self, name):
+        calls = object.__getattribute__(self, "calls")
+        calls[name] += 1
+        raise RuntimeError(f"{name}-must-not-run")
+
+    def __bool__(self):
+        return self._record_and_raise("__bool__")
+
+    def __len__(self):
+        return self._record_and_raise("__len__")
+
+    def __str__(self):
+        return self._record_and_raise("__str__")
+
+    def __repr__(self):
+        return self._record_and_raise("__repr__")
+
+
+class HostileStr(_HostileBodyMixin, str):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.calls = {
+            "__bool__": 0,
+            "__len__": 0,
+            "__str__": 0,
+            "__repr__": 0,
+        }
+        return instance
+
+
+class HostileBytes(_HostileBodyMixin, bytes):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.calls = {
+            "__bool__": 0,
+            "__len__": 0,
+            "__str__": 0,
+            "__repr__": 0,
+        }
+        return instance
+
+
+class HostileBytearray(_HostileBodyMixin, bytearray):
+    def __init__(self, value):
+        super().__init__(value)
+        self.calls = {
+            "__bool__": 0,
+            "__len__": 0,
+            "__str__": 0,
+            "__repr__": 0,
+        }
+
+
+class HostileUnknown(_HostileBodyMixin):
+    def __init__(self):
+        self.calls = {
+            "__bool__": 0,
+            "__len__": 0,
+            "__str__": 0,
+            "__repr__": 0,
+        }
+
+
+class HostileErrorTypeName(str):
+    def __new__(cls, value="metaclass-secret"):
+        instance = super().__new__(cls, value)
+        instance.calls = {
+            "__getitem__": 0,
+            "__iter__": 0,
+            "__len__": 0,
+            "__bool__": 0,
+            "__str__": 0,
+            "__repr__": 0,
+        }
+        return instance
+
+    def _record_and_raise(self, name):
+        calls = object.__getattribute__(self, "calls")
+        calls[name] += 1
+        raise RuntimeError("metaclass-secret")
+
+    def __getitem__(self, _key):
+        return self._record_and_raise("__getitem__")
+
+    def __iter__(self):
+        return self._record_and_raise("__iter__")
+
+    def __len__(self):
+        return self._record_and_raise("__len__")
+
+    def __bool__(self):
+        return self._record_and_raise("__bool__")
+
+    def __str__(self):
+        return self._record_and_raise("__str__")
+
+    def __repr__(self):
+        return self._record_and_raise("__repr__")
 
 
 def _png_bytes():
@@ -119,6 +305,651 @@ def test_embedding_engine_public_entry_delegates_once():
 
     assert result == [0.25, 0.75]
     engine._generate_embedding.assert_awaited_once_with("visible text")
+
+
+@pytest.mark.asyncio
+async def test_embedding_engine_http_diagnostics_and_logs_are_redacted(caplog):
+    engine = _diagnostic_engine(SyntheticHttpError())
+
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.embedding"):
+        result = await engine._generate_embedding("synthetic query")
+
+    assert result == []
+    assert engine.last_error == "embedding_http_error"
+    assert engine.last_error_details == {
+        "request_url": "https://api.example.invalid",
+        "status_code": 502,
+        "response_body": "[redacted]",
+        "error_type": "SyntheticHttpError",
+    }
+    _assert_diagnostics_redacted(engine, caplog.text)
+
+
+@pytest.mark.asyncio
+async def test_embedding_engine_non_http_exception_is_redacted(caplog):
+    engine = _diagnostic_engine(
+        RuntimeError(
+            "exception-message-secret bearer-header-secret "
+            "response-body-secret"
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.embedding"):
+        result = await engine._generate_embedding("synthetic query")
+
+    assert result == []
+    assert engine.last_error == "embedding_provider_error"
+    assert engine.last_error_details == {
+        "request_url": "",
+        "status_code": None,
+        "response_body": "",
+        "error_type": "RuntimeError",
+    }
+    _assert_diagnostics_redacted(engine, caplog.text)
+
+
+def test_embedding_engine_malformed_url_and_hostile_properties_fail_closed():
+    class HostileError(Exception):
+        @property
+        def response(self):
+            raise RuntimeError("response-body-secret")
+
+        @property
+        def request(self):
+            raise RuntimeError("url-query-secret")
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(HostileError("exception-message-secret"))
+    assert engine.last_error == "embedding_provider_error"
+    assert engine.last_error_details == {
+        "request_url": "",
+        "status_code": None,
+        "response_body": "",
+        "error_type": "HostileError",
+    }
+    _assert_diagnostics_redacted(engine)
+
+    malformed = SyntheticHttpError(
+        request_url="not a safe URL url-query-secret#fragment-secret"
+    )
+    engine._capture_error(malformed)
+    assert engine.last_error_details["request_url"] == ""
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    ("request_url", "expected"),
+    [
+        (PATH_SECRET_REQUEST_URL, "https://api.example.invalid"),
+        (
+            "https://api.example.invalid/"
+            "%0d%0aAuthorization%3Apercent-path-secret",
+            "https://api.example.invalid",
+        ),
+        (
+            "https://api.example.invalid:8443/v1/path-secret",
+            "https://api.example.invalid:8443",
+        ),
+        (
+            "https://[2001:db8::1]:8443/v1/path-secret",
+            "https://[2001:db8::1]:8443",
+        ),
+        ("http://api.example.invalid:80/path-secret", "http://api.example.invalid"),
+        (
+            "https://api.example.invalid:443/path-secret",
+            "https://api.example.invalid",
+        ),
+    ],
+)
+def test_embedding_engine_request_url_retains_only_safe_origin(
+    request_url,
+    expected,
+):
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(SyntheticHttpError(request_url=request_url))
+
+    sanitized = engine.last_error_details["request_url"]
+    assert sanitized == expected
+    assert sanitized.count("/") == 2
+    for forbidden in (
+        "/v1",
+        "path-secret",
+        "signed-value",
+        "%0d",
+        "%0a",
+        "Authorization",
+        "?",
+        "#",
+        "@",
+    ):
+        assert forbidden not in sanitized
+    _assert_diagnostics_redacted(engine, sanitized)
+
+
+def test_embedding_engine_request_url_rejects_str_subclass_without_magic_calls():
+    hostile_url = HostileStr(
+        "https://api.example.invalid/path-secret-token"
+    )
+
+    assert _sanitize_request_url(hostile_url) == ""
+    assert hostile_url.calls == {
+        "__bool__": 0,
+        "__len__": 0,
+        "__str__": 0,
+        "__repr__": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (200, 200),
+        (True, None),
+        ("200", None),
+        (-1, None),
+        (0, None),
+        (99, None),
+        (600, None),
+        (200.0, None),
+    ],
+)
+def test_embedding_engine_status_code_is_strictly_validated(
+    status_code,
+    expected,
+):
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(SyntheticHttpError(status_code=status_code))
+    assert engine.last_error_details["status_code"] == expected
+    _assert_diagnostics_redacted(engine)
+
+
+def test_embedding_engine_timeout_and_error_type_are_bounded():
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(TimeoutError("exception-message-secret"))
+    assert engine.last_error == "embedding_timeout"
+    assert engine.last_error_details["error_type"] == "TimeoutError"
+    _assert_diagnostics_redacted(engine)
+
+    hostile_type = type(
+        "Bad-Type-" + ("X" * 100),
+        (Exception,),
+        {},
+    )
+    engine._capture_error(hostile_type("exception-message-secret"))
+    error_type = engine.last_error_details["error_type"]
+    assert len(error_type) == 80
+    assert error_type.startswith("Bad_Type_")
+    assert all(
+        char.isascii() and (char.isalnum() or char == "_")
+        for char in error_type
+    )
+    _assert_diagnostics_redacted(engine)
+
+
+def test_embedding_engine_response_property_failures_are_redacted():
+    class HostileResponse:
+        request = SimpleNamespace(url="https://api.example.invalid/v1")
+        status_code = 503
+
+        @property
+        def text(self):
+            raise RuntimeError("response-body-secret")
+
+        @property
+        def content(self):
+            raise RuntimeError("response-json-token-secret")
+
+    error = RuntimeError("exception-message-secret")
+    error.response = HostileResponse()
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error == "embedding_http_error"
+    assert engine.last_error_details == {
+        "request_url": "https://api.example.invalid",
+        "status_code": 503,
+        "response_body": "[redacted]",
+        "error_type": "RuntimeError",
+    }
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    ("text", "content", "expected"),
+    [
+        ("", b"response-body-secret", "[redacted]"),
+        (None, b"response-body-secret", "[redacted]"),
+        (b"", b"response-body-secret", "[redacted]"),
+        ("", b"", ""),
+        (None, b"", ""),
+        ("", None, ""),
+        (None, None, ""),
+        (bytearray(), memoryview(b""), ""),
+    ],
+)
+def test_embedding_engine_combines_text_and_content_before_redaction(
+    text,
+    content,
+    expected,
+    caplog,
+):
+    error = RuntimeError("exception-message-secret")
+    error.response = SimpleNamespace(
+        request=SimpleNamespace(url="https://api.example.invalid/path-secret"),
+        status_code=502,
+        text=text,
+        content=content,
+    )
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error_details["response_body"] == expected
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine, caplog.text)
+
+
+class _BodyPropertyResponse:
+    def __init__(self, *, text, content):
+        self._text = text
+        self._content = content
+        self.request = SimpleNamespace(
+            url="https://api.example.invalid/path-secret"
+        )
+        self.status_code = 502
+
+    @property
+    def text(self):
+        if self._text is RuntimeError:
+            raise RuntimeError("response-body-secret")
+        if self._text is KeyError:
+            raise KeyError("response-json-token-secret")
+        return self._text
+
+    @property
+    def content(self):
+        if self._content is RuntimeError:
+            raise RuntimeError("response-body-secret")
+        if self._content is KeyError:
+            raise KeyError("response-json-token-secret")
+        return self._content
+
+
+@pytest.mark.parametrize(
+    ("text", "content"),
+    [
+        (RuntimeError, b""),
+        ("", RuntimeError),
+        (RuntimeError, None),
+        (None, RuntimeError),
+        (RuntimeError, RuntimeError),
+    ],
+)
+def test_embedding_engine_unknown_body_state_is_redacted(text, content):
+    error = RuntimeError("exception-message-secret")
+    error.response = _BodyPropertyResponse(text=text, content=content)
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error_details["response_body"] == "[redacted]"
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (SimpleNamespace(content=None), "[redacted]"),
+        (SimpleNamespace(text=""), "[redacted]"),
+        (SimpleNamespace(), "[redacted]"),
+    ],
+)
+def test_embedding_engine_missing_body_attribute_is_not_treated_as_empty(
+    response,
+    expected,
+):
+    error = RuntimeError("exception-message-secret")
+    error.response = response
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error_details["response_body"] == expected
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+def test_embedding_engine_missing_response_has_empty_body_diagnostic():
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(RuntimeError("exception-message-secret"))
+    assert engine.last_error_details["response_body"] == ""
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        ("SyntheticHttpError", "SyntheticHttpError"),
+        ("Bad-Type.Path", "Bad_Type_Path"),
+        ("", "Exception"),
+        ("X" * 100, "X" * 80),
+    ],
+)
+def test_embedding_engine_error_type_accepts_only_safe_exact_names(
+    candidate,
+    expected,
+):
+    class CandidateMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                return candidate
+            return super().__getattribute__(name)
+
+    class CandidateError(Exception, metaclass=CandidateMeta):
+        def __str__(self):
+            raise RuntimeError("exception-message-secret")
+
+        def __repr__(self):
+            raise RuntimeError("metaclass-secret")
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(CandidateError("exception-message-secret"))
+
+    assert engine.last_error_details["error_type"] == expected
+    assert type(engine.last_error_details["error_type"]) is str
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        HostileStr("metaclass-secret"),
+        b"metaclass-secret",
+        bytearray(b"metaclass-secret"),
+        None,
+        SimpleNamespace(secret="metaclass-secret"),
+    ],
+)
+def test_embedding_engine_error_type_rejects_non_exact_strings(candidate):
+    class CandidateMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                return candidate
+            return super().__getattribute__(name)
+
+    class CandidateError(Exception, metaclass=CandidateMeta):
+        pass
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(CandidateError("exception-message-secret"))
+
+    assert engine.last_error_details["error_type"] == "Exception"
+    assert type(engine.last_error_details["error_type"]) is str
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+def test_embedding_engine_hostile_error_type_name_never_invokes_magic_methods(
+    caplog,
+):
+    hostile_name = HostileErrorTypeName()
+
+    class HostileMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                return hostile_name
+            return super().__getattribute__(name)
+
+    class HostileTypedError(Exception, metaclass=HostileMeta):
+        pass
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(HostileTypedError("exception-message-secret"))
+
+    assert engine.last_error == "embedding_provider_error"
+    assert engine.last_error_details["error_type"] == "Exception"
+    assert hostile_name.calls == {
+        "__getitem__": 0,
+        "__iter__": 0,
+        "__len__": 0,
+        "__bool__": 0,
+        "__str__": 0,
+        "__repr__": 0,
+    }
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine, caplog.text)
+
+
+def test_embedding_engine_error_type_name_read_failure_falls_back():
+    class RaisingMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise RuntimeError("metaclass-secret")
+            return super().__getattribute__(name)
+
+    class RaisingNameError(Exception, metaclass=RaisingMeta):
+        pass
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(RaisingNameError("exception-message-secret"))
+
+    assert engine.last_error == "embedding_provider_error"
+    assert engine.last_error_details["error_type"] == "Exception"
+    assert type(engine.last_error_details["error_type"]) is str
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    "base_exception",
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+def test_embedding_engine_error_type_base_exception_propagates(base_exception):
+    class InterruptingMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise base_exception("metaclass-secret")
+            return super().__getattribute__(name)
+
+    class InterruptingError(Exception, metaclass=InterruptingMeta):
+        pass
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    with pytest.raises(base_exception):
+        engine._capture_error(InterruptingError())
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("", ""),
+        ("response-body-secret", "[redacted]"),
+        (b"", ""),
+        (b"response-body-secret", "[redacted]"),
+        (bytearray(), ""),
+        (bytearray(b"response-body-secret"), "[redacted]"),
+        (memoryview(b""), ""),
+        (memoryview(b"response-body-secret"), "[redacted]"),
+    ],
+)
+@pytest.mark.parametrize("attribute", ["text", "content"])
+def test_embedding_engine_exact_builtin_body_types_are_safely_classified(
+    body,
+    expected,
+    attribute,
+):
+    response_values = {
+        "request": SimpleNamespace(url="https://api.example.invalid/path-secret"),
+        "status_code": 502,
+        "text": None,
+        "content": None,
+    }
+    response_values[attribute] = body
+    error = RuntimeError("exception-message-secret")
+    error.response = SimpleNamespace(**response_values)
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error_details["response_body"] == expected
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    "body_factory",
+    [
+        lambda: HostileStr("response-body-secret"),
+        lambda: HostileBytes(b"response-body-secret"),
+        lambda: HostileBytearray(b"response-body-secret"),
+        HostileUnknown,
+    ],
+)
+@pytest.mark.parametrize("attribute", ["text", "content"])
+def test_embedding_engine_hostile_body_objects_do_not_invoke_magic_methods(
+    body_factory,
+    attribute,
+):
+    body = body_factory()
+    response_values = {
+        "request": SimpleNamespace(url="https://api.example.invalid/path-secret"),
+        "status_code": 502,
+        "text": None,
+        "content": None,
+    }
+    response_values[attribute] = body
+    error = RuntimeError("exception-message-secret")
+    error.response = SimpleNamespace(**response_values)
+    engine = _diagnostic_engine(RuntimeError("unused"))
+
+    engine._capture_error(error)
+
+    assert engine.last_error_details["response_body"] == "[redacted]"
+    assert body.calls == {
+        "__bool__": 0,
+        "__len__": 0,
+        "__str__": 0,
+        "__repr__": 0,
+    }
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+@pytest.mark.parametrize(
+    "failing_attribute",
+    [
+        "error_response",
+        "error_request",
+        "response_request",
+        "request_url",
+        "response_status_code",
+        "response_text",
+        "response_content",
+    ],
+)
+def test_embedding_engine_each_hostile_property_fails_closed(failing_attribute):
+    class HostileRequest:
+        @property
+        def url(self):
+            if failing_attribute == "request_url":
+                raise RuntimeError("url-query-secret")
+            return "https://api.example.invalid/path-secret"
+
+    class HostileResponse:
+        @property
+        def request(self):
+            if failing_attribute == "response_request":
+                raise RuntimeError("url-password-secret")
+            return HostileRequest()
+
+        @property
+        def status_code(self):
+            if failing_attribute == "response_status_code":
+                raise RuntimeError("bearer-header-secret")
+            return 502
+
+        @property
+        def text(self):
+            if failing_attribute == "response_text":
+                raise RuntimeError("response-body-secret")
+            return None
+
+        @property
+        def content(self):
+            if failing_attribute == "response_content":
+                raise RuntimeError("response-json-token-secret")
+            return b"response-body-secret"
+
+    class HostileError(Exception):
+        @property
+        def response(self):
+            if failing_attribute == "error_response":
+                raise RuntimeError("response-body-secret")
+            return HostileResponse()
+
+        @property
+        def request(self):
+            if failing_attribute == "error_request":
+                raise RuntimeError("url-user-secret")
+            return None
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    engine._capture_error(HostileError("exception-message-secret"))
+
+    _assert_json_safe_diagnostics(engine)
+    _assert_diagnostics_redacted(engine)
+
+
+def test_embedding_engine_hostile_properties_do_not_swallow_base_exception():
+    class InterruptingError(Exception):
+        @property
+        def response(self):
+            raise KeyboardInterrupt()
+
+    engine = _diagnostic_engine(RuntimeError("unused"))
+    with pytest.raises(KeyboardInterrupt):
+        engine._capture_error(InterruptingError())
+
+
+@pytest.mark.asyncio
+async def test_embedding_engine_store_and_search_logs_are_redacted(caplog):
+    store_engine = _diagnostic_engine(RuntimeError("unused"))
+    store_engine._generate_embedding = AsyncMock(return_value=[1.0, 0.0])
+
+    def fail_store(*_args):
+        raise RuntimeError(
+            "exception-message-secret bearer-header-secret "
+            "response-body-secret"
+        )
+
+    store_engine._store_embedding = fail_store
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.embedding"):
+        assert (
+            await store_engine.generate_and_store(
+                "synthetic-bucket",
+                "synthetic content",
+            )
+            is False
+        )
+    assert store_engine.last_error == "embedding_store_error"
+    _assert_diagnostics_redacted(store_engine, caplog.text)
+
+    caplog.clear()
+    search_engine = _diagnostic_engine(RuntimeError("unused"))
+    search_engine._generate_embedding = AsyncMock(
+        side_effect=RuntimeError(
+            "exception-message-secret bearer-header-secret "
+            "response-body-secret"
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.embedding"):
+        assert await search_engine.search_similar("synthetic query") == []
+    assert search_engine.last_error == "embedding_search_error"
+    _assert_diagnostics_redacted(search_engine, caplog.text)
 
 
 def test_provider_identity_is_stable_redacted_and_sensitive_to_inputs():
@@ -524,6 +1355,63 @@ async def test_disabled_provider_is_keyword_only_and_reindex_reports_failure(tmp
     assert result["results"][0]["asset_id"] == asset["asset_id"]
     assert "semantic_score" not in result["results"][0]
     assert engine.calls == []
+
+
+@pytest.mark.asyncio
+async def test_real_rm_search_and_reindex_provider_failure_are_redacted(tmp_path):
+    engine = _diagnostic_engine(SyntheticHttpError())
+    provider = RememberMeVectorProviderAdapter(engine)
+    core = RememberMeCoreAdapter.from_host_adapter(
+        RememberMeAdapter(),
+        tmp_path / "rm-runtime",
+        vector_provider=provider,
+    )
+    presenter = RememberMeMcpCompatibilityPresenter(core, NullLinks())
+    content = _png_bytes()
+    asset = core.ingest_image(
+        content,
+        len(content),
+        "keyword.png",
+        "image/png",
+        title="Keyword title",
+    )
+
+    search_raw = await presenter.rm_asset_search(query="Keyword")
+    search = json.loads(search_raw)
+    assert search["ok"] is True
+    assert search["results"][0]["asset_id"] == asset["asset_id"]
+    assert "semantic_score" not in search["results"][0]
+
+    reindex_raw = await presenter.rm_asset_reindex_embeddings(
+        asset_id=asset["asset_id"]
+    )
+    reindex = json.loads(reindex_raw)
+    assert reindex == {
+        "ok": True,
+        "scanned": 1,
+        "indexed": 0,
+        "skipped": 0,
+        "failed": 1,
+    }
+    assert reindex["scanned"] == (
+        reindex["indexed"] + reindex["skipped"] + reindex["failed"]
+    )
+
+    public_output = search_raw + reindex_raw
+    for private_key in (
+        "last_error",
+        "last_error_details",
+        "error_type",
+        "request_url",
+        "status_code",
+        "response_body",
+        "model_id",
+        "endpoint",
+        "api_key",
+        "exception",
+    ):
+        assert private_key not in public_output
+    _assert_diagnostics_redacted(engine, public_output)
 
 
 @pytest.mark.asyncio
