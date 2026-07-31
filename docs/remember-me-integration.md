@@ -691,7 +691,9 @@ headers. POST keeps the existing public success page with `asset_id`,
 status codes and never expose source, paths, hashes, bytes, tokens, data roots,
 or exception text.
 
-At the end of this stage, `rm_asset_upload_link`, `rm_asset_upload_status`,
+The following ownership statement records the historical state at the end of
+Stage 8F-I; it does not describe the current `main`. At that point,
+`rm_asset_upload_link`, `rm_asset_upload_status`,
 `rm_asset_get`, `rm_asset_download_link`, `rm_asset_view`, `rm_asset_inspect`,
 `rm_asset_update_metadata`, and `rm_asset_search` are wired. Only
 `rm_asset_reindex_embeddings` remains on the legacy implementation. The Viewer
@@ -699,21 +701,26 @@ resource, Viewer fallback, download route and Ticket side table, Dashboard,
 diagnostic upload routes, schema snapshots, tool counts, route counts, and all
 environment variables remain unchanged.
 
-The current production Render environment must still keep the RM runtime flag
-disabled. This is still not a complete public migration release because Reindex
-remains follow-up work. Rollback is to restore the upload link/status handlers,
-route source dispatch, upload source side table, host upload result hardening,
-Stage 8F-I tests, related static test updates, and this section. No data
-migration, copy, double write, shadow write, sync, Render change, or production
-data access is involved.
+At that historical Stage 8F-I point, the production Render environment still
+had to keep the RM runtime flag disabled and Reindex remained follow-up work.
+Stage 8F-J subsequently completed the ninth RM-enabled handler. Rollback of
+Stage 8F-I is to restore the upload link/status handlers, route source dispatch,
+upload source side table, host upload result hardening, Stage 8F-I tests,
+related static test updates, and this section. No data migration, copy, double
+write, shadow write, sync, Render change, or production data access is involved.
 
 ## Stage 8F-J RM Reindex and Semantic Provider Wiring
 
-Stage 8F-J updates the immutable Remember-Me dependency pin to
-`5c430d3f265be059198fe230c1a0682e23e89e32` and completes 9/9
-RM-enabled Core ownership. The Python RM Search API is async, so the OB
-CoreAdapter, Presenter, and server handler now await it end to end without a
-synchronous wrapper, event-loop bridge, or worker thread.
+Stage 8F-J originally updated the immutable Remember-Me dependency pin to
+`5c430d3f265be059198fe230c1a0682e23e89e32` and completed 9/9
+RM-enabled Core ownership. That commit is the historical Stage 8F-J
+implementation pin, not the current dependency. Current `main` uses the later
+compatible superset at commit
+`67240f5aa359ba94130b737b357f2f54190e6c3c`, package `0.1.0.dev6`; it retains
+the public vector, Search, and Reindex contracts required by Stage 8F-J. Final
+Acceptance Hardening does not change that pin. The Python RM Search API is
+async, so the OB CoreAdapter, Presenter, and server handler await it end to end
+without a synchronous wrapper, event-loop bridge, or worker thread.
 
 OB creates one process-lifetime `RememberMeVectorProviderAdapter` over the
 existing `EmbeddingEngine` and passes that exact instance into the RM runtime
@@ -750,6 +757,45 @@ Reindex counters, error envelopes, upload behavior, Viewer behavior, Tickets,
 and default-off behavior remain unchanged. No Render deployment, production
 configuration change, production data migration, or automatic backfill is part
 of this stage.
+
+### Stage 8F-J Final Acceptance Hardening
+
+All nine RM asset handlers retain RM-enabled ownership. This hardening changes
+only Host embedding failure diagnostics: exception messages, URL credentials,
+query strings, fragments, response bodies, API secrets, and arbitrary upstream
+objects are not retained or logged. Diagnostics contain only a stable bounded
+error code, a sanitized exception class name, a credential-free HTTP(S) origin,
+a validated HTTP status code, and a fixed response-body redaction marker. The
+URL diagnostic retains only scheme, host, and a non-default port. User info,
+query, fragment, and the entire path are removed, so signed, token-bearing, or
+percent-encoded path segments are never retained.
+
+When no response object exists, the response-body diagnostic is empty. When a
+response exists, its `text` and `content` fields are classified independently,
+and the diagnostic is empty only when both are safely proven empty. Any
+non-empty, missing, unknown, or ordinary attribute-read failure state receives
+the fixed redaction marker, so empty `text` cannot mask non-empty `content`.
+Presence checks use length only for exact built-in `str`, `bytes`, `bytearray`,
+and `memoryview` values. Built-in subclasses and unknown objects are never
+subjected to truthiness, length, string conversion, or representation methods.
+
+The diagnostic exception type accepts only an exact built-in `str` returned as
+the exception class name. String subclasses, proxies, hostile metaclasses,
+attribute-read failures, and unknown candidate types fail closed to
+`Exception` without invoking candidate magic methods. These protections catch
+ordinary exceptions only; cancellation and other `BaseException` values still
+propagate.
+
+Search still degrades to keyword-only results when the provider fails. Reindex
+still isolates failures per asset and returns the existing four balanced public
+counters. MCP names, signatures, schemas, envelopes, model identity, the
+default-off legacy fallback, and the runtime gate are unchanged. The
+process-lifetime AsyncOpenAI shutdown lifecycle remains a separate,
+low-priority, non-blocking follow-up and is not expanded here.
+
+This hardening does not enable the production RM runtime, call a real embedding
+provider, execute Reindex, access production data, migrate data, add dual or
+shadow writes, or delete legacy assets or vectors.
 
 ## Rollback
 

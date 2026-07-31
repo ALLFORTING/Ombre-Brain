@@ -16,10 +16,34 @@ import json
 import math
 import sqlite3
 import logging
+import re
+from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
+
+_ERROR_TYPE_LIMIT = 80
+_REQUEST_URL_LIMIT = 500
+_REDACTED_RESPONSE_BODY = "[redacted]"
+_BODY_ATTRIBUTE_MISSING = object()
+_BODY_EMPTY = object()
+_BODY_PRESENT = object()
+_BODY_UNKNOWN = object()
+_ERROR_CODES = {
+    "embedding_http_error",
+    "embedding_provider_error",
+    "embedding_search_error",
+    "embedding_store_error",
+    "embedding_timeout",
+}
+_TIMEOUT_ERROR_TYPES = {
+    "APITimeoutError",
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ReadTimeout",
+    "TimeoutError",
+}
 
 
 class EmbeddingEngine:
@@ -105,8 +129,12 @@ class EmbeddingEngine:
             self.last_error_details = {}
             return True
         except Exception as e:
-            self._capture_error(e)
-            logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
+            self._capture_error(e, error_code="embedding_store_error")
+            logger.warning(
+                "Embedding store failed [%s:%s]",
+                self.last_error,
+                self.last_error_details.get("error_type", "Exception"),
+            )
             return False
 
     async def embed_text(self, text: str) -> list[float]:
@@ -127,21 +155,45 @@ class EmbeddingEngine:
             return []
         except Exception as e:
             self._capture_error(e)
-            logger.warning(f"Embedding API call failed: {e}")
+            logger.warning(
+                "Embedding API call failed [%s:%s]",
+                self.last_error,
+                self.last_error_details.get("error_type", "Exception"),
+            )
             return []
 
-    def _capture_error(self, error: Exception) -> None:
-        """Keep upstream diagnostics without retaining credentials or headers."""
-        response = getattr(error, "response", None)
-        request = getattr(error, "request", None)
+    def _capture_error(
+        self,
+        error: Exception,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        """Keep bounded diagnostics without retaining upstream content."""
+        response = _safe_getattr(error, "response")
+        request = _safe_getattr(error, "request")
         if request is None and response is not None:
-            request = getattr(response, "request", None)
+            request = _safe_getattr(response, "request")
 
-        self.last_error = f"{type(error).__name__}: {error}"[:500]
+        error_type = _safe_error_type(error)
+        selected_code = (
+            error_code
+            if error_code in _ERROR_CODES
+            else _embedding_error_code(
+                error,
+                response=response,
+                error_type=error_type,
+            )
+        )
+        self.last_error = selected_code
         self.last_error_details = {
-            "request_url": str(getattr(request, "url", "")),
-            "status_code": getattr(response, "status_code", None),
-            "response_body": getattr(response, "text", "")[:2000],
+            "request_url": _sanitize_request_url(
+                _safe_getattr(request, "url")
+            ),
+            "status_code": _sanitize_status_code(
+                _safe_getattr(response, "status_code")
+            ),
+            "response_body": _redacted_response_body(response),
+            "error_type": error_type,
         }
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
@@ -198,7 +250,12 @@ class EmbeddingEngine:
             if not query_embedding:
                 return []
         except Exception as e:
-            logger.warning(f"Query embedding failed: {e}")
+            self._capture_error(e, error_code="embedding_search_error")
+            logger.warning(
+                "Embedding search failed [%s:%s]",
+                self.last_error,
+                self.last_error_details.get("error_type", "Exception"),
+            )
             return []
 
         # Load all embeddings from SQLite
@@ -236,3 +293,115 @@ class EmbeddingEngine:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+
+def _safe_getattr(value, name: str):
+    if value is None:
+        return None
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _safe_error_type(error: Exception) -> str:
+    try:
+        error_class = type(error)
+        candidate = error_class.__name__
+        if type(candidate) is not str:
+            return "Exception"
+        normalized = "".join(
+            char
+            if char.isascii() and (char.isalnum() or char == "_")
+            else "_"
+            for char in candidate[:_ERROR_TYPE_LIMIT]
+        )
+        return normalized or "Exception"
+    except Exception:
+        return "Exception"
+
+
+def _embedding_error_code(
+    error: Exception,
+    *,
+    response,
+    error_type: str,
+) -> str:
+    if response is not None:
+        return "embedding_http_error"
+    if isinstance(error, TimeoutError) or error_type in _TIMEOUT_ERROR_TYPES:
+        return "embedding_timeout"
+    return "embedding_provider_error"
+
+
+def _sanitize_request_url(value) -> str:
+    try:
+        if type(value) is not str:
+            return ""
+        raw = value
+        if not raw or len(raw) > _REQUEST_URL_LIMIT:
+            return ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+            return ""
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        hostname = parsed.hostname
+        if ":" in hostname:
+            if not re.fullmatch(r"[0-9A-Fa-f:.]+", hostname):
+                return ""
+        elif not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
+            return ""
+        port = parsed.port
+        if (scheme == "https" and port == 443) or (
+            scheme == "http" and port == 80
+        ):
+            port = None
+        host = "[{}]".format(hostname) if ":" in hostname else hostname
+        netloc = "{}:{}".format(host, port) if port is not None else host
+        sanitized = "{}://{}".format(scheme, netloc)
+        if len(sanitized) > _REQUEST_URL_LIMIT:
+            return ""
+        return sanitized
+    except Exception:
+        return ""
+
+
+def _sanitize_status_code(value):
+    if type(value) is int and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _redacted_response_body(response) -> str:
+    if response is None:
+        return ""
+
+    text_state = _classify_body_attribute(response, "text")
+    content_state = _classify_body_attribute(response, "content")
+    if text_state is _BODY_PRESENT or content_state is _BODY_PRESENT:
+        return _REDACTED_RESPONSE_BODY
+    if text_state is _BODY_UNKNOWN or content_state is _BODY_UNKNOWN:
+        return _REDACTED_RESPONSE_BODY
+    if text_state is _BODY_EMPTY and content_state is _BODY_EMPTY:
+        return ""
+    return _REDACTED_RESPONSE_BODY
+
+
+def _classify_body_attribute(response, name: str):
+    try:
+        body = getattr(response, name, _BODY_ATTRIBUTE_MISSING)
+    except Exception:
+        return _BODY_UNKNOWN
+    if body is _BODY_ATTRIBUTE_MISSING:
+        return _BODY_UNKNOWN
+    return _classify_body_value(body)
+
+
+def _classify_body_value(body):
+    if body is None:
+        return _BODY_EMPTY
+    if type(body) in {str, bytes, bytearray, memoryview}:
+        return _BODY_PRESENT if len(body) else _BODY_EMPTY
+    return _BODY_PRESENT
