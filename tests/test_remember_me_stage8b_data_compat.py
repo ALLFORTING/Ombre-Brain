@@ -118,6 +118,7 @@ async def test_ob_and_public_rm_read_write_the_same_copied_data(tmp_path):
     added_schema = set(schema_after_init) - set(schema_before)
     assert added_schema == {
         "asset_embeddings",
+        "asset_verification_state",
         "idx_asset_embeddings_content_hash",
         "idx_asset_embeddings_model",
     }

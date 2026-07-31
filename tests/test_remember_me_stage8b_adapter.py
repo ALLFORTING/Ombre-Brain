@@ -9,6 +9,17 @@ from unittest.mock import patch
 import pytest
 
 import remember_me_adapter as adapter_module
+from remember_me.core import (
+    AssetBlobVerificationResult,
+    AssetVerificationCompletion,
+    AssetVerificationPage,
+    AssetVerificationSnapshot,
+    BeginAssetVerificationRequest,
+    CompleteAssetVerificationRequest,
+    ListAssetVerificationPageRequest,
+    RememberMeService,
+    VerifyAssetBlobRequest,
+)
 from remember_me_adapter import (
     EXPECTED_MCP_TOOLS,
     RememberMeAdapter,
@@ -19,13 +30,18 @@ from remember_me_adapter import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
+EXPECTED_VERSION = "0.1.0.dev7"
+EXPECTED_TAG = "v0.1.0.dev7"
+EXPECTED_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
+EXPECTED_TREE = "f397d8631cabfe5aa62cabb000f754e00ac06bca"
 EXPECTED_ARCHIVE_SHA256 = (
-    "8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053"
+    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
 )
 EXPECTED_ARCHIVE_URL = (
-    "https://api.github.com/repos/peanutsuee/Remember-Me/tarball/{}"
-).format(EXPECTED_COMMIT)
+    "https://github.com/peanutsuee/Remember-Me/releases/download/"
+    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
+    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
+)
 OLD_COMMIT = "184e223c6392fd14dd5cfa73227d41f46d90e3c8"
 
 
@@ -39,16 +55,26 @@ def _requirement_line():
     )
 
 
-def test_dependency_is_commit_and_digest_pinned_without_extras_or_git():
+def test_dependency_is_immutable_release_asset_and_digest_pinned():
     line = _requirement_line()
+    integration_text = (ROOT / "docs" / "remember-me-integration.md").read_text(
+        encoding="utf-8"
+    )
 
-    assert EXPECTED_COMMIT in line
-    assert EXPECTED_ARCHIVE_URL in line
+    assert line == "remember-me @ {}#sha256={}".format(
+        EXPECTED_ARCHIVE_URL,
+        EXPECTED_ARCHIVE_SHA256,
+    )
     assert len(EXPECTED_COMMIT) == 40
-    assert "#sha256={}".format(EXPECTED_ARCHIVE_SHA256) in line
+    assert EXPECTED_VERSION in EXPECTED_ARCHIVE_URL
+    assert EXPECTED_TAG in EXPECTED_ARCHIVE_URL
+    assert EXPECTED_COMMIT in EXPECTED_ARCHIVE_URL
+    assert EXPECTED_TREE in integration_text
     assert "git+" not in line
     assert "remember-me[" not in line
     assert "/main" not in line
+    assert "/tarball/" not in line
+    assert "/archive/refs/" not in line
     assert OLD_COMMIT not in line
 
 
@@ -96,6 +122,31 @@ def test_installed_contract_matches_pinned_public_package():
     assert validate_remember_me_contract(contract) is contract
     assert contract.mcp_tools == EXPECTED_MCP_TOOLS
     assert "remember_me.standalone" not in sys.modules
+
+
+def test_public_asset_verification_contract_is_available():
+    assert all(
+        item is not None
+        for item in (
+            BeginAssetVerificationRequest,
+            ListAssetVerificationPageRequest,
+            VerifyAssetBlobRequest,
+            CompleteAssetVerificationRequest,
+            AssetVerificationSnapshot,
+            AssetVerificationPage,
+            AssetBlobVerificationResult,
+            AssetVerificationCompletion,
+        )
+    )
+    assert all(
+        callable(getattr(RememberMeService, method_name, None))
+        for method_name in (
+            "begin_asset_verification",
+            "list_asset_verification_page",
+            "verify_asset_blob",
+            "complete_asset_verification",
+        )
+    )
 
 
 def test_contract_inspection_failure_is_redacted():

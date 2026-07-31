@@ -36,9 +36,15 @@ from remember_me_import_adapter import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-RM_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
+RM_VERSION = "0.1.0.dev7"
+RM_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
 RM_ARCHIVE_SHA256 = (
-    "8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053"
+    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
+)
+RM_ARCHIVE_URL = (
+    "https://github.com/peanutsuee/Remember-Me/releases/download/"
+    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
+    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
 )
 CREATED_AT = "2026-06-01T01:02:03+00:00"
 TAG_CREATED_AT = "2026-06-01T01:03:04+00:00"
@@ -198,9 +204,12 @@ def test_pin_version_and_public_import_contract():
         for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line.startswith("remember-me @")
     )
-    assert RM_COMMIT in requirement
-    assert "#sha256={}".format(RM_ARCHIVE_SHA256) in requirement
-    assert PROJECT_VERSION == "0.1.0.dev6"
+    assert requirement == "remember-me @ {}#sha256={}".format(
+        RM_ARCHIVE_URL,
+        RM_ARCHIVE_SHA256,
+    )
+    assert RM_COMMIT in RM_ARCHIVE_URL
+    assert PROJECT_VERSION == RM_VERSION
     assert all(
         item is not None
         for item in (

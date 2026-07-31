@@ -500,6 +500,7 @@ def test_sequential_cross_runtime_reopen_and_schema_guard(tmp_path):
     added = set(schema_after) - set(schema_before)
     assert added == {
         "asset_embeddings",
+        "asset_verification_state",
         "idx_asset_embeddings_content_hash",
         "idx_asset_embeddings_model",
     }
