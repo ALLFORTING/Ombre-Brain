@@ -1,23 +1,37 @@
 # Remember-Me Integration
 
-## Stage 8B baseline
+## Current dependency provenance
 
 Ombre-Brain pins the public Remember-Me Core to:
 
 - official repository: `peanutsuee/Remember-Me`;
-- current commit: `67240f5aa359ba94130b737b357f2f54190e6c3c`;
-- archive SHA-256: `8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053`;
 - distribution: `remember-me`;
-- package version: `0.1.0.dev6`;
+- package version: `0.1.0.dev7`;
+- immutable prerelease tag: `v0.1.0.dev7`;
+- final main commit: `dc868c4b757db701cfadcb0225acb905c07775e4`;
+- Git tree: `f397d8631cabfe5aa62cabb000f754e00ac06bca`;
+- custom deterministic archive:
+  `https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0.dev7/Remember-Me-0.1.0.dev7-dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz`;
+- archive SHA-256:
+  `5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27`;
 - data compatibility: `ombre-brain-assets-v1`;
 - sanitizer: `remember-me-pillow-v1`.
 
-The dependency is an immutable GitHub source archive with a verified SHA-256
-fragment. It does not use a branch, tag, Git checkout, Standalone extra,
-submodule, vendored source, or sibling working tree.
+The dependency is the custom source asset uploaded to an immutable GitHub
+prerelease, with an exact SHA-256 fragment in `requirements.txt`. GitHub's
+automatically generated Source code archives are not pin targets. The pin does
+not use a branch URL, Git checkout, Standalone extra, submodule, vendored
+source, or sibling working tree.
+
+Stage 8H-C updates dependency provenance only. It does not execute migration,
+Reindex, production switching, or production access. The new public asset
+verification API is present in the pinned package; a later Ombre-Brain
+acceptance stage must integrate it explicitly.
 
 Remember-Me is the long-term single public source for the image Core. Remember-Me
 was originally created by Ting. The original creator is Ting (`peanutsuee`).
+
+## Stage 8B baseline
 
 Stage 8B installs and validates that public Core only. The adapter is not
 imported by `server.py`, `asset_dashboard.py`, or any production startup path.
@@ -191,8 +205,13 @@ asset rows, hashes, relative paths, and blobs remain unchanged during initial
 repository construction. Initialization may add only:
 
 - `asset_embeddings`;
+- `asset_verification_state`;
 - `idx_asset_embeddings_content_hash`;
 - `idx_asset_embeddings_model`.
+
+The verification state table belongs to the pinned public Core's bounded asset
+verification session contract. This provenance update does not call that API
+or treat the table's presence as Ombre-Brain migration acceptance evidence.
 
 Production data must still be copied and accepted offline before any future
 first connection. Stage 8B never reads a real buckets directory, database, or
@@ -716,7 +735,7 @@ Stage 8F-J originally updated the immutable Remember-Me dependency pin to
 RM-enabled Core ownership. That commit is the historical Stage 8F-J
 implementation pin, not the current dependency. Current `main` uses the later
 compatible superset at commit
-`67240f5aa359ba94130b737b357f2f54190e6c3c`, package `0.1.0.dev6`; it retains
+`dc868c4b757db701cfadcb0225acb905c07775e4`, package `0.1.0.dev7`; it retains
 the public vector, Search, and Reindex contracts required by Stage 8F-J. Final
 Acceptance Hardening does not change that pin. The Python RM Search API is
 async, so the OB CoreAdapter, Presenter, and server handler await it end to end

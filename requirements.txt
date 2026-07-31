@@ -23,7 +23,7 @@ python-frontmatter>=1.1.0
 Pillow>=11,<13
 
 # Public Remember-Me Core pinned to an immutable source archive.
-remember-me @ https://api.github.com/repos/peanutsuee/Remember-Me/tarball/67240f5aa359ba94130b737b357f2f54190e6c3c#sha256=8139ece1e9e76464c01dadcc0817fbbe538e7bf59616f1c89252317d27e85053
+remember-me @ https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0.dev7/Remember-Me-0.1.0.dev7-dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz#sha256=5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27
 
 # 中文分词
 jieba>=0.42.1

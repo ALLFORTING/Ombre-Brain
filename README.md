@@ -408,11 +408,13 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 
 #### Remember-Me Stage 1 asset storage
 
-- Ombre-Brain pins the public `peanutsuee/Remember-Me` Core at commit
-  `67240f5aa359ba94130b737b357f2f54190e6c3c` and package version
-  `0.1.0.dev6`. Stage 8F-J completes RM-enabled Core ownership for all nine
-  `rm_asset_*` tools while the default-off path retains the existing legacy
-  handlers, routes, Dashboard, Viewer, authentication, and Tickets. See
+- Ombre-Brain pins public `peanutsuee/Remember-Me` package `0.1.0.dev7` at
+  final main commit `dc868c4b757db701cfadcb0225acb905c07775e4`. The dependency
+  comes from the immutable prerelease's custom deterministic archive, not a
+  GitHub-generated Source code archive. Stage 8F-J completes RM-enabled Core
+  ownership for all nine `rm_asset_*` tools while the default-off path retains
+  the existing legacy handlers, routes, Dashboard, Viewer, authentication, and
+  Tickets. See
   [`docs/remember-me-integration.md`](docs/remember-me-integration.md).
 - Stage 8G-B adds a local-only, single-asset Host import adapter over the public
   `RememberMeCore.import_asset()` contract. It preserves legacy image IDs,

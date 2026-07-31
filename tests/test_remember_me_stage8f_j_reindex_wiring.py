@@ -6,7 +6,6 @@ import inspect
 import io
 import json
 import logging
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -39,9 +38,16 @@ from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
 
 ROOT = Path(__file__).resolve().parent.parent
-RM_ROOT = Path(r"D:\Codex\projects\Remember-Me")
-RM_SRC = (RM_ROOT / "src").resolve()
-RM_COMMIT = "67240f5aa359ba94130b737b357f2f54190e6c3c"
+RM_VERSION = "0.1.0.dev7"
+RM_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
+RM_ARCHIVE_SHA256 = (
+    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
+)
+RM_ARCHIVE_URL = (
+    "https://github.com/peanutsuee/Remember-Me/releases/download/"
+    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
+    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
+)
 ASSET_ID = "a" * 32
 DIAGNOSTIC_SECRETS = (
     "url-user-secret",
@@ -285,16 +291,24 @@ def _load_server(tmp_path, monkeypatch):
 
 def test_target_rm_source_version_and_async_api_provenance():
     module_path = Path(remember_me.__file__).resolve()
+    requirement = next(
+        line
+        for line in (ROOT / "requirements.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.startswith("remember-me @")
+    )
+
     assert not module_path.is_relative_to(ROOT)
-    assert PROJECT_VERSION == "0.1.0.dev6"
-    assert importlib_metadata.version("remember-me") == "0.1.0.dev6"
+    assert PROJECT_VERSION == RM_VERSION
+    assert importlib_metadata.version("remember-me") == RM_VERSION
+    assert requirement == "remember-me @ {}#sha256={}".format(
+        RM_ARCHIVE_URL,
+        RM_ARCHIVE_SHA256,
+    )
+    assert RM_COMMIT in RM_ARCHIVE_URL
     assert inspect.iscoroutinefunction(RememberMeService.search_assets)
     assert inspect.iscoroutinefunction(RememberMeService.reindex_embeddings)
-    if RM_ROOT.is_dir():
-        assert subprocess.check_output(
-            ["git", "-C", str(RM_ROOT), "rev-parse", "HEAD"],
-            text=True,
-        ).strip() == RM_COMMIT
 
 
 def test_embedding_engine_public_entry_delegates_once():
