@@ -8,12 +8,25 @@ from pathlib import Path
 from typing import Iterable
 
 
-COVERAGE_SCHEMA_VERSION = 1
+COVERAGE_SCHEMA_VERSION = 2
 
 # Function-level registrations only. Startup entries execute before an
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
+    "add_timestamps.py": {"main": "standalone_maintenance_script"},
+    "migrate_to_domains.py": {"migrate": "standalone_maintenance_script"},
+    "reclassify_api.py": {"reclassify": "standalone_maintenance_script"},
+    "reclassify_domains.py": {
+        "update_domain_in_file": "standalone_maintenance_script",
+        "reclassify": "standalone_maintenance_script",
+    },
+    "write_memory.py": {"write_memory": "standalone_maintenance_script"},
+    "asset_dashboard.py": {
+        "on_part_data": "guarded_caller_only",
+        "parse_upload": "guarded_caller_only",
+        "create_asset": "guarded_caller_only",
+    },
     "offline_backup_bundle.py": {
         "prepare_backup_workspace": "isolated_workspace_factory",
         "_capture_source_into_bundle": "frozen_external_or_workspace_capture",
@@ -41,7 +54,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "__init__": "permission_tightening_only",
         "acknowledge": "owned_encrypted_bundle_cleanup",
         "cleanup_stale": "owned_encrypted_bundle_cleanup",
-        "_finish_bundle": "owned_encrypted_bundle_limit_cleanup",
+        "_fail_and_cleanup": "owned_encrypted_bundle_cleanup",
         "body": "read_only_encrypted_stream",
         "receive_encrypted_bundle": "synthetic_transport_no_replace",
     },
@@ -60,6 +73,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_time_ripple": "guarded_async_mutation",
         "archive": "guarded_async_mutation",
         "clean_display_aliases": "guarded_async_mutation",
+        "get_letters": "dynamic_sql_read_only",
     },
     "asset_store.py": {
         "__init__": "startup_initialization",
@@ -74,6 +88,8 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_update_metadata_unchecked": "guarded_mutation",
         "delete": "guarded_mutation",
         "_delete_unchecked": "guarded_mutation",
+        "_tags_for_assets": "dynamic_sql_read_only",
+        "search": "dynamic_sql_read_only",
     },
     "asset_embedding_index.py": {
         "_init_db": "startup_initialization",
@@ -101,6 +117,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "create_checkpoint": "guarded_mutation",
         "set_checkpoint_status": "guarded_mutation",
         "record_asset_success": "guarded_mutation",
+        "_connect": "dynamic_sql_read_only",
     },
     "import_memory.py": {
         "save": "guarded_mutation",
@@ -123,6 +140,32 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "api_import_upload": "excluded_transient_import_upload",
         "_run_import": "guarded_storage_components",
         "api_import_review": "excluded_transient_import_upload_cleanup",
+    },
+    "remember_me_import_adapter.py": {
+        "__init__": "guarded_caller_only",
+    },
+    "remember_me_migration_rehearsal.py": {
+        "prepare_rehearsal_workspace": "isolated_offline_workspace",
+        "_atomic_write_json": "isolated_offline_workspace",
+    },
+    "utils.py": {"load_config": "startup_initialization"},
+}
+
+GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
+    ("asset_dashboard.py", "on_part_data"): {("asset_dashboard.py", "parse_upload")},
+    ("asset_dashboard.py", "parse_upload"): {("server.py", "api_assets")},
+    ("asset_dashboard.py", "create_asset"): {("server.py", "api_assets")},
+    ("asset_store.py", "_create_temp_path_unchecked"): {
+        ("asset_store.py", "create_temp_path"),
+        ("asset_store.py", "_clean_image"),
+    },
+    ("asset_store.py", "_clean_image"): {("asset_store.py", "_prepare_candidate")},
+    ("asset_store.py", "_prepare_candidate"): {("asset_store.py", "_persist_upload_unchecked")},
+    ("remember_me_import_adapter.py", "__init__"): {
+        ("remember_me_migration_runner.py", "run_migration_batch"),
+        ("remember_me_migration_rehearsal.py", "run_rehearsal"),
+        ("remember_me_migration_runner.py", "__init__"),
+        ("remember_me_migration_rehearsal.py", "__init__"),
     },
 }
 
@@ -155,8 +198,10 @@ class _WriteVisitor(ast.NodeVisitor):
         self.filename = filename
         self.stack: list[str] = []
         self.hits: list[WriteCoverageIssue] = []
+        self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.functions[node.name] = node
         self.stack.append(node.name)
         self.generic_visit(node)
         self.stack.pop()
@@ -179,12 +224,26 @@ class _WriteVisitor(ast.NodeVisitor):
         if name in {"open", "Path.open"} or name.endswith(".open"):
             mode = _open_mode(node)
             return f"open:{mode}" if mode in _WRITE_MODES else None
-        if name.endswith(".execute") and node.args:
+        if name.endswith((".execute", ".executemany", ".executescript")) and node.args:
             statement = _constant_string(node.args[0])
-            if statement and statement.lstrip().upper().startswith(_SQL_PREFIXES):
+            if statement is None:
+                return "sqlite_dynamic"
+            if statement.lstrip().upper().startswith(_SQL_PREFIXES):
                 return "sqlite_dml"
-        if name in {"os.remove", "os.rename", "os.replace"}:
+        if name in {
+            "os.remove", "os.rename", "os.replace",
+            "shutil.move", "shutil.copy", "shutil.copyfile", "shutil.rmtree",
+        }:
             return name
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "touch", "rename", "replace", "unlink",
+        }:
+            receiver = _call_name(node.func.value).casefold()
+            if any(token in receiver for token in (
+                "path", "file", "destination", "source", "target",
+                "temporary", "bundle", "archive", "root",
+            )):
+                return node.func.attr
         if name.endswith(("_path.rename", "_path.replace")):
             return name.rsplit(".", 1)[-1]
         leaf = name.rsplit(".", 1)[-1]
@@ -192,12 +251,25 @@ class _WriteVisitor(ast.NodeVisitor):
 
 
 def scan_registered_write_coverage(root: str | Path) -> list[WriteCoverageIssue]:
+    """Discover every production module, then validate each write boundary."""
     root_path = Path(root)
     issues: list[WriteCoverageIssue] = []
-    for filename, registrations in REGISTERED_BOUNDARIES.items():
-        path = root_path / filename
-        visitor = _scan(path.read_text(encoding="utf-8"), filename)
-        issues.extend(hit for hit in visitor if hit.function not in registrations)
+    visitors: dict[str, _WriteVisitor] = {}
+    for path in _production_python_files(root_path):
+        filename = path.relative_to(root_path).as_posix()
+        visitor = _visitor(path.read_text(encoding="utf-8"), filename)
+        visitors[filename] = visitor
+        registrations = REGISTERED_BOUNDARIES.get(filename, {})
+        for hit in visitor.hits:
+            reason = registrations.get(hit.function)
+            if reason is None:
+                issues.append(hit)
+                continue
+            if not _boundary_shape_valid(visitor, hit.function, reason):
+                issues.append(WriteCoverageIssue(
+                    filename, hit.function, hit.line, f"guard_missing:{reason}"
+                ))
+    issues.extend(_validate_guarded_callers(visitors))
     return issues
 
 
@@ -205,10 +277,119 @@ def scan_unregistered_source(source: str, filename: str = "synthetic.py") -> lis
     return _scan(source, filename)
 
 
+def scan_registered_source(source: str, filename: str) -> list[WriteCoverageIssue]:
+    """Validate one registered production module, including guard structure."""
+    visitor = _visitor(source, filename)
+    registrations = REGISTERED_BOUNDARIES.get(filename, {})
+    issues: list[WriteCoverageIssue] = []
+    for hit in visitor.hits:
+        reason = registrations.get(hit.function)
+        if reason is None or not _boundary_shape_valid(
+            visitor, hit.function, reason or ""
+        ):
+            issues.append(hit if reason is None else WriteCoverageIssue(
+                filename, hit.function, hit.line, f"guard_missing:{reason}"
+            ))
+    return issues
+
+
 def _scan(source: str, filename: str) -> list[WriteCoverageIssue]:
+    return _visitor(source, filename).hits
+
+
+def _visitor(source: str, filename: str) -> _WriteVisitor:
     visitor = _WriteVisitor(filename)
     visitor.visit(ast.parse(source, filename=filename))
-    return visitor.hits
+    return visitor
+
+
+def _production_python_files(root: Path) -> Iterable[Path]:
+    excluded = {"tests", ".git", ".venv", "venv", "build", "dist", "__pycache__"}
+    for path in sorted(root.rglob("*.py")):
+        relative = path.relative_to(root)
+        if any(part in excluded or part.startswith(".tmp") for part in relative.parts):
+            continue
+        yield path
+
+
+def _boundary_shape_valid(
+    visitor: _WriteVisitor,
+    function: str,
+    reason: str,
+) -> bool:
+    node = visitor.functions.get(function)
+    if function == "<module>":
+        return reason == "startup_initialization"
+    if node is None:
+        return False
+    decorators = {_call_name(item.func if isinstance(item, ast.Call) else item).rsplit(".", 1)[-1]
+                  for item in node.decorator_list}
+    if reason in {"guarded_mutation", "guarded_mutation_after_network"}:
+        return "guarded_mutation" in decorators
+    if reason == "guarded_async_mutation":
+        return "guarded_async_mutation" in decorators
+    if reason == "guarded_http_mutation":
+        return "guarded_http_mutation" in decorators
+    if reason in {"manual_writer_scope", "inline_writer_scope_after_network"}:
+        return _contains_writer_scope(node) or function in {"__exit__", "_finalize_write"}
+    if reason == "startup_initialization":
+        return function in {"__init__", "_initialize", "load_config"} or function.startswith("_init")
+    if reason == "standalone_maintenance_script":
+        return function in {"main", "migrate", "reclassify", "update_domain_in_file", "write_memory"}
+    return reason in {
+        "guarded_caller_only", "isolated_workspace_factory",
+        "frozen_external_or_workspace_capture", "invalid_lease_bundle_cleanup",
+        "isolated_temporary_verification", "isolated_restore_and_no_replace_publish",
+        "test_key_only", "capture_staging", "encrypted_bundle_staging_and_publish",
+        "isolated_temporary_restore", "workspace_manifest_factory",
+        "formal_bundle_no_replace", "workspace_restore_lock", "formal_restore_no_replace",
+        "contained_temporary_cleanup", "permission_tightening_only",
+        "owned_encrypted_bundle_cleanup", "owned_encrypted_bundle_limit_cleanup",
+        "read_only_encrypted_stream", "synthetic_transport_no_replace",
+        "excluded_transient_upload", "excluded_transient_import_upload",
+        "excluded_transient_import_upload_cleanup",
+        "excluded_transient_upload_then_guarded_store", "guarded_storage_components",
+        "isolated_offline_workspace",
+        "dynamic_sql_read_only",
+    }
+
+
+def _contains_writer_scope(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and _call_name(child.func).endswith(
+            ("writer_scope", "async_writer_scope")
+        ):
+            return True
+        if isinstance(child, (ast.With, ast.AsyncWith)):
+            for item in child.items:
+                call = item.context_expr
+                if isinstance(call, ast.Call) and _call_name(call.func).endswith(
+                    ("writer_scope", "async_writer_scope")
+                ):
+                    return True
+    return False
+
+
+def _validate_guarded_callers(
+    visitors: dict[str, _WriteVisitor],
+) -> list[WriteCoverageIssue]:
+    issues: list[WriteCoverageIssue] = []
+    for (target_file, target_function), allowed in GUARDED_CALLERS.items():
+        found = False
+        for filename, visitor in visitors.items():
+            for function, node in visitor.functions.items():
+                for child in ast.walk(node):
+                    if not isinstance(child, ast.Call):
+                        continue
+                    if _call_name(child.func).rsplit(".", 1)[-1] != target_function:
+                        continue
+                    found = True
+                    if (filename, function) not in allowed:
+                        issues.append(WriteCoverageIssue(
+                            filename, function, child.lineno,
+                            f"unguarded_caller:{target_file}:{target_function}",
+                        ))
+    return issues
 
 
 def _call_name(node: ast.AST) -> str:

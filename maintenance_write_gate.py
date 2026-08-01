@@ -215,6 +215,10 @@ class MaintenanceWriteCoordinator:
                 freeze_reason=lease.reason if lease is not None else None,
             )
 
+    def monotonic(self) -> float:
+        """Return the coordinator clock used by lease deadlines."""
+        return self._monotonic()
+
     def _wait_for_writers(self, timeout_seconds: float) -> bool:
         deadline = self._monotonic() + timeout_seconds
         with self._condition:

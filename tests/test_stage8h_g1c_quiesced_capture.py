@@ -12,6 +12,7 @@ import shutil
 from types import SimpleNamespace
 import sqlite3
 import threading
+import time
 import uuid
 
 import pytest
@@ -32,10 +33,12 @@ from maintenance_write_gate import (
 from maintenance_write_coverage import (
     COVERAGE_SCHEMA_VERSION,
     scan_registered_write_coverage,
+    scan_registered_source,
     scan_unregistered_source,
 )
 from offline_backup_bundle import (
     BackupBundleError,
+    CaptureAbortSignal,
     capture_external_source,
     generate_test_keypair,
     inspect_bundle,
@@ -61,7 +64,7 @@ from production_backup_capture import (
 COMMIT = "1" * 40
 
 
-def _claims(run_id: str = "123") -> dict[str, str]:
+def _claims(run_id: str = "123", run_attempt: str = "1") -> dict[str, str]:
     return {
         "repository": V2_REPOSITORY,
         "repository_owner": "ALLFORTING",
@@ -72,8 +75,23 @@ def _claims(run_id: str = "123") -> dict[str, str]:
         "aud": V2_AUDIENCE,
         "workflow_ref": f"{V2_REPOSITORY}/{V2_WORKFLOW}@{V2_REF}",
         "run_id": run_id,
-        "run_attempt": "1",
+        "run_attempt": run_attempt,
     }
+
+
+def _policy() -> StrictBackupV2OidcPolicy:
+    return StrictBackupV2OidcPolicy(
+        expected_repository_id="99",
+        expected_repository_owner_id="88",
+    )
+
+
+async def _terminal(controller, request_id, claims=None):
+    return await controller.wait_for_terminal(
+        request_id,
+        claims or _claims(),
+        timeout=30,
+    )
 
 
 def _config(tmp_path: Path) -> dict:
@@ -110,7 +128,7 @@ def _controller(tmp_path: Path, *, coordinator=None, limits=None, worker_count=1
         recipient_fingerprint=public_key_fingerprint(public_key),
         runtime_commit=COMMIT,
         limits=limits,
-        oidc_policy=StrictBackupV2OidcPolicy(),
+        oidc_policy=_policy(),
     )
     return controller, source, workspace, private_key, public_key
 
@@ -401,23 +419,23 @@ async def test_controller_capture_transport_cross_workspace_restore_and_ack(tmp_
         expected_recipient_fingerprint=controller.recipient_fingerprint,
         claims=_claims(),
     )
+    assert result["state"] == "accepted"
+    result = await _terminal(controller, request_id)
     assert result["state"] == "ready"
     assert controller.coordinator.status().state == "open"
-    job, server_bundle = controller.bundle_metadata(request_id, _claims())
-
-    async def chunks():
-        with server_bundle.open("rb") as handle:
-            while block := handle.read(13):
+    restore_workspace = prepare_backup_workspace(tmp_path / "restore-workspace")
+    async with controller.delivery(request_id, _claims()) as delivery:
+        async def chunks():
+            while block := delivery.handle.read(13):
                 yield block
 
-    restore_workspace = prepare_backup_workspace(tmp_path / "restore-workspace")
-    received = await receive_encrypted_bundle(
-        chunks(),
-        restore_workspace.bundles_root / server_bundle.name,
-        expected_size=job.encrypted_size,
-        expected_sha256=job.encrypted_sha256,
-        maximum_bytes=controller.limits.max_bundle_bytes,
-    )
+        received = await receive_encrypted_bundle(
+            chunks(),
+            restore_workspace.bundles_root / f"{delivery.bundle_id}.obbackup",
+            expected_size=delivery.encrypted_size,
+            expected_sha256=delivery.encrypted_sha256,
+            maximum_bytes=controller.limits.max_bundle_bytes,
+        )
     assert inspect_bundle(restore_workspace.root, received.name)["authenticated"] is False
     assert verify_bundle(restore_workspace.root, received.name, private_key)["authenticated"] is True
     restored = restore_bundle(restore_workspace.root, received.name, private_key)
@@ -426,7 +444,8 @@ async def test_controller_capture_transport_cross_workspace_restore_and_ack(tmp_
     with sqlite3.connect(restored_root / "assets.sqlite3") as connection:
         assert connection.execute("SELECT value FROM assets").fetchone()[0] == "synthetic"
     assert not list(restored_root.rglob("*-wal"))
-    acknowledged = controller.acknowledge(request_id, _claims())
+    server_bundle = next(controller.workspace.bundles_root.glob("*.obbackup"))
+    acknowledged = await controller.acknowledge(request_id, _claims())
     assert acknowledged["state"] == "consumed"
     assert not server_bundle.exists()
     assert not any(controller.workspace.temp_root.iterdir())
@@ -475,12 +494,13 @@ async def test_controller_drains_then_blocks_real_storage_components(tmp_path, m
 
     monkeypatch.setattr(capture_module, "capture_external_source", paused_capture)
     request_id = str(uuid.uuid4())
-    task = asyncio.create_task(controller.create_capture(
+    accepted = await controller.create_capture(
         request_id=request_id,
         expected_runtime_commit=COMMIT,
         expected_recipient_fingerprint=controller.recipient_fingerprint,
         claims=_claims(),
-    ))
+    )
+    assert accepted["state"] == "accepted"
     for _ in range(100):
         if coordinator.status().state == "draining":
             break
@@ -496,7 +516,7 @@ async def test_controller_drains_then_blocks_real_storage_components(tmp_path, m
     with pytest.raises(MaintenanceWriteError, match="maintenance_in_progress"):
         state.acquire_freeze(ttl_seconds=30)
     capture_release.set()
-    result = await task
+    result = await _terminal(controller, request_id)
     await slow
     assert result["state"] == "ready"
     assert coordinator.status().state == "open"
@@ -545,11 +565,11 @@ def test_oidc_policy_rejects_non_v2_identity(change):
     claims = _claims()
     claims.update(change)
     with pytest.raises(CaptureChannelError, match="oidc_denied"):
-        StrictBackupV2OidcPolicy().verify(claims)
+        _policy().verify(claims)
 
 
 def test_oidc_policy_accepts_exact_v2_claims():
-    assert StrictBackupV2OidcPolicy().verify(_claims()) == {
+    assert _policy().verify(_claims()) == {
         "run_id": "123",
         "run_attempt": "1",
     }
@@ -562,7 +582,7 @@ def test_controller_disabled_multiworker_and_private_key_config_rejected(tmp_pat
         "coordinator": MaintenanceWriteCoordinator(),
         "source_root": tmp_path / "source",
         "workspace_root": tmp_path / "workspace",
-        "oidc_policy": StrictBackupV2OidcPolicy(),
+        "oidc_policy": _policy(),
     }
     with pytest.raises(CaptureChannelError, match="capture_disabled"):
         ProductionBackupCaptureController.from_config({"enabled": False}, **common)
@@ -592,7 +612,7 @@ def test_controller_disabled_multiworker_and_private_key_config_rejected(tmp_pat
             recipient_fingerprint=controller.recipient_fingerprint,
             runtime_commit=COMMIT,
             limits=controller.limits,
-            oidc_policy=StrictBackupV2OidcPolicy(),
+            oidc_policy=_policy(),
         )
 
 
@@ -601,13 +621,16 @@ async def test_preflight_limits_fail_before_freeze(tmp_path):
     limits = CaptureLimits(1, 5, 1, 1024 * 1024, minimum_free_bytes=1)
     controller, source, _, _, _ = _controller(tmp_path, limits=limits)
     (source / "large.bin").write_bytes(b"12")
-    with pytest.raises(CaptureChannelError, match="capture_source_too_large"):
-        await controller.create_capture(
-            request_id=str(uuid.uuid4()),
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+            request_id=request_id,
             expected_runtime_commit=COMMIT,
             expected_recipient_fingerprint=controller.recipient_fingerprint,
             claims=_claims(),
         )
+    result = await _terminal(controller, request_id)
+    assert result["state"] == "failed"
+    assert result["failure_code"] == "capture_source_too_large"
     assert controller.coordinator.status().state == "open"
 
 
@@ -616,13 +639,15 @@ async def test_space_preflight_fails_before_freeze(tmp_path):
     controller, source, _, _, _ = _controller(tmp_path)
     (source / "one.bin").write_bytes(b"x")
     controller._disk_usage = lambda path: SimpleNamespace(free=0)
-    with pytest.raises(CaptureChannelError, match="capture_space_insufficient"):
-        await controller.create_capture(
-            request_id=str(uuid.uuid4()),
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+            request_id=request_id,
             expected_runtime_commit=COMMIT,
             expected_recipient_fingerprint=controller.recipient_fingerprint,
             claims=_claims(),
         )
+    result = await _terminal(controller, request_id)
+    assert result["failure_code"] == "capture_space_insufficient"
     assert controller.coordinator.status().state == "open"
 
 
@@ -631,13 +656,15 @@ async def test_bundle_limit_removes_formal_bundle_and_thaws(tmp_path):
     limits = CaptureLimits(1, 5, 1024 * 1024, 1, minimum_free_bytes=1)
     controller, source, workspace, _, _ = _controller(tmp_path, limits=limits)
     (source / "one.bin").write_bytes(b"x")
-    with pytest.raises(CaptureChannelError, match="capture_bundle_too_large"):
-        await controller.create_capture(
-            request_id=str(uuid.uuid4()),
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+            request_id=request_id,
             expected_runtime_commit=COMMIT,
             expected_recipient_fingerprint=controller.recipient_fingerprint,
             claims=_claims(),
         )
+    result = await _terminal(controller, request_id)
+    assert result["failure_code"] == "capture_bundle_too_large"
     assert controller.coordinator.status().state == "open"
     assert not list(workspace.bundles_root.glob("*.obbackup"))
 
@@ -655,10 +682,11 @@ async def test_ready_bundle_survives_until_stale_cleanup(tmp_path):
         expected_recipient_fingerprint=controller.recipient_fingerprint,
         claims=_claims(),
     )
+    await _terminal(controller, request_id)
     assert len(list(workspace.bundles_root.glob("*.obbackup"))) == 1
-    assert controller.cleanup_stale() == 0
+    assert await controller.cleanup_stale() == 0
     now += timedelta(seconds=controller.limits.ready_ttl_seconds + 1)
-    assert controller.cleanup_stale() == 1
+    assert await controller.cleanup_stale() == 1
     assert not list(workspace.bundles_root.glob("*.obbackup"))
     assert controller.get_job(request_id, _claims())["state"] == "stale"
 
@@ -767,7 +795,14 @@ def test_route_factory_strict_body_oidc_download_headers_and_ack(tmp_path):
             "expected_recipient_fingerprint": controller.recipient_fingerprint,
         })
         assert created.status_code == 202
-        assert created.json()["state"] == "ready"
+        assert created.json()["state"] == "accepted"
+        status = None
+        for _ in range(300):
+            status = client.get(f"/api/backup/v2/captures/{request_id}")
+            if status.json()["state"] in {"ready", "failed"}:
+                break
+            time.sleep(0.01)
+        assert status is not None and status.json()["state"] == "ready"
         assert controller.coordinator.status().state == "open"
         downloaded = client.get(f"/api/backup/v2/captures/{request_id}/bundle")
         assert downloaded.status_code == 200
@@ -835,7 +870,7 @@ def test_invalid_request_ids_rejected(tmp_path):
 
 def test_registered_production_write_coverage_is_complete():
     root = Path(__file__).parents[1]
-    assert COVERAGE_SCHEMA_VERSION == 1
+    assert COVERAGE_SCHEMA_VERSION == 2
     assert scan_registered_write_coverage(root) == []
 
 
@@ -846,3 +881,372 @@ def test_new_bare_write_primitive_is_detected():
     assert [(issue.function, issue.primitive) for issue in issues] == [
         ("newly_added", "write_bytes")
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_capture_worker_exits_before_thaw(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    entered = threading.Event()
+    exited = threading.Event()
+
+    def cooperative_capture(*args, abort_signal=None, **kwargs):
+        entered.set()
+        try:
+            while True:
+                abort_signal.raise_if_aborted()
+                time.sleep(0.005)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(capture_module, "capture_external_source", cooperative_capture)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    task = controller._tasks[request_id]
+    task.cancel()
+    await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    assert exited.is_set()
+    assert controller._active_workers == 0
+    assert controller.coordinator.status().state == "open"
+    assert controller.get_job(request_id, _claims())["failure_code"] == "capture_cancelled"
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    assert not list(workspace.temp_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_cancelled_preflight_reader_exits_before_next_capture(tmp_path, monkeypatch):
+    controller, source, _, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    entered = threading.Event()
+    exited = threading.Event()
+
+    def paused_preflight(abort_signal):
+        entered.set()
+        try:
+            while True:
+                abort_signal.raise_if_aborted()
+                time.sleep(0.005)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(controller, "_preflight", paused_preflight)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    controller._tasks[request_id].cancel()
+    await asyncio.wait_for(asyncio.shield(controller._tasks[request_id]), 5)
+    assert exited.is_set()
+    assert controller._active_workers == 0
+    assert controller.coordinator.status().state == "open"
+    assert controller._active_request_id is None
+
+
+@pytest.mark.asyncio
+async def test_max_freeze_deadline_aborts_worker_before_open(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    limits = CaptureLimits(1, 0.05, 1024 * 1024, 1024 * 1024, minimum_free_bytes=1)
+    controller, source, workspace, _, _ = _controller(tmp_path, limits=limits)
+    (source / "one.bin").write_bytes(b"synthetic")
+    exited = threading.Event()
+
+    def deadline_capture(*args, abort_signal=None, **kwargs):
+        try:
+            while True:
+                abort_signal.raise_if_aborted()
+                time.sleep(0.005)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(capture_module, "capture_external_source", deadline_capture)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert result["state"] == "failed"
+    assert result["failure_code"] == "freeze_lease_expired"
+    assert exited.is_set() and controller._active_workers == 0
+    assert controller.coordinator.status().state == "open"
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    assert not list(workspace.temp_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_delivery_lease_blocks_ack_cleanup_and_parallel_delivery(tmp_path):
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    controller._clock = lambda: now
+    (source / "one.bin").write_bytes(b"synthetic")
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    assert (await _terminal(controller, request_id))["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as delivery:
+        with pytest.raises(CaptureChannelError, match="capture_delivery_active"):
+            await controller.acknowledge(request_id, _claims())
+        with pytest.raises(CaptureChannelError, match="capture_delivery_active"):
+            async with controller.delivery(request_id, _claims()):
+                pass
+        now += timedelta(seconds=controller.limits.ready_ttl_seconds + 1)
+        assert await controller.cleanup_stale() == 0
+        assert delivery.handle.read(1)
+    assert next(workspace.bundles_root.glob("*.obbackup")).exists()
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_run_attempt_is_part_of_job_ownership(tmp_path):
+    controller, source, _, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims("123", "1"),
+    )
+    await _terminal(controller, request_id, _claims("123", "1"))
+    with pytest.raises(CaptureChannelError, match="capture_not_found"):
+        controller.get_job(request_id, _claims("123", "2"))
+    with pytest.raises(CaptureChannelError, match="capture_not_found"):
+        async with controller.delivery(request_id, _claims("123", "2")):
+            pass
+    with pytest.raises(CaptureChannelError, match="capture_not_found"):
+        await controller.acknowledge(request_id, _claims("123", "2"))
+
+
+def test_oidc_requires_exact_repository_and_owner_ids():
+    for field, value in (
+        ("repository_id", "100"),
+        ("repository_owner_id", "89"),
+        ("repository_id", ""),
+        ("repository_owner_id", ""),
+    ):
+        claims = _claims()
+        claims[field] = value
+        with pytest.raises(CaptureChannelError, match="oidc_denied"):
+            _policy().verify(claims)
+
+
+def test_async_claim_verifier_and_redacted_failure(tmp_path):
+    controller, _, _, _, _ = _controller(tmp_path)
+
+    async def verifier(request):
+        del request
+        return _claims()
+
+    app = Starlette(routes=build_backup_v2_routes(controller, verifier))
+    with TestClient(app) as client:
+        response = client.get(f"/api/backup/v2/captures/{uuid.uuid4()}")
+    assert response.status_code == 400
+    assert response.json() == {"status": "capture_not_found"}
+
+    async def failing(request):
+        del request
+        raise RuntimeError("private synthetic detail")
+
+    app = Starlette(routes=build_backup_v2_routes(controller, failing))
+    with TestClient(app) as client:
+        response = client.get(f"/api/backup/v2/captures/{uuid.uuid4()}")
+    assert response.json() == {"status": "internal_error"}
+    assert "private synthetic detail" not in response.text
+
+
+def test_registered_decorator_and_manual_scope_are_structurally_verified():
+    root = Path(__file__).parents[1]
+    bucket_source = (root / "bucket_manager.py").read_text(encoding="utf-8")
+    assert scan_registered_source(bucket_source, "bucket_manager.py") == []
+    broken = bucket_source.replace(
+        '    @guarded_async_mutation("bucket_create")\n', "", 1
+    )
+    assert any(
+        issue.primitive.startswith("guard_missing")
+        for issue in scan_registered_source(broken, "bucket_manager.py")
+    )
+    embedding_source = (root / "asset_embedding_index.py").read_text(encoding="utf-8")
+    broken = embedding_source.replace(
+        'with self.write_coordinator.writer_scope("asset_embedding_store"):',
+        'if True:',
+        1,
+    )
+    assert any(
+        issue.primitive.startswith("guard_missing")
+        for issue in scan_registered_source(broken, "asset_embedding_index.py")
+    )
+
+
+def test_dynamic_sql_and_new_production_module_fail_closed(tmp_path):
+    issues = scan_unregistered_source(
+        "def mutate(connection, statement):\n    connection.execute(statement)\n",
+        "new_production.py",
+    )
+    assert issues[0].primitive == "sqlite_dynamic"
+    module = tmp_path / "new_production.py"
+    module.write_text("def mutate(path):\n    path.write_bytes(b'x')\n", encoding="utf-8")
+    assert scan_registered_write_coverage(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_post_capture_hash_failure_cleans_owned_bundle(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    original_hash = capture_module._hash_file
+
+    def fail_hash(path):
+        if path.suffix == ".obbackup":
+            raise CaptureChannelError("bundle_invalid")
+        return original_hash(path)
+
+    monkeypatch.setattr(capture_module, "_hash_file", fail_hash)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert result["state"] == "failed"
+    assert result["orphan_present"] is False
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+
+
+@pytest.mark.asyncio
+async def test_ready_metadata_failure_cleans_owned_bundle(tmp_path, monkeypatch):
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    original_set_state = controller._set_state
+
+    def fail_ready(job, state):
+        if state == "ready":
+            raise RuntimeError("synthetic metadata failure")
+        return original_set_state(job, state)
+
+    monkeypatch.setattr(controller, "_set_state", fail_ready)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert result["state"] == "failed"
+    assert result["failure_code"] == "internal_error"
+    assert result["orphan_present"] is False
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+
+
+@pytest.mark.parametrize("phase", ["hash", "sqlite", "encryption"])
+@pytest.mark.asyncio
+async def test_deadline_is_observed_inside_capture_phases(tmp_path, monkeypatch, phase):
+    import offline_backup_bundle as bundle_module
+
+    limits = CaptureLimits(1, 0.5, 4 * 1024 * 1024, 8 * 1024 * 1024, minimum_free_bytes=1)
+    controller, source, workspace, _, _ = _controller(tmp_path, limits=limits)
+    if phase == "sqlite":
+        with sqlite3.connect(source / "data.sqlite3") as connection:
+            connection.execute("CREATE TABLE values_table(value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES ('synthetic')")
+    else:
+        (source / "one.bin").write_bytes(b"synthetic")
+    target_name = {
+        "hash": "_hash_file",
+        "sqlite": "_snapshot_sqlite",
+        "encryption": "_encrypt_archive",
+    }[phase]
+    original = getattr(bundle_module, target_name)
+    observed = threading.Event()
+    controller._preflight = lambda abort_signal: abort_signal.raise_if_aborted()
+
+    def delayed(*args, abort_signal=None, **kwargs):
+        if abort_signal is None:
+            return original(*args, abort_signal=abort_signal, **kwargs)
+        observed.set()
+        while True:
+            abort_signal.raise_if_aborted()
+            time.sleep(0.005)
+
+    monkeypatch.setattr(bundle_module, target_name, delayed)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert observed.is_set()
+    assert result["failure_code"] == "freeze_lease_expired"
+    assert controller._active_workers == 0
+    assert controller.coordinator.status().state == "open"
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    monkeypatch.setattr(bundle_module, target_name, original)
+
+
+def test_create_route_returns_before_controller_owned_job_finishes(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, source, _, _, _ = _controller(tmp_path)
+    (source / "one.bin").write_bytes(b"synthetic")
+    entered = threading.Event()
+    release = threading.Event()
+    original = capture_module.capture_external_source
+
+    def paused(*args, **kwargs):
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("synthetic pause timeout")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "capture_external_source", paused)
+
+    async def verifier(request):
+        del request
+        return _claims()
+
+    app = Starlette(routes=build_backup_v2_routes(controller, verifier))
+    request_id = str(uuid.uuid4())
+    with TestClient(app) as client:
+        created = client.post("/api/backup/v2/captures", json={
+            "request_id": request_id,
+            "expected_runtime_commit": COMMIT,
+            "expected_recipient_fingerprint": controller.recipient_fingerprint,
+        })
+        assert created.status_code == 202
+        assert created.json()["state"] == "accepted"
+        assert entered.wait(5)
+        status = client.get(f"/api/backup/v2/captures/{request_id}")
+        assert status.json()["state"] == "capturing"
+        assert controller.coordinator.status().state == "frozen"
+        release.set()
+        for _ in range(300):
+            status = client.get(f"/api/backup/v2/captures/{request_id}")
+            if status.json()["state"] in {"ready", "failed"}:
+                break
+            time.sleep(0.01)
+        assert status.json()["state"] == "ready"
+    assert controller.coordinator.status().state == "open"

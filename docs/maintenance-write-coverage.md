@@ -1,6 +1,6 @@
 # Maintenance write coverage
 
-Schema version: `1`
+Schema version: `2`
 
 Stage 8H-G1C uses one process-local `MaintenanceWriteCoordinator` for
 production persistence mutations. Nested calls are reentrant and count as one
@@ -29,12 +29,26 @@ controller cannot be used during startup. Capture fails closed when configured
 for more than one worker. Browser, MCP, and import upload files are transient
 staging only; formal AssetStore or bucket publication remains guarded.
 
-`maintenance_write_coverage.py` scans production modules for writable opens,
-file publication/removal, SQLite DML/commit, and related primitives. Each hit
-must have a function-level registration or a narrow startup/transient reason.
-A synthetic test proves that a newly added bare write is reported. There are no
-file-level exemptions.
+`maintenance_write_coverage.py` first discovers every production Python module
+in the repository, excluding only tests, virtual environments, build output and
+caches. It then scans writable opens, file publication/removal, copy/move
+operations, SQLite DML/DDL/commit, and non-constant SQL. A module cannot evade
+coverage by being absent from the registry.
+
+Registrations declaring `guarded_mutation`, `guarded_async_mutation`, or
+`guarded_http_mutation` are checked for the corresponding decorator. Manual
+writer scopes are checked structurally, and guarded-caller-only helpers have a
+narrow caller registry. Startup-only and isolated maintenance entries use
+specific reason codes rather than file-wide exemptions. Tests remove a real
+decorator and writer scope, introduce dynamic SQL, and add a new production
+module with a bare write; each case fails coverage.
 
 Reads remain available while draining or frozen. New writes fail immediately
 with `maintenance_in_progress`; they do not wait for thaw. This guarantee is
 limited to the current single Python process and single service instance.
+
+Capture execution is controller-owned and asynchronous. Cancellation and the
+monotonic maximum-freeze deadline set a cooperative abort signal checked by
+inventory traversal, chunk hashing/copy, SQLite backup progress, archive
+construction and encryption. The controller waits for the worker to exit and
+contains all temporary or newly published output before the lease can thaw.

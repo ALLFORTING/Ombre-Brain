@@ -382,6 +382,33 @@ the private key must never enter Render. The injected v2 OIDC policy permits
 only the main branch of `ALLFORTING/ob-backup`, future `backup-v2.yml`, the v2
 audience, and `workflow_dispatch`; tests perform no network calls.
 
+Capture creation is a controller-owned asynchronous job. The create route
+returns `202 accepted`; status reports the stable
+accepted/draining/capturing/ready/failed lifecycle. Client disconnect does not
+cancel the job. A monotonic maximum-freeze deadline is enforced, not merely
+reported in lease metadata. Cancellation or expiry signals the blocking worker,
+and OPEN is restored only after that worker has exited and its staging,
+plaintext, encrypted temporary output, and any newly published bundle have
+been contained.
+
+OIDC ownership includes both `run_id` and `run_attempt`, plus fixed repository
+and repository-owner numeric identities. A different attempt cannot inspect,
+download, acknowledge, or reuse another attempt's request. Claim verification
+may be injected as a synchronous or asynchronous callable and remains offline
+in this stage.
+
+Bundle delivery acquires an exclusive per-job delivery lease and fixes an open
+encrypted file handle before response construction. Acknowledge and stale
+cleanup cannot remove a bundle during delivery; disconnect releases the lease
+and leaves the ready bundle retryable. Post-capture failures retain exact
+ownership long enough to remove only the new bundle, and expose only a
+non-sensitive orphan flag if contained cleanup itself fails.
+
+Write coverage discovers all repository production Python modules before
+checking registered boundaries. Decorator-backed boundaries, manual writer
+scopes, guarded callers, startup-only code, and transient staging are validated
+under distinct rules; adding an unregistered production module fails tests.
+
 The ASGI route factory is unregistered and is not imported by `server.py`,
 `backup_entry.py`, MCP startup, or Dashboard startup. Synthetic transport
 accepts only encrypted `.obbackup` bytes, validates size and SHA-256, and never
