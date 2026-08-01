@@ -659,6 +659,10 @@ class LegacyRmReconciler:
                     )
                     if sum(summary.values()) != before:
                         mismatched_ids.add(target.asset_id)
+                    self._state.renew_freeze(
+                        owner,
+                        ttl_seconds=self._lease_ttl_seconds,
+                    )
                     expected_bytes = (
                         self._adapter.get_legacy_verification_bytes(
                             target.asset_id
@@ -686,6 +690,7 @@ class LegacyRmReconciler:
                         raise LegacyAssetImportAdapterError(
                             "rm_target_verification_result_invalid"
                         )
+                    self._state.assert_freeze_owner(owner)
                     blob_verified += 1
                 if not page.has_more:
                     if page.next_cursor != "":

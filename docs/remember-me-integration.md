@@ -147,6 +147,9 @@ calls are forwarded through the same Adapter and the same in-process
 maximum. Acceptance detects count differences, missing or extra assets,
 duplicate or out-of-order identities, repeated or non-progressing cursors, and
 malformed page results. It never assumes the inventory fits on one page.
+Before each blob verification, Ombre-Brain renews the legacy freeze; after the
+blob result is validated, it verifies that the same freeze owner still holds
+the lease. It never reacquires or takes over a lost acceptance lease.
 
 Each public verification record is compared with the frozen legacy expectation
 for asset identity, source and stored SHA-256, stored byte count, filename,
@@ -161,6 +164,14 @@ hash ownership exists. Remember-Me performs a fresh inventory and blob rescan
 during completion. Only a valid completion can produce report version 2
 `passed` and recovery state `completed_verified`; any snapshot, cursor,
 inventory, blob, or completion failure is fail-closed.
+
+Remember-Me permits at most 32 active verification sessions per service, and
+an idle session expires after 15 minutes. Successful completion closes its
+session. The current public API has no abort operation, so failed acceptance
+must not be retried in an unbounded or high-frequency loop. A future production
+dry-run must use one single-process maintenance runtime and, after failure,
+wait for the session to expire or restart that offline runtime before retrying.
+This operating boundary does not mean a production migration has been run.
 
 The verification snapshot is generation-guarded, not a filesystem freeze.
 Direct writes to either data root still require a maintenance window and a

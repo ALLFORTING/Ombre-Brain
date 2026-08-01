@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from asset_migration_state import HostMigrationStateError
 from remember_me.core import (
     AssetBlobVerificationResult,
     AssetVerificationCompletion,
@@ -74,22 +75,34 @@ def _target(source):
 
 
 class _State:
-    def __init__(self):
+    def __init__(self, events=None):
         self.renewals = 0
         self.assertions = 0
+        self.events = events
 
     def renew_freeze(self, owner, *, ttl_seconds):
         assert owner == "owner"
         assert ttl_seconds == 60
         self.renewals += 1
+        if self.events is not None:
+            self.events.append("renew")
 
     def assert_freeze_owner(self, owner):
         assert owner == "owner"
         self.assertions += 1
+        if self.events is not None:
+            self.events.append("assert")
 
 
 class _Adapter:
-    def __init__(self, sources, *, fail_phase=None, extra=False):
+    def __init__(
+        self,
+        sources,
+        *,
+        fail_phase=None,
+        extra=False,
+        events=None,
+    ):
         self.sources = sources
         self.records = [_target(item) for item in sources.values()]
         if extra:
@@ -98,6 +111,7 @@ class _Adapter:
         self.page_limits = []
         self.verified_ids = []
         self.call_order = []
+        self.events = events
 
     def _fail(self, phase):
         if self.fail_phase == phase:
@@ -113,6 +127,8 @@ class _Adapter:
     def begin_target_verification(self):
         self._fail("begin")
         self.call_order.append("begin")
+        if self.events is not None:
+            self.events.append("begin")
         return AssetVerificationSnapshot(
             SNAPSHOT_ID,
             7,
@@ -124,6 +140,8 @@ class _Adapter:
     def list_target_verification_page(self, *, snapshot_id, cursor, limit):
         self._fail("page")
         self.call_order.append("page")
+        if self.events is not None:
+            self.events.append("page")
         assert snapshot_id == SNAPSHOT_ID
         self.page_limits.append(limit)
         start = 0 if cursor == "" else VERIFICATION_PAGE_SIZE
@@ -140,6 +158,8 @@ class _Adapter:
 
     def get_legacy_verification_bytes(self, asset_id):
         assert asset_id in self.sources
+        if self.events is not None:
+            self.events.append(f"legacy:{asset_id}")
         return CONTENT
 
     def verify_target_blob(
@@ -153,6 +173,8 @@ class _Adapter:
     ):
         self._fail("blob")
         self.call_order.append("blob")
+        if self.events is not None:
+            self.events.append(f"blob:{asset_id}")
         assert snapshot_id == SNAPSHOT_ID
         assert expected_sha256 == CONTENT_SHA
         assert expected_size == 1
@@ -173,6 +195,8 @@ class _Adapter:
     def complete_target_verification(self, *, snapshot_id):
         self._fail("complete")
         self.call_order.append("complete")
+        if self.events is not None:
+            self.events.append("complete")
         assert snapshot_id == SNAPSHOT_ID
         count = len(self.verified_ids)
         return AssetVerificationCompletion(
@@ -189,10 +213,10 @@ class _Adapter:
         )
 
 
-def _verify(sources, adapter):
+def _verify(sources, adapter, state=None):
     reconciler = object.__new__(LegacyRmReconciler)
     reconciler._adapter = adapter
-    reconciler._state = _State()
+    reconciler._state = state or _State()
     reconciler._lease_ttl_seconds = 60
     reconciler._mismatch_limit = 100
     summary = Counter()
@@ -212,9 +236,10 @@ def test_bounded_verification_pagination_success(count):
         f"{index:032x}": _source(f"{index:032x}")
         for index in range(count)
     }
+    state = _State()
     adapter = _Adapter(sources)
 
-    result, summary, details = _verify(sources, adapter)
+    result, summary, details = _verify(sources, adapter, state)
 
     assert result["error_code"] is None
     assert result["missing"] == 0
@@ -236,6 +261,62 @@ def test_bounded_verification_pagination_success(count):
         )
     expected_order.append("complete")
     assert adapter.call_order == expected_order
+    expected_pages = 1 if count <= VERIFICATION_PAGE_SIZE else 2
+    assert state.renewals == expected_pages + count
+    assert state.assertions == count + 1
+
+
+def test_each_blob_renews_then_checks_freeze_ownership():
+    sources = {
+        f"{index:032x}": _source(f"{index:032x}")
+        for index in range(3)
+    }
+    events = []
+    state = _State(events)
+    adapter = _Adapter(sources, events=events)
+
+    result, summary, _ = _verify(sources, adapter, state)
+
+    assert result["error_code"] is None
+    assert summary == Counter()
+    expected = ["begin", "renew", "page"]
+    for asset_id in sources:
+        expected.extend(
+            [
+                "renew",
+                f"legacy:{asset_id}",
+                f"blob:{asset_id}",
+                "assert",
+            ]
+        )
+    expected.extend(["complete", "assert"])
+    assert events == expected
+
+
+def test_lease_loss_after_blob_stops_before_next_asset_or_completion():
+    sources = {
+        f"{index:032x}": _source(f"{index:032x}")
+        for index in range(3)
+    }
+
+    class LeaseLosingState(_State):
+        def assert_freeze_owner(self, owner):
+            super().assert_freeze_owner(owner)
+            if self.assertions == 2:
+                raise HostMigrationStateError("migration_freeze_lost")
+
+    state = LeaseLosingState()
+    adapter = _Adapter(sources)
+
+    with pytest.raises(
+        HostMigrationStateError,
+        match="^migration_freeze_lost$",
+    ):
+        _verify(sources, adapter, state)
+
+    assert adapter.verified_ids == list(sources)[:2]
+    assert adapter.call_order.count("blob") == 2
+    assert "complete" not in adapter.call_order
 
 
 def test_metadata_tags_and_exact_bytes_are_compared():

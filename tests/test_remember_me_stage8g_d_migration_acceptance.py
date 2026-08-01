@@ -650,6 +650,56 @@ def test_reconciliation_lease_takeover_invalidates_old_scan(
     fixture.close()
 
 
+def test_reconciliation_lease_loss_after_blob_fails_closed(
+    tmp_path, monkeypatch
+):
+    fixture, state, store, adapter, _, assets = _fixture(
+        tmp_path,
+        ("red", "green", "blue"),
+    )
+    assert _coordinator(state, store, adapter).run().completed
+    original_verify = adapter.verify_target_blob
+    original_assert = state.assert_freeze_owner
+    verified_ids = []
+    completion_calls = []
+    lease_lost = {"value": False}
+
+    def verify_with_lease_loss(**kwargs):
+        result = original_verify(**kwargs)
+        verified_ids.append(kwargs["asset_id"])
+        if len(verified_ids) == 2:
+            lease_lost["value"] = True
+        return result
+
+    def assert_owner(owner):
+        if lease_lost["value"]:
+            raise HostMigrationStateError("migration_freeze_lost")
+        return original_assert(owner)
+
+    original_complete = adapter.complete_target_verification
+
+    def record_completion(**kwargs):
+        completion_calls.append(kwargs)
+        return original_complete(**kwargs)
+
+    monkeypatch.setattr(adapter, "verify_target_blob", verify_with_lease_loss)
+    monkeypatch.setattr(
+        adapter,
+        "complete_target_verification",
+        record_completion,
+    )
+    monkeypatch.setattr(state, "assert_freeze_owner", assert_owner)
+
+    report = _reconciler(state, store, adapter).reconcile()
+
+    assert report.overall_result == "blocked"
+    assert report.error_code == "reconciliation_freeze_lost"
+    expected_ids = sorted(asset["asset_id"] for asset in assets)
+    assert verified_ids == expected_ids[:2]
+    assert completion_calls == []
+    fixture.close()
+
+
 def test_recovery_diagnostics_are_read_only_for_core_states(tmp_path):
     fixture, state, store, adapter, _, assets = _fixture(tmp_path, ("red",))
     diagnostics = MigrationRecoveryDiagnostics(
