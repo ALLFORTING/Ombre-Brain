@@ -107,6 +107,11 @@ _STABLE_STATUSES = {
     "manifest_invalid",
     "restore_target_invalid",
     "restore_failed",
+    "capture_cancelled",
+    "freeze_lease_expired",
+    "capture_source_too_large",
+    "capture_space_insufficient",
+    "capture_bundle_too_large",
     "internal_error",
 }
 _EXIT_CODES = {
@@ -122,6 +127,11 @@ _EXIT_CODES = {
     "restore_target_invalid": 10,
     "restore_failed": 11,
     "internal_error": 12,
+    "capture_cancelled": 13,
+    "freeze_lease_expired": 14,
+    "capture_source_too_large": 15,
+    "capture_space_insufficient": 16,
+    "capture_bundle_too_large": 17,
 }
 
 
@@ -222,6 +232,23 @@ class SourceInventoryRecord:
 class SourceInventory:
     root_identity: tuple[int, int, int, int]
     records: tuple[SourceInventoryRecord, ...]
+
+
+@dataclass(frozen=True)
+class FrozenCaptureLimits:
+    """Bounds enforced against the exact inventory captured under freeze."""
+
+    max_source_bytes: int
+    max_bundle_bytes: int
+    minimum_free_bytes: int
+
+    def validate(self) -> None:
+        if (
+            self.max_source_bytes <= 0
+            or self.max_bundle_bytes <= 0
+            or self.minimum_free_bytes < 0
+        ):
+            raise BackupBundleError("internal_error")
 
 
 def prepare_backup_workspace(path: str | Path) -> BackupWorkspace:
@@ -337,6 +364,8 @@ def capture_external_source(
     clock: Callable[[], datetime] | None = None,
     chunk_size: int = CHUNK_SIZE,
     abort_signal: CaptureAbortSignal | None = None,
+    frozen_limits: FrozenCaptureLimits | None = None,
+    disk_usage: Callable[[Path], Any] = shutil.disk_usage,
 ) -> CaptureResult:
     """Capture one explicitly authorized external root under a live freeze."""
     workspace = load_backup_workspace(workspace_path)
@@ -362,6 +391,8 @@ def capture_external_source(
         clock=clock,
         chunk_size=chunk_size,
         abort_signal=abort_signal,
+        frozen_limits=frozen_limits,
+        disk_usage=disk_usage,
     )
     try:
         coordinator.validate_lease(freeze_lease)
@@ -384,6 +415,8 @@ def _capture_source_into_bundle(
     clock: Callable[[], datetime] | None,
     chunk_size: int,
     abort_signal: CaptureAbortSignal | None = None,
+    frozen_limits: FrozenCaptureLimits | None = None,
+    disk_usage: Callable[[Path], Any] = shutil.disk_usage,
 ) -> CaptureResult:
     bundle_id = secrets.token_hex(16)
     bundle_name = f"{bundle_id}{BUNDLE_SUFFIX}"
@@ -403,6 +436,14 @@ def _capture_source_into_bundle(
             chunk_size=chunk_size,
             abort_signal=abort_signal,
         )
+        if frozen_limits is not None:
+            _validate_frozen_capture_limits(
+                initial_inventory,
+                workspace.temp_root,
+                frozen_limits,
+                disk_usage=disk_usage,
+            )
+        _check_abort(abort_signal)
         entries, exclusions = _call_abortable(
             _capture_source,
             source_root,
@@ -461,6 +502,11 @@ def _capture_source_into_bundle(
             created_at=created_at,
             chunk_size=chunk_size,
             abort_signal=abort_signal,
+            max_output_bytes=(
+                frozen_limits.max_bundle_bytes
+                if frozen_limits is not None
+                else None
+            ),
         )
         try:
             _check_abort(abort_signal)
@@ -739,6 +785,30 @@ def _inventory_source(
     if first != second:
         raise BackupBundleError("source_changed")
     return second
+
+
+def _validate_frozen_capture_limits(
+    inventory: SourceInventory,
+    work_root: Path,
+    limits: FrozenCaptureLimits,
+    *,
+    disk_usage: Callable[[Path], Any],
+) -> None:
+    limits.validate()
+    source_bytes = sum(
+        record.size_bytes or 0
+        for record in inventory.records
+        if record.item_type in {"regular", "sqlite", "sqlite_content_sidecar"}
+    )
+    if source_bytes > limits.max_source_bytes:
+        raise BackupBundleError("capture_source_too_large")
+    required = source_bytes * 3 + limits.minimum_free_bytes
+    try:
+        free_bytes = int(disk_usage(work_root).free)
+    except Exception as exc:
+        raise BackupBundleError("internal_error") from exc
+    if free_bytes < required:
+        raise BackupBundleError("capture_space_insufficient")
 
 
 def _scan_source_metadata(
@@ -1190,6 +1260,7 @@ def _encrypt_archive(
     created_at: str,
     chunk_size: int,
     abort_signal: CaptureAbortSignal | None = None,
+    max_output_bytes: int | None = None,
 ) -> None:
     ephemeral_private = X25519PrivateKey.generate()
     ephemeral_public = ephemeral_private.public_key().public_bytes_raw()
@@ -1226,17 +1297,30 @@ def _encrypt_archive(
         ).encryptor()
         encryptor.authenticate_additional_data(header_bytes)
         with archive_path.open("rb") as reader, temporary.open("xb") as writer:
-            writer.write(MAGIC)
-            writer.write(struct.pack(">I", len(header_bytes)))
-            writer.write(header_bytes)
+            written = 0
+
+            def write_bounded(block: bytes) -> None:
+                nonlocal written
+                _check_abort(abort_signal)
+                if (
+                    max_output_bytes is not None
+                    and written + len(block) > max_output_bytes
+                ):
+                    raise BackupBundleError("capture_bundle_too_large")
+                writer.write(block)
+                written += len(block)
+
+            write_bounded(MAGIC)
+            write_bounded(struct.pack(">I", len(header_bytes)))
+            write_bounded(header_bytes)
             while True:
                 _check_abort(abort_signal)
                 block = reader.read(chunk_size)
                 if not block:
                     break
-                writer.write(encryptor.update(block))
-            writer.write(encryptor.finalize())
-            writer.write(encryptor.tag)
+                write_bounded(encryptor.update(block))
+            write_bounded(encryptor.finalize())
+            write_bounded(encryptor.tag)
             writer.flush()
             os.fsync(writer.fileno())
         _check_abort(abort_signal)

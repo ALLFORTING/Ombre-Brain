@@ -33,6 +33,7 @@ from offline_backup_bundle import (
     BackupBundleError,
     CaptureAbortSignal,
     CaptureResult,
+    FrozenCaptureLimits,
     _inventory_source,
     capture_external_source,
     load_backup_workspace,
@@ -162,6 +163,20 @@ class BundleDelivery:
     encrypted_size: int
     encrypted_sha256: str
     recipient_fingerprint: str
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """Always release delivery ownership when ASGI response handling ends."""
+
+    def __init__(self, *args, release: Callable[[], Any], **kwargs) -> None:
+        self._release_delivery = release
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._release_delivery()
 
 
 class ProductionBackupCaptureController:
@@ -296,6 +311,11 @@ class ProductionBackupCaptureController:
                 name=f"backup-capture-{canonical_id}",
             )
             self._tasks[canonical_id] = task
+            task.add_done_callback(
+                lambda completed, request_id=canonical_id: self._task_completed(
+                    request_id, completed
+                )
+            )
         return job.public()
 
     async def _run_capture_job(self, job: CaptureJob) -> None:
@@ -336,6 +356,12 @@ class ProductionBackupCaptureController:
                     freeze_lease=lease,
                     ob_commit_sha=self.runtime_commit,
                     abort_signal=abort_signal,
+                    frozen_limits=FrozenCaptureLimits(
+                        max_source_bytes=self.limits.max_source_bytes,
+                        max_bundle_bytes=self.limits.max_bundle_bytes,
+                        minimum_free_bytes=self.limits.minimum_free_bytes,
+                    ),
+                    disk_usage=self._disk_usage,
                 ))
                 self._active_workers += 1
                 try:
@@ -388,6 +414,15 @@ class ProductionBackupCaptureController:
             with suppress(Exception, asyncio.CancelledError):
                 worker.result()
 
+    def _task_completed(self, request_id: str, task: asyncio.Task[None]) -> None:
+        if self._tasks.get(request_id) is task:
+            self._tasks.pop(request_id, None)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except BaseException:
+                pass
+
     async def wait_for_terminal(
         self,
         request_id: str,
@@ -433,7 +468,16 @@ class ProductionBackupCaptureController:
                 raise CaptureChannelError("bundle_invalid") from exc
             self._active_deliveries.add(canonical_id)
         try:
-            size, digest = await asyncio.to_thread(_hash_handle, handle)
+            hash_worker = asyncio.create_task(asyncio.to_thread(_hash_handle, handle))
+            self._active_workers += 1
+            try:
+                try:
+                    size, digest = await asyncio.shield(hash_worker)
+                except asyncio.CancelledError:
+                    await self._wait_worker_exit(hash_worker)
+                    raise
+            finally:
+                self._active_workers -= 1
             handle.seek(0)
             if size != job.encrypted_size or digest != job.encrypted_sha256:
                 raise CaptureChannelError("bundle_invalid")
@@ -607,6 +651,18 @@ def build_backup_v2_routes(
             return _route_error(exc)
 
     async def download(request: Request):
+        delivery_context = None
+        release_lock = asyncio.Lock()
+        released = False
+
+        async def release_delivery() -> None:
+            nonlocal released
+            async with release_lock:
+                if released or delivery_context is None:
+                    return
+                released = True
+                await delivery_context.__aexit__(None, None, None)
+
         try:
             claims = await _verify_request_claims(claim_verifier, request)
             delivery_context = controller.delivery(
@@ -618,7 +674,11 @@ def build_backup_v2_routes(
                 digest = hashlib.sha256()
                 size = 0
                 try:
-                    while block := delivery.handle.read(1024 * 1024):
+                    while True:
+                        await asyncio.sleep(0)
+                        block = delivery.handle.read(1024 * 1024)
+                        if not block:
+                            break
                         size += len(block)
                         digest.update(block)
                         yield block
@@ -628,21 +688,30 @@ def build_backup_v2_routes(
                     ):
                         raise CaptureChannelError("bundle_invalid")
                 finally:
-                    await delivery_context.__aexit__(None, None, None)
+                    await release_delivery()
 
-            return StreamingResponse(
-                body(),
-                media_type="application/octet-stream",
-                headers={
-                    "Cache-Control": "no-store",
-                    "Content-Disposition": f'attachment; filename="{delivery.bundle_id}.obbackup"',
-                    "Content-Length": str(delivery.encrypted_size),
-                    "X-Backup-Bundle-Id": delivery.bundle_id,
-                    "X-Backup-SHA256": delivery.encrypted_sha256,
-                    "X-Backup-Recipient-Fingerprint": delivery.recipient_fingerprint,
-                },
-            )
+            try:
+                return _ManagedStreamingResponse(
+                    body(),
+                    media_type="application/octet-stream",
+                    release=release_delivery,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Content-Disposition": f'attachment; filename="{delivery.bundle_id}.obbackup"',
+                        "Content-Length": str(delivery.encrypted_size),
+                        "X-Backup-Bundle-Id": delivery.bundle_id,
+                        "X-Backup-SHA256": delivery.encrypted_sha256,
+                        "X-Backup-Recipient-Fingerprint": delivery.recipient_fingerprint,
+                    },
+                )
+            except BaseException:
+                await release_delivery()
+                raise
+        except asyncio.CancelledError:
+            await release_delivery()
+            raise
         except Exception as exc:
+            await release_delivery()
             return _route_error(exc)
 
     async def acknowledge(request: Request):

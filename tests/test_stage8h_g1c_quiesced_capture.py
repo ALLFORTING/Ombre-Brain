@@ -23,6 +23,7 @@ from starlette.testclient import TestClient
 from asset_migration_state import HostMigrationState
 from asset_store import AssetStore, AssetStoreError
 from bucket_manager import BucketManager
+from dehydrator import Dehydrator
 from maintenance_write_gate import (
     DEFAULT_WRITE_COORDINATOR,
     FreezeLease,
@@ -39,6 +40,7 @@ from maintenance_write_coverage import (
 from offline_backup_bundle import (
     BackupBundleError,
     CaptureAbortSignal,
+    _EXIT_CODES,
     capture_external_source,
     generate_test_keypair,
     inspect_bundle,
@@ -104,7 +106,14 @@ def _config(tmp_path: Path) -> dict:
     }
 
 
-def _controller(tmp_path: Path, *, coordinator=None, limits=None, worker_count=1):
+def _controller(
+    tmp_path: Path,
+    *,
+    coordinator=None,
+    limits=None,
+    worker_count=1,
+    disk_usage=shutil.disk_usage,
+):
     source = tmp_path / "external-source"
     source.mkdir(parents=True)
     workspace = prepare_backup_workspace(tmp_path / "capture-workspace")
@@ -129,6 +138,7 @@ def _controller(tmp_path: Path, *, coordinator=None, limits=None, worker_count=1
         runtime_commit=COMMIT,
         limits=limits,
         oidc_policy=_policy(),
+        disk_usage=disk_usage,
     )
     return controller, source, workspace, private_key, public_key
 
@@ -142,6 +152,96 @@ def test_writer_scope_normal_nested_and_generation():
             assert coordinator.status().active_writers == 1
     assert coordinator.status().state == "open"
     assert coordinator.status().generation == 1
+
+
+def test_capture_abort_statuses_are_stable_and_have_distinct_exit_codes():
+    cancelled = CaptureAbortSignal()
+    cancelled.abort("capture_cancelled")
+    with pytest.raises(BackupBundleError) as cancelled_error:
+        cancelled.raise_if_aborted()
+    assert cancelled_error.value.status == "capture_cancelled"
+
+    now = [10.0]
+    expired = CaptureAbortSignal(deadline=10.0, monotonic=lambda: now[0])
+    with pytest.raises(BackupBundleError) as expired_error:
+        expired.raise_if_aborted()
+    assert expired_error.value.status == "freeze_lease_expired"
+    assert _EXIT_CODES["capture_cancelled"] != _EXIT_CODES["freeze_lease_expired"]
+    assert "internal_error" not in {
+        cancelled_error.value.status,
+        expired_error.value.status,
+    }
+
+
+@pytest.mark.asyncio
+async def test_optional_writer_scope_skips_only_during_maintenance():
+    coordinator = MaintenanceWriteCoordinator()
+    with coordinator.optional_writer_scope("incidental") as entered:
+        assert entered is True
+    assert coordinator.status().generation == 1
+    async with coordinator.freeze(
+        reason="synthetic_capture",
+        drain_timeout_seconds=1,
+        max_freeze_seconds=5,
+    ):
+        with coordinator.optional_writer_scope("incidental") as entered:
+            assert entered is False
+        async with coordinator.optional_async_writer_scope("incidental") as entered:
+            assert entered is False
+        assert coordinator.status().generation == 1
+
+
+@pytest.mark.asyncio
+async def test_frozen_reads_skip_touch_ripple_and_dehydration_cache(tmp_path, monkeypatch):
+    coordinator = MaintenanceWriteCoordinator()
+    config = _config(tmp_path)
+    manager = BucketManager(config, write_coordinator=coordinator)
+    first_id = await manager.create("first synthetic memory")
+    second_id = await manager.create("second synthetic memory")
+    first_path = Path(manager._find_bucket_file(first_id))
+    second_path = Path(manager._find_bucket_file(second_id))
+
+    dehydrator = Dehydrator(config, write_coordinator=coordinator)
+    cached_content = "cached synthetic content " * 80
+    uncached_content = "uncached synthetic content " * 80
+    dehydrator._set_cached_summary(cached_content, "cached result")
+    dehydrator.api_available = True
+
+    async def synthetic_dehydrate(content):
+        assert content == uncached_content
+        return "uncached result"
+
+    monkeypatch.setattr(dehydrator, "_api_dehydrate", synthetic_dehydrate)
+    bucket_before = (first_path.read_bytes(), second_path.read_bytes())
+    cache_before = Path(dehydrator.cache_db_path).read_bytes()
+    generation_before = coordinator.status().generation
+
+    async with coordinator.freeze(
+        reason="synthetic_capture",
+        drain_timeout_seconds=1,
+        max_freeze_seconds=10,
+    ):
+        assert (await manager.get(first_id))["content"] == "first synthetic memory"
+        breath_like = await manager.get(first_id)
+        await manager.touch(breath_like["id"])
+        dream_like = (await manager.list_all(include_archive=False))[0]
+        await manager.touch(dream_like["id"])
+        assert "cached result" in await dehydrator.dehydrate(cached_content)
+        assert "uncached result" in await dehydrator.dehydrate(uncached_content)
+        with pytest.raises(MaintenanceWriteError, match="maintenance_in_progress"):
+            dehydrator.invalidate_cache(cached_content)
+        with pytest.raises(MaintenanceWriteError, match="maintenance_in_progress"):
+            await manager.update(first_id, content="blocked")
+        with pytest.raises(MaintenanceWriteError, match="maintenance_in_progress"):
+            await manager.create("blocked")
+        assert (first_path.read_bytes(), second_path.read_bytes()) == bucket_before
+        assert Path(dehydrator.cache_db_path).read_bytes() == cache_before
+        assert coordinator.status().generation == generation_before
+
+    await manager.touch(first_id)
+    assert first_path.read_bytes() != bucket_before[0]
+    await dehydrator.dehydrate(uncached_content)
+    assert dehydrator._get_cached_summary(uncached_content) == "uncached result"
 
 
 @pytest.mark.asyncio
@@ -870,7 +970,7 @@ def test_invalid_request_ids_rejected(tmp_path):
 
 def test_registered_production_write_coverage_is_complete():
     root = Path(__file__).parents[1]
-    assert COVERAGE_SCHEMA_VERSION == 2
+    assert COVERAGE_SCHEMA_VERSION == 3
     assert scan_registered_write_coverage(root) == []
 
 
@@ -1107,6 +1207,49 @@ def test_dynamic_sql_and_new_production_module_fail_closed(tmp_path):
     assert scan_registered_write_coverage(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("def mutate(name, mode):\n    open(name, mode)\n", "open:dynamic"),
+        ("def mutate(p, mode):\n    p.open(mode)\n", "open:dynamic"),
+        ("def mutate(name, flags):\n    os.open(name, flags)\n", "os.open:write_or_dynamic"),
+        ("def mutate(p):\n    p.touch()\n", "touch"),
+        ("def mutate(p):\n    p.unlink()\n", "unlink"),
+        ("def mutate(a, b):\n    shutil.copy2(a, b)\n", "shutil.copy2"),
+        ("def mutate(a, b):\n    shutil.copytree(a, b)\n", "shutil.copytree"),
+        ("def mutate(a, b):\n    os.link(a, b)\n", "os.link"),
+    ],
+)
+def test_ambiguous_and_extended_write_primitives_fail_closed(source, expected):
+    issues = scan_unregistered_source(source, "new_production.py")
+    assert expected in {issue.primitive for issue in issues}
+
+
+def test_new_module_with_all_extended_write_classes_fails(tmp_path):
+    module = tmp_path / "new_production.py"
+    module.write_text(
+        "import os, shutil\n"
+        "def mutate(name, mode, flags, p, a, b, connection, sql):\n"
+        "    open(name, mode)\n"
+        "    p.open(mode)\n"
+        "    os.open(name, flags)\n"
+        "    p.touch()\n"
+        "    p.unlink()\n"
+        "    shutil.copy2(a, b)\n"
+        "    shutil.copytree(a, b)\n"
+        "    os.link(a, b)\n"
+        "    connection.execute(sql)\n",
+        encoding="utf-8",
+    )
+    primitives = {
+        issue.primitive for issue in scan_registered_write_coverage(tmp_path)
+    }
+    assert {
+        "open:dynamic", "os.open:write_or_dynamic", "touch", "unlink",
+        "shutil.copy2", "shutil.copytree", "os.link", "sqlite_dynamic",
+    } <= primitives
+
+
 @pytest.mark.asyncio
 async def test_post_capture_hash_failure_cleans_owned_bundle(tmp_path, monkeypatch):
     import production_backup_capture as capture_module
@@ -1250,3 +1393,280 @@ def test_create_route_returns_before_controller_owned_job_finishes(tmp_path, mon
             time.sleep(0.01)
         assert status.json()["state"] == "ready"
     assert controller.coordinator.status().state == "open"
+
+
+@pytest.mark.asyncio
+async def test_frozen_source_limit_rechecks_after_existing_writer_drains(tmp_path, monkeypatch):
+    import offline_backup_bundle as bundle_module
+
+    coordinator = MaintenanceWriteCoordinator()
+    limits = CaptureLimits(2, 10, 64, 1024 * 1024, minimum_free_bytes=1)
+    controller, source, workspace, _, _ = _controller(
+        tmp_path, coordinator=coordinator, limits=limits
+    )
+    source_file = source / "growing.bin"
+    source_file.write_bytes(b"x")
+    writer_entered = asyncio.Event()
+    enlarge = asyncio.Event()
+    staging_started = threading.Event()
+    original_capture_source = bundle_module._capture_source
+
+    def observed_capture_source(*args, **kwargs):
+        staging_started.set()
+        return original_capture_source(*args, **kwargs)
+
+    monkeypatch.setattr(bundle_module, "_capture_source", observed_capture_source)
+
+    async def existing_writer():
+        async with coordinator.async_writer_scope("synthetic_growth"):
+            writer_entered.set()
+            await enlarge.wait()
+            source_file.write_bytes(b"x" * 128)
+
+    writer = asyncio.create_task(existing_writer())
+    await writer_entered.wait()
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    for _ in range(300):
+        if controller.get_job(request_id, _claims())["state"] == "draining":
+            break
+        await asyncio.sleep(0.01)
+    assert controller.get_job(request_id, _claims())["state"] == "draining"
+    enlarge.set()
+    await writer
+    result = await _terminal(controller, request_id)
+    assert result["failure_code"] == "capture_source_too_large"
+    assert not staging_started.is_set()
+    assert controller.coordinator.status().state == "open"
+    assert controller._active_workers == 0
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    assert not any(workspace.temp_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_frozen_space_recheck_happens_before_plaintext_staging(tmp_path, monkeypatch):
+    import offline_backup_bundle as bundle_module
+
+    calls = 0
+
+    def changing_disk_usage(path):
+        nonlocal calls
+        del path
+        calls += 1
+        return SimpleNamespace(free=10**9 if calls == 1 else 0)
+
+    controller, source, workspace, _, _ = _controller(
+        tmp_path, disk_usage=changing_disk_usage
+    )
+    (source / "one.bin").write_bytes(b"synthetic")
+    staging_started = threading.Event()
+    original_capture_source = bundle_module._capture_source
+
+    def observed_capture_source(*args, **kwargs):
+        staging_started.set()
+        return original_capture_source(*args, **kwargs)
+
+    monkeypatch.setattr(bundle_module, "_capture_source", observed_capture_source)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert result["failure_code"] == "capture_space_insufficient"
+    assert calls >= 2
+    assert not staging_started.is_set()
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    assert not any(workspace.temp_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_encrypted_output_limit_stops_before_formal_publication(tmp_path):
+    limits = CaptureLimits(2, 10, 1024 * 1024, 128, minimum_free_bytes=1)
+    controller, source, workspace, _, _ = _controller(tmp_path, limits=limits)
+    (source / "one.bin").write_bytes(b"synthetic payload")
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    result = await _terminal(controller, request_id)
+    assert result["failure_code"] == "capture_bundle_too_large"
+    assert controller.coordinator.status().state == "open"
+    assert controller._active_workers == 0
+    assert not list(workspace.bundles_root.glob("*.obbackup"))
+    assert not any(workspace.temp_root.iterdir())
+
+
+async def _ready_capture(controller, source):
+    (source / f"{uuid.uuid4()}.bin").write_bytes(b"synthetic delivery")
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(
+        request_id=request_id,
+        expected_runtime_commit=COMMIT,
+        expected_recipient_fingerprint=controller.recipient_fingerprint,
+        claims=_claims(),
+    )
+    assert (await _terminal(controller, request_id))["state"] == "ready"
+    return request_id
+
+
+def _download_request(request_id):
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": f"/api/backup/v2/captures/{request_id}/bundle",
+        "raw_path": b"/api/backup/v2/captures/bundle",
+        "query_string": b"",
+        "headers": [],
+        "client": ("test", 1),
+        "server": ("test", 80),
+        "path_params": {"request_id": request_id},
+    })
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_during_delivery_prehash_joins_worker(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+    original_hash = capture_module._hash_handle
+    entered = threading.Event()
+    release = threading.Event()
+
+    def paused_hash(handle):
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("synthetic hash pause")
+        return original_hash(handle)
+
+    monkeypatch.setattr(capture_module, "_hash_handle", paused_hash)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    task = asyncio.create_task(endpoint(_download_request(request_id)))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert request_id in controller._active_deliveries
+    with pytest.raises(CaptureChannelError, match="capture_delivery_active"):
+        await controller.acknowledge(request_id, _claims())
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert request_id not in controller._active_deliveries
+    assert controller._active_workers == 0
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as retry:
+        assert retry.handle.read(1)
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_asgi_midstream_cancel_releases_delivery_and_allows_retry(tmp_path):
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    response = await endpoint(_download_request(request_id))
+    first_body = asyncio.Event()
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            first_body.set()
+            await asyncio.Event().wait()
+
+    response_task = asyncio.create_task(response(_download_request(request_id).scope, receive, send))
+    await asyncio.wait_for(first_body.wait(), 5)
+    assert request_id in controller._active_deliveries
+    response_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response_task
+    assert request_id not in controller._active_deliveries
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as retry:
+        assert retry.handle.read(1)
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_asgi_stream_exception_releases_delivery_and_preserves_bundle(tmp_path):
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    response = await endpoint(_download_request(request_id))
+
+    async def broken_body():
+        yield b"synthetic-prefix"
+        raise RuntimeError("synthetic stream failure")
+
+    response.body_iterator = broken_body()
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        del message
+
+    with pytest.raises(RuntimeError, match="synthetic stream failure"):
+        await response(_download_request(request_id).scope, receive, send)
+    assert request_id not in controller._active_deliveries
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as retry:
+        assert retry.handle.read(1)
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_response_construction_failure_releases_delivery(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+
+    class FailingResponse:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("synthetic response construction")
+
+    monkeypatch.setattr(capture_module, "_ManagedStreamingResponse", FailingResponse)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    response = await endpoint(_download_request(request_id))
+    assert response.status_code == 400
+    assert json.loads(response.body)["status"] == "internal_error"
+    assert request_id not in controller._active_deliveries
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_sequential_terminal_jobs_release_task_registry(tmp_path):
+    controller, source, _, _, _ = _controller(tmp_path)
+    completed = []
+    for _ in range(3):
+        request_id = await _ready_capture(controller, source)
+        await asyncio.sleep(0)
+        assert controller._tasks == {}
+        assert controller.get_job(request_id, _claims())["state"] == "ready"
+        completed.append(request_id)
+        await controller.acknowledge(request_id, _claims())
+    assert all(
+        controller.get_job(request_id, _claims())["state"] == "consumed"
+        for request_id in completed
+    )

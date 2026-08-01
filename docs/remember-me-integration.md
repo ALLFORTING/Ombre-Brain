@@ -361,6 +361,11 @@ Stage 8H-G1B's encrypted bundle and isolated restore core is merged. Stage
 and FROZEN states. Existing writers drain before freeze; new writes fail with
 `maintenance_in_progress`, while reads remain available. Nested persistence
 operations are reentrant and advance one conservative outer mutation generation.
+Read-side activation touches, time ripple, and dehydration-cache stores use a
+narrow incidental-persistence scope: maintenance rejection skips only that
+optional write while preserving the requested read result. Explicit bucket,
+asset, cache invalidation, migration, Reindex, and administrative mutations
+remain hard failures. Any non-maintenance storage error still propagates.
 
 The versioned registry in `docs/maintenance-write-coverage.md` maps bucket,
 AssetStore, embedding, migration-state, Remember-Me adapter, Dashboard,
@@ -372,8 +377,12 @@ The internal library can capture only an explicitly authorized external buckets
 root under a current freeze lease. It does not copy that root into workspace
 `source` and adds no arbitrary `--source` CLI option. G1B whole-source inventory,
 streaming copies, SQLite online backup, encryption, manifest verification, and
-no-overwrite publication remain in force. Space and source/bundle size limits
-are checked, and lease generation is verified again after capture.
+no-overwrite publication remain in force. OPEN-state preflight remains an early
+filter, but the exact initial inventory produced under FROZEN is authoritative
+for source size and a second free-space check before staging. That same
+inventory drives capture and the final stability comparison. Encrypted output
+is bounded at each write before formal no-replace publication, and lease
+generation is verified again after capture.
 
 The controller is disabled by default. It accepts only a canonical X25519
 public key with its exact fingerprint, rejects private-key configuration, and
@@ -390,6 +399,12 @@ reported in lease metadata. Cancellation or expiry signals the blocking worker,
 and OPEN is restored only after that worker has exited and its staging,
 plaintext, encrypted temporary output, and any newly published bundle have
 been contained.
+Both explicit cancellation and worker- or controller-observed deadline expiry
+retain their stable `capture_cancelled` or `freeze_lease_expired` status; neither
+is normalized to `internal_error`. Completed controller tasks are removed from
+the live task registry while terminal job metadata remains queryable.
+Persistent job retention and process-restart recovery remain future
+production-registration work and are not implied by the process-local metadata.
 
 OIDC ownership includes both `run_id` and `run_attempt`, plus fixed repository
 and repository-owner numeric identities. A different attempt cannot inspect,
@@ -403,11 +418,19 @@ cleanup cannot remove a bundle during delivery; disconnect releases the lease
 and leaves the ready bundle retryable. Post-capture failures retain exact
 ownership long enough to remove only the new bundle, and expose only a
 non-sensitive orphan flag if contained cleanup itself fails.
+Delivery pre-hash cancellation waits for the hash worker and file handle to
+close before releasing ownership. ASGI construction failure, cancellation
+before the first body chunk, mid-stream disconnect, iterator failure, and
+successful completion all use the same idempotent release path.
 
 Write coverage discovers all repository production Python modules before
 checking registered boundaries. Decorator-backed boundaries, manual writer
 scopes, guarded callers, startup-only code, and transient staging are validated
 under distinct rules; adding an unregistered production module fails tests.
+Discovery treats dynamic builtin and `Path.open` modes, dynamic or writable
+`os.open` flags, Path mutation methods, link creation, extended copy operations,
+and dynamic SQLite statements as potential writes. Exact non-Path method-name
+collisions use line-anchored call-site evidence rather than file exemptions.
 
 The ASGI route factory is unregistered and is not imported by `server.py`,
 `backup_entry.py`, MCP startup, or Dashboard startup. Synthetic transport

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-COVERAGE_SCHEMA_VERSION = 2
+COVERAGE_SCHEMA_VERSION = 3
 
 # Function-level registrations only. Startup entries execute before an
 # unregistered capture controller can exist; transient entries are excluded
@@ -40,6 +40,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_snapshot_sqlite": "capture_staging",
         "_build_archive": "capture_staging",
         "_encrypt_archive": "encrypted_bundle_staging_and_publish",
+        "write_bounded": "capture_staging",
         "_decrypt_and_validate": "isolated_temporary_restore",
         "_validate_and_extract_archive": "isolated_temporary_restore",
         "_atomic_write_json": "workspace_manifest_factory",
@@ -47,6 +48,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_publish_file_no_replace": "formal_bundle_no_replace",
         "_exclusive_operation_lock": "workspace_restore_lock",
         "_publish_directory_no_replace": "formal_restore_no_replace",
+        "_fsync_file": "formal_bundle_no_replace",
         "_safe_rmtree": "contained_temporary_cleanup",
         "_remove_file": "contained_temporary_cleanup",
     },
@@ -68,9 +70,9 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_move_bucket": "guarded_mutation",
         "update": "guarded_async_mutation",
         "delete": "guarded_async_mutation",
-        "touch": "guarded_async_mutation",
+        "touch": "guarded_optional_async_mutation",
         "set_dormant": "guarded_async_mutation",
-        "_time_ripple": "guarded_async_mutation",
+        "_time_ripple": "guarded_optional_async_mutation",
         "archive": "guarded_async_mutation",
         "clean_display_aliases": "guarded_async_mutation",
         "get_letters": "dynamic_sql_read_only",
@@ -103,7 +105,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
     },
     "dehydrator.py": {
         "_init_cache_db": "startup_initialization",
-        "_set_cached_summary": "guarded_mutation_after_network",
+        "_set_cached_summary": "guarded_optional_mutation_after_network",
         "invalidate_cache": "guarded_mutation",
     },
     "asset_migration_state.py": {
@@ -137,6 +139,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_asset_stream_browser_upload": "excluded_transient_upload",
         "_rm_delete_upload_temp_path": "excluded_transient_upload",
         "rm_asset_upload_route": "excluded_transient_upload_then_guarded_store",
+        "_rm_persist_remember_me_upload": "excluded_transient_upload_then_guarded_store",
         "api_import_upload": "excluded_transient_import_upload",
         "_run_import": "guarded_storage_components",
         "api_import_review": "excluded_transient_import_upload_cleanup",
@@ -169,6 +172,45 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     },
 }
 
+# Exact call-site exemptions for methods whose names overlap Path mutation
+# primitives. Line anchoring makes nearby code movement or any new call fail
+# until that individual call is audited again.
+NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
+    ("asset_dashboard.py", "resolve_image", 440, "Image.open"): "pillow_image_read",
+    ("asset_migration_state.py", "_now", 313, "value.replace"): "datetime_timezone",
+    ("asset_migration_state.py", "inspect_existing_migration_state", 1107, "now.replace"): "datetime_timezone",
+    ("asset_migration_state.py", "_parse_timestamp", 1177, "replace"): "datetime_timezone",
+    ("asset_store.py", "_parse_iso8601", 250, "parsed.replace"): "datetime_timezone",
+    ("asset_store.py", "_parse_iso8601", 257, "raw.replace"): "string_normalization",
+    ("asset_store.py", "_parse_iso8601", 261, "parsed.replace"): "datetime_timezone",
+    ("asset_store.py", "_row_datetime", 266, "replace"): "datetime_timezone",
+    ("asset_store.py", "_row_datetime", 268, "parsed.replace"): "datetime_timezone",
+    ("maintenance_write_gate.py", "freeze", 187, "reason.replace"): "string_validation",
+    ("offline_backup_bundle.py", "_timestamp", 2243, "value.replace"): "datetime_timezone",
+    ("production_backup_capture.py", "_now", 614, "value.replace"): "datetime_timezone",
+    ("remember_me_core_adapter.py", "_normalize_timestamp", 504, "replace"): "datetime_timezone",
+    ("remember_me_core_adapter.py", "_normalize_timestamp", 508, "parsed.replace"): "datetime_timezone",
+    ("remember_me_migration_acceptance.py", "_timestamp", 1435, "value.replace"): "datetime_timezone",
+    ("remember_me_mcp_presenter.py", "_verified_image", 386, "Image.open"): "pillow_image_read",
+    ("remember_me_vector_provider.py", "_normalized_backend", 57, "replace"): "string_normalization",
+    ("server.py", "breath_hook", 627, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "dream_hook", 666, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "_dream_summary_line", 800, "replace"): "string_formatting",
+    ("server.py", "_normalize_todos", 928, "text.replace"): "string_normalization",
+    ("server.py", "_days_since", 1239, "dt.replace"): "datetime_timezone",
+    ("server.py", "_breath_impl", 1830, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "_breath_impl", 1864, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "_breath_impl", 1930, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "_breath_impl", 2071, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "_attachment_probe_scan", 2212, "replace"): "string_normalization",
+    ("server.py", "_rm_verified_view_image", 3300, "Image.open"): "pillow_image_read",
+    ("server.py", "hold", 4554, "replace"): "string_normalization",
+    ("server.py", "boot", 5077, "replace"): "string_normalization",
+    ("server.py", "dream", 5279, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("server.py", "dream", 5305, "bucket_mgr.touch"): "incidental_bucket_activation",
+    ("utils.py", "apply_display_aliases", 27, "text.replace"): "string_alias_replacement",
+}
+
 _CALL_NAMES = {
     "commit",
     "executemany",
@@ -180,9 +222,10 @@ _CALL_NAMES = {
     "writelines",
     "write_bytes",
     "write_text",
+    "truncate",
 }
 _SQL_PREFIXES = ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "REPLACE")
-_WRITE_MODES = {"w", "wb", "wt", "a", "ab", "at", "x", "xb", "xt", "r+", "w+", "a+"}
+_READ_ONLY_OS_FLAGS = {"O_RDONLY", "O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"}
 
 
 @dataclass(frozen=True)
@@ -210,10 +253,17 @@ class _WriteVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         primitive = self._primitive(node)
-        if primitive:
+        function = self.stack[-1] if self.stack else "<module>"
+        allowed = (
+            self.filename,
+            function,
+            node.lineno,
+            _call_name(node.func),
+        ) in NON_PATH_CALL_ALLOWLIST
+        if primitive and not allowed:
             self.hits.append(WriteCoverageIssue(
                 self.filename,
-                self.stack[-1] if self.stack else "<module>",
+                function,
                 node.lineno,
                 primitive,
             ))
@@ -221,29 +271,31 @@ class _WriteVisitor(ast.NodeVisitor):
 
     def _primitive(self, node: ast.Call) -> str | None:
         name = _call_name(node.func)
+        if name == "os.open":
+            flags = node.args[1] if len(node.args) > 1 else None
+            return None if _os_flags_are_read_only(flags) else "os.open:write_or_dynamic"
         if name in {"open", "Path.open"} or name.endswith(".open"):
-            mode = _open_mode(node)
-            return f"open:{mode}" if mode in _WRITE_MODES else None
-        if name.endswith((".execute", ".executemany", ".executescript")) and node.args:
-            statement = _constant_string(node.args[0])
+            mode = _open_mode(node, bound=name != "open")
+            if mode is None:
+                return "open:dynamic"
+            return f"open:{mode}" if _mode_may_write(mode) else None
+        if name.endswith((".execute", ".executemany", ".executescript")):
+            statement = _constant_string(node.args[0]) if node.args else None
             if statement is None:
                 return "sqlite_dynamic"
             if statement.lstrip().upper().startswith(_SQL_PREFIXES):
                 return "sqlite_dml"
         if name in {
             "os.remove", "os.rename", "os.replace",
-            "shutil.move", "shutil.copy", "shutil.copyfile", "shutil.rmtree",
+            "os.link", "os.symlink",
+            "shutil.move", "shutil.copy", "shutil.copy2", "shutil.copyfile",
+            "shutil.copytree", "shutil.rmtree",
         }:
             return name
         if isinstance(node.func, ast.Attribute) and node.func.attr in {
-            "touch", "rename", "replace", "unlink",
+            "touch", "rename", "replace", "unlink", "symlink_to", "hardlink_to",
         }:
-            receiver = _call_name(node.func.value).casefold()
-            if any(token in receiver for token in (
-                "path", "file", "destination", "source", "target",
-                "temporary", "bundle", "archive", "root",
-            )):
-                return node.func.attr
+            return node.func.attr
         if name.endswith(("_path.rename", "_path.replace")):
             return name.rsplit(".", 1)[-1]
         leaf = name.rsplit(".", 1)[-1]
@@ -328,6 +380,10 @@ def _boundary_shape_valid(
         return "guarded_mutation" in decorators
     if reason == "guarded_async_mutation":
         return "guarded_async_mutation" in decorators
+    if reason == "guarded_optional_mutation_after_network":
+        return "guarded_optional_mutation" in decorators
+    if reason == "guarded_optional_async_mutation":
+        return "guarded_optional_async_mutation" in decorators
     if reason == "guarded_http_mutation":
         return "guarded_http_mutation" in decorators
     if reason in {"manual_writer_scope", "inline_writer_scope_after_network"}:
@@ -401,13 +457,28 @@ def _call_name(node: ast.AST) -> str:
     return ""
 
 
-def _open_mode(node: ast.Call) -> str:
-    if len(node.args) > 1:
-        return _constant_string(node.args[1]) or ""
+def _open_mode(node: ast.Call, *, bound: bool) -> str | None:
+    mode_index = 0 if bound else 1
+    if len(node.args) > mode_index:
+        return _constant_string(node.args[mode_index])
     for keyword in node.keywords:
         if keyword.arg == "mode":
-            return _constant_string(keyword.value) or ""
+            return _constant_string(keyword.value)
     return "r"
+
+
+def _mode_may_write(mode: str) -> bool:
+    return any(marker in mode.casefold() for marker in ("w", "a", "x", "+"))
+
+
+def _os_flags_are_read_only(node: ast.AST | None) -> bool:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value == 0
+    if isinstance(node, ast.Attribute):
+        return node.attr in _READ_ONLY_OS_FLAGS
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _os_flags_are_read_only(node.left) and _os_flags_are_read_only(node.right)
+    return False
 
 
 def _constant_string(node: ast.AST) -> str | None:

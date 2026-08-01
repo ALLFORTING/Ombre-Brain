@@ -122,6 +122,40 @@ class MaintenanceWriteCoordinator:
                     self._generation += 1
                     self._condition.notify_all()
 
+    @contextmanager
+    def optional_writer_scope(
+        self,
+        operation: str = "incidental_persistence",
+    ) -> Iterator[bool]:
+        """Enter incidental persistence, or yield False during maintenance."""
+        del operation
+        execution = _execution_identity()
+        current = self._writer_depth.get()
+        depth = current[1] if current is not None and current[0] == execution else 0
+        token = self._writer_depth.set((execution, depth + 1))
+        entered = False
+        rejected = False
+        if depth == 0:
+            with self._condition:
+                if self._state != "open":
+                    rejected = True
+                else:
+                    self._active_writers += 1
+                    entered = True
+        if rejected:
+            self._writer_depth.reset(token)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self._writer_depth.reset(token)
+            if entered:
+                with self._condition:
+                    self._active_writers -= 1
+                    self._generation += 1
+                    self._condition.notify_all()
+
     @asynccontextmanager
     async def async_writer_scope(
         self,
@@ -129,6 +163,14 @@ class MaintenanceWriteCoordinator:
     ) -> AsyncIterator[None]:
         with self.writer_scope(operation):
             yield
+
+    @asynccontextmanager
+    async def optional_async_writer_scope(
+        self,
+        operation: str = "incidental_persistence",
+    ) -> AsyncIterator[bool]:
+        with self.optional_writer_scope(operation) as entered:
+            yield entered
 
     @asynccontextmanager
     async def freeze(
@@ -257,6 +299,14 @@ def async_writer_scope(operation: str = "persistent_mutation"):
     return DEFAULT_WRITE_COORDINATOR.async_writer_scope(operation)
 
 
+def optional_writer_scope(operation: str = "incidental_persistence"):
+    return DEFAULT_WRITE_COORDINATOR.optional_writer_scope(operation)
+
+
+def optional_async_writer_scope(operation: str = "incidental_persistence"):
+    return DEFAULT_WRITE_COORDINATOR.optional_async_writer_scope(operation)
+
+
 def guarded_mutation(operation: str):
     """Guard one synchronous production persistence boundary."""
 
@@ -292,6 +342,52 @@ def guarded_async_mutation(operation: str):
                 return await function(*args, **kwargs)
 
         guarded.__maintenance_guarded__ = operation
+        return guarded
+
+    return decorate
+
+
+def guarded_optional_mutation(operation: str):
+    """Run incidental synchronous persistence only while writes are open."""
+
+    def decorate(function):
+        @wraps(function)
+        def guarded(*args, **kwargs):
+            coordinator = getattr(
+                args[0],
+                "write_coordinator",
+                DEFAULT_WRITE_COORDINATOR,
+            ) if args else DEFAULT_WRITE_COORDINATOR
+            with coordinator.optional_writer_scope(operation) as entered:
+                if not entered:
+                    return None
+                return function(*args, **kwargs)
+
+        guarded.__maintenance_guarded__ = operation
+        guarded.__maintenance_optional__ = True
+        return guarded
+
+    return decorate
+
+
+def guarded_optional_async_mutation(operation: str):
+    """Run incidental asynchronous persistence only while writes are open."""
+
+    def decorate(function):
+        @wraps(function)
+        async def guarded(*args, **kwargs):
+            coordinator = getattr(
+                args[0],
+                "write_coordinator",
+                DEFAULT_WRITE_COORDINATOR,
+            ) if args else DEFAULT_WRITE_COORDINATOR
+            async with coordinator.optional_async_writer_scope(operation) as entered:
+                if not entered:
+                    return None
+                return await function(*args, **kwargs)
+
+        guarded.__maintenance_guarded__ = operation
+        guarded.__maintenance_optional__ = True
         return guarded
 
     return decorate

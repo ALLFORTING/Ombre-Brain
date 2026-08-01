@@ -41,6 +41,7 @@ from maintenance_write_gate import (
     DEFAULT_WRITE_COORDINATOR,
     guarded_async_mutation,
     guarded_mutation,
+    guarded_optional_async_mutation,
 )
 
 from utils import (
@@ -559,7 +560,7 @@ class BucketManager:
     # Called on every recall hit; affects decay score.
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
-    @guarded_async_mutation("bucket_touch")
+    @guarded_optional_async_mutation("bucket_touch")
     async def touch(self, bucket_id: str) -> None:
         """
         Update a bucket's last activation time and count.
@@ -586,6 +587,7 @@ class BucketManager:
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+            raise
 
     @guarded_async_mutation("bucket_dormant")
     async def set_dormant(self, bucket_id: str, dormant: bool = True) -> bool:
@@ -603,17 +605,14 @@ class BucketManager:
             logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
             return False
 
-    @guarded_async_mutation("bucket_time_ripple")
+    @guarded_optional_async_mutation("bucket_time_ripple")
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         """
         Slightly boost activation_count of buckets created/activated near the reference time.
         轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
         Max 5 buckets rippled per touch to bound I/O.
         """
-        try:
-            all_buckets = await self.list_all(include_archive=False)
-        except Exception:
-            return
+        all_buckets = await self.list_all(include_archive=False)
 
         rippled = 0
         max_ripple = 5
@@ -648,7 +647,8 @@ class BucketManager:
                         f.write(frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
-                    continue
+                    logger.warning("Failed to persist time ripple for %s", bucket["id"])
+                    raise
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)

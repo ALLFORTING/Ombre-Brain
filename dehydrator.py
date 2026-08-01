@@ -32,6 +32,7 @@ import sqlite3
 from maintenance_write_gate import (
     DEFAULT_WRITE_COORDINATOR,
     guarded_mutation,
+    guarded_optional_mutation,
 )
 import logging
 
@@ -222,7 +223,7 @@ class Dehydrator:
         conn.close()
         return row[0] if row else None
 
-    @guarded_mutation("dehydration_cache_store")
+    @guarded_optional_mutation("dehydration_cache_store")
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
