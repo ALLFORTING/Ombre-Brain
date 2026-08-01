@@ -8,6 +8,11 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+)
+
 
 logger = logging.getLogger("ombre_brain.asset_embedding")
 
@@ -18,6 +23,11 @@ class AssetEmbeddingIndex:
     def __init__(self, asset_store, embedding_engine):
         self.asset_store = asset_store
         self.embedding_engine = embedding_engine
+        self.write_coordinator = getattr(
+            asset_store,
+            "write_coordinator",
+            DEFAULT_WRITE_COORDINATOR,
+        )
         self.db_path = asset_store.db_path
         self._lock = threading.Lock()
         self._init_db()
@@ -94,6 +104,7 @@ class AssetEmbeddingIndex:
             ).fetchone()
         return dict(row) if row else None
 
+    @guarded_mutation("asset_embedding_delete")
     def delete(self, asset_id: str) -> None:
         if not re.fullmatch(r"[0-9a-f]{32}", asset_id or ""):
             return
@@ -162,26 +173,27 @@ class AssetEmbeddingIndex:
         ):
             return "failed"
 
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO asset_embeddings (
-                    asset_id, embedding, model, content_hash, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(asset_id) DO UPDATE SET
-                    embedding = excluded.embedding,
-                    model = excluded.model,
-                    content_hash = excluded.content_hash,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    asset_id,
-                    json.dumps(embedding),
-                    model,
-                    content_hash,
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                ),
-            )
+        with self.write_coordinator.writer_scope("asset_embedding_store"):
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO asset_embeddings (
+                        asset_id, embedding, model, content_hash, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(asset_id) DO UPDATE SET
+                        embedding = excluded.embedding,
+                        model = excluded.model,
+                        content_hash = excluded.content_hash,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        asset_id,
+                        json.dumps(embedding),
+                        model,
+                        content_hash,
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    ),
+                )
         return "indexed"
 
     async def search(

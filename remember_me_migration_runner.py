@@ -14,6 +14,7 @@ from remember_me_import_adapter import (
     LegacyAssetImportAdapter,
     LegacyAssetImportRequest,
 )
+from maintenance_write_gate import guarded_mutation
 
 
 MIGRATION_KEY = "ombre-stage8g-c-assets"
@@ -43,6 +44,7 @@ class MigrationBatchResult:
     completed: bool
 
 
+@guarded_mutation("remember_me_migration_batch")
 def run_migration_batch(
     *,
     legacy_store: AssetStore,

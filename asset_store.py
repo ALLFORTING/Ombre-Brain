@@ -19,6 +19,10 @@ from asset_migration_state import (
     HostMigrationState,
     HostMigrationStateError,
 )
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+)
 
 
 MAX_IMAGE_PIXELS = 20_000_000
@@ -59,7 +63,9 @@ class AssetStore:
         self,
         data_root: str,
         write_gate: HostMigrationState | None = None,
+        write_coordinator=None,
     ):
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
         self.data_root = Path(data_root).resolve()
         if write_gate is not None and (
             not isinstance(write_gate, HostMigrationState)
@@ -174,6 +180,7 @@ class AssetStore:
         os.close(fd)
         return Path(raw_path)
 
+    @guarded_mutation("asset_temp_create")
     def create_temp_path(self, suffix: str = ".upload") -> Path:
         try:
             with self._asset_write_guard() as write_guard:
@@ -376,6 +383,7 @@ class AssetStore:
             raise InvalidAssetImage("invalid_image")
         return source_path, "application/octet-stream", "file", ".bin", 0, 0
 
+    @guarded_mutation("asset_persist")
     def persist_upload(
         self,
         source_path: str | Path,
@@ -399,6 +407,7 @@ class AssetStore:
         except HostMigrationStateError as exc:
             raise self._translate_write_gate_error(exc) from exc
 
+    @guarded_mutation("asset_persist_unchecked")
     def _persist_upload_unchecked(
         self,
         *,
@@ -665,6 +674,7 @@ class AssetStore:
             assets.append(asset)
         return assets
 
+    @guarded_mutation("asset_metadata_update")
     def update_metadata(
         self,
         asset_id: str,
@@ -684,6 +694,7 @@ class AssetStore:
         except HostMigrationStateError as exc:
             raise self._translate_write_gate_error(exc) from exc
 
+    @guarded_mutation("asset_metadata_update_unchecked")
     def _update_metadata_unchecked(
         self,
         *,
@@ -792,6 +803,7 @@ class AssetStore:
             raise AssetStoreError("asset_unavailable")
         return result
 
+    @guarded_mutation("asset_delete")
     def delete(self, asset_id: str) -> dict:
         try:
             with self._asset_write_guard() as write_guard:
@@ -802,6 +814,7 @@ class AssetStore:
         except HostMigrationStateError as exc:
             raise self._translate_write_gate_error(exc) from exc
 
+    @guarded_mutation("asset_delete_unchecked")
     def _delete_unchecked(
         self,
         *,

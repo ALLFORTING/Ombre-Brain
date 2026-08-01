@@ -88,6 +88,11 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from maintenance_write_gate import (
+    guarded_async_mutation,
+    guarded_http_mutation,
+    guarded_mutation,
+)
 from utils import (
     DISPLAY_ALIASES,
     apply_display_aliases,
@@ -288,6 +293,7 @@ def _load_password_hash() -> str | None:
     return None
 
 
+@guarded_mutation("dashboard_auth_write")
 def _save_password_hash(password: str) -> None:
     salt = secrets.token_hex(16)
     h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
@@ -469,6 +475,7 @@ async def auth_status(request):
 
 
 @mcp.custom_route("/auth/setup", methods=["POST"])
+@guarded_http_mutation("dashboard_auth_setup", methods=("POST",))
 async def auth_setup_endpoint(request):
     """Initial password setup (only when no password is configured)."""
     from starlette.responses import JSONResponse
@@ -518,6 +525,7 @@ async def auth_logout(request):
 
 
 @mcp.custom_route("/auth/change-password", methods=["POST"])
+@guarded_http_mutation("dashboard_auth_change", methods=("POST",))
 async def auth_change_password(request):
     """Change dashboard password (requires current password)."""
     from starlette.responses import JSONResponse
@@ -966,6 +974,7 @@ def _load_emotion_timeline() -> list[dict]:
     return []
 
 
+@guarded_mutation("emotion_timeline_write")
 def _record_emotion_snapshot(valence: float, arousal: float, source: str) -> None:
     if not (0 <= valence <= 1 and 0 <= arousal <= 1):
         return
@@ -3841,6 +3850,7 @@ async def asset_browser_upload_status(upload_id: str) -> str:
 
 
 @mcp.custom_route("/rm/upload/{token}", methods=["GET", "POST"])
+@guarded_http_mutation("legacy_asset_browser_upload", methods=("POST",))
 async def asset_browser_upload_route(request):
     from starlette.responses import HTMLResponse, Response
 
@@ -4242,6 +4252,7 @@ async def _rm_persist_remember_me_upload(request, claim: dict) -> tuple[int, dic
         _rm_delete_upload_temp_path(temp_path)
 
 @mcp.custom_route("/rm/asset-upload/{token}", methods=["GET", "POST"])
+@guarded_http_mutation("remember_me_asset_upload", methods=("POST",))
 async def rm_asset_upload_route(request):
     from starlette.responses import HTMLResponse, Response
 
@@ -5651,6 +5662,7 @@ async def api_breath_debug(request):
 
 
 @mcp.custom_route("/api/assets", methods=["GET", "POST"])
+@guarded_http_mutation("dashboard_asset_create", methods=("POST",))
 async def api_assets(request):
     """List or create cleaned Remember-Me image assets for the Dashboard."""
     from starlette.responses import JSONResponse
@@ -5698,6 +5710,10 @@ async def api_assets(request):
         return JSONResponse({"error": "asset_list_failed"}, status_code=500)
 
 @mcp.custom_route("/api/assets/{asset_id}", methods=["GET", "PATCH", "DELETE"])
+@guarded_http_mutation(
+    "dashboard_asset_mutation",
+    methods=("PATCH", "DELETE"),
+)
 async def api_asset_detail(request):
     """Read, edit, or permanently delete one cleaned image asset."""
     from starlette.responses import JSONResponse
@@ -5871,6 +5887,7 @@ async def api_config_get(request):
 
 
 @mcp.custom_route("/api/config", methods=["POST"])
+@guarded_http_mutation("dashboard_config_write", methods=("POST",))
 async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
@@ -5990,6 +6007,7 @@ def _read_env_var(name: str) -> str:
     return ""
 
 
+@guarded_mutation("dashboard_env_write")
 def _write_env_var(name: str, value: str) -> None:
     """
     Idempotent upsert of `NAME=value` in project .env. Creates the file if missing.
@@ -6038,6 +6056,7 @@ async def api_host_vault_get(request):
 
 
 @mcp.custom_route("/api/host-vault", methods=["POST"])
+@guarded_http_mutation("dashboard_vault_write", methods=("POST",))
 async def api_host_vault_set(request):
     """
     Persist OMBRE_HOST_VAULT_DIR to the project .env file.
@@ -6080,6 +6099,7 @@ async def api_host_vault_set(request):
 # =============================================================
 
 @mcp.custom_route("/api/import/upload", methods=["POST"])
+@guarded_http_mutation("dashboard_import_start", methods=("POST",))
 async def api_import_upload(request):
     """Upload a conversation file and start import."""
     from starlette.responses import JSONResponse

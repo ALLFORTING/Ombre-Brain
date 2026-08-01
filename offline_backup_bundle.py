@@ -35,6 +35,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from maintenance_write_gate import FreezeLease, MaintenanceWriteCoordinator
+
 
 WORKSPACE_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
@@ -265,6 +267,74 @@ def capture_bundle(
     if remember_me_version != EXPECTED_REMEMBER_ME_VERSION:
         raise BackupBundleError("workspace_invalid")
     _validate_chunk_size(chunk_size)
+    return _capture_source_into_bundle(
+        workspace,
+        workspace.source_root,
+        recipient_public_key,
+        ob_commit_sha=ob_commit_sha,
+        remember_me_version=remember_me_version,
+        clock=clock,
+        chunk_size=chunk_size,
+    )
+
+
+def capture_external_source(
+    workspace_path: str | Path,
+    source_root: str | Path,
+    authorized_source_root: str | Path,
+    recipient_public_key: X25519PublicKey,
+    *,
+    coordinator: MaintenanceWriteCoordinator,
+    freeze_lease: FreezeLease,
+    ob_commit_sha: str,
+    remember_me_version: str = EXPECTED_REMEMBER_ME_VERSION,
+    clock: Callable[[], datetime] | None = None,
+    chunk_size: int = CHUNK_SIZE,
+) -> CaptureResult:
+    """Capture one explicitly authorized external root under a live freeze."""
+    workspace = load_backup_workspace(workspace_path)
+    coordinator.validate_lease(freeze_lease)
+    source = _validate_external_source(
+        workspace,
+        source_root,
+        authorized_source_root,
+    )
+    _validate_public_key(recipient_public_key)
+    if _GIT_SHA_PATTERN.fullmatch(ob_commit_sha) is None:
+        raise BackupBundleError("workspace_invalid")
+    if remember_me_version != EXPECTED_REMEMBER_ME_VERSION:
+        raise BackupBundleError("workspace_invalid")
+    _validate_chunk_size(chunk_size)
+    result = _capture_source_into_bundle(
+        workspace,
+        source,
+        recipient_public_key,
+        ob_commit_sha=ob_commit_sha,
+        remember_me_version=remember_me_version,
+        clock=clock,
+        chunk_size=chunk_size,
+    )
+    try:
+        coordinator.validate_lease(freeze_lease)
+    except BaseException:
+        try:
+            (workspace.bundles_root / result.bundle_name).unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            raise BackupBundleError("internal_error") from cleanup_exc
+        raise
+    return result
+
+
+def _capture_source_into_bundle(
+    workspace: BackupWorkspace,
+    source_root: Path,
+    recipient_public_key: X25519PublicKey,
+    *,
+    ob_commit_sha: str,
+    remember_me_version: str,
+    clock: Callable[[], datetime] | None,
+    chunk_size: int,
+) -> CaptureResult:
     bundle_id = secrets.token_hex(16)
     bundle_name = f"{bundle_id}{BUNDLE_SUFFIX}"
     final_bundle = workspace.bundles_root / bundle_name
@@ -278,18 +348,18 @@ def capture_bundle(
     staging_root.mkdir()
     try:
         initial_inventory = _inventory_source(
-            workspace.source_root,
+            source_root,
             chunk_size=chunk_size,
         )
         entries, exclusions = _capture_source(
-            workspace.source_root,
+            source_root,
             staging_root,
             initial_inventory,
             chunk_size=chunk_size,
         )
         try:
             final_inventory = _inventory_source(
-                workspace.source_root,
+                source_root,
                 chunk_size=chunk_size,
             )
         except BackupBundleError as exc:
@@ -304,6 +374,7 @@ def capture_bundle(
         created_at = _timestamp(clock)
         manifest = _build_manifest(
             workspace=workspace,
+            source_root=source_root,
             bundle_id=bundle_id,
             created_at=created_at,
             ob_commit_sha=ob_commit_sha,
@@ -883,6 +954,7 @@ def _snapshot_sqlite(
 def _build_manifest(
     *,
     workspace: BackupWorkspace,
+    source_root: Path | None = None,
     bundle_id: str,
     created_at: str,
     ob_commit_sha: str,
@@ -903,7 +975,7 @@ def _build_manifest(
         "capture_mode": CAPTURE_MODE,
         "encryption_profile": ENCRYPTION_PROFILE,
         "recipient_key_fingerprint": recipient_fingerprint,
-        "source_identity": _path_identity(workspace.source_root),
+        "source_identity": _path_identity(source_root or workspace.source_root),
         "entry_count": len(entries),
         "total_plaintext_bytes": sum(entry["size_bytes"] for entry in entries),
         "sqlite_snapshot_count": len(entries) - ordinary_count,
@@ -1476,6 +1548,45 @@ def _validate_workspace_paths(root: Path, roots: dict[str, Path]) -> None:
         for right in values[index + 1:]:
             if _is_within(left, right) or _is_within(right, left):
                 raise BackupBundleError("workspace_invalid")
+
+
+def _validate_external_source(
+    workspace: BackupWorkspace,
+    source_root: str | Path,
+    authorized_source_root: str | Path,
+) -> Path:
+    try:
+        candidate = Path(source_root)
+        authorized = Path(authorized_source_root)
+        if (
+            not candidate.is_absolute()
+            or not authorized.is_absolute()
+            or _path_contains_reparse_point(candidate)
+            or _path_contains_reparse_point(authorized)
+        ):
+            raise BackupBundleError("workspace_invalid")
+        source = candidate.resolve(strict=True)
+        expected = authorized.resolve(strict=True)
+        if source != expected or not source.is_dir():
+            raise BackupBundleError("workspace_invalid")
+        _validate_root_location(source)
+        workspace_roots = (
+            workspace.root,
+            workspace.bundles_root,
+            workspace.restored_root,
+            workspace.reports_root,
+            workspace.temp_root,
+        )
+        if any(
+            _is_within(source, root) or _is_within(root, source)
+            for root in workspace_roots
+        ):
+            raise BackupBundleError("workspace_invalid")
+        return source
+    except BackupBundleError:
+        raise
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise BackupBundleError("workspace_invalid") from exc
 
 
 def _validate_relative_path(value: Any) -> None:

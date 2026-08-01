@@ -14,6 +14,11 @@ import secrets
 import tempfile
 from typing import Any, Protocol
 
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+)
+
 from asset_store import AssetStoreError
 from remember_me.core import (
     AssetBlobVerificationResult,
@@ -484,6 +489,11 @@ class LegacyAssetImportAdapter:
         self._fixture_root = root
         self._legacy_root = legacy_root
         self._fixture_context = capability_context
+        self.write_coordinator = getattr(
+            legacy_store,
+            "write_coordinator",
+            DEFAULT_WRITE_COORDINATOR,
+        )
 
     def is_bound_to_legacy_store(
         self,
@@ -682,6 +692,7 @@ class LegacyAssetImportAdapter:
                 "rm_target_verification_internal_error"
             ) from exc
 
+    @guarded_mutation("remember_me_import")
     def import_asset(
         self,
         request: LegacyAssetImportRequest,

@@ -21,6 +21,11 @@ from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI
 
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+)
+
 logger = logging.getLogger("ombre_brain.embedding")
 
 _ERROR_TYPE_LIMIT = 80
@@ -52,7 +57,8 @@ class EmbeddingEngine:
     ???? + SQLite ???? + ?????
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, write_coordinator=None):
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
 
@@ -196,6 +202,7 @@ class EmbeddingEngine:
             "error_type": error_type,
         }
 
+    @guarded_mutation("bucket_embedding_store")
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         """Store embedding in SQLite."""
         from utils import now_iso
@@ -211,6 +218,7 @@ class EmbeddingEngine:
         conn.commit()
         conn.close()
 
+    @guarded_mutation("bucket_embedding_delete")
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted."""
         conn = sqlite3.connect(self.db_path)
