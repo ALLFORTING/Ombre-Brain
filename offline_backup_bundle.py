@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import closing
+from contextlib import closing, contextmanager
+import ctypes
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +19,7 @@ import shutil
 import sqlite3
 import stat
 import struct
+import sys
 import tarfile
 import tempfile
 import unicodedata
@@ -156,6 +159,23 @@ class CaptureResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class SourceInventoryRecord:
+    relative_path: str
+    item_type: str
+    exclusion_reason: str | None
+    collision_key: str
+    identity: tuple[int, int, int, int] | None
+    size_bytes: int | None
+    sha256: str | None
+
+
+@dataclass(frozen=True)
+class SourceInventory:
+    root_identity: tuple[int, int, int, int]
+    records: tuple[SourceInventoryRecord, ...]
+
+
 def prepare_backup_workspace(path: str | Path) -> BackupWorkspace:
     """Create the fixed offline workspace without copying source data."""
     root = _validate_prepare_root(path)
@@ -257,10 +277,29 @@ def capture_bundle(
     archive_path = operation_root / "payload.tar"
     staging_root.mkdir()
     try:
+        initial_inventory = _inventory_source(
+            workspace.source_root,
+            chunk_size=chunk_size,
+        )
         entries, exclusions = _capture_source(
             workspace.source_root,
             staging_root,
+            initial_inventory,
             chunk_size=chunk_size,
+        )
+        try:
+            final_inventory = _inventory_source(
+                workspace.source_root,
+                chunk_size=chunk_size,
+            )
+        except BackupBundleError as exc:
+            if exc.status == "source_unsupported":
+                raise BackupBundleError("source_changed") from exc
+            raise
+        _validate_capture_stability(
+            initial_inventory,
+            final_inventory,
+            entries,
         )
         created_at = _timestamp(clock)
         manifest = _build_manifest(
@@ -286,7 +325,7 @@ def capture_bundle(
             archive_path,
             final_bundle,
             recipient_public_key,
-            workspace_id=workspace.workspace_id,
+            capture_workspace_id=workspace.workspace_id,
             bundle_id=bundle_id,
             created_at=created_at,
             chunk_size=chunk_size,
@@ -307,10 +346,8 @@ def capture_bundle(
             exclusion_count=len(exclusions),
         )
     except BackupBundleError:
-        _remove_file(final_bundle)
         raise
     except Exception as exc:
-        _remove_file(final_bundle)
         raise BackupBundleError("internal_error") from exc
     finally:
         _safe_rmtree(workspace, operation_root)
@@ -324,14 +361,14 @@ def inspect_bundle(
     workspace = load_backup_workspace(workspace_path)
     bundle = _bundle_path(workspace, bundle_name)
     header, _, _, _ = _read_header(bundle)
-    if header["workspace_id"] != workspace.workspace_id:
-        raise BackupBundleError("bundle_invalid")
     return {
         "status": "success",
+        "authenticated": False,
+        "metadata_trust": "unverified_header",
         "container_version": header["container_version"],
         "bundle_format_version": header["bundle_format_version"],
         "bundle_id": header["bundle_id"],
-        "workspace_id": header["workspace_id"],
+        "capture_workspace_id": header["capture_workspace_id"],
         "created_at": header["created_at"],
         "encryption_profile": header["encryption_profile"],
         "recipient_key_fingerprint": header["recipient_key_fingerprint"],
@@ -361,7 +398,10 @@ def verify_bundle(
         )
         return {
             "status": "success",
+            "authenticated": True,
+            "metadata_trust": "authenticated_bundle",
             "bundle_id": result["manifest"]["bundle_id"],
+            "capture_workspace_id": result["manifest"]["capture_workspace_id"],
             "manifest_sha256": result["manifest"]["manifest_sha256"],
             "entry_count": result["manifest"]["entry_count"],
             "total_plaintext_bytes": result["manifest"]["total_plaintext_bytes"],
@@ -388,51 +428,40 @@ def restore_bundle(
     if _BUNDLE_ID_PATTERN.fullmatch(target_name) is None:
         raise BackupBundleError("restore_target_invalid")
     final_root = workspace.restored_root / target_name
-    target_existed = final_root.exists()
-    if target_existed:
-        if (
-            not final_root.is_dir()
-            or final_root.is_symlink()
-            or any(final_root.iterdir())
-        ):
+    with _exclusive_operation_lock(workspace, "restore"):
+        if final_root.exists():
             raise BackupBundleError("restore_target_invalid")
-    operation_root = Path(tempfile.mkdtemp(
-        prefix=f"restore-{target_name}-", dir=workspace.temp_root
-    ))
-    published = False
-    try:
-        result = _decrypt_and_validate(
-            workspace,
-            bundle,
-            recipient_private_key,
-            operation_root,
-            chunk_size=chunk_size,
-        )
-        staged_restore = result["restore_root"]
-        if target_existed:
-            final_root.rmdir()
+        operation_root = Path(tempfile.mkdtemp(
+            prefix=f"restore-{target_name}-", dir=workspace.temp_root
+        ))
         try:
-            os.replace(staged_restore, final_root)
-            published = True
-        except Exception:
-            if target_existed and not final_root.exists():
-                final_root.mkdir()
+            result = _decrypt_and_validate(
+                workspace,
+                bundle,
+                recipient_private_key,
+                operation_root,
+                chunk_size=chunk_size,
+            )
+            staged_restore = result["restore_root"]
+            _publish_directory_no_replace(staged_restore, final_root)
+            return {
+                "status": "success",
+                "authenticated": True,
+                "metadata_trust": "authenticated_bundle",
+                "bundle_id": result["manifest"]["bundle_id"],
+                "capture_workspace_id": result["manifest"][
+                    "capture_workspace_id"
+                ],
+                "manifest_sha256": result["manifest"]["manifest_sha256"],
+                "entry_count": result["manifest"]["entry_count"],
+                "restore_name": target_name,
+            }
+        except BackupBundleError:
             raise
-        return {
-            "status": "success",
-            "bundle_id": result["manifest"]["bundle_id"],
-            "manifest_sha256": result["manifest"]["manifest_sha256"],
-            "entry_count": result["manifest"]["entry_count"],
-            "restore_name": target_name,
-        }
-    except BackupBundleError:
-        raise
-    except Exception as exc:
-        raise BackupBundleError("restore_failed") from exc
-    finally:
-        if not published and target_existed and not final_root.exists():
-            final_root.mkdir()
-        _safe_rmtree(workspace, operation_root)
+        except Exception as exc:
+            raise BackupBundleError("restore_failed") from exc
+        finally:
+            _safe_rmtree(workspace, operation_root)
 
 
 def generate_test_keypair() -> tuple[X25519PrivateKey, X25519PublicKey]:
@@ -490,18 +519,27 @@ def load_public_key(path: str | Path) -> X25519PublicKey:
 def _capture_source(
     source_root: Path,
     staging_root: Path,
+    inventory: SourceInventory,
     *,
     chunk_size: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     entries: list[dict[str, Any]] = []
-    exclusions: list[dict[str, str]] = []
-    for path, relative, exclusion in _walk_source(source_root):
-        if exclusion:
-            exclusions.append({"relative_path": relative, "reason": exclusion})
+    exclusions = [
+        {
+            "relative_path": record.relative_path,
+            "reason": record.exclusion_reason,
+        }
+        for record in inventory.records
+        if record.exclusion_reason is not None
+    ]
+    for record in inventory.records:
+        if record.item_type not in {"regular", "sqlite"}:
             continue
+        relative = record.relative_path
+        path = source_root / Path(*PurePosixPath(relative).parts)
         destination = staging_root / Path(*PurePosixPath(relative).parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if _is_sqlite_path(path):
+        if record.item_type == "sqlite":
             evidence = _snapshot_sqlite(path, destination, chunk_size=chunk_size)
             entry = {
                 "relative_path": relative,
@@ -528,7 +566,23 @@ def _capture_source(
     return entries, exclusions
 
 
-def _walk_source(source_root: Path):
+def _inventory_source(
+    source_root: Path,
+    *,
+    chunk_size: int,
+) -> SourceInventory:
+    first = _scan_source_metadata(source_root)
+    first = _add_inventory_hashes(source_root, first, chunk_size=chunk_size)
+    second = _scan_source_metadata(source_root)
+    second = _add_inventory_hashes(source_root, second, chunk_size=chunk_size)
+    if first != second:
+        raise BackupBundleError("source_changed")
+    return second
+
+
+def _scan_source_metadata(source_root: Path) -> SourceInventory:
+    root_before = _file_identity(source_root)
+    records: list[SourceInventoryRecord] = []
     stack = [source_root]
     while stack:
         directory = stack.pop()
@@ -551,16 +605,140 @@ def _walk_source(source_root: Path):
                 raise BackupBundleError("source_unsupported")
             if stat.S_ISDIR(metadata.st_mode):
                 reason = _EXCLUDED_DIRECTORY_NAMES.get(child.name)
-                if reason:
-                    yield child, relative, reason
-                else:
+                records.append(SourceInventoryRecord(
+                    relative_path=relative,
+                    item_type="excluded_directory" if reason else "directory",
+                    exclusion_reason=reason,
+                    collision_key=_path_collision_key(relative),
+                    identity=_file_identity(child),
+                    size_bytes=None,
+                    sha256=None,
+                ))
+                if reason is None:
                     directories.append(child)
                 continue
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise BackupBundleError("source_unsupported")
             reason = _exclusion_reason(child.name)
-            yield child, relative, reason
+            lowered = child.name.casefold()
+            if lowered.endswith("-shm"):
+                item_type = "sqlite_coordination_sidecar"
+                identity = None
+            elif lowered.endswith(("-wal", "-journal")):
+                item_type = "sqlite_content_sidecar"
+                identity = _file_identity(child)
+            elif reason is not None:
+                item_type = "excluded_file"
+                identity = _file_identity(child)
+            elif _is_sqlite_path(child):
+                item_type = "sqlite"
+                identity = _file_identity(child)
+            else:
+                item_type = "regular"
+                identity = _file_identity(child)
+            records.append(SourceInventoryRecord(
+                relative_path=relative,
+                item_type=item_type,
+                exclusion_reason=reason,
+                collision_key=_path_collision_key(relative),
+                identity=identity,
+                size_bytes=None,
+                sha256=None,
+            ))
         stack.extend(reversed(directories))
+    root_after = _file_identity(source_root)
+    if root_before != root_after:
+        raise BackupBundleError("source_changed")
+    records.sort(key=lambda record: record.relative_path)
+    collision_keys = [record.collision_key for record in records]
+    if len(collision_keys) != len(set(collision_keys)):
+        raise BackupBundleError("source_unsupported")
+    return SourceInventory(root_identity=root_after, records=tuple(records))
+
+
+def _add_inventory_hashes(
+    source_root: Path,
+    inventory: SourceInventory,
+    *,
+    chunk_size: int,
+) -> SourceInventory:
+    records: list[SourceInventoryRecord] = []
+    for record in inventory.records:
+        if record.item_type not in {
+            "regular",
+            "sqlite",
+            "sqlite_content_sidecar",
+        }:
+            records.append(record)
+            continue
+        path = source_root / Path(*PurePosixPath(record.relative_path).parts)
+        identity, size, digest = _stable_source_file_evidence(
+            path,
+            chunk_size=chunk_size,
+        )
+        if identity != record.identity:
+            raise BackupBundleError("source_changed")
+        records.append(SourceInventoryRecord(
+            relative_path=record.relative_path,
+            item_type=record.item_type,
+            exclusion_reason=record.exclusion_reason,
+            collision_key=record.collision_key,
+            identity=identity,
+            size_bytes=size,
+            sha256=digest,
+        ))
+    if _file_identity(source_root) != inventory.root_identity:
+        raise BackupBundleError("source_changed")
+    return SourceInventory(
+        root_identity=inventory.root_identity,
+        records=tuple(records),
+    )
+
+
+def _validate_capture_stability(
+    initial: SourceInventory,
+    final: SourceInventory,
+    entries: list[dict[str, Any]],
+) -> None:
+    if initial != final:
+        raise BackupBundleError("source_changed")
+    captured = {
+        entry["relative_path"]: entry
+        for entry in entries
+    }
+    expected_paths = {
+        record.relative_path
+        for record in final.records
+        if record.item_type in {"regular", "sqlite"}
+    }
+    if set(captured) != expected_paths:
+        raise BackupBundleError("source_changed")
+    for record in final.records:
+        if record.item_type != "regular":
+            continue
+        entry = captured[record.relative_path]
+        if (
+            entry["entry_type"] != "regular"
+            or entry["size_bytes"] != record.size_bytes
+            or entry["sha256"] != record.sha256
+        ):
+            raise BackupBundleError("source_changed")
+
+
+def _stable_source_file_evidence(
+    path: Path,
+    *,
+    chunk_size: int,
+) -> tuple[tuple[int, int, int, int], int, str]:
+    before = _file_identity(path)
+    try:
+        size, digest = _hash_file(path, chunk_size=chunk_size)
+    except BackupBundleError as exc:
+        raise BackupBundleError("source_changed") from exc
+    after = _file_identity(path)
+    if before != after or size != after[2]:
+        raise BackupBundleError("source_changed")
+    return after, size, digest
 
 
 def _exclusion_reason(name: str) -> str | None:
@@ -630,7 +808,7 @@ def _snapshot_sqlite(
     *,
     chunk_size: int,
 ) -> dict[str, Any]:
-    before = _sqlite_source_signature(source)
+    before = _sqlite_content_signature(source, chunk_size=chunk_size)
     try:
         source_connection = sqlite3.connect(
             f"{source.as_uri()}?mode=ro", uri=True, timeout=5
@@ -655,7 +833,7 @@ def _snapshot_sqlite(
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         raise BackupBundleError("sqlite_snapshot_failed") from exc
-    after = _sqlite_source_signature(source)
+    after = _sqlite_content_signature(source, chunk_size=chunk_size)
     if before != after or data_version_before != data_version_after:
         raise BackupBundleError("source_changed")
     if any(
@@ -718,7 +896,7 @@ def _build_manifest(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "bundle_format_version": BUNDLE_FORMAT_VERSION,
         "bundle_id": bundle_id,
-        "workspace_id": workspace.workspace_id,
+        "capture_workspace_id": workspace.workspace_id,
         "created_at": created_at,
         "ob_commit_sha": ob_commit_sha,
         "remember_me_version": remember_me_version,
@@ -785,7 +963,7 @@ def _encrypt_archive(
     final_bundle: Path,
     recipient_public_key: X25519PublicKey,
     *,
-    workspace_id: str,
+    capture_workspace_id: str,
     bundle_id: str,
     created_at: str,
     chunk_size: int,
@@ -800,7 +978,7 @@ def _encrypt_archive(
         "container_version": CONTAINER_VERSION,
         "bundle_format_version": BUNDLE_FORMAT_VERSION,
         "bundle_id": bundle_id,
-        "workspace_id": workspace_id,
+        "capture_workspace_id": capture_workspace_id,
         "created_at": created_at,
         "encryption_profile": ENCRYPTION_PROFILE,
         "recipient_key_fingerprint": _public_key_fingerprint(recipient_public_key),
@@ -836,8 +1014,7 @@ def _encrypt_archive(
             writer.write(encryptor.tag)
             writer.flush()
             os.fsync(writer.fileno())
-        os.replace(temporary, final_bundle)
-        _fsync_directory(final_bundle.parent)
+        _publish_file_no_replace(temporary, final_bundle)
     except BackupBundleError:
         raise
     except Exception as exc:
@@ -857,8 +1034,6 @@ def _decrypt_and_validate(
     archive_path = operation_root / "payload.tar"
     restore_root = operation_root / "restored"
     header, header_bytes, ciphertext_offset, ciphertext_size = _read_header(bundle)
-    if header["workspace_id"] != workspace.workspace_id:
-        raise BackupBundleError("bundle_invalid")
     expected_fingerprint = _public_key_fingerprint(
         recipient_private_key.public_key()
     )
@@ -916,9 +1091,15 @@ def _decrypt_and_validate(
     manifest = _validate_and_extract_archive(
         archive_path, restore_root, chunk_size=chunk_size
     )
-    if manifest["bundle_id"] != header["bundle_id"]:
-        raise BackupBundleError("manifest_invalid")
-    if manifest["workspace_id"] != workspace.workspace_id:
+    matching_fields = (
+        "bundle_format_version",
+        "bundle_id",
+        "capture_workspace_id",
+        "created_at",
+        "encryption_profile",
+        "recipient_key_fingerprint",
+    )
+    if any(manifest[field] != header[field] for field in matching_fields):
         raise BackupBundleError("manifest_invalid")
     if manifest["recipient_key_fingerprint"] != expected_fingerprint:
         raise BackupBundleError("manifest_invalid")
@@ -956,7 +1137,7 @@ def _read_header(bundle: Path) -> tuple[dict[str, Any], bytes, int, int]:
 def _validate_header(header: Any, raw: bytes) -> None:
     expected_keys = {
         "container_version", "bundle_format_version", "bundle_id",
-        "workspace_id", "created_at", "encryption_profile",
+        "capture_workspace_id", "created_at", "encryption_profile",
         "recipient_key_fingerprint", "ephemeral_public_key", "hkdf_salt",
         "wrap_nonce", "payload_nonce", "wrapped_content_key",
     }
@@ -969,7 +1150,9 @@ def _validate_header(header: Any, raw: bytes) -> None:
         or header["bundle_format_version"] != BUNDLE_FORMAT_VERSION
         or header["encryption_profile"] != ENCRYPTION_PROFILE
         or _BUNDLE_ID_PATTERN.fullmatch(str(header["bundle_id"])) is None
-        or _WORKSPACE_ID_PATTERN.fullmatch(str(header["workspace_id"])) is None
+        or _WORKSPACE_ID_PATTERN.fullmatch(
+            str(header["capture_workspace_id"])
+        ) is None
         or not _is_utc_timestamp(header["created_at"])
         or not isinstance(header["recipient_key_fingerprint"], str)
         or _SHA256_PATTERN.fullmatch(
@@ -1083,7 +1266,8 @@ def _validate_manifest(raw: bytes) -> dict[str, Any]:
     if not isinstance(manifest, dict) or raw != _canonical_json_bytes(manifest):
         raise BackupBundleError("manifest_invalid")
     required = {
-        "schema_version", "bundle_format_version", "bundle_id", "workspace_id",
+        "schema_version", "bundle_format_version", "bundle_id",
+        "capture_workspace_id",
         "created_at", "ob_commit_sha", "remember_me_version", "capture_mode",
         "encryption_profile", "recipient_key_fingerprint", "source_identity",
         "entry_count", "total_plaintext_bytes", "sqlite_snapshot_count",
@@ -1104,7 +1288,9 @@ def _validate_manifest(raw: bytes) -> dict[str, Any]:
         or manifest["encryption_profile"] != ENCRYPTION_PROFILE
         or manifest["remember_me_version"] != EXPECTED_REMEMBER_ME_VERSION
         or _BUNDLE_ID_PATTERN.fullmatch(str(manifest["bundle_id"])) is None
-        or _WORKSPACE_ID_PATTERN.fullmatch(str(manifest["workspace_id"])) is None
+        or _WORKSPACE_ID_PATTERN.fullmatch(
+            str(manifest["capture_workspace_id"])
+        ) is None
         or _GIT_SHA_PATTERN.fullmatch(str(manifest["ob_commit_sha"])) is None
         or not _is_utc_timestamp(manifest["created_at"])
         or not isinstance(manifest["recipient_key_fingerprint"], str)
@@ -1340,11 +1526,21 @@ def _file_identity(path: Path) -> tuple[int, int, int, int]:
     return (int(value.st_dev), int(value.st_ino), int(value.st_size), int(value.st_mtime_ns))
 
 
-def _sqlite_source_signature(path: Path) -> tuple[Any, ...]:
-    signature: list[Any] = [_file_identity(path)]
-    for suffix in ("-wal", "-shm", "-journal"):
+def _sqlite_content_signature(
+    path: Path,
+    *,
+    chunk_size: int,
+) -> tuple[Any, ...]:
+    signature: list[Any] = [
+        _stable_source_file_evidence(path, chunk_size=chunk_size)
+    ]
+    for suffix in ("-wal", "-journal"):
         sidecar = Path(str(path) + suffix)
-        signature.append(_file_identity(sidecar) if sidecar.exists() else None)
+        signature.append(
+            _stable_source_file_evidence(sidecar, chunk_size=chunk_size)
+            if sidecar.exists()
+            else None
+        )
     return tuple(signature)
 
 
@@ -1476,6 +1672,120 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     except Exception:
         _remove_file(temporary)
         raise
+
+
+def _publish_file_no_replace(temporary: Path, destination: Path) -> None:
+    if temporary.parent != destination.parent:
+        raise BackupBundleError("bundle_invalid")
+    published = False
+    try:
+        os.link(temporary, destination)
+        published = True
+        _fsync_file(destination)
+        _fsync_directory(destination.parent)
+    except FileExistsError as exc:
+        raise BackupBundleError("bundle_invalid") from exc
+    except BackupBundleError:
+        raise
+    except OSError as exc:
+        if published:
+            try:
+                destination.unlink()
+            except OSError as cleanup_exc:
+                raise BackupBundleError("internal_error") from cleanup_exc
+        raise BackupBundleError("bundle_invalid") from exc
+
+
+@contextmanager
+def _exclusive_operation_lock(workspace: BackupWorkspace, operation: str):
+    lock_path = workspace.temp_root / f".{operation}-operation.lock"
+    try:
+        handle = lock_path.open("xb")
+    except FileExistsError as exc:
+        raise BackupBundleError("restore_target_invalid") from exc
+    except OSError as exc:
+        raise BackupBundleError("internal_error") from exc
+    try:
+        yield
+    finally:
+        handle.close()
+        _remove_file(lock_path)
+
+
+def _publish_directory_no_replace(source: Path, destination: Path) -> None:
+    if destination.exists():
+        raise BackupBundleError("restore_target_invalid")
+    published = False
+    try:
+        if source.stat().st_dev != destination.parent.stat().st_dev:
+            raise BackupBundleError("restore_failed")
+        if os.name == "nt":
+            os.rename(source, destination)
+        elif sys.platform.startswith("linux"):
+            _linux_rename_no_replace(source, destination)
+        elif sys.platform == "darwin":
+            _darwin_rename_no_replace(source, destination)
+        else:
+            raise BackupBundleError("restore_failed")
+        published = True
+        _fsync_directory(destination.parent)
+    except FileExistsError as exc:
+        raise BackupBundleError("restore_target_invalid") from exc
+    except BackupBundleError:
+        raise
+    except OSError as exc:
+        if published:
+            try:
+                shutil.rmtree(destination)
+            except OSError as cleanup_exc:
+                raise BackupBundleError("internal_error") from cleanup_exc
+        raise BackupBundleError("restore_failed") from exc
+
+
+def _linux_rename_no_replace(source: Path, destination: Path) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = library.renameat2
+    except AttributeError as exc:
+        raise BackupBundleError("restore_failed") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, "destination exists")
+        raise OSError(error, "exclusive directory publication failed")
+
+
+def _darwin_rename_no_replace(source: Path, destination: Path) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        renamex_np = library.renamex_np
+    except AttributeError as exc:
+        raise BackupBundleError("restore_failed") from exc
+    renamex_np.argtypes = (
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renamex_np.restype = ctypes.c_int
+    if renamex_np(os.fsencode(source), os.fsencode(destination), 4) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, "destination exists")
+        raise OSError(error, "exclusive directory publication failed")
 
 
 def _fsync_file(path: Path) -> None:

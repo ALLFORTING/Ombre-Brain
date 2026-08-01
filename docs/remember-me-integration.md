@@ -280,17 +280,32 @@ Every later operation canonicalizes those roots and rejects overlap,
 symlink/junction escape, unsafe archive paths, path collisions, unsupported
 file types, and credential material. There is no force or skip-safety mode.
 Restore always authenticates and verifies into a temporary isolated directory
-before atomically publishing a new workspace-local restored root.
+before exclusively publishing a new workspace-local restored root. Existing
+bundle names and restore targets, including empty restore directories, are
+never overwritten. Bundle files use same-filesystem atomic hard-link
+publication, and compliant restores are serialized by a workspace-local
+operation lock before a platform no-replace directory rename.
 
-Regular files and blobs are copied with streaming hashes, stable file-identity
-checks, and a second source hash. Recognized SQLite stores are captured through
-the SQLite online backup API from a `mode=ro`, `query_only` connection. The
-snapshot receives a read-only integrity check plus page, schema, size, and hash
-evidence. SQLite WAL, SHM, and journal sidecars are excluded from the archive;
-committed WAL transactions are represented by the online snapshot rather than
-restored as sidecar files. Authentication files, backup state, temporary files,
-locks, and private-key material are explicitly excluded with stable reason
-codes instead of being silently ignored.
+Capture records a complete initial source inventory before copying and a
+complete final inventory before building the manifest or archive. Both
+inventories are self-checked and must agree on every path, type, exclusion
+classification, collision key, stable identity, size, and applicable digest.
+Regular staging entries must still equal the final source size and hash. This
+detects later changes to early files, additions, deletion, rename, replacement,
+type changes, exclusion changes, and SQLite/WAL changes after snapshot.
+
+Regular files and blobs are copied with streaming hashes and stable
+file-identity checks. Recognized SQLite stores are captured through the SQLite
+online backup API from a `mode=ro`, `query_only` connection. The snapshot
+receives a read-only integrity check plus page, schema, size, and hash evidence.
+SQLite main files and content-bearing WAL or journal sidecars participate in
+the stable inventory. SHM is treated as non-restored coordination state, so
+read-only lock-byte activity does not create a false content mismatch. WAL,
+SHM, and journal sidecars are excluded from the archive; committed WAL
+transactions are represented by the online snapshot rather than restored as
+sidecar files. Authentication files, backup state, temporary files, locks, and
+private-key material are explicitly excluded with stable reason codes instead
+of being silently ignored.
 
 The canonical manifest records only relative paths, categories, aggregate
 counts, hashes, SQLite structural evidence, version identities, and stable
@@ -299,6 +314,15 @@ paths, credentials, private keys, or raw exception text. The deterministic tar
 payload contains regular members only. Extraction is manual and validates every
 member, digest, size, collision boundary, and SQLite snapshot.
 
+`capture_workspace_id` records the workspace that produced the encrypted
+bundle. It is provenance, not authorization for a local path and not a binding
+to the verification machine. A single `.obbackup` file and its correct private
+key can be moved into the `bundles` directory of another valid isolated backup
+workspace for inspect, verify, and restore. The capture workspace marker and
+manifest are not companion restore files. `source_identity` remains an
+irreversible capture-source identity and is never compared with a local restore
+source path.
+
 Every bundle uses a fresh 256-bit content key. An ephemeral X25519 exchange and
 HKDF-SHA256 derive the key-encryption key, AEAD wraps the content key, and
 AES-256-GCM streams and authenticates the archive with the canonical public
@@ -306,23 +330,29 @@ header as associated data. There is no unencrypted mode, passphrase argument,
 authentication bypass, or recovery mode. Recipient private keys remain outside
 bundles, reports, logs, Render, and source control.
 
-`inspect` reads only non-sensitive public header metadata and needs no private
-key. `verify` fully authenticates, decrypts, and checks the archive without
-publishing restored data. Wrong keys and changes to the header, wrapped key,
-ciphertext, tag, length, manifest, or archive structure fail closed. Temporary
-plaintext and failed outputs are removed, while completed bundles and restored
-roots are published with atomic replacement.
+`inspect` reads only the canonical public container header and needs no private
+key. Its successful output is explicitly `authenticated: false` with
+`metadata_trust: unverified_header`: it proves only that framing and header
+syntax can be parsed. It does not establish that header metadata is truthful or
+that ciphertext, manifest, or payload is intact. Only successful `verify` or
+`restore` returns `authenticated: true` and
+`metadata_trust: authenticated_bundle` after full AEAD, manifest, hash, archive,
+SQLite, and header/manifest provenance checks. Wrong keys and changes to the
+header, wrapped key, ciphertext, tag, length, manifest, or archive structure
+fail closed. Temporary plaintext and failed outputs are removed.
 
-This core can prove that an individual ordinary file did not observably change
-during its capture and that each SQLite snapshot is internally consistent. It
-does not provide a cross-file production point-in-time guarantee. A future
+This core can prove that the initial and final whole-source inventories did not
+observably change during capture and that each SQLite snapshot is internally
+consistent. Inventory comparison is still not an application writer freeze and
+does not provide a production point-in-time guarantee. A future
 production-copy capture still requires a separately approved application-level
 writer freeze and maintenance capability. Render disk snapshots remain an
 independent rollback layer. This stage does not implement retention, restore
-workflow automation, production backup acquisition, production-copy rehearsal,
-migration, Reindex, deployment, or cutover. The 51 historical Git backups remain
-untouched; any history cleanup requires separate approval after a new backup
-chain and restore procedure are proven.
+workflow automation, production endpoint integration, object storage,
+production backup acquisition, production-copy rehearsal, migration, Reindex,
+deployment, or cutover. The 51 historical Git backups remain untouched; any
+history cleanup requires separate approval after a new backup chain and restore
+procedure are proven.
 
 ## Compatibility evidence
 

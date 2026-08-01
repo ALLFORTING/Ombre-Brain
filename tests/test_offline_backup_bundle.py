@@ -1,4 +1,5 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ import sqlite3
 import struct
 import sys
 import tarfile
+import threading
 
 import pytest
 
@@ -110,7 +112,7 @@ def _encrypted_malicious_archive(workspace, public_key, members):
         archive_path,
         destination,
         public_key,
-        workspace_id=workspace.workspace_id,
+        capture_workspace_id=workspace.workspace_id,
         bundle_id=bundle_id,
         created_at="2026-08-01T00:00:00.000000+00:00",
         chunk_size=4096,
@@ -189,19 +191,26 @@ def test_empty_source_capture_verify_restore_and_inspect_are_safe(tmp_path):
     assert before == after
     assert inspection == {
         "status": "success",
+        "authenticated": False,
+        "metadata_trust": "unverified_header",
         "container_version": 1,
         "bundle_format_version": 1,
         "bundle_id": result.bundle_id,
-        "workspace_id": workspace.workspace_id,
+        "capture_workspace_id": workspace.workspace_id,
         "created_at": inspection["created_at"],
         "encryption_profile": bundle.ENCRYPTION_PROFILE,
         "recipient_key_fingerprint": inspection["recipient_key_fingerprint"],
     }
     assert bundle_path.read_bytes().startswith(MAGIC)
-    assert verify_bundle(workspace.root, result.bundle_name, private_key)["entry_count"] == 0
+    verified = verify_bundle(workspace.root, result.bundle_name, private_key)
+    assert verified["entry_count"] == 0
+    assert verified["authenticated"] is True
+    assert verified["metadata_trust"] == "authenticated_bundle"
     assert not any(workspace.restored_root.iterdir())
     restored = restore_bundle(workspace.root, result.bundle_name, private_key)
     assert restored["entry_count"] == 0
+    assert restored["authenticated"] is True
+    assert restored["metadata_trust"] == "authenticated_bundle"
     assert (workspace.restored_root / result.bundle_id).is_dir()
 
 
@@ -359,14 +368,29 @@ def test_atomic_bundle_publish_failure_leaves_no_formal_bundle(tmp_path, monkeyp
     workspace = _workspace(tmp_path)
     (workspace.source_root / "file").write_bytes(b"payload")
     _, public_key = generate_test_keypair()
-    original = bundle.os.replace
+    original = bundle.os.link
 
     def fail_bundle_publish(source, destination):
         if str(destination).endswith(BUNDLE_SUFFIX):
             raise OSError("synthetic path detail")
         return original(source, destination)
 
-    monkeypatch.setattr(bundle.os, "replace", fail_bundle_publish)
+    monkeypatch.setattr(bundle.os, "link", fail_bundle_publish)
+    with pytest.raises(BackupBundleError, match="bundle_invalid"):
+        _capture(workspace, public_key)
+    assert not list(workspace.bundles_root.iterdir())
+    assert not list(workspace.temp_root.iterdir())
+
+
+def test_bundle_fsync_failure_removes_just_published_bundle(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    (workspace.source_root / "file").write_bytes(b"payload")
+    _, public_key = generate_test_keypair()
+
+    def fail_directory_fsync(path):
+        raise OSError("synthetic fsync failure")
+
+    monkeypatch.setattr(bundle, "_fsync_directory", fail_directory_fsync)
     with pytest.raises(BackupBundleError, match="bundle_invalid"):
         _capture(workspace, public_key)
     assert not list(workspace.bundles_root.iterdir())
@@ -545,7 +569,7 @@ def test_duplicate_and_case_colliding_archive_paths_fail_closed(tmp_path):
         (workspace.bundles_root / name).unlink()
 
 
-def test_restore_rejects_nonempty_target_and_preserves_it(tmp_path):
+def test_restore_rejects_any_existing_target_and_preserves_it(tmp_path):
     workspace = _workspace(tmp_path)
     private_key, public_key = generate_test_keypair()
     (workspace.source_root / "file").write_bytes(b"payload")
@@ -562,9 +586,20 @@ def test_restore_rejects_nonempty_target_and_preserves_it(tmp_path):
             restore_name="b" * 32,
         )
     assert existing.read_bytes() == b"unchanged"
+    empty_name = "c" * 32
+    empty = workspace.restored_root / empty_name
+    empty.mkdir()
+    with pytest.raises(BackupBundleError, match="restore_target_invalid"):
+        restore_bundle(
+            workspace.root,
+            result.bundle_name,
+            private_key,
+            restore_name=empty_name,
+        )
+    assert empty.is_dir() and not any(empty.iterdir())
 
 
-def test_restore_publish_failure_preserves_empty_target_and_cleans_plaintext(
+def test_restore_publish_failure_leaves_no_target_and_cleans_plaintext(
     tmp_path, monkeypatch
 ):
     workspace = _workspace(tmp_path)
@@ -573,15 +608,11 @@ def test_restore_publish_failure_preserves_empty_target_and_cleans_plaintext(
     result = _capture(workspace, public_key)
     target_name = "b" * 32
     target = workspace.restored_root / target_name
-    target.mkdir()
-    original = bundle.os.replace
 
     def fail_restore(source, destination):
-        if Path(destination) == target:
-            raise OSError("synthetic private path")
-        return original(source, destination)
+        raise OSError("synthetic private path")
 
-    monkeypatch.setattr(bundle.os, "replace", fail_restore)
+    monkeypatch.setattr(bundle, "_publish_directory_no_replace", fail_restore)
     with pytest.raises(BackupBundleError, match="restore_failed"):
         restore_bundle(
             workspace.root,
@@ -589,7 +620,23 @@ def test_restore_publish_failure_preserves_empty_target_and_cleans_plaintext(
             private_key,
             restore_name=target_name,
         )
-    assert target.is_dir() and not any(target.iterdir())
+    assert not target.exists()
+    assert not list(workspace.temp_root.iterdir())
+
+
+def test_restore_fsync_failure_removes_just_published_target(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    (workspace.source_root / "file").write_bytes(b"payload")
+    result = _capture(workspace, public_key)
+
+    def fail_directory_fsync(path):
+        raise OSError("synthetic fsync failure")
+
+    monkeypatch.setattr(bundle, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(BackupBundleError, match="restore_failed"):
+        restore_bundle(workspace.root, result.bundle_name, private_key)
+    assert not (workspace.restored_root / result.bundle_id).exists()
     assert not list(workspace.temp_root.iterdir())
 
 
@@ -603,17 +650,317 @@ def test_verify_never_publishes_and_cleans_temporary_plaintext(tmp_path):
     assert not list(workspace.temp_root.iterdir())
 
 
-def test_cross_workspace_bundle_is_rejected_by_inspect_and_verify(tmp_path):
+def test_bundle_is_portable_across_isolated_workspaces(tmp_path):
+    first = prepare_backup_workspace(tmp_path / "first")
+    second = prepare_backup_workspace(tmp_path / "second")
+    private_key, public_key = generate_test_keypair()
+    (first.source_root / "bucket.bin").write_bytes(b"portable synthetic bytes")
+    result = _capture(first, public_key)
+    copied = second.bundles_root / result.bundle_name
+    copied.write_bytes((first.bundles_root / result.bundle_name).read_bytes())
+    inspection = inspect_bundle(second.root, result.bundle_name)
+    assert inspection["capture_workspace_id"] == first.workspace_id
+    assert inspection["authenticated"] is False
+    verified = verify_bundle(second.root, result.bundle_name, private_key)
+    assert verified["capture_workspace_id"] == first.workspace_id
+    assert verified["authenticated"] is True
+    restored = restore_bundle(second.root, result.bundle_name, private_key)
+    assert restored["capture_workspace_id"] == first.workspace_id
+    assert restored["authenticated"] is True
+    assert (
+        second.restored_root / result.bundle_id / "bucket.bin"
+    ).read_bytes() == b"portable synthetic bytes"
+
+
+def test_portable_bundle_still_requires_valid_local_workspace(tmp_path):
     first = prepare_backup_workspace(tmp_path / "first")
     second = prepare_backup_workspace(tmp_path / "second")
     private_key, public_key = generate_test_keypair()
     result = _capture(first, public_key)
-    copied = second.bundles_root / result.bundle_name
-    copied.write_bytes((first.bundles_root / result.bundle_name).read_bytes())
+    (second.bundles_root / result.bundle_name).write_bytes(
+        (first.bundles_root / result.bundle_name).read_bytes()
+    )
+    marker = json.loads((second.root / bundle.WORKSPACE_MARKER).read_text())
+    marker["nonce"] = "0" * 64
+    (second.root / bundle.WORKSPACE_MARKER).write_text(json.dumps(marker))
+    operations = (
+        lambda: inspect_bundle(second.root, result.bundle_name),
+        lambda: verify_bundle(second.root, result.bundle_name, private_key),
+        lambda: restore_bundle(second.root, result.bundle_name, private_key),
+    )
+    for operation in operations:
+        with pytest.raises(BackupBundleError, match="workspace_invalid"):
+            operation()
+
+
+def test_bundle_cannot_be_read_from_outside_workspace_bundles(tmp_path):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    result = _capture(workspace, public_key)
+    outside = tmp_path / result.bundle_name
+    outside.write_bytes((workspace.bundles_root / result.bundle_name).read_bytes())
+    for operation in (
+        lambda: inspect_bundle(workspace.root, str(outside)),
+        lambda: verify_bundle(workspace.root, str(outside), private_key),
+        lambda: restore_bundle(workspace.root, str(outside), private_key),
+    ):
+        with pytest.raises(BackupBundleError, match="bundle_invalid"):
+            operation()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("bundle_format_version", 2),
+        ("bundle_id", "b" * 32),
+        ("capture_workspace_id", "b" * 32),
+        ("created_at", "2026-08-01T00:00:01.000000+00:00"),
+        ("encryption_profile", "invalid-profile"),
+        ("recipient_key_fingerprint", "x25519-sha256:" + "0" * 64),
+    ],
+)
+def test_header_manifest_identity_mismatch_is_rejected(tmp_path, field, value):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    manifest = bundle._build_manifest(
+        workspace=workspace,
+        bundle_id="a" * 32,
+        created_at="2026-08-01T00:00:00.000000+00:00",
+        ob_commit_sha=BASE_SHA,
+        remember_me_version=bundle.EXPECTED_REMEMBER_ME_VERSION,
+        recipient_fingerprint=bundle._public_key_fingerprint(public_key),
+        entries=[],
+        exclusions=[],
+    )
+    manifest[field] = value
+    manifest = _recompute_manifest_digest(manifest)
+    name = _encrypted_malicious_archive(
+        workspace,
+        public_key,
+        [
+            (
+                _regular_info("manifest.json"),
+                bundle._canonical_json_bytes(manifest),
+            )
+        ],
+    )
+    with pytest.raises(BackupBundleError, match="manifest_invalid"):
+        verify_bundle(workspace.root, name, private_key)
+
+
+def test_syntactically_modified_header_is_untrusted_until_verify(tmp_path):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    result = _capture(workspace, public_key)
+    path = workspace.bundles_root / result.bundle_name
+
+    def modify_created_at(raw, header_start, header_length, payload_start):
+        del payload_start
+        header = json.loads(bytes(raw[header_start:header_start + header_length]))
+        old = header["created_at"]
+        position = old.index("+") - 1
+        replacement = "1" if old[position] != "1" else "2"
+        header["created_at"] = old[:position] + replacement + old[position + 1:]
+        encoded = bundle._canonical_json_bytes(header)
+        assert len(encoded) == header_length
+        raw[header_start:header_start + header_length] = encoded
+
+    _mutate_bundle(path, modify_created_at)
+    inspection = inspect_bundle(workspace.root, result.bundle_name)
+    assert inspection["status"] == "success"
+    assert inspection["authenticated"] is False
+    assert inspection["metadata_trust"] == "unverified_header"
+    with pytest.raises(BackupBundleError, match="authentication_failed"):
+        verify_bundle(workspace.root, result.bundle_name, private_key)
+
+
+def test_early_file_change_during_later_capture_is_detected(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    first = workspace.source_root / "a.bin"
+    second = workspace.source_root / "b.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    _, public_key = generate_test_keypair()
+    original = bundle._copy_regular_file_stable
+
+    def copy_then_change(source, destination, *, chunk_size):
+        result = original(source, destination, chunk_size=chunk_size)
+        if source == second:
+            first.write_bytes(b"changed after its copy")
+        return result
+
+    monkeypatch.setattr(bundle, "_copy_regular_file_stable", copy_then_change)
+    with pytest.raises(BackupBundleError, match="source_changed"):
+        _capture(workspace, public_key)
+    assert not list(workspace.bundles_root.iterdir())
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["add", "delete", "rename", "excluded_add", "excluded_delete", "type"],
+)
+def test_final_inventory_rejects_whole_source_structure_changes(
+    tmp_path, monkeypatch, change
+):
+    workspace = _workspace(tmp_path)
+    source = workspace.source_root / "source.bin"
+    source.write_bytes(b"source")
+    excluded = workspace.source_root / "secret.pem"
+    if change == "excluded_delete":
+        excluded.write_bytes(b"synthetic excluded")
+    _, public_key = generate_test_keypair()
+    original = bundle._capture_source
+
+    def capture_then_change(source_root, staging_root, inventory, *, chunk_size):
+        result = original(
+            source_root,
+            staging_root,
+            inventory,
+            chunk_size=chunk_size,
+        )
+        if change == "add":
+            (source_root / "added.bin").write_bytes(b"added")
+        elif change == "delete":
+            source.unlink()
+        elif change == "rename":
+            source.rename(source_root / "renamed.bin")
+        elif change == "excluded_add":
+            excluded.write_bytes(b"synthetic excluded")
+        elif change == "excluded_delete":
+            excluded.unlink()
+        else:
+            source.unlink()
+            source.mkdir()
+        return result
+
+    monkeypatch.setattr(bundle, "_capture_source", capture_then_change)
+    with pytest.raises(BackupBundleError, match="source_changed"):
+        _capture(workspace, public_key)
+    assert not list(workspace.bundles_root.iterdir())
+
+
+def test_sqlite_commit_after_snapshot_before_final_inventory_is_detected(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    database = workspace.source_root / "assets.sqlite3"
+    writer = _sqlite(database, wal=True)
+    _, public_key = generate_test_keypair()
+    original = bundle._capture_source
+
+    def capture_then_commit(source_root, staging_root, inventory, *, chunk_size):
+        result = original(
+            source_root,
+            staging_root,
+            inventory,
+            chunk_size=chunk_size,
+        )
+        writer.execute("INSERT INTO items(value) VALUES (?)", (b"late",))
+        writer.commit()
+        return result
+
+    monkeypatch.setattr(bundle, "_capture_source", capture_then_commit)
+    try:
+        with pytest.raises(BackupBundleError, match="source_changed"):
+            _capture(workspace, public_key)
+    finally:
+        writer.close()
+    assert not list(workspace.bundles_root.iterdir())
+
+
+def test_wal_appearance_after_snapshot_is_detected(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    database = workspace.source_root / "assets.sqlite3"
+    _sqlite(database).close()
+    _, public_key = generate_test_keypair()
+    original = bundle._capture_source
+
+    def capture_then_add_wal(source_root, staging_root, inventory, *, chunk_size):
+        result = original(
+            source_root,
+            staging_root,
+            inventory,
+            chunk_size=chunk_size,
+        )
+        Path(str(database) + "-wal").write_bytes(b"synthetic late wal")
+        return result
+
+    monkeypatch.setattr(bundle, "_capture_source", capture_then_add_wal)
+    with pytest.raises(BackupBundleError, match="source_changed"):
+        _capture(workspace, public_key)
+    assert not list(workspace.bundles_root.iterdir())
+
+
+def test_existing_bundle_and_racing_bundle_are_never_overwritten(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    (workspace.source_root / "file").write_bytes(b"payload")
+    _, public_key = generate_test_keypair()
+    fixed_id = "d" * 32
+    existing = workspace.bundles_root / f"{fixed_id}{BUNDLE_SUFFIX}"
+    existing.write_bytes(b"existing bundle bytes")
+    monkeypatch.setattr(bundle.secrets, "token_hex", lambda count: fixed_id)
     with pytest.raises(BackupBundleError, match="bundle_invalid"):
-        inspect_bundle(second.root, result.bundle_name)
+        _capture(workspace, public_key)
+    assert existing.read_bytes() == b"existing bundle bytes"
+
+    existing.unlink()
+    original_link = bundle.os.link
+
+    def racing_link(source, destination):
+        Path(destination).write_bytes(b"racing bundle bytes")
+        return original_link(source, destination)
+
+    monkeypatch.setattr(bundle.os, "link", racing_link)
     with pytest.raises(BackupBundleError, match="bundle_invalid"):
-        verify_bundle(second.root, result.bundle_name, private_key)
+        _capture(workspace, public_key)
+    assert existing.read_bytes() == b"racing bundle bytes"
+
+
+def test_restore_lock_serializes_compliant_publishers(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    (workspace.source_root / "file").write_bytes(b"payload")
+    result = _capture(workspace, public_key)
+    entered = threading.Event()
+    release = threading.Event()
+    original = bundle._decrypt_and_validate
+
+    def blocking_decrypt(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bundle, "_decrypt_and_validate", blocking_decrypt)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            restore_bundle,
+            workspace.root,
+            result.bundle_name,
+            private_key,
+        )
+        assert entered.wait(timeout=10)
+        with pytest.raises(BackupBundleError, match="restore_target_invalid"):
+            restore_bundle(workspace.root, result.bundle_name, private_key)
+        release.set()
+        assert first.result(timeout=10)["status"] == "success"
+    assert (workspace.restored_root / result.bundle_id / "file").read_bytes() == b"payload"
+
+
+def test_restore_base_exception_propagates_and_releases_lock(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    private_key, public_key = generate_test_keypair()
+    result = _capture(workspace, public_key)
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(bundle, "_decrypt_and_validate", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        restore_bundle(workspace.root, result.bundle_name, private_key)
+    assert not (workspace.temp_root / ".restore-operation.lock").exists()
+    assert not (workspace.restored_root / result.bundle_id).exists()
 
 
 def test_fresh_randomness_produces_distinct_ciphertext_but_equal_restores(tmp_path):
