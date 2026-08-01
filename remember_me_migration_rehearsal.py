@@ -38,7 +38,7 @@ from remember_me_migration_acceptance import (
     MigrationRecoveryDiagnostic,
     MigrationRecoveryDiagnostics,
 )
-from remember_me_migration_runner import MIGRATION_KEY
+from remember_me_migration_runner import MIGRATION_KEY, MIGRATION_VERSION
 
 
 WORKSPACE_SCHEMA_VERSION = 1
@@ -72,6 +72,25 @@ _EXIT_CODES = {
     "workspace_invalid": 8,
     "internal_error": 9,
 }
+_LEGAL_CHECKPOINT_STATUSES = {
+    "ready",
+    "running",
+    "paused",
+    "blocked",
+    "failed",
+    "completed",
+}
+_REPORT_STATUS_VALUES = set(_EXIT_CODES)
+_REPORT_COUNT_FIELDS = (
+    "processed_count",
+    "imported_count",
+    "skipped_idempotent_count",
+    "expected_asset_count",
+    "matched_asset_count",
+    "mismatched_asset_count",
+    "missing_target_count",
+    "blob_verified_count",
+)
 
 
 class RehearsalError(RuntimeError):
@@ -239,29 +258,51 @@ def preflight_rehearsal(path: str | Path) -> RehearsalPreflight:
     if corrupt:
         issues.add("corrupt_legacy_records")
 
+    source_identity = canonical_path_identity(workspace.source_root)
+    target_identity = canonical_path_identity(workspace.target_root)
     active_writer = False
+    state_inspection = None
+    state_read_error = False
     if workspace.state_db.exists():
         try:
-            state = inspect_existing_migration_state(
+            state_inspection = inspect_existing_migration_state(
                 workspace.state_db,
                 migration_key=MIGRATION_KEY,
             )
             active_writer = bool(
-                state
+                state_inspection
                 and (
-                    state.write_uncertain
-                    or state.lease_state == "active"
+                    state_inspection.write_uncertain
+                    or state_inspection.lease_state == "active"
                 )
             )
         except HostMigrationStateError:
             issues.add("migration_state_unreadable")
+            state_read_error = True
     if active_writer:
         issues.add("active_writer_detected")
 
-    first_run = not workspace.state_db.exists()
     target_empty = not any(workspace.target_root.iterdir())
-    if first_run and not target_empty:
-        issues.add("target_not_empty")
+    if not target_empty:
+        ownership_issue = None
+        if not workspace.state_db.exists() or state_read_error:
+            ownership_issue = "target_state_unbound"
+        elif state_inspection is None or state_inspection.checkpoint is None:
+            ownership_issue = "target_state_unbound"
+        else:
+            checkpoint = state_inspection.checkpoint
+            if (
+                checkpoint.source_identity != source_identity
+                or checkpoint.target_identity != target_identity
+            ):
+                ownership_issue = "target_state_identity_mismatch"
+            elif checkpoint.migration_version != MIGRATION_VERSION:
+                ownership_issue = "target_state_version_mismatch"
+            elif checkpoint.status not in _LEGAL_CHECKPOINT_STATUSES:
+                ownership_issue = "target_state_unbound"
+        if ownership_issue is not None:
+            issues.add("target_not_empty")
+            issues.add(ownership_issue)
 
     free_space = shutil.disk_usage(workspace.root).free
     if free_space < max(MIN_FREE_SPACE_BYTES, stored_bytes * 2):
@@ -279,8 +320,8 @@ def preflight_rehearsal(path: str | Path) -> RehearsalPreflight:
     return RehearsalPreflight(
         status="success" if not issues else "preflight_failed",
         workspace_id=workspace.workspace_id,
-        source_identity=canonical_path_identity(workspace.source_root),
-        target_identity=canonical_path_identity(workspace.target_root),
+        source_identity=source_identity,
+        target_identity=target_identity,
         legacy_asset_count=asset_count,
         legacy_stored_blob_bytes=stored_bytes,
         unsupported_asset_count=unsupported,
@@ -420,22 +461,28 @@ def run_rehearsal(
 def inspect_rehearsal(path: str | Path) -> dict[str, Any]:
     """Read checkpoint and report state without creating a lease or file."""
     workspace = load_rehearsal_workspace(path)
-    report = _read_report(workspace.report_path)
-    inspection = inspect_existing_migration_state(
-        workspace.state_db,
-        migration_key=MIGRATION_KEY,
-    )
-    checkpoint = inspection.checkpoint if inspection else None
     source_identity = canonical_path_identity(workspace.source_root)
     target_identity = canonical_path_identity(workspace.target_root)
-    if report is not None:
-        recovery_code = report.get("recovery_diagnostic_code", "no_checkpoint")
-    else:
-        recovery_code = MigrationRecoveryDiagnostics.from_existing(
+    report = _read_report(
+        workspace.report_path,
+        workspace=workspace,
+        source_identity=source_identity,
+        target_identity=target_identity,
+    )
+    try:
+        inspection = inspect_existing_migration_state(
+            workspace.state_db,
+            migration_key=MIGRATION_KEY,
+        )
+        checkpoint = inspection.checkpoint if inspection else None
+        current_diagnostic = MigrationRecoveryDiagnostics.from_existing(
             workspace.state_db,
             source_identity=source_identity,
             target_identity=target_identity,
-        ).inspect().diagnostic_code
+        ).inspect()
+    except HostMigrationStateError as exc:
+        raise RehearsalError("workspace_invalid") from exc
+    recovery_code = current_diagnostic.diagnostic_code
     safe_to_rerun = bool(
         inspection is None
         or (
@@ -457,6 +504,11 @@ def inspect_rehearsal(path: str | Path) -> dict[str, Any]:
         "rehearsal_workspace_id": workspace.workspace_id,
         "checkpoint_status": checkpoint.status if checkpoint else None,
         "recovery_diagnostic_code": recovery_code,
+        "current_recovery_diagnostic_code": recovery_code,
+        "last_report_recovery_diagnostic_code": (
+            report.get("recovery_diagnostic_code") if report else None
+        ),
+        "last_report_status": report.get("status") if report else None,
         "processed_count": checkpoint.processed_count if checkpoint else 0,
         "imported_count": checkpoint.imported_count if checkpoint else 0,
         "skipped_idempotent_count": (
@@ -765,7 +817,13 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
-def _read_report(path: Path) -> dict[str, Any] | None:
+def _read_report(
+    path: Path,
+    *,
+    workspace: RehearsalWorkspace,
+    source_identity: str,
+    target_identity: str,
+) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
@@ -775,6 +833,23 @@ def _read_report(path: Path) -> dict[str, Any] | None:
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != REPORT_SCHEMA_VERSION
+        or payload.get("rehearsal_workspace_id") != workspace.workspace_id
+        or payload.get("source_identity") != source_identity
+        or payload.get("target_identity") != target_identity
+        or payload.get("status") not in _REPORT_STATUS_VALUES
+        or payload.get("reindex_ran") is not False
+        or payload.get("production_access_occurred") is not False
+    ):
+        raise RehearsalError("workspace_invalid")
+    for field in _REPORT_COUNT_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RehearsalError("workspace_invalid")
+    unexpected = payload.get("unexpected_target_count")
+    if unexpected is not None and (
+        isinstance(unexpected, bool)
+        or not isinstance(unexpected, int)
+        or unexpected < 0
     ):
         raise RehearsalError("workspace_invalid")
     return payload
@@ -853,6 +928,12 @@ def main(argv: list[str] | None = None) -> int:
             )
     except RehearsalError as exc:
         payload = {"status": exc.status}
+    except HostMigrationStateError as exc:
+        payload = {"status": _state_error_status(exc.code)}
+    except LegacyAssetImportAdapterError:
+        payload = {"status": "workspace_invalid"}
+    except Exception:
+        payload = {"status": "internal_error"}
     _print_result(payload)
     return _EXIT_CODES.get(payload["status"], _EXIT_CODES["internal_error"])
 

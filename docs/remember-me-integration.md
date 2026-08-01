@@ -210,6 +210,14 @@ reports source inventory, stored blob bytes, unsupported or corrupt records,
 available disk space, the pinned Remember-Me version, the current OB commit,
 and any active migration lease or uncertain writer state.
 
+A non-empty target is accepted only when the existing migration state can be
+read without modification and contains a checkpoint bound to the current
+workspace's exact canonical source and target identities, current migration
+version, and a valid checkpoint state. The mere presence of a state database
+file, an initialized database without a checkpoint, or files inside the target
+does not prove rehearsal ownership. Empty, corrupt, incompatible, unbound, or
+identity-mismatched state fails preflight without changing the target or state.
+
 `run` creates a separate factory-only offline maintenance capability bound to
 the exact canonical legacy store, Remember-Me service instance, workspace
 identity, and roots. It does not replace or relax the existing test-fixture
@@ -228,6 +236,20 @@ access. It excludes absolute user paths, image bytes, snapshot tokens,
 cursors, blob locators, raw SQLite errors, credentials, production URLs, and
 private metadata. `inspect` reads the existing checkpoint, diagnostic, and
 report without acquiring a lease or changing any file.
+
+`inspect` derives its current recovery diagnostic and rerun safety only from
+the current read-only migration-state inspection. A validated last report is
+exposed separately as historical evidence; its workspace ID, canonical source
+and target identities, stable status, counters, and no-production flags must
+still match the current workspace contract. A stale report cannot override the
+current checkpoint or lease conclusion.
+
+The command-line boundary prints exactly one stable JSON object for ordinary
+operation failures. Workspace, migration-state, adapter, report-write, and
+unexpected exceptions are mapped without tracebacks, paths, raw SQLite
+details, nonce values, cursors, or internal object representations.
+`KeyboardInterrupt`, `SystemExit`, and other `BaseException` values continue
+to propagate normally.
 
 Only synthetic data is used in this stage. Image bytes cannot be ordinarily
 redacted and then reused as evidence for an exact blob hash; a later realistic

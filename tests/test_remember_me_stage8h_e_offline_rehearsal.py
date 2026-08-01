@@ -10,7 +10,7 @@ from dataclasses import replace
 import pytest
 from PIL import Image
 
-from asset_migration_state import HostMigrationState
+from asset_migration_state import HostMigrationState, HostMigrationStateError
 from asset_store import AssetStore
 from remember_me_adapter import RememberMeAdapter
 from remember_me_import_adapter import (
@@ -32,10 +32,51 @@ from remember_me_migration_rehearsal import (
     _atomic_write_json,
     inspect_rehearsal,
     load_rehearsal_workspace,
+    main,
     preflight_rehearsal,
     prepare_rehearsal_workspace,
     run_rehearsal,
 )
+from remember_me_migration_runner import MIGRATION_KEY, MIGRATION_VERSION
+
+
+def _make_state(workspace):
+    return HostMigrationState(
+        workspace.state_db,
+        legacy_root=workspace.source_root,
+        target_root=workspace.target_root,
+    )
+
+
+def _write_report(workspace, **updates):
+    state = _make_state(workspace)
+    payload = {
+        "schema_version": 1,
+        "status": "success",
+        "rehearsal_workspace_id": workspace.workspace_id,
+        "source_identity": state.source_identity,
+        "target_identity": state.target_identity,
+        "processed_count": 0,
+        "imported_count": 0,
+        "skipped_idempotent_count": 0,
+        "expected_asset_count": 0,
+        "matched_asset_count": 0,
+        "mismatched_asset_count": 0,
+        "missing_target_count": 0,
+        "blob_verified_count": 0,
+        "reindex_ran": False,
+        "production_access_occurred": False,
+        "recovery_diagnostic_code": "stale_report",
+    }
+    payload.update(updates)
+    workspace.report_path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def _make_nonempty_target_without_state(workspace):
+    (workspace.target_root / "orphan").write_bytes(b"synthetic")
 
 
 def _png_bytes(index):
@@ -149,6 +190,86 @@ def test_workspace_fail_closed_boundaries(tmp_path, mutation):
         preflight = preflight_rehearsal(workspace.root)
         assert preflight.status == "preflight_failed"
         assert "target_not_empty" in preflight.issue_codes
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "missing",
+        "empty",
+        "no_checkpoint",
+        "source_mismatch",
+        "target_mismatch",
+        "version_mismatch",
+    ],
+)
+def test_nonempty_target_requires_current_bound_checkpoint(tmp_path, setup):
+    workspace = _workspace(tmp_path / setup)
+    _make_nonempty_target_without_state(workspace)
+    if setup == "missing":
+        preflight = preflight_rehearsal(workspace.root)
+        assert "target_state_unbound" in preflight.issue_codes
+        return
+    if setup == "empty":
+        workspace.state_db.write_bytes(b"")
+    else:
+        state = _make_state(workspace)
+        if setup == "no_checkpoint":
+            state.release_freeze(
+                state.acquire_freeze(ttl_seconds=60)
+            )
+        else:
+            owner = state.acquire_freeze(ttl_seconds=60)
+            state.create_checkpoint(
+                owner_token=owner,
+                migration_key=MIGRATION_KEY,
+                migration_version=(
+                    MIGRATION_VERSION + 1
+                    if setup == "version_mismatch"
+                    else MIGRATION_VERSION
+                ),
+                source_identity=(
+                    "path-sha256:" + "0" * 64
+                    if setup == "source_mismatch"
+                    else state.source_identity
+                ),
+                target_identity=(
+                    "path-sha256:" + "1" * 64
+                    if setup == "target_mismatch"
+                    else state.target_identity
+                ),
+                snapshot_generation=state.current_generation(),
+                upper_bound_asset_id=None,
+                initial_asset_count=0,
+            )
+            state.release_freeze(owner)
+    before = _snapshot(workspace.root)
+    preflight = preflight_rehearsal(workspace.root)
+    after = _snapshot(workspace.root)
+    assert preflight.status == "preflight_failed"
+    assert set(preflight.issue_codes) & {
+        "target_state_unbound",
+        "target_state_identity_mismatch",
+        "target_state_version_mismatch",
+    }
+    assert before == after
+
+
+def test_completed_and_paused_bound_target_allows_rerun(tmp_path):
+    workspace = _workspace(tmp_path / "completed", 1)
+    first = run_rehearsal(workspace.root)
+    assert first["status"] == "success"
+    assert preflight_rehearsal(workspace.root).passed is True
+    assert run_rehearsal(workspace.root)["status"] == "success"
+
+    paused_workspace = _workspace(tmp_path / "paused", 2)
+    paused = run_rehearsal(
+        paused_workspace.root,
+        stop_after_batches=1,
+        batch_size=1,
+    )
+    assert paused["status"] == "migration_blocked"
+    assert preflight_rehearsal(paused_workspace.root).passed is True
 
 
 def test_symlink_or_junction_escape_is_rejected(tmp_path):
@@ -501,6 +622,156 @@ def test_report_is_atomic_and_redacted(tmp_path, monkeypatch):
         "image_bytes",
     ):
         assert forbidden not in serialized.casefold()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"rehearsal_workspace_id": "0" * 32},
+        {"source_identity": "path-sha256:" + "0" * 64},
+        {"target_identity": "path-sha256:" + "1" * 64},
+        {"status": "unknown"},
+        {"processed_count": "broken"},
+        {"matched_asset_count": True},
+        {"unexpected_target_count": -1},
+        {"reindex_ran": True},
+        {"production_access_occurred": True},
+    ],
+)
+def test_inspect_rejects_unbound_or_malformed_report(tmp_path, updates):
+    workspace = _workspace(tmp_path)
+    _write_report(workspace, **updates)
+    with pytest.raises(RehearsalError, match="^workspace_invalid$"):
+        inspect_rehearsal(workspace.root)
+
+
+def test_inspect_separates_current_state_from_last_report(tmp_path):
+    workspace = _workspace(tmp_path)
+    _write_report(
+        workspace,
+        recovery_diagnostic_code="completed_verified",
+    )
+    before = _snapshot(workspace.root)
+    result = inspect_rehearsal(workspace.root)
+    after = _snapshot(workspace.root)
+
+    assert result["recovery_diagnostic_code"] == "no_checkpoint"
+    assert result["current_recovery_diagnostic_code"] == "no_checkpoint"
+    assert (
+        result["last_report_recovery_diagnostic_code"]
+        == "completed_verified"
+    )
+    assert result["last_report_status"] == "success"
+    assert before == after
+
+
+def test_inspect_without_state_does_not_create_it(tmp_path):
+    workspace = _workspace(tmp_path)
+    assert not workspace.state_db.exists()
+    result = inspect_rehearsal(workspace.root)
+    assert result["current_recovery_diagnostic_code"] == "no_checkpoint"
+    assert result["safe_to_rerun"] is True
+    assert not workspace.state_db.exists()
+
+
+def test_cli_maps_ordinary_and_state_errors_without_leaks(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    secret_path = str(tmp_path / "private-workspace")
+
+    def fail_prepare(path):
+        raise OSError(f"sqlite failed at {secret_path}")
+
+    monkeypatch.setattr(
+        "remember_me_migration_rehearsal.prepare_rehearsal_workspace",
+        fail_prepare,
+    )
+    assert main(["prepare", secret_path]) == 9
+    captured = capsys.readouterr()
+    assert captured.out == '{"status": "internal_error"}\n'
+    assert captured.err == ""
+    assert secret_path not in captured.out
+    assert "sqlite" not in captured.out.casefold()
+    assert "traceback" not in captured.err.casefold()
+
+    def fail_inspect(path):
+        raise HostMigrationStateError("migration_state_unavailable")
+
+    monkeypatch.setattr(
+        "remember_me_migration_rehearsal.inspect_rehearsal",
+        fail_inspect,
+    )
+    assert main(["inspect", secret_path]) == 4
+    captured = capsys.readouterr()
+    assert captured.out == '{"status": "migration_failed"}\n'
+    assert captured.err == ""
+
+
+def test_cli_report_replace_failure_preserves_existing_report(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    workspace = _workspace(tmp_path)
+    _write_report(workspace)
+    original = workspace.report_path.read_bytes()
+
+    def fail_replace(source, destination):
+        raise OSError(f"replace failed for {workspace.root}")
+
+    def fail_run(path, **kwargs):
+        _atomic_write_json(
+            workspace.report_path,
+            {"schema_version": 999},
+        )
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(
+        "remember_me_migration_rehearsal.run_rehearsal",
+        fail_run,
+    )
+    assert main(["run", str(workspace.root)]) == 9
+    captured = capsys.readouterr()
+    assert captured.out == '{"status": "internal_error"}\n'
+    assert captured.err == ""
+    assert str(workspace.root) not in captured.out
+    assert workspace.report_path.read_bytes() == original
+    assert not any(
+        path.name.endswith(".tmp")
+        for path in workspace.reports_root.iterdir()
+    )
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit(7)])
+def test_cli_base_exceptions_propagate(tmp_path, monkeypatch, failure):
+    def fail(path):
+        raise failure
+
+    monkeypatch.setattr(
+        "remember_me_migration_rehearsal.inspect_rehearsal",
+        fail,
+    )
+    with pytest.raises(type(failure)):
+        main(["inspect", str(tmp_path)])
+
+
+def test_corrupt_state_cli_is_stable_and_read_only(
+    tmp_path,
+    capsys,
+):
+    workspace = _workspace(tmp_path)
+    workspace.state_db.write_bytes(b"not sqlite")
+    before = _snapshot(workspace.root)
+    assert main(["inspect", str(workspace.root)]) == 8
+    captured = capsys.readouterr()
+    after = _snapshot(workspace.root)
+    assert captured.out == '{"status": "workspace_invalid"}\n'
+    assert captured.err == ""
+    assert "sqlite" not in captured.out.casefold()
+    assert str(workspace.root) not in captured.out
+    assert before == after
 
 
 def test_run_never_uses_search_reindex_or_server_startup(
