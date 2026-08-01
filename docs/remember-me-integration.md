@@ -191,6 +191,80 @@ verification does not mean a production migration has run. Production
 migration, Reindex, runtime cutover, and legacy removal remain separate future
 operations.
 
+## Stage 8H-E offline migration rehearsal
+
+Stage 8H-E adds offline rehearsal tooling only. It does not read or copy
+production data. A rehearsal begins with an explicit `prepare` operation that
+creates an isolated workspace containing fixed `legacy`, `remember-me`,
+`state`, and `reports` directories plus a random workspace identity and
+marker. Preparation never discovers a normal service data root, follows a
+production environment variable, or copies source data.
+
+Every later `preflight`, `run`, or `inspect` operation canonicalizes and
+revalidates the workspace. The source, target, state, and report roots must
+remain distinct children of that workspace, the marker must match the
+manifest, and symlink or junction escapes fail closed. There is no force,
+skip-safety, production-root discovery, server-startup, Dashboard, HTTP, or
+MCP mode. The first run requires an empty target. Preflight is read-only and
+reports source inventory, stored blob bytes, unsupported or corrupt records,
+available disk space, the pinned Remember-Me version, the current OB commit,
+and any active migration lease or uncertain writer state.
+
+A non-empty target is accepted only when the existing migration state can be
+read without modification and contains a checkpoint bound to the current
+workspace's exact canonical source and target identities, current migration
+version, and a valid checkpoint state. The mere presence of a state database
+file, an initialized database without a checkpoint, or files inside the target
+does not prove rehearsal ownership. Empty, corrupt, incompatible, unbound, or
+identity-mismatched state fails preflight without changing the target or state.
+
+`run` creates a separate factory-only offline maintenance capability bound to
+the exact canonical legacy store, Remember-Me service instance, workspace
+identity, and roots. It does not replace or relax the existing test-fixture
+capability. The capability expires when the run ends and cannot be obtained
+from ordinary runtime construction, environment configuration, server
+startup, Dashboard, HTTP, or MCP code. The runner reuses the existing bounded
+migration coordinator, checkpoint and lease state, import adapter,
+`LegacyRmReconciler`, recovery diagnostics, and the Remember-Me `0.1.0.dev7`
+public begin/page/blob/complete verification API. One in-process service
+instance owns the complete verification session.
+
+The machine-readable report is written with a temporary file and atomic
+replacement. It contains stable identities, counts, acceptance and recovery
+states, elapsed time, and explicit `false` values for Reindex and production
+access. It excludes absolute user paths, image bytes, snapshot tokens,
+cursors, blob locators, raw SQLite errors, credentials, production URLs, and
+private metadata. `inspect` reads the existing checkpoint, diagnostic, and
+report without acquiring a lease or changing any file.
+
+`inspect` derives its current recovery diagnostic and rerun safety only from
+the current read-only migration-state inspection. A validated last report is
+exposed separately as historical evidence; its workspace ID, canonical source
+and target identities, stable status, counters, and no-production flags must
+still match the current workspace contract. A stale report cannot override the
+current checkpoint or lease conclusion.
+
+The command-line boundary prints exactly one stable JSON object for ordinary
+operation failures. Workspace, migration-state, adapter, report-write, and
+unexpected exceptions are mapped without tracebacks, paths, raw SQLite
+details, nonce values, cursors, or internal object representations.
+`KeyboardInterrupt`, `SystemExit`, and other `BaseException` values continue
+to propagate normally.
+
+Only synthetic data is used in this stage. Image bytes cannot be ordinarily
+redacted and then reused as evidence for an exact blob hash; a later realistic
+rehearsal must use a complete, isolated, offline backup copy. Creating or
+copying that backup requires separate approval. Rehearsal never performs
+Search, embedding calls, Reindex, cutover, or production startup.
+
+A failed Remember-Me verification session must not be retried without bound.
+A later production-copy rehearsal still requires a dedicated single-process
+maintenance runtime and must wait for session expiry or restart that offline
+runtime after a failed session. Passing this synthetic rehearsal does not
+approve or execute production migration. Maintenance windows, backup,
+rollback, Reindex, cutover, and production enablement remain independently
+gated later stages.
+
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP

@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+import json
 import os
 from pathlib import Path
 import re
@@ -68,6 +69,9 @@ _REQUIRED_RECORD_FIELDS = (
 _FIXTURE_MARKER_NAME = ".ombre-stage8g-b-fixture"
 _FIXTURE_PREFIX = "ombre-stage8g-b-"
 _FIXTURE_FACTORY_TOKEN = object()
+_OFFLINE_FACTORY_TOKEN = object()
+_REHEARSAL_MANIFEST_NAME = "rehearsal-manifest.json"
+_REHEARSAL_MARKER_NAME = ".ombre-stage8h-e-rehearsal"
 _TARGET_RECONCILIATION_UNSUPPORTED_CHECKS: tuple[str, ...] = ()
 
 
@@ -279,6 +283,147 @@ def create_legacy_asset_import_fixture_context(
     )
 
 
+class LegacyAssetImportOfflineContext(AbstractContextManager):
+    """Factory-created capability for one validated offline rehearsal."""
+
+    def __init__(
+        self,
+        *,
+        _token: object,
+        workspace_root: Path,
+        workspace_id: str,
+        nonce: str,
+        legacy_root: Path,
+        rm_root: Path,
+    ) -> None:
+        if _token is not _OFFLINE_FACTORY_TOKEN:
+            raise LegacyAssetImportAdapterError("invalid_offline_capability")
+        self.workspace_root = Path(workspace_root).resolve(strict=True)
+        self.workspace_id = workspace_id
+        self.legacy_root = Path(legacy_root).resolve(strict=True)
+        self.rm_root = Path(rm_root).resolve(strict=True)
+        self._nonce = nonce
+        self._legacy_store_id: int | None = None
+        self._core_id: int | None = None
+        self._core_target_root: Path | None = None
+        self._active = True
+        self._validate_active()
+
+    def bind_legacy_store(
+        self,
+        legacy_store: "LegacyAssetImportSource",
+    ) -> "LegacyAssetImportSource":
+        self._validate_active()
+        if Path(legacy_store.data_root).resolve() != self.legacy_root:
+            raise LegacyAssetImportAdapterError("offline_root_violation")
+        self._legacy_store_id = id(legacy_store)
+        return legacy_store
+
+    def create_runtime(self, adapter=None):
+        self._validate_active()
+        if adapter is None:
+            from remember_me_adapter import RememberMeAdapter
+
+            adapter = RememberMeAdapter()
+        runtime = adapter.create_runtime(self.rm_root)
+        self._core_id = id(runtime.service)
+        self._core_target_root = self.rm_root
+        return runtime
+
+    def close(self) -> None:
+        self._active = False
+        self._legacy_store_id = None
+        self._core_id = None
+        self._core_target_root = None
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def _validate_for_adapter(
+        self,
+        *,
+        legacy_store: "LegacyAssetImportSource",
+        core: RememberMeCore,
+    ) -> None:
+        self._validate_active()
+        if (
+            self._legacy_store_id != id(legacy_store)
+            or self._core_id != id(core)
+            or Path(legacy_store.data_root).resolve() != self.legacy_root
+            or self._core_target_root != self.rm_root
+        ):
+            raise LegacyAssetImportAdapterError("offline_root_violation")
+
+    def _validate_active(self) -> None:
+        if not self._active:
+            raise LegacyAssetImportAdapterError("offline_capability_expired")
+        try:
+            manifest = json.loads(
+                (self.workspace_root / _REHEARSAL_MANIFEST_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            marker = json.loads(
+                (self.workspace_root / _REHEARSAL_MARKER_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise LegacyAssetImportAdapterError(
+                "offline_root_violation"
+            ) from exc
+        if (
+            manifest.get("workspace_id") != self.workspace_id
+            or manifest.get("nonce") != self._nonce
+            or manifest.get("paths")
+            != {
+                "source": "legacy",
+                "target": "remember-me",
+                "state": "state",
+                "reports": "reports",
+            }
+            or marker != {
+                "workspace_id": self.workspace_id,
+                "nonce": self._nonce,
+            }
+        ):
+            raise LegacyAssetImportAdapterError("offline_root_violation")
+        try:
+            if (
+                (self.workspace_root / "legacy").resolve(strict=True)
+                != self.legacy_root
+                or (
+                    self.workspace_root / "remember-me"
+                ).resolve(strict=True)
+                != self.rm_root
+            ):
+                raise LegacyAssetImportAdapterError(
+                    "offline_root_violation"
+                )
+        except (OSError, RuntimeError) as exc:
+            raise LegacyAssetImportAdapterError(
+                "offline_root_violation"
+            ) from exc
+
+
+def _create_legacy_asset_import_offline_context(
+    *,
+    workspace_root: Path,
+    workspace_id: str,
+    nonce: str,
+    legacy_root: Path,
+    rm_root: Path,
+) -> LegacyAssetImportOfflineContext:
+    return LegacyAssetImportOfflineContext(
+        _token=_OFFLINE_FACTORY_TOKEN,
+        workspace_root=workspace_root,
+        workspace_id=workspace_id,
+        nonce=nonce,
+        legacy_root=legacy_root,
+        rm_root=rm_root,
+    )
+
+
 class LegacyAssetImportSource(Protocol):
     data_root: Path
 
@@ -298,18 +443,39 @@ class LegacyAssetImportAdapter:
         legacy_store: LegacyAssetImportSource,
         core: RememberMeCore,
         fixture_context: LegacyAssetImportFixtureContext | None = None,
+        offline_context: LegacyAssetImportOfflineContext | None = None,
         fixture_root: Path | None = None,
     ) -> None:
-        if fixture_root is not None or not isinstance(
-            fixture_context,
-            LegacyAssetImportFixtureContext,
+        contexts = tuple(
+            context
+            for context in (fixture_context, offline_context)
+            if context is not None
+        )
+        if (
+            fixture_root is not None
+            or len(contexts) != 1
+            or not isinstance(
+                contexts[0],
+                (
+                    LegacyAssetImportFixtureContext,
+                    LegacyAssetImportOfflineContext,
+                ),
+            )
         ):
             raise LegacyAssetImportAdapterError("invalid_fixture_capability")
-        fixture_context._validate_for_adapter(
+        capability_context = contexts[0]
+        capability_context._validate_for_adapter(
             legacy_store=legacy_store,
             core=core,
         )
-        root = fixture_context.fixture_root
+        root = (
+            capability_context.fixture_root
+            if isinstance(
+                capability_context,
+                LegacyAssetImportFixtureContext,
+            )
+            else capability_context.workspace_root
+        )
         legacy_root = Path(legacy_store.data_root).resolve()
         if not callable(getattr(core, "import_asset", None)):
             raise LegacyAssetImportAdapterError("rm_import_unavailable")
@@ -317,7 +483,7 @@ class LegacyAssetImportAdapter:
         self._core = core
         self._fixture_root = root
         self._legacy_root = legacy_root
-        self._fixture_context = fixture_context
+        self._fixture_context = capability_context
 
     def is_bound_to_legacy_store(
         self,
@@ -923,6 +1089,7 @@ def _validate_fixture_roots(
 
 __all__ = [
     "LegacyAssetImportFixtureContext",
+    "LegacyAssetImportOfflineContext",
     "LegacyAssetImportAdapter",
     "LegacyAssetImportAdapterError",
     "LegacyAssetImportDisposition",
