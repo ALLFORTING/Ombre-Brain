@@ -15,7 +15,7 @@ import re
 import secrets
 import shutil
 import inspect
-from typing import Any, AsyncIterator, BinaryIO, Callable, Mapping
+from typing import Any, AsyncIterator, Awaitable, BinaryIO, Callable, Mapping
 import uuid
 
 from cryptography.hazmat.primitives import serialization
@@ -163,6 +163,35 @@ class BundleDelivery:
     encrypted_size: int
     encrypted_sha256: str
     recipient_fingerprint: str
+
+
+async def _await_cleanup_uninterruptibly(
+    awaitable: Awaitable[Any],
+    *,
+    propagate_cancel: bool = False,
+) -> Any:
+    """Finish mandatory cleanup even if the caller is cancelled repeatedly."""
+    task = asyncio.ensure_future(awaitable)
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                break
+            interrupted = True
+            continue
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        if task.cancelled() and not interrupted:
+            return None
+        if interrupted and not propagate_cancel:
+            return None
+        raise
+    if interrupted and propagate_cancel:
+        raise asyncio.CancelledError
+    return result
 
 
 class _ManagedStreamingResponse(StreamingResponse):
@@ -365,20 +394,12 @@ class ProductionBackupCaptureController:
                 ))
                 self._active_workers += 1
                 try:
-                    remaining = max(0.0, lease.deadline - self.coordinator.monotonic())
-                    try:
-                        result = await asyncio.wait_for(
-                            asyncio.shield(worker), timeout=remaining
-                        )
-                    except asyncio.TimeoutError as exc:
-                        abort_signal.abort("freeze_lease_expired")
-                        await self._wait_worker_exit(worker)
-                        raise CaptureChannelError("freeze_lease_expired") from exc
-                    except asyncio.CancelledError:
-                        abort_signal.abort("capture_cancelled")
-                        await self._wait_worker_exit(worker)
-                        raise
-                    self._record_owned_bundle(job, result)
+                    result = await self._await_capture_worker(
+                        worker,
+                        job,
+                        abort_signal,
+                        lease.deadline,
+                    )
                     self.coordinator.validate_lease(lease)
                 finally:
                     self._active_workers -= 1
@@ -402,17 +423,74 @@ class ProductionBackupCaptureController:
                 if self._active_request_id == job.request_id:
                     self._active_request_id = None
 
-    async def _wait_worker_exit(self, worker: asyncio.Task[CaptureResult]) -> None:
-        while not worker.done():
+    async def _join_task(
+        self,
+        task: asyncio.Task[Any],
+    ) -> tuple[bool, bool, Any]:
+        interrupted = False
+        while not task.done():
             try:
-                await asyncio.shield(worker)
+                await asyncio.shield(task)
             except asyncio.CancelledError:
+                interrupted = True
                 continue
-            except Exception:
-                break
-        if worker.done():
-            with suppress(Exception, asyncio.CancelledError):
-                worker.result()
+        try:
+            return interrupted, True, task.result()
+        except BaseException as exc:
+            return interrupted, False, exc
+
+    async def _wait_worker_exit(self, worker: asyncio.Task[Any]) -> None:
+        _, completed, outcome = await self._join_task(worker)
+        if not completed and isinstance(outcome, (KeyboardInterrupt, SystemExit)):
+            raise outcome
+
+    async def _collect_capture_worker(
+        self,
+        worker: asyncio.Task[CaptureResult],
+        job: CaptureJob,
+    ) -> CaptureResult:
+        _, completed, outcome = await self._join_task(worker)
+        if not completed:
+            raise outcome
+        if not isinstance(outcome, CaptureResult):
+            raise CaptureChannelError("internal_error")
+        if outcome.status == "success":
+            self._record_owned_bundle(job, outcome)
+        return outcome
+
+    async def _await_capture_worker(
+        self,
+        worker: asyncio.Task[CaptureResult],
+        job: CaptureJob,
+        abort_signal: CaptureAbortSignal,
+        deadline: float,
+    ) -> CaptureResult:
+        remaining = max(0.0, deadline - self.coordinator.monotonic())
+        deadline_task = asyncio.create_task(asyncio.sleep(remaining))
+        try:
+            try:
+                done, _ = await asyncio.wait(
+                    {worker, deadline_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                abort_signal.abort("capture_cancelled")
+                await self._collect_capture_worker(worker, job)
+                raise
+
+            result = await self._collect_capture_worker(worker, job) if worker in done else None
+            if deadline_task in done:
+                if result is None:
+                    abort_signal.abort("freeze_lease_expired")
+                    await self._collect_capture_worker(worker, job)
+                raise CaptureChannelError("freeze_lease_expired")
+            return result
+        finally:
+            deadline_task.cancel()
+            await _await_cleanup_uninterruptibly(
+                deadline_task,
+                propagate_cancel=True,
+            )
 
     def _task_completed(self, request_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(request_id) is task:
@@ -491,9 +569,17 @@ class ProductionBackupCaptureController:
             )
         finally:
             if handle is not None:
-                handle.close()
+                await _await_cleanup_uninterruptibly(
+                    self._release_delivery(canonical_id, handle),
+                    propagate_cancel=True,
+                )
+
+    async def _release_delivery(self, request_id: str, handle: BinaryIO) -> None:
+        try:
+            handle.close()
+        finally:
             async with self._job_lock:
-                self._active_deliveries.discard(canonical_id)
+                self._active_deliveries.discard(request_id)
 
     async def acknowledge(self, request_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
@@ -653,15 +739,28 @@ def build_backup_v2_routes(
     async def download(request: Request):
         delivery_context = None
         release_lock = asyncio.Lock()
-        released = False
+        release_task: asyncio.Task[Any] | None = None
 
         async def release_delivery() -> None:
-            nonlocal released
-            async with release_lock:
-                if released or delivery_context is None:
-                    return
-                released = True
-                await delivery_context.__aexit__(None, None, None)
+            nonlocal release_task
+
+            async def release_once() -> None:
+                nonlocal release_task
+                async with release_lock:
+                    if delivery_context is None:
+                        return
+                    if release_task is None:
+                        release_task = asyncio.create_task(
+                            delivery_context.__aexit__(None, None, None),
+                            name="backup-delivery-release",
+                        )
+                    task = release_task
+                await _await_cleanup_uninterruptibly(task)
+
+            await _await_cleanup_uninterruptibly(
+                release_once(),
+                propagate_cancel=True,
+            )
 
         try:
             claims = await _verify_request_claims(claim_verifier, request)

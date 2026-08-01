@@ -979,6 +979,8 @@ def _stable_source_file_evidence(
             path, chunk_size=chunk_size, abort_signal=abort_signal
         )
     except BackupBundleError as exc:
+        if exc.status in {"capture_cancelled", "freeze_lease_expired"}:
+            raise
         raise BackupBundleError("source_changed") from exc
     after = _file_identity(path)
     if before != after or size != after[2]:

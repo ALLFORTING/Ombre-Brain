@@ -40,6 +40,7 @@ from maintenance_write_coverage import (
 from offline_backup_bundle import (
     BackupBundleError,
     CaptureAbortSignal,
+    CaptureResult,
     _EXIT_CODES,
     capture_external_source,
     generate_test_keypair,
@@ -50,6 +51,7 @@ from offline_backup_bundle import (
 )
 from production_backup_capture import (
     CaptureChannelError,
+    CaptureJob,
     CaptureLimits,
     ProductionBackupCaptureController,
     StrictBackupV2OidcPolicy,
@@ -1670,3 +1672,193 @@ async def test_sequential_terminal_jobs_release_task_registry(tmp_path):
         controller.get_job(request_id, _claims())["state"] == "consumed"
         for request_id in completed
     )
+
+
+def _synthetic_capture_job(controller, request_id):
+    now = controller._timestamp()
+    return CaptureJob(
+        request_id=request_id,
+        oidc_run_id="123",
+        oidc_run_attempt="1",
+        runtime_commit=COMMIT,
+        recipient_fingerprint=controller.recipient_fingerprint,
+        state="capturing",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _synthetic_capture_result(bundle_name):
+    return CaptureResult(
+        status="success",
+        bundle_id=bundle_name[:32],
+        bundle_name=bundle_name,
+        manifest_sha256="a" * 64,
+        entry_count=1,
+        ordinary_file_count=1,
+        sqlite_snapshot_count=0,
+        total_plaintext_bytes=1,
+        exclusion_count=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_worker_result_is_owned_before_cancellation_propagates(tmp_path):
+    controller, _, workspace, _, _ = _controller(tmp_path)
+    request_id = str(uuid.uuid4())
+    job = _synthetic_capture_job(controller, request_id)
+    bundle_name = "a" * 32 + ".obbackup"
+    (workspace.bundles_root / bundle_name).write_bytes(b"synthetic bundle")
+    worker = asyncio.create_task(
+        asyncio.sleep(0, result=_synthetic_capture_result(bundle_name))
+    )
+    signal = CaptureAbortSignal(
+        deadline=controller.coordinator.monotonic() + 10,
+        monotonic=controller.coordinator.monotonic,
+    )
+    asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await controller._await_capture_worker(
+            worker,
+            job,
+            signal,
+            controller.coordinator.monotonic() + 10,
+        )
+    assert job.bundle_name == bundle_name
+    await controller._fail_and_cleanup(job, "capture_cancelled")
+    assert job.failure_code == "capture_cancelled"
+    assert job.orphan_present is False
+    assert not (workspace.bundles_root / bundle_name).exists()
+    assert controller.coordinator.status().state == "open"
+    assert controller._active_workers == 0
+
+
+@pytest.mark.asyncio
+async def test_deadline_worker_result_is_owned_before_expiry_propagates(tmp_path):
+    controller, _, workspace, _, _ = _controller(tmp_path)
+    request_id = str(uuid.uuid4())
+    job = _synthetic_capture_job(controller, request_id)
+    bundle_name = "b" * 32 + ".obbackup"
+    (workspace.bundles_root / bundle_name).write_bytes(b"synthetic bundle")
+
+    async def delayed_success():
+        await asyncio.sleep(0.02)
+        return _synthetic_capture_result(bundle_name)
+
+    worker = asyncio.create_task(delayed_success())
+    signal = CaptureAbortSignal(
+        deadline=controller.coordinator.monotonic() + 0.001,
+        monotonic=controller.coordinator.monotonic,
+    )
+    with pytest.raises(CaptureChannelError, match="freeze_lease_expired"):
+        await controller._await_capture_worker(
+            worker,
+            job,
+            signal,
+            controller.coordinator.monotonic() + 0.001,
+        )
+    assert job.bundle_name == bundle_name
+    await controller._fail_and_cleanup(job, "freeze_lease_expired")
+    assert job.failure_code == "freeze_lease_expired"
+    assert job.orphan_present is False
+    assert not (workspace.bundles_root / bundle_name).exists()
+    assert controller.coordinator.status().state == "open"
+
+
+@pytest.mark.asyncio
+async def test_owned_bundle_cleanup_failure_is_attributable_and_contained(tmp_path, monkeypatch):
+    import production_backup_capture as capture_module
+
+    controller, _, workspace, _, _ = _controller(tmp_path)
+    request_id = str(uuid.uuid4())
+    job = _synthetic_capture_job(controller, request_id)
+    bundle_name = "c" * 32 + ".obbackup"
+    bundle = workspace.bundles_root / bundle_name
+    unrelated = workspace.bundles_root / ("d" * 32 + ".obbackup")
+    bundle.write_bytes(b"owned")
+    unrelated.write_bytes(b"unrelated")
+    original_unlink = capture_module.Path.unlink
+
+    def fail_owned_unlink(path, *args, **kwargs):
+        if path == bundle:
+            raise OSError("synthetic cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(capture_module.Path, "unlink", fail_owned_unlink)
+    job.bundle_name = bundle_name
+    await controller._fail_and_cleanup(job, "capture_cancelled")
+    assert job.failure_code == "internal_error"
+    assert job.orphan_present is True
+    assert job.bundle_name == bundle_name
+    assert bundle.read_bytes() == b"owned"
+    assert unrelated.read_bytes() == b"unrelated"
+
+
+@pytest.mark.asyncio
+async def test_repeated_asgi_cancellation_waits_for_delivery_release(tmp_path):
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    response = await endpoint(_download_request(request_id))
+    first_body = asyncio.Event()
+    body_release = asyncio.Event()
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            first_body.set()
+            await body_release.wait()
+
+    await controller._job_lock.acquire()
+    response_task = asyncio.create_task(
+        response(_download_request(request_id).scope, receive, send)
+    )
+    await asyncio.wait_for(first_body.wait(), 5)
+    response_task.cancel()
+    await asyncio.sleep(0)
+    response_task.cancel()
+    await asyncio.sleep(0)
+    assert not response_task.done()
+    assert request_id in controller._active_deliveries
+    controller._job_lock.release()
+    body_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await response_task
+    assert request_id not in controller._active_deliveries
+    assert controller._active_workers == 0
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as retry:
+        assert retry.handle.read(1)
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_response_failure_releases_delivery(
+    tmp_path, monkeypatch
+):
+    import production_backup_capture as capture_module
+
+    controller, source, _, _, _ = _controller(tmp_path)
+    request_id = await _ready_capture(controller, source)
+
+    class FailingResponse:
+        def __init__(self, *args, **kwargs):
+            current = asyncio.current_task()
+            asyncio.get_running_loop().call_soon(current.cancel)
+            asyncio.get_running_loop().call_soon(current.cancel)
+            raise RuntimeError("synthetic response construction")
+
+    monkeypatch.setattr(capture_module, "_ManagedStreamingResponse", FailingResponse)
+    routes = build_backup_v2_routes(controller, lambda request: _claims())
+    endpoint = next(route.endpoint for route in routes if route.path.endswith("/bundle"))
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint(_download_request(request_id))
+    assert request_id not in controller._active_deliveries
+    assert controller._active_workers == 0
+    assert controller.get_job(request_id, _claims())["state"] == "ready"
+    async with controller.delivery(request_id, _claims()) as retry:
+        assert retry.handle.read(1)
+    assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
