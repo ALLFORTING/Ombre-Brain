@@ -265,6 +265,65 @@ approve or execute production migration. Maintenance windows, backup,
 rollback, Reindex, cutover, and production enablement remain independently
 gated later stages.
 
+## Stage 8H-G1B encrypted offline backup bundle core
+
+The legacy JSON/base64 full-payload backup schedule is paused. Stage 8H-G1B
+adds only an offline bundle and isolated restore core; it is not connected to
+the production HTTP endpoint, Render, GitHub Actions, object storage, or the
+normal Ombre-Brain startup path. All development and tests use synthetic data
+inside a purpose-built workspace. No production data or historical backup
+payload was read, copied, downloaded, deleted, or modified.
+
+`prepare` creates a workspace with fixed `source`, `bundles`, `restored`,
+`reports`, and `temp` roots plus a random identity-bound marker and manifest.
+Every later operation canonicalizes those roots and rejects overlap,
+symlink/junction escape, unsafe archive paths, path collisions, unsupported
+file types, and credential material. There is no force or skip-safety mode.
+Restore always authenticates and verifies into a temporary isolated directory
+before atomically publishing a new workspace-local restored root.
+
+Regular files and blobs are copied with streaming hashes, stable file-identity
+checks, and a second source hash. Recognized SQLite stores are captured through
+the SQLite online backup API from a `mode=ro`, `query_only` connection. The
+snapshot receives a read-only integrity check plus page, schema, size, and hash
+evidence. SQLite WAL, SHM, and journal sidecars are excluded from the archive;
+committed WAL transactions are represented by the online snapshot rather than
+restored as sidecar files. Authentication files, backup state, temporary files,
+locks, and private-key material are explicitly excluded with stable reason
+codes instead of being silently ignored.
+
+The canonical manifest records only relative paths, categories, aggregate
+counts, hashes, SQLite structural evidence, version identities, and stable
+exclusion reasons. It contains no file contents, private metadata, absolute
+paths, credentials, private keys, or raw exception text. The deterministic tar
+payload contains regular members only. Extraction is manual and validates every
+member, digest, size, collision boundary, and SQLite snapshot.
+
+Every bundle uses a fresh 256-bit content key. An ephemeral X25519 exchange and
+HKDF-SHA256 derive the key-encryption key, AEAD wraps the content key, and
+AES-256-GCM streams and authenticates the archive with the canonical public
+header as associated data. There is no unencrypted mode, passphrase argument,
+authentication bypass, or recovery mode. Recipient private keys remain outside
+bundles, reports, logs, Render, and source control.
+
+`inspect` reads only non-sensitive public header metadata and needs no private
+key. `verify` fully authenticates, decrypts, and checks the archive without
+publishing restored data. Wrong keys and changes to the header, wrapped key,
+ciphertext, tag, length, manifest, or archive structure fail closed. Temporary
+plaintext and failed outputs are removed, while completed bundles and restored
+roots are published with atomic replacement.
+
+This core can prove that an individual ordinary file did not observably change
+during its capture and that each SQLite snapshot is internally consistent. It
+does not provide a cross-file production point-in-time guarantee. A future
+production-copy capture still requires a separately approved application-level
+writer freeze and maintenance capability. Render disk snapshots remain an
+independent rollback layer. This stage does not implement retention, restore
+workflow automation, production backup acquisition, production-copy rehearsal,
+migration, Reindex, deployment, or cutover. The 51 historical Git backups remain
+untouched; any history cleanup requires separate approval after a new backup
+chain and restore procedure are proven.
+
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP

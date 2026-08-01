@@ -22,3 +22,4 @@ tests/integration/
 tests/regression/
 tests/unit/
 temp/remember-me-claude-skill.zip
+*.obx25519-private
