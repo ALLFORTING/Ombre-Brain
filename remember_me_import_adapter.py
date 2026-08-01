@@ -15,8 +15,14 @@ from typing import Any, Protocol
 
 from asset_store import AssetStoreError
 from remember_me.core import (
+    AssetBlobVerificationResult,
     AssetNotFoundError,
+    AssetVerificationCompletion,
+    AssetVerificationPage,
+    AssetVerificationSnapshot,
     AssetIdConflict,
+    BeginAssetVerificationRequest,
+    CompleteAssetVerificationRequest,
     ImageMimeMismatch,
     ImageValidationError,
     GetAssetRequest,
@@ -25,12 +31,14 @@ from remember_me.core import (
     ImportAssetTag,
     ImportMetadataValidationError,
     InvalidImportRecord,
+    ListAssetVerificationPageRequest,
     RememberMeCore,
     RememberMeError,
     StoredShaMismatch,
     StoredShaOwnershipConflict,
     UnsupportedAssetKind,
     UnsupportedImageFormat,
+    VerifyAssetBlobRequest,
 )
 
 
@@ -60,14 +68,7 @@ _REQUIRED_RECORD_FIELDS = (
 _FIXTURE_MARKER_NAME = ".ombre-stage8g-b-fixture"
 _FIXTURE_PREFIX = "ombre-stage8g-b-"
 _FIXTURE_FACTORY_TOKEN = object()
-_TARGET_RECONCILIATION_UNSUPPORTED_CHECKS = (
-    "target_blob_bytes",
-    "target_duplicate_asset_detection",
-    "target_full_inventory",
-    "target_snapshot_consistency",
-    "target_tag_created_at",
-    "target_unexpected_asset_detection",
-)
+_TARGET_RECONCILIATION_UNSUPPORTED_CHECKS: tuple[str, ...] = ()
 
 
 class LegacyAssetImportDisposition(str, Enum):
@@ -402,6 +403,118 @@ class LegacyAssetImportAdapter:
             core=self._core,
         )
         return _TARGET_RECONCILIATION_UNSUPPORTED_CHECKS
+
+    def begin_target_verification(self) -> AssetVerificationSnapshot:
+        return self._call_target_verification(
+            "begin_asset_verification",
+            BeginAssetVerificationRequest(kind="image"),
+        )
+
+    def list_target_verification_page(
+        self,
+        *,
+        snapshot_id: str,
+        cursor: str,
+        limit: int,
+    ) -> AssetVerificationPage:
+        return self._call_target_verification(
+            "list_asset_verification_page",
+            ListAssetVerificationPageRequest(
+                snapshot_id=snapshot_id,
+                cursor=cursor,
+                limit=limit,
+            ),
+        )
+
+    def verify_target_blob(
+        self,
+        *,
+        snapshot_id: str,
+        asset_id: str,
+        expected_sha256: str,
+        expected_size: int,
+        expected_bytes: bytes,
+    ) -> AssetBlobVerificationResult:
+        return self._call_target_verification(
+            "verify_asset_blob",
+            VerifyAssetBlobRequest(
+                snapshot_id=snapshot_id,
+                asset_id=asset_id,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                expected_bytes=expected_bytes,
+            ),
+        )
+
+    def complete_target_verification(
+        self,
+        *,
+        snapshot_id: str,
+    ) -> AssetVerificationCompletion:
+        return self._call_target_verification(
+            "complete_asset_verification",
+            CompleteAssetVerificationRequest(snapshot_id=snapshot_id),
+        )
+
+    def get_legacy_verification_bytes(self, asset_id: str) -> bytes:
+        """Read one frozen legacy blob without exposing its locator."""
+        self._fixture_context._validate_for_adapter(
+            legacy_store=self._legacy_store,
+            core=self._core,
+        )
+        if (
+            not isinstance(asset_id, str)
+            or _ASSET_ID_PATTERN.fullmatch(asset_id) is None
+        ):
+            raise LegacyAssetImportAdapterError("invalid_asset_id")
+        try:
+            resolved = self._legacy_store.resolve_file(asset_id)
+        except Exception as exc:
+            raise LegacyAssetImportAdapterError(
+                "legacy_blob_unavailable"
+            ) from exc
+        if (
+            not isinstance(resolved, tuple)
+            or len(resolved) != 2
+            or not isinstance(resolved[1], Path)
+        ):
+            raise LegacyAssetImportAdapterError("legacy_blob_unavailable")
+        _, blob_path = resolved
+        try:
+            content = blob_path.read_bytes()
+        except Exception as exc:
+            raise LegacyAssetImportAdapterError(
+                "legacy_blob_unavailable"
+            ) from exc
+        if type(content) is not bytes:
+            raise LegacyAssetImportAdapterError("legacy_blob_unavailable")
+        return content
+
+    def _call_target_verification(self, method_name: str, request):
+        self._fixture_context._validate_for_adapter(
+            legacy_store=self._legacy_store,
+            core=self._core,
+        )
+        method = getattr(self._core, method_name, None)
+        if not callable(method):
+            raise LegacyAssetImportAdapterError(
+                "rm_target_verification_unavailable"
+            )
+        try:
+            return method(request)
+        except RememberMeError as exc:
+            code = getattr(exc, "code", "")
+            if not isinstance(code, str) or re.fullmatch(
+                r"[a-z0-9_]{1,96}", code
+            ) is None:
+                code = "verification_error"
+            raise LegacyAssetImportAdapterError(
+                "rm_target_{}".format(code)
+            ) from exc
+        except Exception as exc:
+            raise LegacyAssetImportAdapterError(
+                "rm_target_verification_internal_error"
+            ) from exc
 
     def import_asset(
         self,
