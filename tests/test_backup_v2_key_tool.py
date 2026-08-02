@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -12,11 +14,62 @@ from scripts import backup_v2_key_tool as key_tool
 
 
 PASSPHRASE = b"synthetic-test-passphrase"
+SCRIPT_PATH = key_tool.ROOT / "scripts" / "backup_v2_key_tool.py"
 
 
 def _disable_host_acl(monkeypatch):
     monkeypatch.setattr(key_tool, "_harden_private_key_acl", lambda path: None)
     monkeypatch.setattr(key_tool, "_verify_private_key_protection", lambda path: None)
+
+
+def _run_direct_script(tmp_path, public_path):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT_PATH),
+            "inspect-public",
+            "--public-key",
+            str(public_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_direct_script_execution_repairs_repository_import_path(tmp_path):
+    private_key = X25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    public_path = tmp_path / "recipient-public-key.b64"
+    public_path.write_text(
+        key_tool._public_key_b64(public_key) + "\n",
+        encoding="ascii",
+    )
+
+    result = _run_direct_script(tmp_path, public_path)
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["algorithm"] == "X25519"
+    assert payload["fingerprint"] == key_tool.public_key_fingerprint(public_key)
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "production_backup_capture" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_direct_script_invalid_public_key_returns_stable_failure(tmp_path):
+    public_path = tmp_path / "invalid-public-key.b64"
+    public_path.write_text("not-a-public-key\n", encoding="ascii")
+
+    result = _run_direct_script(tmp_path, public_path)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "public_key_invalid"
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "production_backup_capture" not in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_generate_requires_new_absolute_directory_outside_repo(tmp_path, monkeypatch):

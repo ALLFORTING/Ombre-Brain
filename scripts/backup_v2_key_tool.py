@@ -23,6 +23,9 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+ROOT_TEXT = str(ROOT)
+if ROOT_TEXT not in sys.path:
+    sys.path.insert(0, ROOT_TEXT)
 PRIVATE_NAME = "recipient-private-key.pem"
 PUBLIC_NAME = "recipient-public-key.b64"
 METADATA_NAME = "recipient-key-metadata.json"
