@@ -151,6 +151,10 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "prepare_rehearsal_workspace": "isolated_offline_workspace",
         "_atomic_write_json": "isolated_offline_workspace",
     },
+    "scripts/backup_v2_key_tool.py": {
+        "generate": "isolated_offline_key_workspace",
+        "_exclusive_write": "offline_key_no_replace_publish",
+    },
     "utils.py": {"load_config": "startup_initialization"},
 }
 
@@ -406,6 +410,7 @@ def _boundary_shape_valid(
         "excluded_transient_import_upload_cleanup",
         "excluded_transient_upload_then_guarded_store", "guarded_storage_components",
         "isolated_offline_workspace",
+        "isolated_offline_key_workspace", "offline_key_no_replace_publish",
         "dynamic_sql_read_only",
     }
 
@@ -437,7 +442,10 @@ def _validate_guarded_callers(
                 for child in ast.walk(node):
                     if not isinstance(child, ast.Call):
                         continue
-                    if _call_name(child.func).rsplit(".", 1)[-1] != target_function:
+                    call_name = _call_name(child.func)
+                    if target_function == "__init__" and _is_super_init_call(child):
+                        continue
+                    if call_name.rsplit(".", 1)[-1] != target_function:
                         continue
                     found = True
                     if (filename, function) not in allowed:
@@ -455,6 +463,17 @@ def _call_name(node: ast.AST) -> str:
         prefix = _call_name(node.value)
         return f"{prefix}.{node.attr}" if prefix else node.attr
     return ""
+
+
+def _is_super_init_call(node: ast.Call) -> bool:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "__init__":
+        return False
+    receiver = node.func.value
+    return (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Name)
+        and receiver.func.id == "super"
+    )
 
 
 def _open_mode(node: ast.Call, *, bound: bool) -> str | None:
