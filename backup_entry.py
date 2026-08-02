@@ -9,6 +9,7 @@ import httpx
 import server
 from backfill_embeddings import backfill_batch
 from backup_export import backup_payload_json, verify_github_oidc
+from backup_v2_runtime import register_backup_v2_if_enabled
 
 
 logger = logging.getLogger("ombre_brain.backup")
@@ -114,6 +115,8 @@ async def aliases_clean_endpoint(request):
 def run() -> None:
     transport = server.config.get("transport", "stdio")
     logger.info("Ombre Brain starting with backup export | transport: %s", transport)
+
+    register_backup_v2_if_enabled(server, transport)
 
     if transport not in ("sse", "streamable-http"):
         server.mcp.run(transport=transport)

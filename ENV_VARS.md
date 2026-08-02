@@ -50,3 +50,49 @@
 ```
 
 Webhook 推送失败仅在服务日志中以 WARNING 级别记录，**不会影响 MCP 工具的正常返回**。
+
+## Backup v2 production registration placeholders
+
+Stage 8H-G1D-B adds a disabled-by-default registration path for the encrypted
+backup-v2 capture API. These variables are documented as placeholders only.
+This PR does not configure Render, GitHub secrets, GitHub variables, endpoint
+values, production keys, or production paths.
+
+| Variable | Required when enabled | Default | Description |
+|----------|-----------------------|---------|-------------|
+| `OMBRE_BACKUP_V2_ENABLED` | No | disabled | Backup-v2 remains disabled when unset, empty, or exact `false`. Exact lowercase `true` is required to enable. Any other non-empty value fails startup. |
+| `OMBRE_BACKUP_V2_PUBLIC_KEY_B64` | Yes | none | Canonical base64 for the 32 raw X25519 recipient public-key bytes. Placeholder only; do not commit a production key. |
+| `OMBRE_BACKUP_V2_RECIPIENT_FINGERPRINT` | Yes | none | `x25519-sha256:` plus 64 lowercase hex characters, matching the public key. Placeholder only; do not commit a production fingerprint. |
+| `OMBRE_BACKUP_V2_REPOSITORY_ID` | Yes | none | Decimal GitHub repository ID for the approved backup transport repository. Placeholder only. |
+| `OMBRE_BACKUP_V2_REPOSITORY_OWNER_ID` | Yes | none | Decimal GitHub owner ID for the approved backup transport owner. Placeholder only. |
+| `OMBRE_BACKUP_V2_WORKSPACE_ROOT` | Yes | none | Absolute backup-v2 workspace directory outside the repository and outside the source bucket tree. Placeholder only. |
+| `OMBRE_BACKUP_V2_FREEZE_TIMEOUT_SECONDS` | Yes | none | Positive integer from 1 through 600. Must be less than `OMBRE_BACKUP_V2_MAX_FREEZE_SECONDS`. |
+| `OMBRE_BACKUP_V2_MAX_FREEZE_SECONDS` | Yes | none | Positive integer from 2 through 1800. |
+| `OMBRE_BACKUP_V2_MAX_SOURCE_BYTES` | Yes | none | Positive integer up to 10737418240. |
+| `OMBRE_BACKUP_V2_MAX_BUNDLE_BYTES` | Yes | none | Positive integer up to 10737418240. |
+| `OMBRE_BACKUP_V2_MINIMUM_FREE_BYTES` | Yes | none | Positive integer up to 10737418240. |
+| `OMBRE_BACKUP_V2_READY_TTL_SECONDS` | Yes | none | Positive integer from 1 through 86400. |
+| `RENDER_GIT_COMMIT` | Yes | none | Runtime commit supplied by the production platform; exact 40-character lowercase hex. There is no separate production override. |
+
+Numeric values reject whitespace, signs, booleans, decimals, zero, negatives,
+overflow, scientific notation, and trailing junk. Invalid enabled configuration
+aborts startup instead of silently falling back to disabled mode.
+
+The backup-v2 source root is the existing `server.config["buckets_dir"]`; there
+is no backup-v2 source-root environment override. Backup-v2 supports only
+`streamable-http` with one Python process and one Uvicorn worker.
+
+Offline key preparation must happen on a trusted local machine outside the
+repository:
+
+```powershell
+python scripts/backup_v2_key_tool.py generate --output-dir <absolute-new-directory-outside-repo>
+python scripts/backup_v2_key_tool.py verify-keyset --key-dir <absolute-key-directory>
+python scripts/backup_v2_key_tool.py inspect-public --public-key <absolute-key-directory>\recipient-public-key.b64
+```
+
+The private key is encrypted PKCS#8 PEM and must never be placed in Render,
+GitHub Actions, Git, logs, artifacts, job summaries, shell history, ChatGPT,
+Codex, issues, pull requests, or environment exports. Only the public key and
+fingerprint may later be copied into production after an explicitly approved
+activation stage.
