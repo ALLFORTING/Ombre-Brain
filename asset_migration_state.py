@@ -12,6 +12,11 @@ import secrets
 import sqlite3
 from typing import Callable
 
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+)
+
 
 MIGRATION_SCHEMA_VERSION = 1
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
@@ -73,10 +78,20 @@ class AssetWriteGuard(AbstractContextManager):
         self._connection: sqlite3.Connection | None = None
         self._owner_token: str | None = None
         self._outcome: str | None = None
+        self._maintenance_scope = None
 
     def __enter__(self) -> "AssetWriteGuard":
+        self._maintenance_scope = self._state.write_coordinator.writer_scope(
+            "legacy_asset_guard"
+        )
+        self._maintenance_scope.__enter__()
         owner_token = secrets.token_hex(32)
-        connection = self._state._connect()
+        try:
+            connection = self._state._connect()
+        except BaseException:
+            self._maintenance_scope.__exit__(None, None, None)
+            self._maintenance_scope = None
+            raise
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._state._assert_runtime_schema(connection)
@@ -147,13 +162,23 @@ class AssetWriteGuard(AbstractContextManager):
         except HostMigrationStateError:
             connection.rollback()
             connection.close()
+            self._maintenance_scope.__exit__(None, None, None)
+            self._maintenance_scope = None
             raise
         except (OSError, sqlite3.Error, ValueError) as exc:
             connection.rollback()
             connection.close()
+            self._maintenance_scope.__exit__(None, None, None)
+            self._maintenance_scope = None
             raise HostMigrationStateError(
                 "asset_write_gate_unavailable"
             ) from exc
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            self._maintenance_scope.__exit__(None, None, None)
+            self._maintenance_scope = None
+            raise
 
     def mark_changed(self) -> None:
         self._set_outcome("changed")
@@ -207,7 +232,12 @@ class AssetWriteGuard(AbstractContextManager):
                 "asset_write_gate_unavailable"
             ) from exc
         finally:
-            connection.close()
+            try:
+                connection.close()
+            finally:
+                if self._maintenance_scope is not None:
+                    self._maintenance_scope.__exit__(exc_type, exc_value, traceback)
+                    self._maintenance_scope = None
 
 
 def canonical_path_identity(path: str | Path) -> str:
@@ -232,7 +262,9 @@ class HostMigrationState:
         target_root: str | Path,
         clock: Callable[[], datetime] | None = None,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        write_coordinator=None,
     ) -> None:
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
         if (
             isinstance(busy_timeout_ms, bool)
             or not isinstance(busy_timeout_ms, int)
@@ -517,6 +549,7 @@ class HostMigrationState:
                 "migration_state_unavailable"
             ) from exc
 
+    @guarded_mutation("migration_freeze_acquire")
     def acquire_freeze(
         self,
         *,
@@ -596,6 +629,7 @@ class HostMigrationState:
         finally:
             connection.close()
 
+    @guarded_mutation("migration_freeze_renew")
     def renew_freeze(self, owner_token: str, *, ttl_seconds: int) -> None:
         ttl = _validate_ttl(ttl_seconds)
         _validate_owner(owner_token)
@@ -666,6 +700,7 @@ class HostMigrationState:
                 "migration_state_unavailable"
             ) from exc
 
+    @guarded_mutation("migration_freeze_release")
     def release_freeze(self, owner_token: str) -> bool:
         _validate_owner(owner_token)
         connection = self._connect()
@@ -740,6 +775,7 @@ class HostMigrationState:
                 "migration_state_unavailable"
             ) from exc
 
+    @guarded_mutation("migration_checkpoint_create")
     def create_checkpoint(
         self,
         *,
@@ -818,6 +854,7 @@ class HostMigrationState:
             raise HostMigrationStateError("migration_state_unavailable")
         return checkpoint
 
+    @guarded_mutation("migration_checkpoint_status")
     def set_checkpoint_status(
         self,
         *,
@@ -920,6 +957,7 @@ class HostMigrationState:
             raise HostMigrationStateError("migration_checkpoint_missing")
         return checkpoint
 
+    @guarded_mutation("migration_checkpoint_progress")
     def record_asset_success(
         self,
         *,

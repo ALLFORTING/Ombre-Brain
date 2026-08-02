@@ -22,6 +22,8 @@ import struct
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unicodedata
 from typing import Any, Callable
 
@@ -34,6 +36,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from maintenance_write_gate import FreezeLease, MaintenanceWriteCoordinator
 
 
 WORKSPACE_SCHEMA_VERSION = 1
@@ -103,6 +107,11 @@ _STABLE_STATUSES = {
     "manifest_invalid",
     "restore_target_invalid",
     "restore_failed",
+    "capture_cancelled",
+    "freeze_lease_expired",
+    "capture_source_too_large",
+    "capture_space_insufficient",
+    "capture_bundle_too_large",
     "internal_error",
 }
 _EXIT_CODES = {
@@ -118,6 +127,11 @@ _EXIT_CODES = {
     "restore_target_invalid": 10,
     "restore_failed": 11,
     "internal_error": 12,
+    "capture_cancelled": 13,
+    "freeze_lease_expired": 14,
+    "capture_source_too_large": 15,
+    "capture_space_insufficient": 16,
+    "capture_bundle_too_large": 17,
 }
 
 
@@ -129,6 +143,50 @@ class BackupBundleError(RuntimeError):
             status = "internal_error"
         self.status = status
         super().__init__(status)
+
+
+class CaptureAbortSignal:
+    """Thread-safe cooperative stop signal for internal capture workers."""
+
+    def __init__(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._deadline = deadline
+        self._monotonic = monotonic
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._code: str | None = None
+
+    def abort(self, code: str = "capture_cancelled") -> None:
+        if code not in {"capture_cancelled", "freeze_lease_expired"}:
+            code = "capture_cancelled"
+        with self._lock:
+            if self._code is None:
+                self._code = code
+                self._event.set()
+
+    def raise_if_aborted(self) -> None:
+        with self._lock:
+            code = self._code
+        if code is not None:
+            raise BackupBundleError(code)
+        if self._deadline is not None and self._monotonic() >= self._deadline:
+            self.abort("freeze_lease_expired")
+            raise BackupBundleError("freeze_lease_expired")
+
+
+def _check_abort(abort_signal: CaptureAbortSignal | None) -> None:
+    if abort_signal is not None:
+        abort_signal.raise_if_aborted()
+
+
+def _call_abortable(function, *args, abort_signal=None, **kwargs):
+    if abort_signal is not None:
+        kwargs["abort_signal"] = abort_signal
+    return function(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -174,6 +232,23 @@ class SourceInventoryRecord:
 class SourceInventory:
     root_identity: tuple[int, int, int, int]
     records: tuple[SourceInventoryRecord, ...]
+
+
+@dataclass(frozen=True)
+class FrozenCaptureLimits:
+    """Bounds enforced against the exact inventory captured under freeze."""
+
+    max_source_bytes: int
+    max_bundle_bytes: int
+    minimum_free_bytes: int
+
+    def validate(self) -> None:
+        if (
+            self.max_source_bytes <= 0
+            or self.max_bundle_bytes <= 0
+            or self.minimum_free_bytes < 0
+        ):
+            raise BackupBundleError("internal_error")
 
 
 def prepare_backup_workspace(path: str | Path) -> BackupWorkspace:
@@ -265,6 +340,84 @@ def capture_bundle(
     if remember_me_version != EXPECTED_REMEMBER_ME_VERSION:
         raise BackupBundleError("workspace_invalid")
     _validate_chunk_size(chunk_size)
+    return _capture_source_into_bundle(
+        workspace,
+        workspace.source_root,
+        recipient_public_key,
+        ob_commit_sha=ob_commit_sha,
+        remember_me_version=remember_me_version,
+        clock=clock,
+        chunk_size=chunk_size,
+    )
+
+
+def capture_external_source(
+    workspace_path: str | Path,
+    source_root: str | Path,
+    authorized_source_root: str | Path,
+    recipient_public_key: X25519PublicKey,
+    *,
+    coordinator: MaintenanceWriteCoordinator,
+    freeze_lease: FreezeLease,
+    ob_commit_sha: str,
+    remember_me_version: str = EXPECTED_REMEMBER_ME_VERSION,
+    clock: Callable[[], datetime] | None = None,
+    chunk_size: int = CHUNK_SIZE,
+    abort_signal: CaptureAbortSignal | None = None,
+    frozen_limits: FrozenCaptureLimits | None = None,
+    disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+) -> CaptureResult:
+    """Capture one explicitly authorized external root under a live freeze."""
+    workspace = load_backup_workspace(workspace_path)
+    coordinator.validate_lease(freeze_lease)
+    source = _validate_external_source(
+        workspace,
+        source_root,
+        authorized_source_root,
+    )
+    _validate_public_key(recipient_public_key)
+    if _GIT_SHA_PATTERN.fullmatch(ob_commit_sha) is None:
+        raise BackupBundleError("workspace_invalid")
+    if remember_me_version != EXPECTED_REMEMBER_ME_VERSION:
+        raise BackupBundleError("workspace_invalid")
+    _validate_chunk_size(chunk_size)
+    _check_abort(abort_signal)
+    result = _capture_source_into_bundle(
+        workspace,
+        source,
+        recipient_public_key,
+        ob_commit_sha=ob_commit_sha,
+        remember_me_version=remember_me_version,
+        clock=clock,
+        chunk_size=chunk_size,
+        abort_signal=abort_signal,
+        frozen_limits=frozen_limits,
+        disk_usage=disk_usage,
+    )
+    try:
+        coordinator.validate_lease(freeze_lease)
+    except BaseException:
+        try:
+            (workspace.bundles_root / result.bundle_name).unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            raise BackupBundleError("internal_error") from cleanup_exc
+        raise
+    return result
+
+
+def _capture_source_into_bundle(
+    workspace: BackupWorkspace,
+    source_root: Path,
+    recipient_public_key: X25519PublicKey,
+    *,
+    ob_commit_sha: str,
+    remember_me_version: str,
+    clock: Callable[[], datetime] | None,
+    chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
+    frozen_limits: FrozenCaptureLimits | None = None,
+    disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+) -> CaptureResult:
     bundle_id = secrets.token_hex(16)
     bundle_name = f"{bundle_id}{BUNDLE_SUFFIX}"
     final_bundle = workspace.bundles_root / bundle_name
@@ -277,20 +430,34 @@ def capture_bundle(
     archive_path = operation_root / "payload.tar"
     staging_root.mkdir()
     try:
-        initial_inventory = _inventory_source(
-            workspace.source_root,
+        initial_inventory = _call_abortable(
+            _inventory_source,
+            source_root,
             chunk_size=chunk_size,
+            abort_signal=abort_signal,
         )
-        entries, exclusions = _capture_source(
-            workspace.source_root,
+        if frozen_limits is not None:
+            _validate_frozen_capture_limits(
+                initial_inventory,
+                workspace.temp_root,
+                frozen_limits,
+                disk_usage=disk_usage,
+            )
+        _check_abort(abort_signal)
+        entries, exclusions = _call_abortable(
+            _capture_source,
+            source_root,
             staging_root,
             initial_inventory,
             chunk_size=chunk_size,
+            abort_signal=abort_signal,
         )
         try:
-            final_inventory = _inventory_source(
-                workspace.source_root,
+            final_inventory = _call_abortable(
+                _inventory_source,
+                source_root,
                 chunk_size=chunk_size,
+                abort_signal=abort_signal,
             )
         except BackupBundleError as exc:
             if exc.status == "source_unsupported":
@@ -304,6 +471,7 @@ def capture_bundle(
         created_at = _timestamp(clock)
         manifest = _build_manifest(
             workspace=workspace,
+            source_root=source_root,
             bundle_id=bundle_id,
             created_at=created_at,
             ob_commit_sha=ob_commit_sha,
@@ -314,14 +482,18 @@ def capture_bundle(
         )
         manifest_bytes = _canonical_json_bytes(manifest)
         _validate_manifest(manifest_bytes)
-        _build_archive(
+        _call_abortable(
+            _build_archive,
             archive_path,
             staging_root,
             manifest_bytes,
             entries,
             chunk_size=chunk_size,
+            abort_signal=abort_signal,
         )
-        _encrypt_archive(
+        _check_abort(abort_signal)
+        _call_abortable(
+            _encrypt_archive,
             archive_path,
             final_bundle,
             recipient_public_key,
@@ -329,7 +501,18 @@ def capture_bundle(
             bundle_id=bundle_id,
             created_at=created_at,
             chunk_size=chunk_size,
+            abort_signal=abort_signal,
+            max_output_bytes=(
+                frozen_limits.max_bundle_bytes
+                if frozen_limits is not None
+                else None
+            ),
         )
+        try:
+            _check_abort(abort_signal)
+        except BackupBundleError:
+            _remove_file(final_bundle)
+            raise
         ordinary_count = sum(
             entry["entry_type"] == "regular" for entry in entries
         )
@@ -522,6 +705,7 @@ def _capture_source(
     inventory: SourceInventory,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     entries: list[dict[str, Any]] = []
     exclusions = [
@@ -533,6 +717,7 @@ def _capture_source(
         if record.exclusion_reason is not None
     ]
     for record in inventory.records:
+        _check_abort(abort_signal)
         if record.item_type not in {"regular", "sqlite"}:
             continue
         relative = record.relative_path
@@ -540,7 +725,13 @@ def _capture_source(
         destination = staging_root / Path(*PurePosixPath(relative).parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if record.item_type == "sqlite":
-            evidence = _snapshot_sqlite(path, destination, chunk_size=chunk_size)
+            evidence = _call_abortable(
+                _snapshot_sqlite,
+                path,
+                destination,
+                chunk_size=chunk_size,
+                abort_signal=abort_signal,
+            )
             entry = {
                 "relative_path": relative,
                 "entry_type": "sqlite_snapshot",
@@ -550,8 +741,12 @@ def _capture_source(
                 **evidence,
             }
         else:
-            size, digest = _copy_regular_file_stable(
-                path, destination, chunk_size=chunk_size
+            size, digest = _call_abortable(
+                _copy_regular_file_stable,
+                path,
+                destination,
+                chunk_size=chunk_size,
+                abort_signal=abort_signal,
             )
             entry = {
                 "relative_path": relative,
@@ -570,21 +765,62 @@ def _inventory_source(
     source_root: Path,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> SourceInventory:
-    first = _scan_source_metadata(source_root)
-    first = _add_inventory_hashes(source_root, first, chunk_size=chunk_size)
-    second = _scan_source_metadata(source_root)
-    second = _add_inventory_hashes(source_root, second, chunk_size=chunk_size)
+    _check_abort(abort_signal)
+    first = _call_abortable(
+        _scan_source_metadata, source_root, abort_signal=abort_signal
+    )
+    first = _call_abortable(
+        _add_inventory_hashes,
+        source_root, first, chunk_size=chunk_size, abort_signal=abort_signal
+    )
+    second = _call_abortable(
+        _scan_source_metadata, source_root, abort_signal=abort_signal
+    )
+    second = _call_abortable(
+        _add_inventory_hashes,
+        source_root, second, chunk_size=chunk_size, abort_signal=abort_signal
+    )
     if first != second:
         raise BackupBundleError("source_changed")
     return second
 
 
-def _scan_source_metadata(source_root: Path) -> SourceInventory:
+def _validate_frozen_capture_limits(
+    inventory: SourceInventory,
+    work_root: Path,
+    limits: FrozenCaptureLimits,
+    *,
+    disk_usage: Callable[[Path], Any],
+) -> None:
+    limits.validate()
+    source_bytes = sum(
+        record.size_bytes or 0
+        for record in inventory.records
+        if record.item_type in {"regular", "sqlite", "sqlite_content_sidecar"}
+    )
+    if source_bytes > limits.max_source_bytes:
+        raise BackupBundleError("capture_source_too_large")
+    required = source_bytes * 3 + limits.minimum_free_bytes
+    try:
+        free_bytes = int(disk_usage(work_root).free)
+    except Exception as exc:
+        raise BackupBundleError("internal_error") from exc
+    if free_bytes < required:
+        raise BackupBundleError("capture_space_insufficient")
+
+
+def _scan_source_metadata(
+    source_root: Path,
+    *,
+    abort_signal: CaptureAbortSignal | None = None,
+) -> SourceInventory:
     root_before = _file_identity(source_root)
     records: list[SourceInventoryRecord] = []
     stack = [source_root]
     while stack:
+        _check_abort(abort_signal)
         directory = stack.pop()
         try:
             children = sorted(directory.iterdir(), key=lambda item: item.name)
@@ -592,6 +828,7 @@ def _scan_source_metadata(source_root: Path) -> SourceInventory:
             raise BackupBundleError("source_unsupported") from exc
         directories: list[Path] = []
         for child in children:
+            _check_abort(abort_signal)
             relative = child.relative_to(source_root).as_posix()
             try:
                 _validate_relative_path(relative)
@@ -661,9 +898,11 @@ def _add_inventory_hashes(
     inventory: SourceInventory,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> SourceInventory:
     records: list[SourceInventoryRecord] = []
     for record in inventory.records:
+        _check_abort(abort_signal)
         if record.item_type not in {
             "regular",
             "sqlite",
@@ -672,9 +911,11 @@ def _add_inventory_hashes(
             records.append(record)
             continue
         path = source_root / Path(*PurePosixPath(record.relative_path).parts)
-        identity, size, digest = _stable_source_file_evidence(
+        identity, size, digest = _call_abortable(
+            _stable_source_file_evidence,
             path,
             chunk_size=chunk_size,
+            abort_signal=abort_signal,
         )
         if identity != record.identity:
             raise BackupBundleError("source_changed")
@@ -729,11 +970,17 @@ def _stable_source_file_evidence(
     path: Path,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> tuple[tuple[int, int, int, int], int, str]:
     before = _file_identity(path)
     try:
-        size, digest = _hash_file(path, chunk_size=chunk_size)
+        size, digest = _call_abortable(
+            _hash_file,
+            path, chunk_size=chunk_size, abort_signal=abort_signal
+        )
     except BackupBundleError as exc:
+        if exc.status in {"capture_cancelled", "freeze_lease_expired"}:
+            raise
         raise BackupBundleError("source_changed") from exc
     after = _file_identity(path)
     if before != after or size != after[2]:
@@ -776,6 +1023,7 @@ def _copy_regular_file_stable(
     destination: Path,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> tuple[int, str]:
     before = _file_identity(source)
     digest = hashlib.sha256()
@@ -783,6 +1031,7 @@ def _copy_regular_file_stable(
     try:
         with source.open("rb") as reader, destination.open("xb") as writer:
             while True:
+                _check_abort(abort_signal)
                 block = reader.read(chunk_size)
                 if not block:
                     break
@@ -796,7 +1045,10 @@ def _copy_regular_file_stable(
     after = _file_identity(source)
     if before != after or size != before[2]:
         raise BackupBundleError("source_changed")
-    confirm_size, confirm_digest = _hash_file(source, chunk_size=chunk_size)
+    confirm_size, confirm_digest = _call_abortable(
+        _hash_file,
+        source, chunk_size=chunk_size, abort_signal=abort_signal
+    )
     if confirm_size != size or confirm_digest != digest.hexdigest():
         raise BackupBundleError("source_changed")
     return size, digest.hexdigest()
@@ -807,8 +1059,12 @@ def _snapshot_sqlite(
     destination: Path,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> dict[str, Any]:
-    before = _sqlite_content_signature(source, chunk_size=chunk_size)
+    before = _call_abortable(
+        _sqlite_content_signature,
+        source, chunk_size=chunk_size, abort_signal=abort_signal
+    )
     try:
         source_connection = sqlite3.connect(
             f"{source.as_uri()}?mode=ro", uri=True, timeout=5
@@ -821,7 +1077,15 @@ def _snapshot_sqlite(
                 "PRAGMA data_version"
             ).fetchone()[0]
             with closing(sqlite3.connect(destination)) as target_connection:
-                source_connection.backup(target_connection)
+                def progress(status, remaining, total):
+                    del status, remaining, total
+                    _check_abort(abort_signal)
+
+                source_connection.backup(
+                    target_connection,
+                    pages=64,
+                    progress=progress,
+                )
                 target_connection.execute("PRAGMA journal_mode = DELETE")
                 target_connection.commit()
             data_version_after = source_connection.execute(
@@ -833,7 +1097,10 @@ def _snapshot_sqlite(
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         raise BackupBundleError("sqlite_snapshot_failed") from exc
-    after = _sqlite_content_signature(source, chunk_size=chunk_size)
+    after = _call_abortable(
+        _sqlite_content_signature,
+        source, chunk_size=chunk_size, abort_signal=abort_signal
+    )
     if before != after or data_version_before != data_version_after:
         raise BackupBundleError("source_changed")
     if any(
@@ -883,6 +1150,7 @@ def _snapshot_sqlite(
 def _build_manifest(
     *,
     workspace: BackupWorkspace,
+    source_root: Path | None = None,
     bundle_id: str,
     created_at: str,
     ob_commit_sha: str,
@@ -903,7 +1171,7 @@ def _build_manifest(
         "capture_mode": CAPTURE_MODE,
         "encryption_profile": ENCRYPTION_PROFILE,
         "recipient_key_fingerprint": recipient_fingerprint,
-        "source_identity": _path_identity(workspace.source_root),
+        "source_identity": _path_identity(source_root or workspace.source_root),
         "entry_count": len(entries),
         "total_plaintext_bytes": sum(entry["size_bytes"] for entry in entries),
         "sqlite_snapshot_count": len(entries) - ordinary_count,
@@ -924,17 +1192,21 @@ def _build_archive(
     entries: list[dict[str, Any]],
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> None:
-    del chunk_size
     try:
         with tarfile.open(archive_path, mode="w", format=tarfile.PAX_FORMAT) as archive:
             _add_bytes_member(archive, ARCHIVE_MANIFEST_PATH, manifest_bytes)
             for entry in entries:
+                _check_abort(abort_signal)
                 relative = entry["relative_path"]
                 source = staging_root / Path(*PurePosixPath(relative).parts)
                 info = _tar_info(f"data/{relative}", entry["size_bytes"])
                 with source.open("rb") as handle:
-                    archive.addfile(info, handle)
+                    archive.addfile(
+                        info,
+                        _AbortableReader(handle, abort_signal, chunk_size),
+                    )
         _fsync_file(archive_path)
     except (OSError, tarfile.TarError) as exc:
         raise BackupBundleError("bundle_invalid") from exc
@@ -944,6 +1216,28 @@ def _add_bytes_member(archive: tarfile.TarFile, name: str, content: bytes) -> No
     import io
 
     archive.addfile(_tar_info(name, len(content)), io.BytesIO(content))
+
+
+class _AbortableReader:
+    def __init__(self, handle, abort_signal, chunk_size: int) -> None:
+        self._handle = handle
+        self._abort_signal = abort_signal
+        self._chunk_size = chunk_size
+
+    def read(self, size: int = -1) -> bytes:
+        _check_abort(self._abort_signal)
+        if size < 0:
+            size = self._chunk_size
+        remaining = size
+        chunks: list[bytes] = []
+        while remaining:
+            _check_abort(self._abort_signal)
+            block = self._handle.read(min(remaining, self._chunk_size))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
 
 
 def _tar_info(name: str, size: int) -> tarfile.TarInfo:
@@ -967,6 +1261,8 @@ def _encrypt_archive(
     bundle_id: str,
     created_at: str,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
+    max_output_bytes: int | None = None,
 ) -> None:
     ephemeral_private = X25519PrivateKey.generate()
     ephemeral_public = ephemeral_private.public_key().public_bytes_raw()
@@ -997,24 +1293,45 @@ def _encrypt_archive(
         raise BackupBundleError("bundle_invalid")
     temporary = final_bundle.parent / f".{final_bundle.name}.{secrets.token_hex(8)}.tmp"
     try:
+        _check_abort(abort_signal)
         encryptor = Cipher(
             algorithms.AES(content_key), modes.GCM(payload_nonce)
         ).encryptor()
         encryptor.authenticate_additional_data(header_bytes)
         with archive_path.open("rb") as reader, temporary.open("xb") as writer:
-            writer.write(MAGIC)
-            writer.write(struct.pack(">I", len(header_bytes)))
-            writer.write(header_bytes)
+            written = 0
+
+            def write_bounded(block: bytes) -> None:
+                nonlocal written
+                _check_abort(abort_signal)
+                if (
+                    max_output_bytes is not None
+                    and written + len(block) > max_output_bytes
+                ):
+                    raise BackupBundleError("capture_bundle_too_large")
+                writer.write(block)
+                written += len(block)
+
+            write_bounded(MAGIC)
+            write_bounded(struct.pack(">I", len(header_bytes)))
+            write_bounded(header_bytes)
             while True:
+                _check_abort(abort_signal)
                 block = reader.read(chunk_size)
                 if not block:
                     break
-                writer.write(encryptor.update(block))
-            writer.write(encryptor.finalize())
-            writer.write(encryptor.tag)
+                write_bounded(encryptor.update(block))
+            write_bounded(encryptor.finalize())
+            write_bounded(encryptor.tag)
             writer.flush()
             os.fsync(writer.fileno())
+        _check_abort(abort_signal)
         _publish_file_no_replace(temporary, final_bundle)
+        try:
+            _check_abort(abort_signal)
+        except BackupBundleError:
+            _remove_file(final_bundle)
+            raise
     except BackupBundleError:
         raise
     except Exception as exc:
@@ -1478,6 +1795,45 @@ def _validate_workspace_paths(root: Path, roots: dict[str, Path]) -> None:
                 raise BackupBundleError("workspace_invalid")
 
 
+def _validate_external_source(
+    workspace: BackupWorkspace,
+    source_root: str | Path,
+    authorized_source_root: str | Path,
+) -> Path:
+    try:
+        candidate = Path(source_root)
+        authorized = Path(authorized_source_root)
+        if (
+            not candidate.is_absolute()
+            or not authorized.is_absolute()
+            or _path_contains_reparse_point(candidate)
+            or _path_contains_reparse_point(authorized)
+        ):
+            raise BackupBundleError("workspace_invalid")
+        source = candidate.resolve(strict=True)
+        expected = authorized.resolve(strict=True)
+        if source != expected or not source.is_dir():
+            raise BackupBundleError("workspace_invalid")
+        _validate_root_location(source)
+        workspace_roots = (
+            workspace.root,
+            workspace.bundles_root,
+            workspace.restored_root,
+            workspace.reports_root,
+            workspace.temp_root,
+        )
+        if any(
+            _is_within(source, root) or _is_within(root, source)
+            for root in workspace_roots
+        ):
+            raise BackupBundleError("workspace_invalid")
+        return source
+    except BackupBundleError:
+        raise
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise BackupBundleError("workspace_invalid") from exc
+
+
 def _validate_relative_path(value: Any) -> None:
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise BackupBundleError("manifest_invalid")
@@ -1530,26 +1886,39 @@ def _sqlite_content_signature(
     path: Path,
     *,
     chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
 ) -> tuple[Any, ...]:
     signature: list[Any] = [
-        _stable_source_file_evidence(path, chunk_size=chunk_size)
+        _call_abortable(
+            _stable_source_file_evidence,
+            path, chunk_size=chunk_size, abort_signal=abort_signal
+        )
     ]
     for suffix in ("-wal", "-journal"):
         sidecar = Path(str(path) + suffix)
         signature.append(
-            _stable_source_file_evidence(sidecar, chunk_size=chunk_size)
+            _call_abortable(
+                _stable_source_file_evidence,
+                sidecar, chunk_size=chunk_size, abort_signal=abort_signal
+            )
             if sidecar.exists()
             else None
         )
     return tuple(signature)
 
 
-def _hash_file(path: Path, *, chunk_size: int) -> tuple[int, str]:
+def _hash_file(
+    path: Path,
+    *,
+    chunk_size: int,
+    abort_signal: CaptureAbortSignal | None = None,
+) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     try:
         with path.open("rb") as handle:
             while True:
+                _check_abort(abort_signal)
                 block = handle.read(chunk_size)
                 if not block:
                     break

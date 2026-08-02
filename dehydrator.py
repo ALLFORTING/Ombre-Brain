@@ -28,6 +28,12 @@ import re
 import json
 import hashlib
 import sqlite3
+
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_mutation,
+    guarded_optional_mutation,
+)
 import logging
 
 from openai import AsyncOpenAI
@@ -161,7 +167,8 @@ class Dehydrator:
     （根据 BEHAVIOR_SPEC.md 三、降级行为表决策：无本地降级）
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, write_coordinator=None):
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
         # --- Read dehydration API config / 读取脱水 API 配置 ---
         dehy_cfg = config.get("dehydration", {})
         self.api_key = dehy_cfg.get("api_key", "")
@@ -216,6 +223,7 @@ class Dehydrator:
         conn.close()
         return row[0] if row else None
 
+    @guarded_optional_mutation("dehydration_cache_store")
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -227,6 +235,7 @@ class Dehydrator:
         conn.commit()
         conn.close()
 
+    @guarded_mutation("dehydration_cache_delete")
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()

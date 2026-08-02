@@ -28,6 +28,11 @@ from remember_me.core import (
     UploadSizeMismatch,
     UploadTooLarge,
 )
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_async_mutation,
+    guarded_mutation,
+)
 
 _ASSET_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _OB_METADATA_ERROR_CODES = {
@@ -91,7 +96,13 @@ class RememberMeReindexResult:
 class RememberMeCoreAdapter:
     """Translate public Remember-Me Core operations into OB-safe structures."""
 
-    def __init__(self, runtime: Any, *, host_adapter: Any = None) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        host_adapter: Any = None,
+        write_coordinator=None,
+    ) -> None:
         if runtime is None or not all(
             hasattr(runtime, name)
             for name in ("service", "repository", "blob_store")
@@ -99,6 +110,7 @@ class RememberMeCoreAdapter:
             raise RememberMeCoreAdapterError("runtime_unavailable")
         self._runtime = runtime
         self._host_adapter = host_adapter
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
 
     @classmethod
     def from_host_adapter(
@@ -125,6 +137,7 @@ class RememberMeCoreAdapter:
             raise RememberMeCoreAdapterError("runtime_unavailable") from exc
         return cls(runtime, host_adapter=host_adapter)
 
+    @guarded_mutation("remember_me_ingest")
     def ingest_image(
         self,
         content: bytes,
@@ -155,6 +168,7 @@ class RememberMeCoreAdapter:
         except Exception as exc:
             self._raise_mapped(exc)
 
+    @guarded_mutation("remember_me_ingest_ob")
     def ingest_ob_public_metadata(
         self,
         content: bytes,
@@ -243,6 +257,7 @@ class RememberMeCoreAdapter:
         )
         return self._ob_public_metadata(asset)
 
+    @guarded_mutation("remember_me_metadata_update")
     def _update_metadata_asset(
         self,
         asset_id: str,
@@ -311,6 +326,7 @@ class RememberMeCoreAdapter:
                 raise RememberMeCoreAdapterError(candidate) from exc
             self._raise_mapped(exc)
 
+    @guarded_async_mutation("remember_me_reindex")
     async def reindex_embeddings(
         self,
         asset_id: str = "",
@@ -367,6 +383,7 @@ class RememberMeCoreAdapter:
         except Exception as exc:
             self._raise_mapped(exc)
 
+    @guarded_mutation("remember_me_delete")
     def delete(self, asset_id: str) -> dict:
         self._require_asset_id(asset_id)
         try:

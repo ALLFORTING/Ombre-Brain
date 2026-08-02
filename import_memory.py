@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from utils import count_tokens_approx, now_iso
+from maintenance_write_gate import guarded_mutation
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -298,6 +299,7 @@ class ImportState:
                 return False
         return False
 
+    @guarded_mutation("import_state_write")
     def save(self):
         """Persist state to file."""
         self.data["updated_at"] = now_iso()

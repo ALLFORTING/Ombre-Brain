@@ -354,6 +354,97 @@ deployment, or cutover. The 51 historical Git backups remain untouched; any
 history cleanup requires separate approval after a new backup chain and restore
 procedure are proven.
 
+## Stage 8H-G1C quiesced encrypted capture channel
+
+Stage 8H-G1B's encrypted bundle and isolated restore core is merged. Stage
+8H-G1C adds a process-local application writer coordinator with OPEN, DRAINING,
+and FROZEN states. Existing writers drain before freeze; new writes fail with
+`maintenance_in_progress`, while reads remain available. Nested persistence
+operations are reentrant and advance one conservative outer mutation generation.
+Read-side activation touches, time ripple, and dehydration-cache stores use a
+narrow incidental-persistence scope: maintenance rejection skips only that
+optional write while preserving the requested read result. Explicit bucket,
+asset, cache invalidation, migration, Reindex, and administrative mutations
+remain hard failures. Any non-maintenance storage error still propagates.
+
+The versioned registry in `docs/maintenance-write-coverage.md` maps bucket,
+AssetStore, embedding, migration-state, Remember-Me adapter, Dashboard,
+timeline, and import-state persistence to guarded boundaries. An AST test
+rejects unregistered write primitives. The guarantee is limited to one Python
+server process and one instance; worker counts above one fail capture preflight.
+
+The internal library can capture only an explicitly authorized external buckets
+root under a current freeze lease. It does not copy that root into workspace
+`source` and adds no arbitrary `--source` CLI option. G1B whole-source inventory,
+streaming copies, SQLite online backup, encryption, manifest verification, and
+no-overwrite publication remain in force. OPEN-state preflight remains an early
+filter, but the exact initial inventory produced under FROZEN is authoritative
+for source size and a second free-space check before staging. That same
+inventory drives capture and the final stability comparison. Encrypted output
+is bounded at each write before formal no-replace publication, and lease
+generation is verified again after capture.
+
+The controller is disabled by default. It accepts only a canonical X25519
+public key with its exact fingerprint, rejects private-key configuration, and
+fails closed for multiple workers. A public key may later enter production;
+the private key must never enter Render. The injected v2 OIDC policy permits
+only the main branch of `ALLFORTING/ob-backup`, future `backup-v2.yml`, the v2
+audience, and `workflow_dispatch`; tests perform no network calls.
+
+Capture creation is a controller-owned asynchronous job. The create route
+returns `202 accepted`; status reports the stable
+accepted/draining/capturing/ready/failed lifecycle. Client disconnect does not
+cancel the job. A monotonic maximum-freeze deadline is enforced, not merely
+reported in lease metadata. Cancellation or expiry signals the blocking worker,
+and OPEN is restored only after that worker has exited and its staging,
+plaintext, encrypted temporary output, and any newly published bundle have
+been contained.
+Both explicit cancellation and worker- or controller-observed deadline expiry
+retain their stable `capture_cancelled` or `freeze_lease_expired` status; neither
+is normalized to `internal_error`. Completed controller tasks are removed from
+the live task registry while terminal job metadata remains queryable.
+Persistent job retention and process-restart recovery remain future
+production-registration work and are not implied by the process-local metadata.
+
+OIDC ownership includes both `run_id` and `run_attempt`, plus fixed repository
+and repository-owner numeric identities. A different attempt cannot inspect,
+download, acknowledge, or reuse another attempt's request. Claim verification
+may be injected as a synchronous or asynchronous callable and remains offline
+in this stage.
+
+Bundle delivery acquires an exclusive per-job delivery lease and fixes an open
+encrypted file handle before response construction. Acknowledge and stale
+cleanup cannot remove a bundle during delivery; disconnect releases the lease
+and leaves the ready bundle retryable. Post-capture failures retain exact
+ownership long enough to remove only the new bundle, and expose only a
+non-sensitive orphan flag if contained cleanup itself fails.
+Delivery pre-hash cancellation waits for the hash worker and file handle to
+close before releasing ownership. ASGI construction failure, cancellation
+before the first body chunk, mid-stream disconnect, iterator failure, and
+successful completion all use the same idempotent release path.
+
+Write coverage discovers all repository production Python modules before
+checking registered boundaries. Decorator-backed boundaries, manual writer
+scopes, guarded callers, startup-only code, and transient staging are validated
+under distinct rules; adding an unregistered production module fails tests.
+Discovery treats dynamic builtin and `Path.open` modes, dynamic or writable
+`os.open` flags, Path mutation methods, link creation, extended copy operations,
+and dynamic SQLite statements as potential writes. Exact non-Path method-name
+collisions use line-anchored call-site evidence rather than file exemptions.
+
+The ASGI route factory is unregistered and is not imported by `server.py`,
+`backup_entry.py`, MCP startup, or Dashboard startup. Synthetic transport
+accepts only encrypted `.obbackup` bytes, validates size and SHA-256, and never
+overwrites a target. `inspect` remains unauthenticated; private-key `verify` and
+isolated `restore` establish authenticated bundle status.
+
+No Render setting, production endpoint, real key, real data, backup workflow,
+production capture, production-copy rehearsal, migration, Reindex, deployment,
+or cutover is part of G1C. The old workflow remains paused and the 51 historical
+Git backups remain untouched. Later stages require independent G1C review, real
+key custody, artifact retention, disabled deployment validation, and explicit
+approval for any real capture or rehearsal.
+
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP

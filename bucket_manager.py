@@ -37,6 +37,13 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
+from maintenance_write_gate import (
+    DEFAULT_WRITE_COORDINATOR,
+    guarded_async_mutation,
+    guarded_mutation,
+    guarded_optional_async_mutation,
+)
+
 from utils import (
     DISPLAY_ALIASES,
     apply_display_aliases,
@@ -70,7 +77,13 @@ class BucketManager:
     天然兼容 Obsidian 直接浏览和编辑。
     """
 
-    def __init__(self, config: dict, embedding_engine=None):
+    def __init__(
+        self,
+        config: dict,
+        embedding_engine=None,
+        write_coordinator=None,
+    ):
+        self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
@@ -155,6 +168,7 @@ class BucketManager:
                 "ON letters(created_at)"
             )
 
+    @guarded_mutation("bucket_history_write")
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
         """Persist the old content before a destructive content change."""
         with sqlite3.connect(self.history_db_path) as conn:
@@ -184,6 +198,7 @@ class BucketManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    @guarded_mutation("bucket_letter_write")
     def record_letter(self, content: str, session_id: str, sealed: bool = False) -> None:
         """Persist an inter-window handoff letter outside normal memory buckets."""
         if not content or not content.strip():
@@ -215,6 +230,7 @@ class BucketManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    @guarded_mutation("bucket_letter_seal")
     def seal_letter(self, letter_id: int, sealed: bool = True) -> bool:
         """Hide or unhide one handoff letter by id."""
         with sqlite3.connect(self.history_db_path) as conn:
@@ -230,6 +246,7 @@ class BucketManager:
     # Write content and metadata into a .md file
     # 将内容和元数据写入一个 .md 文件
     # ---------------------------------------------------------
+    @guarded_async_mutation("bucket_create")
     async def create(
         self,
         content: str,
@@ -367,6 +384,7 @@ class BucketManager:
     # Move bucket between directories
     # 在目录间移动桶文件
     # ---------------------------------------------------------
+    @guarded_mutation("bucket_move")
     def _move_bucket(self, file_path: str, target_type_dir: str, domain: list[str] = None) -> str:
         """
         Move a bucket file to a new type directory, preserving domain subfolder.
@@ -387,6 +405,7 @@ class BucketManager:
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
+    @guarded_async_mutation("bucket_update")
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
@@ -511,6 +530,7 @@ class BucketManager:
     # Delete bucket
     # 删除桶
     # ---------------------------------------------------------
+    @guarded_async_mutation("bucket_delete")
     async def delete(self, bucket_id: str) -> bool:
         """
         Delete a memory bucket file.
@@ -540,6 +560,7 @@ class BucketManager:
     # Called on every recall hit; affects decay score.
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
+    @guarded_optional_async_mutation("bucket_touch")
     async def touch(self, bucket_id: str) -> None:
         """
         Update a bucket's last activation time and count.
@@ -566,7 +587,9 @@ class BucketManager:
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+            raise
 
+    @guarded_async_mutation("bucket_dormant")
     async def set_dormant(self, bucket_id: str, dormant: bool = True) -> bool:
         """Set dormant without refreshing last_active or updated_at."""
         file_path = self._find_bucket_file(bucket_id)
@@ -582,16 +605,14 @@ class BucketManager:
             logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
             return False
 
+    @guarded_optional_async_mutation("bucket_time_ripple")
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         """
         Slightly boost activation_count of buckets created/activated near the reference time.
         轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
         Max 5 buckets rippled per touch to bound I/O.
         """
-        try:
-            all_buckets = await self.list_all(include_archive=False)
-        except Exception:
-            return
+        all_buckets = await self.list_all(include_archive=False)
 
         rippled = 0
         max_ripple = 5
@@ -626,7 +647,8 @@ class BucketManager:
                         f.write(frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
-                    continue
+                    logger.warning("Failed to persist time ripple for %s", bucket["id"])
+                    raise
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
@@ -989,6 +1011,7 @@ class BucketManager:
     # Called by decay engine to simulate "forgetting"
     # 由衰减引擎调用，模拟"遗忘"
     # ---------------------------------------------------------
+    @guarded_async_mutation("bucket_archive")
     async def archive(self, bucket_id: str) -> bool:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
@@ -1094,6 +1117,7 @@ class BucketManager:
             )
             return None
 
+    @guarded_async_mutation("bucket_alias_cleanup")
     async def clean_display_aliases(self) -> dict:
         """Persist display aliases across all bucket files without changing dates."""
         changed = []
