@@ -161,6 +161,54 @@ def test_fingerprint_mismatch_and_workspace_overlap_are_rejected(tmp_path):
         backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
 
 
+@pytest.mark.parametrize("workspace_value", ["equal", "below", "above"])
+def test_workspace_overlap_fails_before_preparation(tmp_path, workspace_value, monkeypatch):
+    server = _server(tmp_path)
+    source = Path(server.config["buckets_dir"])
+    env = _key_env(tmp_path)
+    env["OMBRE_BACKUP_V2_WORKSPACE_ROOT"] = {
+        "equal": str(source),
+        "below": str(source / "nested"),
+        "above": str(source.parent),
+    }[workspace_value]
+
+    import offline_backup_bundle
+
+    calls = []
+    monkeypatch.setattr(
+        offline_backup_bundle,
+        "prepare_backup_workspace",
+        lambda path: calls.append(path),
+    )
+    with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError):
+        backup_v2_runtime.register_backup_v2_if_enabled(
+            server,
+            "streamable-http",
+            environ=env,
+        )
+    assert calls == []
+    assert not (source / "nested").exists()
+
+
+def test_windows_case_only_workspace_aliases_are_rejected_deterministically():
+    source = Path("/tmp/Backup/Buckets")
+    assert backup_v2_runtime._paths_overlap(
+        Path("/tmp/backup/buckets"),
+        source,
+        case_sensitive=False,
+    )
+    assert backup_v2_runtime._paths_overlap(
+        Path("/tmp/backup/buckets/nested"),
+        source,
+        case_sensitive=False,
+    )
+    assert backup_v2_runtime._paths_overlap(
+        source,
+        Path("/tmp/backup"),
+        case_sensitive=False,
+    )
+
+
 def test_valid_configuration_registers_exactly_four_routes_once(tmp_path):
     server = _server(tmp_path)
     env = _key_env(tmp_path)

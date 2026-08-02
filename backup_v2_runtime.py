@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any, Mapping
 
@@ -210,15 +210,39 @@ def _validate_workspace_root(value: str, source_root: Path) -> Path:
     ):
         raise BackupV2RuntimeConfigError()
     workspace_root = candidate.resolve(strict=False)
-    source_text = str(source_root)
-    workspace_text = str(workspace_root)
-    if (
-        workspace_text == source_text
-        or workspace_text.startswith(source_text + os.sep)
-        or source_text.startswith(workspace_text + os.sep)
+    if _paths_overlap(
+        workspace_root,
+        source_root,
+        case_sensitive=os.name != "nt",
     ):
         raise BackupV2RuntimeConfigError("backup_v2_workspace_invalid")
     return workspace_root
+
+
+def _paths_overlap(left: Path, right: Path, *, case_sensitive: bool) -> bool:
+    left_path = _comparison_path(left, case_sensitive=case_sensitive)
+    right_path = _comparison_path(right, case_sensitive=case_sensitive)
+    return _is_equal_or_descendant(left_path, right_path) or _is_equal_or_descendant(
+        right_path,
+        left_path,
+    )
+
+
+def _comparison_path(path: Path, *, case_sensitive: bool) -> Path:
+    if case_sensitive:
+        return path
+    path_text = str(path).casefold()
+    if isinstance(path, PureWindowsPath) or os.name == "nt":
+        return PureWindowsPath(path_text)  # type: ignore[return-value]
+    return PurePosixPath(path_text)  # type: ignore[return-value]
+
+
+def _is_equal_or_descendant(candidate: Path, ancestor: Path) -> bool:
+    try:
+        candidate.relative_to(ancestor)
+    except ValueError:
+        return False
+    return True
 
 
 def _register_routes_once(mcp: Any, routes: list[Any]) -> None:

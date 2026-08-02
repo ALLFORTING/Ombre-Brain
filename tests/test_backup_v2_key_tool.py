@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -17,6 +16,7 @@ PASSPHRASE = b"synthetic-test-passphrase"
 
 def _disable_host_acl(monkeypatch):
     monkeypatch.setattr(key_tool, "_harden_private_key_acl", lambda path: None)
+    monkeypatch.setattr(key_tool, "_verify_private_key_protection", lambda path: None)
 
 
 def test_generate_requires_new_absolute_directory_outside_repo(tmp_path, monkeypatch):
@@ -122,34 +122,115 @@ def test_existing_files_are_never_overwritten_and_partial_failure_cleans_output(
     assert not output.exists()
 
 
-def test_windows_acl_hardening_uses_sid_and_fails_closed(monkeypatch, tmp_path):
+def test_interruption_after_directory_creation_cleans_output(tmp_path, monkeypatch):
+    output = tmp_path / "interrupted"
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        key_tool.generate(str(output), passphrase_provider=interrupt, environ={})
+    assert not output.exists()
+
+
+def _valid_acl():
+    return {
+        "current_sid": "S-1-5-21-123",
+        "owner_sid": "S-1-5-21-123",
+        "protected": True,
+        "rules": [
+            {
+                "sid": "S-1-5-21-123",
+                "inherited": False,
+                "type": 0,
+                "has_full_control": True,
+                "inheritance_flags": 0,
+                "propagation_flags": 0,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda acl: acl.update(owner_sid="S-1-5-21-999"),
+        lambda acl: acl.update(protected=False),
+        lambda acl: acl["rules"][0].update(inherited=True),
+        lambda acl: acl["rules"][0].update(sid="S-1-5-21-999"),
+        lambda acl: acl["rules"][0].update(type=1),
+        lambda acl: acl["rules"][0].update(has_full_control=False),
+        lambda acl: acl["rules"][0].update(inheritance_flags=1),
+        lambda acl: acl["rules"][0].update(propagation_flags=1),
+    ],
+)
+def test_windows_acl_verification_rejects_unsafe_variants(mutator):
+    acl = _valid_acl()
+    mutator(acl)
+    with pytest.raises(key_tool.KeyToolError) as error:
+        key_tool._validate_windows_acl(acl)
+    assert error.value.code == "private_key_acl_invalid"
+
+
+def test_windows_acl_verification_uses_sid_data_not_display_names():
+    acl = _valid_acl()
+    acl["rules"][0]["display_name"] = "Everyone"
+    key_tool._validate_windows_acl(acl)
+
+
+def test_windows_acl_hardening_uses_argument_safe_machine_readable_acl(
+    monkeypatch,
+    tmp_path,
+):
     private_path = tmp_path / "recipient-private-key.pem"
     private_path.write_bytes(b"synthetic")
     monkeypatch.setattr(key_tool.os, "name", "nt")
 
     calls = []
+    acl = json.dumps(_valid_acl())
 
-    def fake_run(command, capture_output, text, check):
-        calls.append(command)
-        if command[0] == "powershell":
-            return SimpleNamespace(returncode=0, stdout="S-1-5-21-123\n", stderr="")
-        if command[:2] == ["icacls", str(private_path)] and "/inheritance:r" in command:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command[:2] == ["icacls", str(private_path)] and "/grant:r" in command:
-            assert "*S-1-5-21-123:F" in command
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["icacls", str(private_path)]:
-            return SimpleNamespace(returncode=0, stdout="*S-1-5-21-123:(F)", stderr="")
-        raise AssertionError(command)
+    def fake_powershell(script, path):
+        calls.append((script, path))
+        if script == key_tool._ACL_INSPECT_SCRIPT:
+            return acl
+        assert script == key_tool._ACL_APPLY_SCRIPT
+        assert str(private_path) not in script
+        return ""
 
-    monkeypatch.setattr(key_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(key_tool, "_run_powershell", fake_powershell)
     key_tool._harden_private_key_acl(private_path)
-    assert calls[0][0] == "powershell"
-    assert calls[1][0] == "icacls"
+    assert [path for _, path in calls] == [private_path, private_path]
 
-    def failing_run(command, capture_output, text, check):
-        return SimpleNamespace(returncode=1, stdout="", stderr="denied")
 
-    monkeypatch.setattr(key_tool.subprocess, "run", failing_run)
-    with pytest.raises(key_tool.KeyToolError):
-        key_tool._harden_private_key_acl(private_path)
+def test_verify_keyset_rechecks_private_key_protection(tmp_path, monkeypatch):
+    _disable_host_acl(monkeypatch)
+    output = tmp_path / "keys"
+    key_tool.generate(
+        str(output),
+        passphrase_provider=lambda: (PASSPHRASE, PASSPHRASE),
+        environ={},
+    )
+    monkeypatch.setattr(
+        key_tool,
+        "_verify_private_key_protection",
+        lambda path: (_ for _ in ()).throw(
+            key_tool.KeyToolError("private_key_acl_invalid")
+        ),
+    )
+    with pytest.raises(key_tool.KeyToolError) as error:
+        key_tool.verify_keyset(str(output), passphrase_provider=lambda: PASSPHRASE)
+    assert error.value.code == "private_key_acl_invalid"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows ACL facilities")
+def test_windows_acl_real_integration_smoke(tmp_path):
+    output = tmp_path / "keys"
+    generated = key_tool.generate(
+        str(output),
+        passphrase_provider=lambda: (PASSPHRASE, PASSPHRASE),
+        environ={},
+    )
+    assert key_tool.verify_keyset(
+        str(output),
+        passphrase_provider=lambda: PASSPHRASE,
+    ) == generated

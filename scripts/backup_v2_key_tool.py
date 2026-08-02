@@ -14,7 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Callable
+from typing import Any, Callable
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -28,6 +28,62 @@ PUBLIC_NAME = "recipient-public-key.b64"
 METADATA_NAME = "recipient-key-metadata.json"
 SCHEMA_VERSION = 1
 MIN_PASSPHRASE_LENGTH = 16
+_ACL_PATH_ENV = "OB_BACKUP_V2_ACL_PATH"
+_ACL_APPLY_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:OB_BACKUP_V2_ACL_PATH
+if ([string]::IsNullOrEmpty($path)) { exit 2 }
+$security = Get-Acl -LiteralPath $path
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$security.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($security.Access)) {
+    [void]$security.RemoveAccessRuleSpecific($rule)
+}
+$security.SetOwner($currentSid)
+$access = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $currentSid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.InheritanceFlags]::None,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+)
+[void]$security.AddAccessRule($access)
+Set-Acl -LiteralPath $path -AclObject $security
+"""
+_ACL_INSPECT_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:OB_BACKUP_V2_ACL_PATH
+if ([string]::IsNullOrEmpty($path)) { exit 2 }
+$security = Get-Acl -LiteralPath $path
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$rules = @(
+    foreach ($rule in @($security.Access)) {
+        $sid = $rule.IdentityReference.Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        )
+        [pscustomobject]@{
+            sid = $sid.Value
+            inherited = [bool]$rule.IsInherited
+            type = [int]$rule.AccessControlType
+            has_full_control = (
+                ([int]$rule.FileSystemRights -band
+                    [int][System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+                [int][System.Security.AccessControl.FileSystemRights]::FullControl
+            )
+            inheritance_flags = [int]$rule.InheritanceFlags
+            propagation_flags = [int]$rule.PropagationFlags
+        }
+    }
+)
+[pscustomobject]@{
+    current_sid = $currentSid.Value
+    owner_sid = $security.GetOwner(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    protected = [bool]$security.AreAccessRulesProtected
+    rules = $rules
+} | ConvertTo-Json -Compress -Depth 5
+"""
 
 
 class KeyToolError(RuntimeError):
@@ -97,9 +153,12 @@ def generate(
             "fingerprint": fingerprint,
             "public_key_b64": public_b64,
         }
-    except Exception:
+    except BaseException:
         if created_dir:
-            shutil.rmtree(destination, ignore_errors=True)
+            try:
+                shutil.rmtree(destination)
+            except BaseException:
+                raise KeyToolError("key_output_cleanup_failed") from None
         raise
 
 
@@ -123,6 +182,7 @@ def verify_keyset(
     metadata_path = root / METADATA_NAME
     public_key = _load_public_key_b64(public_path)
     metadata = _load_metadata(metadata_path)
+    _verify_private_key_protection(private_path)
     passphrase = passphrase_provider() if passphrase_provider else _prompt_passphrase()
     private_key = _load_private_key(private_path, passphrase)
     derived_public = private_key.public_key()
@@ -216,41 +276,66 @@ def _fsync_directory(path: Path) -> None:
 
 def _harden_private_key_acl(path: Path) -> None:
     if os.name != "nt":
+        _verify_private_key_protection(path)
+        return
+    _run_powershell(_ACL_APPLY_SCRIPT, path)
+    _verify_private_key_protection(path)
+
+
+def _verify_private_key_protection(path: Path) -> None:
+    if os.name != "nt":
         mode = stat.S_IMODE(path.stat().st_mode)
-        if mode & 0o077:
+        if mode != 0o600:
             raise KeyToolError("private_key_permissions_invalid")
         return
-    sid = _current_user_sid()
-    commands = [
-        ["icacls", str(path), "/inheritance:r"],
-        ["icacls", str(path), "/grant:r", f"*{sid}:F"],
-    ]
-    for command in commands:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            raise KeyToolError("private_key_acl_invalid")
-    verify = subprocess.run(
-        ["icacls", str(path)],
+    try:
+        details = json.loads(_run_powershell(_ACL_INSPECT_SCRIPT, path))
+    except (KeyToolError, TypeError, ValueError, json.JSONDecodeError):
+        raise KeyToolError("private_key_acl_invalid")
+    _validate_windows_acl(details)
+
+
+def _validate_windows_acl(details: Any) -> None:
+    if not isinstance(details, dict):
+        raise KeyToolError("private_key_acl_invalid")
+    current_sid = details.get("current_sid")
+    owner_sid = details.get("owner_sid")
+    if (
+        not isinstance(current_sid, str)
+        or not isinstance(owner_sid, str)
+        or current_sid != owner_sid
+        or details.get("protected") is not True
+    ):
+        raise KeyToolError("private_key_acl_invalid")
+    rules = details.get("rules")
+    if not isinstance(rules, list) or len(rules) != 1:
+        raise KeyToolError("private_key_acl_invalid")
+    rule = rules[0]
+    if (
+        not isinstance(rule, dict)
+        or rule.get("sid") != current_sid
+        or rule.get("inherited") is not False
+        or rule.get("type") != 0
+        or rule.get("has_full_control") is not True
+        or rule.get("inheritance_flags") != 0
+        or rule.get("propagation_flags") != 0
+    ):
+        raise KeyToolError("private_key_acl_invalid")
+
+
+def _run_powershell(script: str, path: Path) -> str:
+    environment = os.environ.copy()
+    environment[_ACL_PATH_ENV] = str(path)
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
         check=False,
+        env=environment,
     )
-    if verify.returncode != 0 or f"*{sid}:" not in verify.stdout:
+    if result.returncode != 0:
         raise KeyToolError("private_key_acl_invalid")
-
-
-def _current_user_sid() -> str:
-    command = [
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    sid = result.stdout.strip()
-    if result.returncode != 0 or not sid.startswith("S-1-"):
-        raise KeyToolError("private_key_acl_invalid")
-    return sid
+    return result.stdout
 
 
 def _load_public_key_b64(path: Path) -> X25519PublicKey:
