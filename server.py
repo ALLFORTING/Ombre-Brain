@@ -36,6 +36,7 @@ import os
 import sys
 import base64
 import binascii
+import errno
 import io
 import random
 import logging
@@ -44,6 +45,7 @@ import hashlib
 import hmac
 import html
 import secrets
+import stat
 import time
 import threading
 import tempfile
@@ -336,53 +338,159 @@ def diagnostic_tool(*args, **kwargs):
 # =============================================================
 _sessions: dict[str, dict] = {}  # {token: {expires_at, csrf_token}}
 
+_AUTH_STORE_MISSING = "missing"
+_AUTH_STORE_VALID = "valid"
+_AUTH_STORE_CORRUPT = "corrupt"
+_AUTH_STORE_UNREADABLE = "unreadable"
+
 
 def _get_auth_file() -> str:
     return os.path.join(config["buckets_dir"], ".dashboard_auth.json")
 
 
-def _load_password_hash() -> str | None:
+def _log_auth_store_error(state: str) -> None:
+    logger.error("auth_store_%s", state)
+
+
+def _valid_password_hash(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    salt, separator, digest = value.partition(":")
+    if not separator or len(salt) != 32 or len(digest) != 64:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in salt + digest)
+
+
+def _auth_store_state() -> tuple[str, str | None]:
+    """Return the auth file state without treating abnormal nodes as missing."""
+    auth_file = _get_auth_file()
     try:
-        auth_file = _get_auth_file()
-        if os.path.exists(auth_file):
-            with open(auth_file, "r", encoding="utf-8") as f:
-                return _json_lib.load(f).get("password_hash")
-    except Exception:
-        pass
-    return None
+        try:
+            file_stat = os.lstat(auth_file)
+        except FileNotFoundError:
+            try:
+                has_node = os.path.lexists(auth_file)
+            except OSError:
+                _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+                return _AUTH_STORE_UNREADABLE, None
+            if not has_node:
+                return _AUTH_STORE_MISSING, None
+            _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+            return _AUTH_STORE_UNREADABLE, None
+    except OSError:
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if (
+        stat.S_ISLNK(file_stat.st_mode)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or (
+            reparse_point
+            and getattr(file_stat, "st_file_attributes", 0) & reparse_point
+        )
+    ):
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+
+    try:
+        with open(auth_file, "r", encoding="utf-8") as handle:
+            payload = _json_lib.load(handle)
+    except (OSError, UnicodeError):
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+    except (_json_lib.JSONDecodeError, TypeError, ValueError):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+
+    if not isinstance(payload, dict):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+    stored = payload.get("password_hash")
+    if not _valid_password_hash(stored):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+    return _AUTH_STORE_VALID, stored
+
+
+def _load_password_hash() -> str | None:
+    state, stored = _auth_store_state()
+    return stored if state == _AUTH_STORE_VALID else None
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush directory metadata where the platform exposes directory fsync."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_auth_payload(payload: dict) -> None:
+    auth_file = _get_auth_file()
+    parent = os.path.dirname(auth_file) or "."
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".dashboard_auth.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            _json_lib.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, auth_file)
+        _fsync_directory(parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+            _fsync_directory(parent)
 
 
 @guarded_mutation("dashboard_auth_write")
 def _save_password_hash(password: str) -> None:
     salt = secrets.token_hex(16)
-    h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    auth_file = _get_auth_file()
-    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
-    with open(auth_file, "w", encoding="utf-8") as f:
-        _json_lib.dump({"password_hash": f"{salt}:{h}"}, f)
+    h = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    _atomic_write_auth_payload({"password_hash": f"{salt}:{h}"})
 
 
 def _verify_password_hash(password: str, stored: str) -> bool:
-    if ":" not in stored:
+    if not isinstance(password, str) or not _valid_password_hash(stored):
         return False
     salt, h = stored.split(":", 1)
-    return hmac.compare_digest(
-        h, hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    )
+    try:
+        actual = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+        return hmac.compare_digest(h.encode("ascii"), actual.encode("ascii"))
+    except (UnicodeError, TypeError):
+        return False
 
 
 def _is_setup_needed() -> bool:
-    """True if no password is configured (env var or file)."""
-    if os.environ.get("OMBRE_DASHBOARD_PASSWORD", ""):
-        return False
-    return _load_password_hash() is None
+    """Only a truly missing auth file permits setup."""
+    state, _stored = _auth_store_state()
+    return state == _AUTH_STORE_MISSING
 
 
 def _verify_any_password(password: str) -> bool:
     """Check password against env var (first) or stored hash."""
+    if not isinstance(password, str):
+        return False
     env_pwd = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
     if env_pwd:
-        return hmac.compare_digest(password, env_pwd)
+        try:
+            return hmac.compare_digest(
+                password.encode("utf-8"), env_pwd.encode("utf-8")
+            )
+        except (UnicodeError, TypeError):
+            return False
     stored = _load_password_hash()
     if not stored:
         return False
@@ -500,7 +608,13 @@ def _require_dashboard_write(request, route: str):
         )
         return _require_auth(request)
     supplied = request.headers.get("x-ombre-csrf", "")
-    if not supplied or not hmac.compare_digest(supplied, session["csrf_token"]):
+    try:
+        csrf_valid = bool(supplied) and hmac.compare_digest(
+            supplied.encode("utf-8"), session["csrf_token"].encode("utf-8")
+        )
+    except (UnicodeError, TypeError, AttributeError):
+        csrf_valid = False
+    if not csrf_valid:
         return _dashboard_write_error(route, 403, "csrf_required")
     origin = _normalize_origin(request.headers.get("origin", ""))
     expected_origin = _dashboard_external_origin(request)
@@ -538,7 +652,10 @@ async def auth_status(request):
 async def auth_setup_endpoint(request):
     """Initial password setup (only when no password is configured)."""
     from starlette.responses import JSONResponse
-    if not _is_setup_needed():
+    auth_state, _stored = _auth_store_state()
+    if auth_state in {_AUTH_STORE_CORRUPT, _AUTH_STORE_UNREADABLE}:
+        return JSONResponse({"error": "auth_store_unreadable"}, status_code=503)
+    if auth_state != _AUTH_STORE_MISSING:
         return JSONResponse({"error": "Already configured"}, status_code=400)
     try:
         body = await request.json()
@@ -588,22 +705,34 @@ async def auth_logout(request):
 async def auth_change_password(request):
     """Change dashboard password (requires current password)."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/auth/change-password")
     if err:
         return err
-    if os.environ.get("OMBRE_DASHBOARD_PASSWORD", ""):
+    auth_state, _stored = _auth_store_state()
+    env_password = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
+    if env_password and auth_state not in {
+        _AUTH_STORE_CORRUPT,
+        _AUTH_STORE_UNREADABLE,
+    }:
         return JSONResponse({"error": "当前使用环境变量密码，请直接修改 OMBRE_DASHBOARD_PASSWORD"}, status_code=400)
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     current = body.get("current", "")
-    new_pwd = body.get("new", "").strip()
+    new_pwd = body.get("new", "")
+    if not isinstance(current, str) or not isinstance(new_pwd, str):
+        return JSONResponse({"error": "密码必须是字符串"}, status_code=400)
     if not _verify_any_password(current):
         return JSONResponse({"error": "当前密码错误"}, status_code=401)
     if len(new_pwd) < 6:
         return JSONResponse({"error": "新密码不能少于6位"}, status_code=400)
     _save_password_hash(new_pwd)
+    if env_password and auth_state in {
+        _AUTH_STORE_CORRUPT,
+        _AUTH_STORE_UNREADABLE,
+    }:
+        logger.info("auth_store_recovered state=%s", auth_state)
     _sessions.clear()
     token = _create_session()
     resp = JSONResponse({"ok": True})
