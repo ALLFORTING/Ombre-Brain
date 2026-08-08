@@ -6535,6 +6535,7 @@ async def api_import_status(request):
 
 
 @mcp.custom_route("/api/import/pause", methods=["POST"])
+@guarded_http_mutation("dashboard_import_pause", methods=("POST",))
 async def api_import_pause(request):
     """Pause the running import."""
     from starlette.responses import JSONResponse
@@ -6588,6 +6589,7 @@ async def api_import_results(request):
 
 
 @mcp.custom_route("/api/import/review", methods=["POST"])
+@guarded_http_mutation("dashboard_import_review", methods=("POST",))
 async def api_import_review(request):
     """Apply review decisions: mark buckets as important/noise/pinned."""
     from starlette.responses import JSONResponse
