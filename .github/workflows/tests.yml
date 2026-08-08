@@ -9,9 +9,12 @@ on:
       - '.gitignore'
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
 
 jobs:
-  test:
+  offline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,11 +30,32 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio
 
-      - name: Run local tests (no API key needed)
-        run: python -m pytest tests/test_scoring.py tests/test_feel_flow.py -v --asyncio-mode=auto
+      - name: Run offline tests and security regressions
+        run: python -m pytest -m "not external" -v --asyncio-mode=auto
 
-      - name: Run LLM quality tests
+  external:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    env:
+      OMBRE_API_KEY: ${{ secrets.OMBRE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run external quality tests
         if: env.OMBRE_API_KEY != ''
-        env:
-          OMBRE_API_KEY: ${{ secrets.OMBRE_API_KEY }}
-        run: python -m pytest tests/test_llm_quality.py -v --asyncio-mode=auto
+        run: python -m pytest -m external -v --asyncio-mode=auto
+
+      - name: Report external tests not configured
+        if: env.OMBRE_API_KEY == ''
+        run: echo "OMBRE_API_KEY is not configured; external tests were not run."

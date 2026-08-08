@@ -11,6 +11,8 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 
+pytestmark = pytest.mark.security
+
 HOOK_TOKEN = "H" * 32
 
 

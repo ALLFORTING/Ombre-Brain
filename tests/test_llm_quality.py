@@ -14,11 +14,14 @@
 import os
 import pytest
 
-# Skip all tests if no API key
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("OMBRE_API_KEY"),
-    reason="OMBRE_API_KEY not set — skipping LLM quality tests"
-)
+# These tests are intentionally outside the default offline CI job.
+pytestmark = [
+    pytest.mark.external,
+    pytest.mark.skipif(
+        not os.environ.get("OMBRE_API_KEY"),
+        reason="OMBRE_API_KEY not set — skipping LLM quality tests",
+    ),
+]
 
 
 @pytest.fixture

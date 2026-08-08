@@ -1619,7 +1619,8 @@ document.getElementById('breath-query').addEventListener('keydown', function(e) 
 
 async function loadConfig() {
   try {
-    var res = await fetch(BASE + '/api/config');
+    var res = await authFetch('/api/config');
+    if (!res) return;
     var cfg = await res.json();
     document.getElementById('cfg-dehy-model').value = cfg.dehydration.model || '';
     document.getElementById('cfg-dehy-url').value = cfg.dehydration.base_url || '';
@@ -1658,11 +1659,12 @@ async function saveConfig(persist) {
 
   var status = document.getElementById('config-status');
   try {
-    var res = await fetch(BASE + '/api/config', {
+    var res = await authFetch('/api/config', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
+    if (!res) return;
     var result = await res.json();
     if (result.ok) {
       status.innerHTML = '<span style="color:var(--positive)">✓ 已更新: ' + result.updated.join(', ') + '</span>';
@@ -1696,7 +1698,8 @@ async function startImport(file) {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    const res = await authFetch('/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    if (!res) return;
     const data = await res.json();
     if (data.error) { alert('导入失败: ' + data.error); return; }
     document.getElementById('import-progress').style.display = '';
@@ -1747,7 +1750,7 @@ function updateImportUI(s) {
 }
 
 async function pauseImport() {
-  try { await fetch(BASE + '/api/import/pause', { method: 'POST' }); } catch(e) {}
+  try { await authFetch('/api/import/pause', { method: 'POST' }); } catch(e) {}
 }
 
 async function loadImportResults() {
@@ -1805,7 +1808,7 @@ async function detectPatterns() {
 
 async function reviewAction(bid, action) {
   try {
-    await fetch(BASE + '/api/import/review', {
+    await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
     });
@@ -1818,7 +1821,7 @@ async function reviewAction(bid, action) {
 async function batchReview(idsJson, action) {
   try {
     const ids = JSON.parse(idsJson);
-    await fetch(BASE + '/api/import/review', {
+    await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: ids.map(id => ({ bucket_id: id, action })) })
     });

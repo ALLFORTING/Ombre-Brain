@@ -114,7 +114,10 @@ def test_env_password_recovers_corrupt_store_through_change_password(
         handle.write("{broken")
     client = _auth_client(server)
 
-    login = client.post("/auth/login", json={"password": "env-password"})
+    login = client.post(
+        "/auth/login", headers={"Origin": "http://testserver"},
+        json={"password": "env-password"},
+    )
     assert login.status_code == 200
     headers, old_session = _login_headers(server, client)
 
@@ -147,7 +150,10 @@ def test_env_password_with_valid_store_keeps_change_password_disabled(
     monkeypatch.setenv("OMBRE_DASHBOARD_PASSWORD", "env-password")
     client = _auth_client(server)
 
-    assert client.post("/auth/login", json={"password": "env-password"}).status_code == 200
+    assert client.post(
+        "/auth/login", headers={"Origin": "http://testserver"},
+        json={"password": "env-password"},
+    ).status_code == 200
     headers, _old_session = _login_headers(server, client)
     response = client.post(
         "/auth/change-password",
@@ -168,7 +174,10 @@ def test_corrupt_store_without_env_password_fails_closed(tmp_path, monkeypatch):
         handle.write("{broken")
     client = _auth_client(server)
 
-    assert client.post("/auth/login", json={"password": "anything"}).status_code == 401
+    assert client.post(
+        "/auth/login", headers={"Origin": "http://testserver"},
+        json={"password": "anything"},
+    ).status_code == 401
     setup = client.post(
         "/auth/setup", headers={"Origin": "http://testserver"},
         json={"password": "new-password"},

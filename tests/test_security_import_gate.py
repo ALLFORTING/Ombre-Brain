@@ -69,6 +69,9 @@ def test_import_review_and_pause_are_rejected_before_any_mutation_during_freeze(
 def test_import_review_and_pause_work_when_maintenance_is_open(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setattr(server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        server, "_require_dashboard_write", lambda _request, _route: None
+    )
     update = AsyncMock()
     server.bucket_mgr = SimpleNamespace(
         update=update,

@@ -840,11 +840,18 @@ async def auth_setup_endpoint(request):
 async def auth_login(request):
     """Login with password."""
     from starlette.responses import JSONResponse
+    err = _require_same_origin(request, "/auth/login")
+    if err:
+        return err
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "password_invalid"}, status_code=400)
     password = body.get("password", "")
+    if not isinstance(password, str):
+        return JSONResponse({"error": "password_invalid"}, status_code=400)
     if _verify_any_password(password):
         token = _create_session()
         resp = JSONResponse({"ok": True})
@@ -6265,7 +6272,7 @@ async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
     import yaml
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/config")
     if err: return err
     try:
         body = await request.json()
@@ -6437,7 +6444,7 @@ async def api_host_vault_set(request):
     Note: container restart is required for docker-compose to pick up the new mount.
     """
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/host-vault")
     if err: return err
     try:
         body = await request.json()
@@ -6476,7 +6483,7 @@ async def api_host_vault_set(request):
 async def api_import_upload(request):
     """Upload a conversation file and start import."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/upload")
     if err: return err
 
     if import_engine.is_running:
@@ -6539,7 +6546,7 @@ async def api_import_status(request):
 async def api_import_pause(request):
     """Pause the running import."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/pause")
     if err: return err
     if not import_engine.is_running:
         return JSONResponse({"error": "No import running"}, status_code=400)
@@ -6593,7 +6600,7 @@ async def api_import_results(request):
 async def api_import_review(request):
     """Apply review decisions: mark buckets as important/noise/pinned."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/review")
     if err: return err
     try:
         body = await request.json()
