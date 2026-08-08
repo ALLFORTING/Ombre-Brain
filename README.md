@@ -657,6 +657,7 @@ Sensitive config via env vars:
 | `OMBRE_TRANSPORT` | 否 / No | `stdio` | MCP 传输方式：本地 Claude Desktop 用 `stdio`；远程/Render 用 `streamable-http` / MCP transport |
 | `OMBRE_PORT` | 否 / No | `8000` | HTTP/SSE/streamable-http 监听端口 / HTTP port |
 | `OMBRE_AUTH_TOKEN` | 否 / No | 空 / empty | 远程 `/mcp` 访问令牌。未设置时匿名 MCP 访问保持旧行为；设置后 `/mcp` 必须带 Bearer 或 URL token / Remote `/mcp` access token. Anonymous MCP access remains unchanged when unset; when set, `/mcp` requires Bearer or URL token |
+| `OMBRE_HOOK_TOKEN` | 否 / No | 空 / empty | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时返回 `503 hook_not_configured`，不支持 query token 或匿名回退 / Dedicated Bearer token for the two hook endpoints; unset returns `503 hook_not_configured`, with no query-token or anonymous fallback |
 | `OMBRE_RESPONSE_SEAL` | 否 / No | 空 / empty | 防伪暗语。设置后 `boot`/`breath` 末尾带 `seal: ...`，用于 CI 判断返回是否来自可信通道 / Verification phrase appended to `boot`/`breath` |
 | `OMBRE_DIGEST_API_KEY` | 否 / No | — | `digest` 自动消化和 `hold`/`grow` 矛盾检测使用的 LLM key / Key used by `digest` and conflict detection |
 | `OMBRE_DIGEST_BASE_URL` | 否 / No | `https://api.deepseek.com/v1` | 消化/矛盾检测 API base URL / API base URL for digestion/conflict detection |
@@ -1025,9 +1026,13 @@ When connecting via tunnel, ensure:
 
 可以通过 `OMBRE_HOOK_URL` 环境变量指定服务器地址（默认 `http://localhost:8000`），或者设置 `OMBRE_HOOK_SKIP=1` 临时禁用。
 
+HTTP hook 还需要配置独立的 `OMBRE_HOOK_TOKEN`。仓库内 SessionStart 脚本会发送 `Authorization: Bearer <token>`；未配置 token 时会明确跳过 hook。token 应使用 `secrets.token_urlsafe(32)` 或等价密码学安全随机源生成，不要放入仓库或 URL。
+
 新窗口的推荐开局是 `boot()`；旧的 `breath` hook 仍可作为轻量自动浮现入口。
 
 If using Claude Code, `.claude/settings.json` configures a `SessionStart` hook that auto-calls `breath` on each new or resumed session, surfacing your highest-weight unresolved memories as context. The recommended current startup call is `boot()`, while the older `breath` hook remains a lightweight surfacing entry point. Only active in remote HTTP mode. Set `OMBRE_HOOK_SKIP=1` to disable temporarily.
+
+The hook also requires the independent `OMBRE_HOOK_TOKEN` and sends it as `Authorization: Bearer <token>`. The repository hook skips calls when the token is unset. Generate the token with `secrets.token_urlsafe(32)` or an equivalent cryptographically secure source; never put it in a URL or commit it.
 
 ## 更新 / How to Update
 

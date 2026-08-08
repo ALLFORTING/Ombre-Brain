@@ -8,6 +8,7 @@
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
 | `OMBRE_BUCKETS_DIR` | 否 | `./buckets` | 记忆桶文件存放目录（绑定 Docker Volume 时务必设置） |
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
+| `OMBRE_HOOK_TOKEN` | 否 | — | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时端点返回 503。使用 `secrets.token_urlsafe(32)` 或等价安全随机源生成，不要提交到仓库 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 | — | 预设 Dashboard 访问密码；设置后覆盖文件存储的密码，首次访问不弹设置向导 |
 | `OMBRE_DIAG_TOOLS` | 否 | 关闭 | 仅供开发与验收临时启用 15 个 Stage 0 / 诊断 MCP 工具；只有 `1`、`true`、`yes`、`on`（忽略大小写和首尾空白）表示开启 |
@@ -24,6 +25,7 @@
 
 - `OMBRE_API_KEY` 也可在 `config.yaml` 的 `dehydration.api_key` / `embedding.api_key` 中设置，但**强烈建议**通过环境变量传入，避免密钥写入文件。
 - `OMBRE_DASHBOARD_PASSWORD` 设置后，Dashboard 的"修改密码"功能将被禁用（显示提示，建议直接修改环境变量）。未设置则密码存储在 `{buckets_dir}/.dashboard_auth.json`（SHA-256 + salt）。
+- `OMBRE_HOOK_TOKEN` 只用于两个 HTTP hook 的 `Authorization: Bearer` 认证，与 `OMBRE_AUTH_TOKEN` 独立，不支持 query token 或匿名回退；未配置时 hook 返回 `503 hook_not_configured`。
 - 默认 MCP 工具面只注册 21 个正式工具。15 个诊断工具仍保留在代码和测试中，只有显式设置 `OMBRE_DIAG_TOOLS` 为开启值时才注册；普通用户不应开启。
 
 - `OMBRE_RM_RUNTIME_ENABLED` 默认关闭。关闭时 `OMBRE_RM_DATA_ROOT` 即使是非法值也不会被读取或验证。开启时 `OMBRE_RM_DATA_ROOT` 必须是绝对路径，例如 `C:\example\remember-me-data` 或 `/tmp/remember-me-data`；启动失败会 fail closed，不会回退到旧 AssetStore。

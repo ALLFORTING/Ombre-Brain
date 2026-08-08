@@ -147,7 +147,7 @@
 - 密码存储：SHA-256 + 随机 salt，保存于 `{buckets_dir}/.dashboard_auth.json`
 - 环境变量 `OMBRE_DASHBOARD_PASSWORD` 设置后，覆盖文件密码（只读，不可通过 Dashboard 修改）
 - Session：内存字典（服务重启失效），cookie `ombre_session`（HttpOnly, SameSite=Lax, 7天）
-- `/health`, `/breath-hook`, `/dream-hook`, `/mcp*` 路径不受保护（公开）
+- `/health` 不需要 Dashboard session；`/breath-hook` 与 `/dream-hook` 必须使用独立 `OMBRE_HOOK_TOKEN` 的 `Authorization: Bearer`，未配置返回 503，不支持 query token 或匿名回退；`/mcp*` 使用其自身的 MCP 鉴权配置
 
 **Dashboard（6 个 Tab）**
 1. 记忆桶列表：6 种过滤器 + 主题域过滤 + 搜索 + 详情面板
@@ -187,6 +187,7 @@
 | `OMBRE_TRANSPORT` | 传输模式：`stdio` / `sse` / `streamable-http` | 否 | `""` → 回退到 config 或 `"stdio"` |
 | `OMBRE_BUCKETS_DIR` | 记忆桶存储目录路径 | 否 | `""` → 回退到 config 或 `./buckets` |
 | `OMBRE_HOOK_URL` | SessionStart 钩子调用的服务器 URL | 否 | `"http://localhost:8000"` |
+| `OMBRE_HOOK_TOKEN` | SessionStart hook 的独立 Bearer token | 否 | 未设置时 hook 返回 503；使用 `secrets.token_urlsafe(32)` 生成 |
 | `OMBRE_HOOK_SKIP` | 设为 `"1"` 跳过 SessionStart 钩子 | 否 | 未设置（不跳过） |
 | `OMBRE_DASHBOARD_PASSWORD` | 预设 Dashboard 访问密码；设置后覆盖文件密码，首次访问不弹设置向导 | 否 | `""` |
 

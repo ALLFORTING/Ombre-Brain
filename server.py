@@ -92,6 +92,7 @@ from maintenance_write_gate import (
     guarded_async_mutation,
     guarded_http_mutation,
     guarded_mutation,
+    optional_async_writer_scope,
 )
 from utils import (
     DISPLAY_ALIASES,
@@ -137,6 +138,64 @@ def _with_response_seal(text: str) -> str:
 
 def _mcp_auth_token() -> str:
     return os.environ.get("OMBRE_AUTH_TOKEN", "").strip()
+
+
+_HOOK_OBVIOUS_TOKENS = frozenset({
+    "changeme",
+    "password",
+    "token",
+    "secret",
+    "example",
+    "test",
+})
+
+
+def _hook_token() -> str:
+    return os.environ.get("OMBRE_HOOK_TOKEN", "")
+
+
+def _validate_hook_token() -> None:
+    token = _hook_token()
+    if not token:
+        return
+    if len(token) < 32 or any(ord(char) < 0x21 or ord(char) > 0x7E for char in token):
+        raise RuntimeError("OMBRE_HOOK_TOKEN invalid")
+    if token.casefold() in _HOOK_OBVIOUS_TOKENS:
+        raise RuntimeError("OMBRE_HOOK_TOKEN invalid")
+
+
+def _hook_unauthorized_response():
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"error": "hook_unauthorized"}, status_code=401)
+
+
+def _require_hook_auth(request):
+    from starlette.responses import JSONResponse
+
+    expected = _hook_token()
+    if not expected:
+        return JSONResponse({"error": "hook_not_configured"}, status_code=503)
+
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, candidate = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not separator:
+        return _hook_unauthorized_response()
+    candidate = candidate.strip()
+    if not candidate:
+        return _hook_unauthorized_response()
+    if any(ord(char) > 0x7F for char in candidate):
+        return _hook_unauthorized_response()
+    try:
+        candidate_bytes = candidate.encode("utf-8")
+        expected_bytes = expected.encode("utf-8")
+        matched = hmac.compare_digest(candidate_bytes, expected_bytes)
+    except (UnicodeError, TypeError):
+        matched = False
+    return None if matched else _hook_unauthorized_response()
+
+
+_validate_hook_token()
 
 
 def _constant_time_token_match(candidate: str, expected: str) -> bool:
@@ -586,20 +645,29 @@ async def health_check(request):
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    auth_error = _require_hook_auth(request)
+    if auth_error:
+        return auth_error
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # pinned
-        pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
+        pinned = [
+            b for b in all_buckets
+            if (b["metadata"].get("pinned") or b["metadata"].get("protected"))
+            and not _is_sealed(b)
+        ]
         # top 2 unresolved by score
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
                       and b["metadata"].get("type") not in ("permanent", "feel")
                       and not b["metadata"].get("dormant", False)
                       and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
+                      and not b["metadata"].get("protected")
+                      and not _is_sealed(b)]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
 
         parts = []
+        touch_ids = []
         token_budget = 10000
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
@@ -624,13 +692,17 @@ async def breath_hook(request):
             if summary_tokens > token_budget:
                 break
             parts.append(summary)
-            await bucket_mgr.touch(b["id"])
+            touch_ids.append(b["id"])
             token_budget -= summary_tokens
-
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
             return PlainTextResponse("")
         body_text = "[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts)
+        if touch_ids:
+            async with optional_async_writer_scope("breath_hook_touch") as entered:
+                if entered:
+                    for bucket_id in touch_ids:
+                        await bucket_mgr.touch(bucket_id)
         await _fire_webhook("breath_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -645,6 +717,9 @@ async def breath_hook(request):
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    auth_error = _require_hook_auth(request)
+    if auth_error:
+        return auth_error
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
@@ -653,6 +728,7 @@ async def dream_hook(request):
             and not b["metadata"].get("dormant", False)
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and not _is_sealed(b)
         ]
         candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         recent = candidates[:10]
@@ -663,7 +739,6 @@ async def dream_hook(request):
         parts = []
         for b in recent:
             meta = b["metadata"]
-            await bucket_mgr.touch(b["id"])
             resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
@@ -672,6 +747,10 @@ async def dream_hook(request):
             )
 
         body_text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
+        async with optional_async_writer_scope("dream_hook_touch") as entered:
+            if entered:
+                for bucket_id in (b["id"] for b in recent):
+                    await bucket_mgr.touch(bucket_id)
         await _fire_webhook("dream_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
