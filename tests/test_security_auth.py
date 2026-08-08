@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import os
@@ -9,6 +10,8 @@ import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
+
+from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
 
 
 def _load_server(tmp_path, monkeypatch, *, env_password=None):
@@ -82,6 +85,28 @@ def test_auth_store_distinguishes_missing_valid_corrupt_and_abnormal_nodes(
 
 
 @pytest.mark.security
+@pytest.mark.parametrize("contents", [b"", b"{}", b'{"password_hash": 123}'])
+def test_empty_or_malformed_auth_payloads_are_corrupt_and_fail_closed(
+    tmp_path, monkeypatch, contents
+):
+    server = _load_server(tmp_path, monkeypatch)
+    auth_file = _auth_file(server)
+    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
+    with open(auth_file, "wb") as handle:
+        handle.write(contents)
+
+    assert server._auth_store_state() == (server._AUTH_STORE_CORRUPT, None)
+    assert server._is_setup_needed() is False
+    response = _auth_client(server).post(
+        "/auth/setup",
+        headers={"Origin": "http://testserver"},
+        json={"password": "new-password"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"error": "auth_store_unreadable"}
+
+
+@pytest.mark.security
 def test_corrupt_auth_store_closes_setup_even_with_env_recovery_password(
     tmp_path, monkeypatch
 ):
@@ -139,6 +164,42 @@ def test_env_password_recovers_corrupt_store_through_change_password(
 
     assert server._verify_any_password("env-password") is True
     assert server._verify_any_password("new-file-password") is False
+
+
+@pytest.mark.security
+def test_recovered_file_password_works_after_env_removal_and_restart(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch, env_password="env-password")
+    auth_file = _auth_file(server)
+    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
+    with open(auth_file, "w", encoding="utf-8") as handle:
+        handle.write("{broken")
+    client = _auth_client(server)
+    assert client.post(
+        "/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"password": "env-password"},
+    ).status_code == 200
+    headers, _session = _login_headers(server, client)
+    assert client.post(
+        "/auth/change-password",
+        headers=headers,
+        json={"current": "env-password", "new": "new-file-password"},
+    ).status_code == 200
+
+    monkeypatch.delenv("OMBRE_DASHBOARD_PASSWORD", raising=False)
+    sys.modules.pop("server", None)
+    restarted = importlib.import_module("server")
+    assert restarted._setup_token is None
+    assert restarted._is_setup_needed() is False
+    restarted_client = _auth_client(restarted)
+    login = restarted_client.post(
+        "/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"password": "new-file-password"},
+    )
+    assert login.status_code == 200
 
 
 @pytest.mark.security
@@ -209,6 +270,88 @@ def test_atomic_password_replace_preserves_original_when_publish_fails(
         if entry.name.startswith(".dashboard_auth.") and entry.name.endswith(".tmp")
     ]
     assert temp_files == []
+
+
+@pytest.mark.security
+def test_password_temp_file_is_private_while_it_exists(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    auth_file = _auth_file(server)
+    observed = []
+    original_fsync = server.os.fsync
+
+    def observe_fsync(descriptor):
+        if not observed:
+            temporary = [
+                entry.path
+                for entry in os.scandir(os.path.dirname(auth_file))
+                if entry.name.startswith(".dashboard_auth.")
+                and entry.name.endswith(".tmp")
+            ]
+            assert len(temporary) == 1
+            if os.name != "nt":
+                assert stat.S_IMODE(os.stat(temporary[0]).st_mode) == 0o600
+            observed.append(temporary[0])
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(server.os, "fsync", observe_fsync)
+    server._save_password_hash("private-password")
+    assert observed
+
+
+@pytest.mark.security
+def test_recovery_requires_csrf_origin_and_respects_freeze(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch, env_password="env-password")
+    auth_file = _auth_file(server)
+    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
+    with open(auth_file, "w", encoding="utf-8") as handle:
+        handle.write("{broken")
+    client = _auth_client(server)
+    assert client.post(
+        "/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"password": "env-password"},
+    ).status_code == 200
+    headers, session_token = _login_headers(server, client)
+    before = open(auth_file, "rb").read()
+
+    missing_csrf = client.post(
+        "/auth/change-password",
+        headers={"Origin": "http://testserver"},
+        json={"current": "env-password", "new": "new-password"},
+    )
+    assert missing_csrf.status_code == 403
+    wrong_origin = client.post(
+        "/auth/change-password",
+        headers={**headers, "Origin": "https://evil.example"},
+        json={"current": "env-password", "new": "new-password"},
+    )
+    assert wrong_origin.status_code == 403
+    assert open(auth_file, "rb").read() == before
+
+    request = SimpleNamespace(
+        method="POST",
+        cookies={"ombre_session": session_token},
+        headers=headers,
+        url=SimpleNamespace(scheme="http"),
+    )
+
+    async def request_body():
+        return {"current": "env-password", "new": "new-password"}
+
+    request.json = request_body
+
+    async def exercise():
+        async with DEFAULT_WRITE_COORDINATOR.freeze(
+            reason="auth_recovery_test",
+            drain_timeout_seconds=1,
+            max_freeze_seconds=5,
+        ):
+            return await server.auth_change_password(request)
+
+    frozen = asyncio.run(exercise())
+    assert frozen.status_code == 503
+    assert frozen.body == b'{"error":"maintenance_in_progress"}'
+    assert open(auth_file, "rb").read() == before
 
 
 @pytest.mark.security

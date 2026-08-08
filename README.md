@@ -752,8 +752,25 @@ For a brand-new auth store, setup also requires the one-time startup token print
 environment:
   - OMBRE_DASHBOARD_PASSWORD=your_password_here
 ```
-设置后，Dashboard 的"修改密码"功能将被禁用，必须通过环境变量修改。
-When set, the in-Dashboard password change is disabled — modify the env var directly.
+设置后，valid auth store 的 Dashboard "修改密码"功能将被禁用，必须通过环境变量修改；如果 auth store corrupt/unreadable，则可用该 env 密码登录后通过现有 `/auth/change-password` 显式恢复文件。
+When set, in-Dashboard password change remains disabled for a valid auth store — modify the env var directly. If the auth store is corrupt or unreadable, the env password is an explicit recovery credential through the existing `/auth/change-password` route.
+
+#### Auth store states and recovery
+
+`{buckets_dir}/.dashboard_auth.json` has four possible states:
+
+- `missing`: the path is truly absent. Only this state permits setup.
+- `valid`: a regular file with a valid `password_hash`.
+- `corrupt`: the file exists but is empty, invalid JSON, or has a missing or wrong-type `password_hash`.
+- `unreadable`: the path is a symlink, dangling symlink, directory, non-regular node, or cannot be read.
+
+Only `missing` can enter setup. `corrupt` and `unreadable` fail closed, return `503` from setup, and do not generate a startup token. With `OMBRE_DASHBOARD_PASSWORD`, an operator can log in and explicitly rebuild the file through `/auth/change-password`; without it, recovery requires filesystem-level manual repair. The service never automatically rebuilds the file.
+
+The env password remains higher priority after recovery, so the new file password is not a login credential while `OMBRE_DASHBOARD_PASSWORD` remains configured. After verifying recovery, delete or rotate that env password and restart the service. Keeping it indefinitely preserves an additional login channel.
+
+For an existing `.dashboard_auth.json`, the deployment operator must verify and tighten permissions to `0600`. This is a manual deployment check; the application does not claim to migrate permissions on every pre-existing file.
+
+For a clean first deploy, use the one-time in-memory startup token printed once in the service startup log and send it in `X-Ombre-Setup-Token` with a same-origin request and a password without leading or trailing whitespace. The token is consumed only after the auth file is published. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
 
 完整环境变量说明见 [ENV_VARS.md](ENV_VARS.md)。
 Full env var reference: [ENV_VARS.md](ENV_VARS.md).
@@ -1035,6 +1052,8 @@ HTTP hook 还需要配置独立的 `OMBRE_HOOK_TOKEN`。仓库内 SessionStart �
 If using Claude Code, `.claude/settings.json` configures a `SessionStart` hook that auto-calls `breath` on each new or resumed session, surfacing your highest-weight unresolved memories as context. The recommended current startup call is `boot()`, while the older `breath` hook remains a lightweight surfacing entry point. Only active in remote HTTP mode. Set `OMBRE_HOOK_SKIP=1` to disable temporarily.
 
 The hook also requires the independent `OMBRE_HOOK_TOKEN` and sends it as `Authorization: Bearer <token>`. The repository hook skips calls when the token is unset. Generate the token with `secrets.token_urlsafe(32)` or an equivalent cryptographically secure source; never put it in a URL or commit it.
+
+**Hook rollout order / Hook 发布顺序:** configure `OMBRE_HOOK_TOKEN` first; update every real caller or trusted reverse proxy to send `Authorization: Bearer <OMBRE_HOOK_TOKEN>`; then deploy the backend that enforces the token. After deployment, observe a complete caller cycle and confirm that breath/dream surfacing still succeeds. Do not make the backend mandatory before the caller has been updated.
 
 ## 更新 / How to Update
 

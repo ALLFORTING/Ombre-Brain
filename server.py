@@ -486,8 +486,8 @@ _LINK_COMPAT_ERRNOS = frozenset(
     for errno_value in (
         getattr(errno, "EOPNOTSUPP", None),
         getattr(errno, "ENOTSUP", None),
-        getattr(errno, "EXDEV", None),
-        getattr(errno, "EINVAL", None),
+        getattr(errno, "EXDEV", None),  # cross-device link: use conservative fallback
+        # EINVAL is intentionally not treated as link incompatibility.
         getattr(errno, "ENOSYS", None),
     )
     if errno_value is not None

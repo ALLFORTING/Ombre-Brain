@@ -10,6 +10,8 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
+
 
 pytestmark = pytest.mark.security
 
@@ -134,6 +136,18 @@ def test_hook_token_denylist_is_exact(tmp_path, monkeypatch):
     server._validate_hook_token()
 
 
+def test_invalid_hook_token_failure_does_not_log_token_value(
+    tmp_path, monkeypatch, caplog
+):
+    server = _load_server(tmp_path, monkeypatch)
+    token = "x" * 31 + "\u00e4"
+    monkeypatch.setenv("OMBRE_HOOK_TOKEN", token)
+    with caplog.at_level("ERROR", logger="ombre_brain"):
+        with pytest.raises(RuntimeError, match="^OMBRE_HOOK_TOKEN invalid$"):
+            server._validate_hook_token()
+    assert token not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_breath_hook_filters_sealed_and_enters_one_touch_scope_after_dehydration(
     tmp_path, monkeypatch
@@ -251,6 +265,111 @@ def test_breath_hook_freeze_starting_during_build_skips_touch_without_losing_con
     assert "SUMMARY:OPEN" in response.text
     assert touched == []
     assert scope_entries == 1
+
+
+@pytest.mark.asyncio
+async def test_hooks_use_default_coordinator_once_with_real_decorated_touch(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch, hook_token=HOOK_TOKEN)
+    first_id = await server.bucket_mgr.create("first real hook memory")
+    second_id = await server.bucket_mgr.create("second real hook memory")
+    active_during_dehydrate = []
+
+    async def dehydrate(content, _metadata):
+        active_during_dehydrate.append(
+            DEFAULT_WRITE_COORDINATOR.status().active_writers
+        )
+        await asyncio.sleep(0)
+        return f"SUMMARY:{content}"
+
+    server.dehydrator = SimpleNamespace(dehydrate=dehydrate)
+
+    class Request:
+        headers = {"authorization": f"Bearer {HOOK_TOKEN}"}
+
+    before = DEFAULT_WRITE_COORDINATOR.status()
+    response = await server.breath_hook(Request())
+    after = DEFAULT_WRITE_COORDINATOR.status()
+
+    assert response.status_code == 200
+    assert "first real hook memory" in response.body.decode()
+    assert "second real hook memory" in response.body.decode()
+    assert active_during_dehydrate and set(active_during_dehydrate) == {0}
+    assert after.active_writers == 0
+    assert after.generation - before.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_default_coordinator_freeze_during_dehydrate_skips_real_touches(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch, hook_token=HOOK_TOKEN)
+    await server.bucket_mgr.create("freeze hook memory")
+    active_during_dehydrate = []
+    dehydrate_started = asyncio.Event()
+    freeze_entered = asyncio.Event()
+    release_freeze = asyncio.Event()
+
+    async def dehydrate(content, _metadata):
+        active_during_dehydrate.append(
+            DEFAULT_WRITE_COORDINATOR.status().active_writers
+        )
+        dehydrate_started.set()
+        await freeze_entered.wait()
+        return f"SUMMARY:{content}"
+
+    server.dehydrator = SimpleNamespace(dehydrate=dehydrate)
+
+    class Request:
+        headers = {"authorization": f"Bearer {HOOK_TOKEN}"}
+
+    async def hold_freeze():
+        await dehydrate_started.wait()
+        async with DEFAULT_WRITE_COORDINATOR.freeze(
+            reason="hook_dehydrate_test",
+            drain_timeout_seconds=1,
+            max_freeze_seconds=5,
+        ):
+            freeze_entered.set()
+            await release_freeze.wait()
+
+    before = DEFAULT_WRITE_COORDINATOR.status()
+    freezer = asyncio.create_task(hold_freeze())
+    response = await server.breath_hook(Request())
+    assert freeze_entered.is_set()
+    release_freeze.set()
+    await freezer
+
+    after = DEFAULT_WRITE_COORDINATOR.status()
+    assert response.status_code == 200
+    assert "freeze hook memory" in response.body.decode()
+    assert active_during_dehydrate == [0]
+    assert after.active_writers == 0
+    assert after.generation == before.generation
+
+
+@pytest.mark.asyncio
+async def test_dream_hook_filters_sealed_candidates_and_returns_empty(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch, hook_token=HOOK_TOKEN)
+    buckets = [
+        _bucket("sealed-one", "SEALED_ONE", sealed=1),
+        _bucket("sealed-two", "SEALED_TWO", sealed=1),
+    ]
+    touched = []
+    _install_hook_fakes(server, buckets, touch=touched.append)
+    client = _hook_client(server)
+
+    response = client.get(
+        "/dream-hook",
+        headers={"Authorization": f"Bearer {HOOK_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert touched == []
 
 
 def test_session_hook_script_sends_bearer_and_skips_without_token():

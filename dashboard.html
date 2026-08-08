@@ -1750,7 +1750,14 @@ function updateImportUI(s) {
 }
 
 async function pauseImport() {
-  try { await authFetch('/api/import/pause', { method: 'POST' }); } catch(e) {}
+  try {
+    const resp = await authFetch('/api/import/pause', { method: 'POST' });
+    if (!resp) return;
+    if (resp.ok) return;
+    alert('暂停失败: ' + await importResponseError(resp, '请稍后重试'));
+  } catch(e) {
+    alert('暂停失败: ' + e.message);
+  }
 }
 
 async function loadImportResults() {
@@ -1806,27 +1813,51 @@ async function detectPatterns() {
   } catch(e) { container.innerHTML = '<p style="color:var(--negative)">检测失败: ' + e.message + '</p>'; }
 }
 
+async function importResponseError(resp, fallback) {
+  try {
+    const data = await resp.json();
+    if (data.error === 'maintenance_in_progress') return '系统维护中，请稍后重试';
+    return data.error || data.detail || fallback;
+  } catch(e) {
+    return fallback;
+  }
+}
+
 async function reviewAction(bid, action) {
   try {
-    await authFetch('/api/import/review', {
+    const resp = await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
     });
+    if (!resp) return;
+    if (!resp.ok) {
+      alert('处理失败: ' + await importResponseError(resp, '请稍后重试'));
+      return;
+    }
     // Remove card from UI
     const card = document.getElementById('ir-' + bid);
     if (card) card.style.display = 'none';
-  } catch(e) {}
+  } catch(e) {
+    alert('处理失败: ' + e.message);
+  }
 }
 
 async function batchReview(idsJson, action) {
   try {
     const ids = JSON.parse(idsJson);
-    await authFetch('/api/import/review', {
+    const resp = await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: ids.map(id => ({ bucket_id: id, action })) })
     });
+    if (!resp) return;
+    if (!resp.ok) {
+      alert('批量处理失败: ' + await importResponseError(resp, '请稍后重试'));
+      return;
+    }
     detectPatterns();
-  } catch(e) {}
+  } catch(e) {
+    alert('批量处理失败: ' + e.message);
+  }
 }
 </script>
 </body>

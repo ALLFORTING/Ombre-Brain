@@ -86,6 +86,7 @@ def test_all_cookie_session_write_routes_require_csrf_and_origin(
     server.import_engine._running = False
     client = _client(server)
     headers = _login(server, client)
+    anonymous = _client(server)
 
     cases = [
         ("/api/config", {"json": {}}),
@@ -95,11 +96,33 @@ def test_all_cookie_session_write_routes_require_csrf_and_origin(
         ("/api/import/review", {"json": {"decisions": []}}),
     ]
     for path, kwargs in cases:
+        assert anonymous.post(
+            path,
+            headers={"Origin": "http://testserver"},
+            **kwargs,
+        ).status_code == 401
+
         missing_csrf = client.post(
             path, headers={"Origin": "http://testserver"}, **kwargs
         )
         assert missing_csrf.status_code == 403
         assert missing_csrf.json() == {"error": "csrf_required"}
+
+        wrong_csrf = client.post(
+            path,
+            headers={"Origin": "http://testserver", "X-Ombre-CSRF": "wrong"},
+            **kwargs,
+        )
+        assert wrong_csrf.status_code == 403
+        assert wrong_csrf.json() == {"error": "csrf_required"}
+
+        missing_origin = client.post(
+            path,
+            headers={"X-Ombre-CSRF": headers["X-Ombre-CSRF"]},
+            **kwargs,
+        )
+        assert missing_origin.status_code == 403
+        assert missing_origin.json() == {"error": "same_origin_required"}
 
         wrong_origin = client.post(
             path,
@@ -128,3 +151,21 @@ def test_dashboard_write_calls_use_auth_fetch_without_multipart_override():
     assert "fetch(BASE + '/api/import/pause'" not in dashboard
     assert "fetch(BASE + '/api/import/review'" not in dashboard
     assert "multipart/form-data" not in dashboard
+
+    pause = dashboard.split("async function pauseImport()", 1)[1].split(
+        "async function loadImportResults()", 1
+    )[0]
+    review = dashboard.split("async function reviewAction", 1)[1].split(
+        "async function batchReview", 1
+    )[0]
+    batch = dashboard.split("async function batchReview", 1)[1].split(
+        "</script>", 1
+    )[0]
+    assert "if (!resp) return;" in pause
+    assert "if (resp.ok) return;" in pause
+    assert "alert(" in pause
+    assert "maintenance_in_progress" in dashboard
+    assert "if (!resp.ok)" in review
+    assert review.index("if (!resp.ok)") < review.index("card.style.display")
+    assert "detectPatterns();" in batch
+    assert batch.index("if (!resp.ok)") < batch.index("detectPatterns();")

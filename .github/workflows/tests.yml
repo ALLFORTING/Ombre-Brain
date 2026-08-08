@@ -30,7 +30,12 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio
 
+      - name: Prepare isolated buckets directory
+        run: mkdir -p "${{ runner.temp }}/ombre-buckets"
+
       - name: Run offline tests and security regressions
+        env:
+          OMBRE_BUCKETS_DIR: ${{ runner.temp }}/ombre-buckets
         run: python -m pytest -m "not external" -v --asyncio-mode=auto
 
   external:
@@ -52,8 +57,13 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio
 
+      - name: Prepare isolated buckets directory
+        run: mkdir -p "${{ runner.temp }}/ombre-buckets"
+
       - name: Run external quality tests
         if: env.OMBRE_API_KEY != ''
+        env:
+          OMBRE_BUCKETS_DIR: ${{ runner.temp }}/ombre-buckets
         run: python -m pytest -m external -v --asyncio-mode=auto
 
       - name: Report external tests not configured

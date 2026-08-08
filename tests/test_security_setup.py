@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import hashlib
 import importlib
 import json
@@ -163,6 +164,71 @@ def test_setup_write_failure_leaves_token_available_for_retry(tmp_path, monkeypa
 
 
 @pytest.mark.security
+def test_published_auth_survives_restart_without_a_new_setup_token(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _auth_client(server)
+    token = server._setup_token
+    response = client.post(
+        "/auth/setup",
+        headers=_setup_headers(server, token),
+        json={"password": "restart-password"},
+    )
+    assert response.status_code == 200
+    assert os.path.exists(_auth_file(server))
+
+    sys.modules.pop("server", None)
+    restarted = importlib.import_module("server")
+    assert restarted._setup_token is None
+    assert restarted._is_setup_needed() is False
+    login = _auth_client(restarted).post(
+        "/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"password": "restart-password"},
+    )
+    assert login.status_code == 200
+
+
+@pytest.mark.security
+def test_published_auth_rejects_second_setup_after_pre_consume_exception(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _auth_client(server)
+    token = server._setup_token
+    original = server._create_auth_file_if_absent
+    calls = []
+
+    def publish_then_raise(password_hash):
+        calls.append(password_hash)
+        result = original(password_hash)
+        assert result == server._AUTH_PUBLISH_CREATED
+        raise OSError("synthetic post-publish interruption")
+
+    monkeypatch.setattr(server, "_create_auth_file_if_absent", publish_then_raise)
+    first = client.post(
+        "/auth/setup",
+        headers=_setup_headers(server, token),
+        json={"password": "published-password"},
+    )
+    assert first.status_code == 500
+    assert first.json() == {"error": "setup_failed"}
+    assert server._setup_token == token
+    auth_file = _auth_file(server)
+    published = open(auth_file, "rb").read()
+
+    second = client.post(
+        "/auth/setup",
+        headers=_setup_headers(server, token),
+        json={"password": "second-password"},
+    )
+    assert second.status_code == 400
+    assert len(calls) == 1
+    assert open(auth_file, "rb").read() == published
+
+
+@pytest.mark.security
 def test_publish_competition_returns_409_without_consuming_loser_token(
     tmp_path, monkeypatch
 ):
@@ -296,24 +362,60 @@ def test_cross_process_publish_race_has_one_winner(tmp_path):
 
 
 @pytest.mark.security
-def test_link_fallback_is_limited_to_compatibility_errors(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "compat_errno",
+    sorted(
+        {
+            errno_value
+            for errno_value in (
+                getattr(errno, "EOPNOTSUPP", None),
+                getattr(errno, "ENOTSUP", None),
+                getattr(errno, "EXDEV", None),
+                getattr(errno, "ENOSYS", None),
+            )
+            if errno_value is not None
+        }
+    ),
+)
+def test_link_fallback_is_limited_to_compatibility_errors(
+    tmp_path, monkeypatch, compat_errno
+):
     server = _load_server(tmp_path, monkeypatch)
     auth_file = _auth_file(server)
     monkeypatch.setattr(
         server.os, "link", lambda _source, _target: (_ for _ in ()).throw(
-            OSError(server.errno.EINVAL, "link unsupported")
+            OSError(compat_errno, "link unsupported")
         ),
     )
     result = server._create_auth_file_if_absent(server._password_hash_record("fallback"))
     assert result == server._AUTH_PUBLISH_CREATED
     assert server._auth_store_state()[0] == server._AUTH_STORE_VALID
 
-    os.remove(auth_file)
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "link_errno",
+    [
+        errno.EINVAL,
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOSPC,
+        errno.EIO,
+    ],
+)
+def test_link_real_failures_do_not_fallback_or_publish(
+    tmp_path, monkeypatch, link_errno
+):
+    server = _load_server(tmp_path, monkeypatch)
+    auth_file = _auth_file(server)
     monkeypatch.setattr(
         server.os, "link", lambda _source, _target: (_ for _ in ()).throw(
-            OSError(server.errno.EACCES, "permission denied")
+            OSError(link_errno, "link failed")
         ),
     )
     with pytest.raises(OSError):
-        server._create_auth_file_if_absent(server._password_hash_record("no-fallback"))
+        server._create_auth_file_if_absent(
+            server._password_hash_record("no-fallback")
+        )
     assert not os.path.lexists(auth_file)
