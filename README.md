@@ -744,6 +744,8 @@ Since v1.3.0, the Dashboard and all `/api/*` endpoints are password-protected.
 **首次访问**：若未设置密码，浏览器会弹出设置向导，填写并确认密码后即可使用。
 **First visit**: If no password is set, a setup wizard will appear. Enter and confirm a password to get started.
 
+For a brand-new auth store, setup also requires the one-time startup token printed once in the service startup log. Submit it in the `X-Ombre-Setup-Token` header; it is kept in memory only and is consumed only after the auth file is published. Corrupt or unreadable auth stores do not receive a setup token. A `setup_completed_login_required` response means the password was committed and the normal login flow should be used; a `409` means another setup request won the race.
+
 **通过环境变量预设密码**：在 `docker-compose.user.yml` 中添加：
 **Pre-set via env var** in your `docker-compose.user.yml`:
 ```yaml

@@ -337,6 +337,8 @@ def diagnostic_tool(*args, **kwargs):
 # Sessions stored in memory (lost on restart, 7-day expiry).
 # =============================================================
 _sessions: dict[str, dict] = {}  # {token: {expires_at, csrf_token}}
+_setup_token: str | None = None
+_setup_lock = asyncio.Lock()
 
 _AUTH_STORE_MISSING = "missing"
 _AUTH_STORE_VALID = "valid"
@@ -413,6 +415,17 @@ def _auth_store_state() -> tuple[str, str | None]:
     return _AUTH_STORE_VALID, stored
 
 
+def _initialize_setup_token() -> None:
+    global _setup_token
+    state, _stored = _auth_store_state()
+    if state == _AUTH_STORE_MISSING:
+        _setup_token = secrets.token_urlsafe(32)
+        logger.info("dashboard_setup_token=%s", _setup_token)
+
+
+_initialize_setup_token()
+
+
 def _load_password_hash() -> str | None:
     state, stored = _auth_store_state()
     return stored if state == _AUTH_STORE_VALID else None
@@ -455,11 +468,103 @@ def _atomic_write_auth_payload(payload: dict) -> None:
             _fsync_directory(parent)
 
 
-@guarded_mutation("dashboard_auth_write")
-def _save_password_hash(password: str) -> None:
+def _password_hash_record(password: str) -> str:
     salt = secrets.token_hex(16)
     h = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
-    _atomic_write_auth_payload({"password_hash": f"{salt}:{h}"})
+    return f"{salt}:{h}"
+
+
+@guarded_mutation("dashboard_auth_write")
+def _save_password_hash(password: str) -> None:
+    _atomic_write_auth_payload({"password_hash": _password_hash_record(password)})
+
+
+_AUTH_PUBLISH_CREATED = "created"
+_AUTH_PUBLISH_EXISTS = "exists"
+_LINK_COMPAT_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EXDEV", None),
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOSYS", None),
+    )
+    if errno_value is not None
+)
+
+
+def _write_fd_bytes(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(descriptor, payload[offset:])
+
+
+def _publish_auth_payload_exclusive(
+    auth_file: str, parent: str, payload: bytes
+) -> str:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        descriptor = os.open(auth_file, flags, 0o600)
+    except FileExistsError:
+        return _AUTH_PUBLISH_EXISTS
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return _AUTH_PUBLISH_EXISTS
+        raise
+
+    try:
+        os.chmod(auth_file, 0o600)
+        _write_fd_bytes(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(parent)
+    return _AUTH_PUBLISH_CREATED
+
+
+def _create_auth_file_if_absent(password_hash: str) -> str:
+    """Publish the initial auth file without ever replacing an existing target."""
+    auth_file = _get_auth_file()
+    parent = os.path.dirname(auth_file) or "."
+    os.makedirs(parent, exist_ok=True)
+    payload = _json_lib.dumps(
+        {"password_hash": password_hash}, ensure_ascii=False
+    ).encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".dashboard_auth.setup.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            os.link(temporary, auth_file)
+        except FileExistsError:
+            return _AUTH_PUBLISH_EXISTS
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                return _AUTH_PUBLISH_EXISTS
+            if exc.errno not in _LINK_COMPAT_ERRNOS:
+                raise
+            return _publish_auth_payload_exclusive(auth_file, parent, payload)
+
+        _fsync_directory(parent)
+        os.unlink(temporary)
+        _fsync_directory(parent)
+        return _AUTH_PUBLISH_CREATED
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+            _fsync_directory(parent)
 
 
 def _verify_password_hash(password: str, stored: str) -> bool:
@@ -599,6 +704,14 @@ def _dashboard_write_error(route: str, status_code: int, code: str):
     return JSONResponse({"error": code}, status_code=status_code)
 
 
+def _require_same_origin(request, route: str):
+    origin = _normalize_origin(request.headers.get("origin", ""))
+    expected_origin = _dashboard_external_origin(request)
+    if origin is None or expected_origin is None or origin != expected_origin:
+        return _dashboard_write_error(route, 403, "same_origin_required")
+    return None
+
+
 def _require_dashboard_write(request, route: str):
     session = _session_data(request)
     if session is None:
@@ -647,28 +760,80 @@ async def auth_status(request):
     })
 
 
+async def _auth_setup_impl(request):
+    from starlette.responses import JSONResponse
+    global _setup_token
+
+    err = _require_same_origin(request, "/auth/setup")
+    if err:
+        return err
+
+    async with _setup_lock:
+        auth_state, _stored = _auth_store_state()
+        if auth_state in {_AUTH_STORE_CORRUPT, _AUTH_STORE_UNREADABLE}:
+            return JSONResponse({"error": "auth_store_unreadable"}, status_code=503)
+        if auth_state != _AUTH_STORE_MISSING:
+            return JSONResponse({"error": "Already configured"}, status_code=400)
+
+        supplied_token = request.headers.get("x-ombre-setup-token", "")
+        expected_token = _setup_token
+        try:
+            token_valid = (
+                isinstance(supplied_token, str)
+                and isinstance(expected_token, str)
+                and hmac.compare_digest(
+                    supplied_token.encode("utf-8"), expected_token.encode("utf-8")
+                )
+            )
+        except (UnicodeError, TypeError, AttributeError):
+            token_valid = False
+        if not token_valid:
+            return JSONResponse({"error": "setup_token_invalid"}, status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "password_invalid"}, status_code=400)
+        password = body.get("password")
+        if not isinstance(password, str):
+            return JSONResponse({"error": "password_invalid"}, status_code=400)
+        if password != password.strip():
+            return JSONResponse({"error": "password_whitespace"}, status_code=400)
+        if len(password) < 6:
+            return JSONResponse({"error": "password_too_short"}, status_code=400)
+
+        try:
+            publish_result = _create_auth_file_if_absent(
+                _password_hash_record(password)
+            )
+        except Exception:
+            logger.error("dashboard_auth_setup_write_failed")
+            return JSONResponse({"error": "setup_failed"}, status_code=500)
+        if publish_result == _AUTH_PUBLISH_EXISTS:
+            return JSONResponse({"error": "setup_conflict"}, status_code=409)
+
+        _setup_token = None
+
+    try:
+        token = _create_session()
+    except Exception:
+        logger.error("dashboard_auth_setup_session_failed")
+        return JSONResponse(
+            {"error": "setup_completed_login_required"}, status_code=500
+        )
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        "ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7
+    )
+    return resp
+
+
 @mcp.custom_route("/auth/setup", methods=["POST"])
 @guarded_http_mutation("dashboard_auth_setup", methods=("POST",))
 async def auth_setup_endpoint(request):
-    """Initial password setup (only when no password is configured)."""
-    from starlette.responses import JSONResponse
-    auth_state, _stored = _auth_store_state()
-    if auth_state in {_AUTH_STORE_CORRUPT, _AUTH_STORE_UNREADABLE}:
-        return JSONResponse({"error": "auth_store_unreadable"}, status_code=503)
-    if auth_state != _AUTH_STORE_MISSING:
-        return JSONResponse({"error": "Already configured"}, status_code=400)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    password = body.get("password", "").strip()
-    if len(password) < 6:
-        return JSONResponse({"error": "密码不能少于6位"}, status_code=400)
-    _save_password_hash(password)
-    token = _create_session()
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie("ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
-    return resp
+    return await _auth_setup_impl(request)
 
 
 @mcp.custom_route("/auth/login", methods=["POST"])

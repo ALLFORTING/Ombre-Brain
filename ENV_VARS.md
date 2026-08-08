@@ -2,6 +2,7 @@
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|------|--------|------|
+Initial dashboard setup is protected by a one-time in-memory startup token, printed once in the service startup log and supplied as `X-Ombre-Setup-Token`. The token is generated only when the auth file is truly absent; corrupt or unreadable auth stores fail closed and do not generate one.
 | `OMBRE_API_KEY` | 是 | — | Gemini / OpenAI-compatible API Key，用于脱水(dehydration)和向量嵌入 |
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |

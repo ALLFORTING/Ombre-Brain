@@ -92,7 +92,10 @@ def test_corrupt_auth_store_closes_setup_even_with_env_recovery_password(
         handle.write("{broken")
     client = _auth_client(server)
 
-    response = client.post("/auth/setup", json={"password": "new-password"})
+    response = client.post(
+        "/auth/setup", headers={"Origin": "http://testserver"},
+        json={"password": "new-password"},
+    )
 
     assert response.status_code == 503
     assert response.json() == {"error": "auth_store_unreadable"}
@@ -166,7 +169,10 @@ def test_corrupt_store_without_env_password_fails_closed(tmp_path, monkeypatch):
     client = _auth_client(server)
 
     assert client.post("/auth/login", json={"password": "anything"}).status_code == 401
-    setup = client.post("/auth/setup", json={"password": "new-password"})
+    setup = client.post(
+        "/auth/setup", headers={"Origin": "http://testserver"},
+        json={"password": "new-password"},
+    )
     assert setup.status_code == 503
     assert setup.json() == {"error": "auth_store_unreadable"}
 

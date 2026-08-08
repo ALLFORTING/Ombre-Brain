@@ -5,6 +5,8 @@
 
 ---
 
+Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-Setup-Token` header. The token exists only for a truly missing auth file, is consumed after create-if-absent publication, and is never stored in the auth file or configuration. `setup_completed_login_required` means the auth file is already valid and the user must use normal login; `409` means another setup request published first.
+
 ## 0. 功能总览——这个系统到底做了什么
 
 ### 记忆能力
