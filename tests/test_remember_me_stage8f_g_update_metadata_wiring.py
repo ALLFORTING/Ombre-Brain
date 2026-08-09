@@ -333,7 +333,7 @@ async def test_enabled_rm_asset_update_metadata_uses_core_mutation_only(tmp_path
     assert after_metadata["title"] == "Updated"
     assert after_metadata["description"] == ""
     assert after_metadata["tags"] == []
-    assert after_blob == before_blob == data
+    assert after_blob == before_blob
     assert server.asset_store.get(legacy_before["asset_id"])["title"] == legacy_before["title"]
 
     raw = await server.rm_asset_update_metadata(asset_id, title=None, description=None, tags=None)

@@ -7,13 +7,13 @@ Ombre-Brain pins the public Remember-Me Core to:
 - official repository: `peanutsuee/Remember-Me`;
 - distribution: `remember-me`;
 - package version: `0.1.0.dev7`;
-- immutable prerelease tag: `v0.1.0.dev7`;
-- final main commit: `dc868c4b757db701cfadcb0225acb905c07775e4`;
-- Git tree: `f397d8631cabfe5aa62cabb000f754e00ac06bca`;
+- immutable public release tag: `v0.1.0-dev.7-public.1`;
+- source commit: `a00ea991442d7581a3856b178525a8e77da833fe`;
+- Git tree: `a958d995421c97ccc572b127cb859797aa7a415f`;
 - custom deterministic archive:
-  `https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0.dev7/Remember-Me-0.1.0.dev7-dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz`;
+  `https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-a00ea991442d7581a3856b178525a8e77da833fe.tar.gz`;
 - archive SHA-256:
-  `5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27`;
+  `80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214`;
 - data compatibility: `ombre-brain-assets-v1`;
 - sanitizer: `remember-me-pillow-v1`.
 
@@ -448,9 +448,13 @@ approval for any real capture or rehearsal.
 ## Compatibility evidence
 
 The controlled test environment uses Python 3.12, Pillow 12.3.0, and MCP
-1.28.1. Synthetic PNG and JPEG fixtures produce byte-identical privacy-cleaned
-outputs, stored hashes, MIME types, dimensions, extensions, and relative blob
-paths under the current Ombre-Brain and pinned Remember-Me sanitizers.
+1.28.1. Synthetic PNG and JPEG fixtures produce deterministic,
+privacy-cleaned outputs under both the current Ombre-Brain and pinned
+Remember-Me sanitizers. Their MIME types, dimensions, and extensions are
+compatible, but their encoded bytes, hashes, and relative blob paths are not
+required to be byte-identical. Consequently, re-ingesting source bytes next
+to legacy stored bytes may create a distinct public1 asset rather than
+deduplicating against the legacy representation.
 
 Copied temporary Ombre-Brain data is readable and writable through the public
 Core, then remains readable through the legacy Ombre-Brain store. Existing
@@ -458,9 +462,7 @@ asset rows, hashes, relative paths, and blobs remain unchanged during initial
 repository construction. Initialization may add only:
 
 - `asset_embeddings`;
-- `asset_verification_state`;
-- `idx_asset_embeddings_content_hash`;
-- `idx_asset_embeddings_model`.
+- `asset_verification_state`.
 
 The verification state table belongs to the pinned public Core's bounded asset
 verification session contract. Stage 8H-D uses only the public service API; it
@@ -987,11 +989,11 @@ write, shadow write, sync, Render change, or production data access is involved.
 Stage 8F-J originally updated the immutable Remember-Me dependency pin to
 `5c430d3f265be059198fe230c1a0682e23e89e32` and completed 9/9
 RM-enabled Core ownership. That commit is the historical Stage 8F-J
-implementation pin, not the current dependency. Current `main` uses the later
-compatible superset at commit
-`dc868c4b757db701cfadcb0225acb905c07775e4`, package `0.1.0.dev7`; it retains
-the public vector, Search, and Reindex contracts required by Stage 8F-J. Final
-Acceptance Hardening does not change that pin. The Python RM Search API is
+implementation pin, not the current dependency. The current dependency is the
+independently published public1 asset at source commit
+`a00ea991442d7581a3856b178525a8e77da833fe`, package `0.1.0.dev7`; it retains
+the public vector, Search, and Reindex contracts required by Stage 8F-J. The
+Python RM Search API is
 async, so the OB CoreAdapter, Presenter, and server handler await it end to end
 without a synchronous wrapper, event-loop bridge, or worker thread.
 
@@ -1007,9 +1009,14 @@ constructs `NullVectorProvider` when no Host provider is supplied.
 
 When RM is enabled, `rm_asset_reindex_embeddings` calls the Presenter and Core
 once. RM Core owns canonical text, content hashes, current/stale decisions,
-provider calls, per-item isolation, and embedding persistence. Presenter hides
-RM's internal `enabled` and `model_id` fields and preserves the existing sorted
-four-counter JSON and stable `invalid_limit` / `asset_unavailable` envelopes.
+provider calls, per-item isolation, and embedding persistence. With the default
+disabled `NullVectorProvider`, an asset without a current embedding is counted
+as `skipped`, not `failed`; the Presenter preserves those public counters. The
+OB adapter validates Reindex limits before calling RM and preserves the existing
+sorted four-counter JSON and stable `invalid_limit` / `asset_unavailable`
+envelopes. Public RM uses its own internal `invalid_metadata` error for invalid
+limits; it is translated at this OB boundary without exposing that internal
+code.
 Cancellation propagates through provider, Search, Reindex, CoreAdapter,
 Presenter, and handler boundaries.
 

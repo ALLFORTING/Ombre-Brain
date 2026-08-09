@@ -268,8 +268,10 @@ class RememberMeCoreAdapter:
     ) -> Any:
         self._require_asset_id(asset_id)
         try:
-            clean_tags = (
-                None if tags is None else self._tag_tuple(tags)
+            clean_tags = self._validate_metadata_update(
+                title=title,
+                description=description,
+                tags=tags,
             )
             return self._runtime.service.update_metadata(
                 UpdateMetadataRequest(
@@ -332,6 +334,8 @@ class RememberMeCoreAdapter:
         asset_id: str = "",
         limit: int = 100,
     ) -> RememberMeReindexResult:
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise RememberMeCoreAdapterError("invalid_limit")
         try:
             result = await self._runtime.service.reindex_embeddings(
                 ReindexEmbeddingsRequest(
@@ -346,8 +350,6 @@ class RememberMeCoreAdapter:
                 failed=result.failed,
             )
         except InvalidMetadata as exc:
-            if str(exc) == "invalid_limit":
-                raise RememberMeCoreAdapterError("invalid_limit") from exc
             raise RememberMeCoreAdapterError("asset_unavailable") from exc
         except AssetUnavailable as exc:
             raise RememberMeCoreAdapterError("asset_unavailable") from exc
@@ -460,6 +462,72 @@ class RememberMeCoreAdapter:
         if not isinstance(tags, (list, tuple)):
             raise RememberMeCoreAdapterError("invalid_metadata")
         return tuple(tags)
+
+    @classmethod
+    def _validate_metadata_update(
+        cls,
+        *,
+        title: Any,
+        description: Any,
+        tags: Any,
+    ) -> tuple[str, ...] | None:
+        import unicodedata
+
+        whitespace = re.compile(r"\s+")
+        control_categories = {"Cc", "Cf"}
+        for value, field, maximum in (
+            (title, "title", 200),
+            (description, "description", 4000),
+        ):
+            if value is None:
+                continue
+            if type(value) is not str:
+                raise RememberMeCoreAdapterError(
+                    "invalid_metadata", ob_code=f"invalid_{field}"
+                )
+            normalized = unicodedata.normalize("NFKC", value)
+            normalized = "".join(
+                " "
+                if unicodedata.category(character)
+                in control_categories
+                else character
+                for character in normalized
+            )
+            normalized = whitespace.sub(" ", normalized).strip()
+            if len(normalized) > maximum:
+                raise RememberMeCoreAdapterError(
+                    "invalid_metadata", ob_code=f"{field}_too_long"
+                )
+
+        clean_tags = None if tags is None else cls._tag_tuple(tags)
+        if clean_tags is None:
+            return None
+        identities = set()
+        for value in clean_tags:
+            if type(value) is not str:
+                raise RememberMeCoreAdapterError(
+                    "invalid_metadata", ob_code="invalid_tag"
+                )
+            normalized = unicodedata.normalize("NFKC", value)
+            normalized = "".join(
+                " "
+                if unicodedata.category(character)
+                in control_categories
+                else character
+                for character in normalized
+            )
+            normalized = whitespace.sub(" ", normalized).strip()
+            if len(normalized) > 64:
+                raise RememberMeCoreAdapterError(
+                    "invalid_metadata", ob_code="tag_too_long"
+                )
+            if normalized:
+                identities.add(normalized.casefold())
+        if len(identities) > 30:
+            raise RememberMeCoreAdapterError(
+                "invalid_metadata", ob_code="too_many_tags"
+            )
+        return clean_tags
 
     @staticmethod
     def _raise_mapped(exc: Exception) -> None:
