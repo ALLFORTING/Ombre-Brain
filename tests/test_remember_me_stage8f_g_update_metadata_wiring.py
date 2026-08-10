@@ -403,6 +403,62 @@ def test_presenter_update_metadata_error_allowlist(code):
     assert links.calls == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("title", "a" + (" " * 201) + "b", "title_too_long"),
+        ("description", "a" + (" " * 4001) + "b", "description_too_long"),
+    ],
+)
+async def test_legacy_metadata_length_prevalidation_preserves_internal_whitespace(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+    error,
+):
+    server = _load_server(tmp_path, monkeypatch, rm_enabled=True)
+    data = _png_bytes()
+    asset = server.remember_me_host_bundle.core_adapter.ingest_image(
+        data,
+        expected_bytes=len(data),
+        filename="metadata.png",
+        mime_type="image/png",
+    )
+
+    raw = await server.rm_asset_update_metadata(asset["asset_id"], **{field: value})
+
+    _error_payload(raw, error)
+
+
+@pytest.mark.asyncio
+async def test_metadata_whitespace_uses_legacy_prevalidation_and_public_rm_normalization(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch, rm_enabled=True)
+    data = _png_bytes()
+    asset = server.remember_me_host_bundle.core_adapter.ingest_image(
+        data,
+        expected_bytes=len(data),
+        filename="metadata.png",
+        mime_type="image/png",
+    )
+
+    raw = await server.rm_asset_update_metadata(
+        asset["asset_id"],
+        title="  short   title  ",
+        description="\tbrief   description\n",
+        tags=["  one   two  "],
+    )
+
+    payload = _assert_success_payload(raw)
+    assert payload["title"] == "short title"
+    assert payload["description"] == "brief description"
+    assert payload["tags"] == ["one two"]
+
+
 @pytest.mark.parametrize(
     "error",
     [

@@ -493,7 +493,7 @@ class RememberMeCoreAdapter:
                 else character
                 for character in normalized
             )
-            normalized = whitespace.sub(" ", normalized).strip()
+            normalized = normalized.strip()
             if len(normalized) > maximum:
                 raise RememberMeCoreAdapterError(
                     "invalid_metadata", ob_code=f"{field}_too_long"

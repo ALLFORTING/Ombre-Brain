@@ -12,13 +12,17 @@ from PIL import Image
 from asset_store import AssetStore
 from remember_me.core import (
     AssetUnavailable,
+    BeginAssetVerificationRequest,
+    CompleteAssetVerificationRequest,
     GetAssetRequest,
     ImportAssetDisposition,
     ImportAssetRequest,
     ImportAssetResult,
     ImportAssetTag,
+    ListAssetVerificationPageRequest,
     ReindexEmbeddingsRequest,
     RememberMeCore,
+    VerifyAssetBlobRequest,
 )
 from remember_me.metadata import PROJECT_VERSION
 from remember_me_adapter import RememberMeAdapter
@@ -257,6 +261,31 @@ async def test_real_single_asset_import_preserves_identity_bytes_and_history(
     assert stored.tags == ("Legacy Tag",)
     assert runtime.blob_store.read(stored.stored_relpath) == legacy_blob
     assert hashlib.sha256(legacy_blob).hexdigest() == stored.stored_sha256
+    snapshot = runtime.service.begin_asset_verification(
+        BeginAssetVerificationRequest(kind="image")
+    )
+    page = runtime.service.list_asset_verification_page(
+        ListAssetVerificationPageRequest(snapshot.snapshot_id)
+    )
+    assert page.total_count == 1
+    verified_record = page.records[0]
+    assert verified_record.asset_id == record["asset_id"]
+    assert len(verified_record.tags) == 1
+    assert verified_record.tags[0].value == "Legacy Tag"
+    assert verified_record.tags[0].created_at == TAG_CREATED_AT
+    runtime.service.verify_asset_blob(
+        VerifyAssetBlobRequest(
+            snapshot.snapshot_id,
+            verified_record.asset_id,
+            stored.stored_sha256,
+            len(legacy_blob),
+            legacy_blob,
+        )
+    )
+    completion = runtime.service.complete_asset_verification(
+        CompleteAssetVerificationRequest(snapshot.snapshot_id)
+    )
+    assert completion.complete is True
     reindex = await runtime.service.reindex_embeddings(
         ReindexEmbeddingsRequest(asset_id=record["asset_id"])
     )
@@ -295,6 +324,7 @@ def test_dry_run_is_zero_write_for_rm_and_legacy(tmp_path, monkeypatch):
 async def test_repeat_is_idempotent_and_dry_run_reports_would_skip(tmp_path):
     legacy = AssetStore(tmp_path / "legacy")
     record = _persist_image(legacy)
+    legacy_blob = legacy.resolve_file(record["asset_id"])[1].read_bytes()
     adapter, runtime = _adapter(tmp_path, legacy)
 
     first = adapter.import_asset(LegacyAssetImportRequest(record["asset_id"]))
@@ -309,6 +339,27 @@ async def test_repeat_is_idempotent_and_dry_run_reports_would_skip(tmp_path):
     assert dry.rm_disposition == "would_skip_idempotent"
     stored = runtime.service.get_asset(GetAssetRequest(record["asset_id"]))
     assert stored.asset_id == record["asset_id"]
+    snapshot = runtime.service.begin_asset_verification(
+        BeginAssetVerificationRequest(kind="image")
+    )
+    page = runtime.service.list_asset_verification_page(
+        ListAssetVerificationPageRequest(snapshot.snapshot_id)
+    )
+    assert page.total_count == 1
+    assert tuple(item.asset_id for item in page.records) == (record["asset_id"],)
+    runtime.service.verify_asset_blob(
+        VerifyAssetBlobRequest(
+            snapshot.snapshot_id,
+            page.records[0].asset_id,
+            stored.stored_sha256,
+            len(legacy_blob),
+            legacy_blob,
+        )
+    )
+    completion = runtime.service.complete_asset_verification(
+        CompleteAssetVerificationRequest(snapshot.snapshot_id)
+    )
+    assert completion.complete is True
     reindex = await runtime.service.reindex_embeddings(
         ReindexEmbeddingsRequest(asset_id=record["asset_id"])
     )
