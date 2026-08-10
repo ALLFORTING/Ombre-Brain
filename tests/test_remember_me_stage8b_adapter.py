@@ -31,16 +31,16 @@ from remember_me_adapter import (
 
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_VERSION = "0.1.0.dev7"
-EXPECTED_TAG = "v0.1.0.dev7"
-EXPECTED_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
-EXPECTED_TREE = "f397d8631cabfe5aa62cabb000f754e00ac06bca"
+EXPECTED_TAG = "v0.1.0-dev.7-public.1"
+EXPECTED_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
+EXPECTED_TREE = "a958d995421c97ccc572b127cb859797aa7a415f"
 EXPECTED_ARCHIVE_SHA256 = (
-    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
+    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
 )
 EXPECTED_ARCHIVE_URL = (
     "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
-    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
+    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
+    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
 )
 OLD_COMMIT = "184e223c6392fd14dd5cfa73227d41f46d90e3c8"
 

@@ -363,12 +363,15 @@ async def test_enabled_rm_asset_inspect_supports_jpeg(tmp_path, monkeypatch):
         filename="rm.jpg",
         mime_type="image/jpeg",
     )
+    stored_bytes = server.remember_me_host_bundle.core_adapter.resolve_blob(
+        ingested["asset_id"]
+    )[1]
 
     result = await server.rm_asset_inspect(ingested["asset_id"])
 
     _assert_inspect_success(
         result,
-        data,
+        stored_bytes,
         mime_type="image/jpeg",
         filename="rm.jpg",
     )
