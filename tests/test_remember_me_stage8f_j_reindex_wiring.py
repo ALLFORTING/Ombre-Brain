@@ -39,14 +39,14 @@ from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
 ROOT = Path(__file__).resolve().parent.parent
 RM_VERSION = "0.1.0.dev7"
-RM_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
+RM_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
 RM_ARCHIVE_SHA256 = (
-    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
+    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
 )
 RM_ARCHIVE_URL = (
     "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
-    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
+    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
+    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
 )
 ASSET_ID = "a" * 32
 DIAGNOSTIC_SECRETS = (
@@ -1128,7 +1128,7 @@ async def test_core_adapter_reindex_maps_only_four_counters_and_errors():
     assert request.limit == 7
 
     for error, code in (
-        (InvalidMetadata("invalid_limit"), "invalid_limit"),
+        (InvalidMetadata(), "asset_unavailable"),
         (AssetUnavailable(), "asset_unavailable"),
         (RuntimeError("private path"), "asset_unavailable"),
     ):
@@ -1346,7 +1346,7 @@ async def test_real_rm_reindex_search_closure_and_staleness(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_disabled_provider_is_keyword_only_and_reindex_reports_failure(tmp_path):
+async def test_disabled_provider_is_keyword_only_and_reindex_reports_skip(tmp_path):
     engine = FakeEngine(enabled=False)
     provider = RememberMeVectorProviderAdapter(engine)
     core = RememberMeCoreAdapter.from_host_adapter(
@@ -1364,7 +1364,7 @@ async def test_disabled_provider_is_keyword_only_and_reindex_reports_failure(tmp
     )
 
     reindex = await core.reindex_embeddings()
-    assert reindex == RememberMeReindexResult(1, 0, 0, 1)
+    assert reindex == RememberMeReindexResult(1, 0, 1, 0)
     result = await core.search(query="Keyword")
     assert result["results"][0]["asset_id"] == asset["asset_id"]
     assert "semantic_score" not in result["results"][0]
@@ -1440,6 +1440,21 @@ async def test_reindex_invalid_limits_keep_exact_error_envelope(tmp_path, limit)
     assert await presenter.rm_asset_reindex_embeddings(limit=limit) == (
         '{"error": "invalid_limit", "ok": false}'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [True, "10", 0, 501])
+async def test_core_adapter_rejects_invalid_limits_before_public_rm_call(
+    limit,
+):
+    service = SimpleNamespace(reindex_embeddings=AsyncMock())
+    adapter = RememberMeCoreAdapter(_runtime(service))
+
+    with pytest.raises(RememberMeCoreAdapterError) as caught:
+        await adapter.reindex_embeddings(asset_id="missing", limit=limit)
+
+    assert caught.value.code == "invalid_limit"
+    service.reindex_embeddings.assert_not_awaited()
 
 
 @pytest.mark.asyncio

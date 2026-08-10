@@ -206,7 +206,7 @@ def _semantic(asset):
     return {
         key: value
         for key, value in asset.items()
-        if key not in {"asset_id", "created_at", "updated_at"}
+        if key not in {"asset_id", "created_at", "updated_at", "stored_bytes"}
     }
 
 
@@ -347,20 +347,20 @@ async def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
         old_asset, old_blob = legacy.resolve_blob(old["asset_id"])
         new_asset, new_blob = rm.resolve_blob(new["asset_id"])
         assert _semantic(old_asset) == _semantic(new_asset)
-        assert old_blob == new_blob
         old_row = _row(legacy_root, old["asset_id"])
         new_row = _row(rm_root, new["asset_id"])
-        assert old_row["stored_sha256"] == new_row["stored_sha256"]
-        assert old_row["stored_relpath"] == new_row["stored_relpath"]
+        assert old_row["stored_sha256"] == hashlib.sha256(old_blob).hexdigest()
+        assert new_row["stored_sha256"] == hashlib.sha256(new_blob).hexdigest()
         assert Path(old_row["stored_relpath"]).suffix == Path(
             new_row["stored_relpath"]
         ).suffix
-        with Image.open(io.BytesIO(new_blob)) as cleaned:
-            cleaned.load()
-            assert not cleaned.getexif()
-            assert "icc_profile" not in cleaned.info
-            assert "comment" not in cleaned.info
-            assert "private-note" not in cleaned.info
+        for clean_blob in (old_blob, new_blob):
+            with Image.open(io.BytesIO(clean_blob)) as cleaned:
+                cleaned.load()
+                assert not cleaned.getexif()
+                assert "icc_profile" not in cleaned.info
+                assert "comment" not in cleaned.info
+                assert "private-note" not in cleaned.info
         pairs.append((old, new))
 
     duplicate_old = legacy.ingest_image(
@@ -498,12 +498,7 @@ def test_sequential_cross_runtime_reopen_and_schema_guard(tmp_path):
     rm_owner, rm = _new_rm(root)
     schema_after = _schema(root)
     added = set(schema_after) - set(schema_before)
-    assert added == {
-        "asset_embeddings",
-        "asset_verification_state",
-        "idx_asset_embeddings_content_hash",
-        "idx_asset_embeddings_model",
-    }
+    assert added == {"asset_embeddings", "asset_verification_state"}
     for name, sql in schema_before.items():
         assert schema_after[name] == sql
     assert _rows(root) == rows_before
@@ -575,9 +570,12 @@ def test_metadata_not_found_and_repository_errors_are_safely_mapped(tmp_path):
     with pytest.raises(RememberMeCoreAdapterError) as invalid_metadata:
         adapter.update_metadata(asset["asset_id"], title=object())
     assert invalid_metadata.value.code == "invalid_metadata"
-    with pytest.raises(RememberMeCoreAdapterError) as not_found:
-        adapter.delete("f" * 32)
-    assert not_found.value.code == "asset_not_found"
+    missing_delete = adapter.delete("f" * 32)
+    assert missing_delete == {
+        "asset_id": "f" * 32,
+        "deleted": False,
+        "cleanup_pending": False,
+    }
 
     class BrokenService:
         @staticmethod

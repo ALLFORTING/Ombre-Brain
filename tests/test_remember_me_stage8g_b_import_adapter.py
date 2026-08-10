@@ -2,7 +2,6 @@ import hashlib
 import io
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
 import tempfile
@@ -12,12 +11,18 @@ from PIL import Image
 
 from asset_store import AssetStore
 from remember_me.core import (
+    AssetUnavailable,
+    BeginAssetVerificationRequest,
+    CompleteAssetVerificationRequest,
     GetAssetRequest,
     ImportAssetDisposition,
     ImportAssetRequest,
     ImportAssetResult,
     ImportAssetTag,
+    ListAssetVerificationPageRequest,
+    ReindexEmbeddingsRequest,
     RememberMeCore,
+    VerifyAssetBlobRequest,
 )
 from remember_me.metadata import PROJECT_VERSION
 from remember_me_adapter import RememberMeAdapter
@@ -37,14 +42,14 @@ from remember_me_import_adapter import (
 
 ROOT = Path(__file__).resolve().parent.parent
 RM_VERSION = "0.1.0.dev7"
-RM_COMMIT = "dc868c4b757db701cfadcb0225acb905c07775e4"
+RM_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
 RM_ARCHIVE_SHA256 = (
-    "5e1d1cf3d9006386d23ede678379d957c6caefcc9de22c845a49d4234016aa27"
+    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
 )
 RM_ARCHIVE_URL = (
     "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0.dev7/Remember-Me-0.1.0.dev7-"
-    "dc868c4b757db701cfadcb0225acb905c07775e4.tar.gz"
+    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
+    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
 )
 CREATED_AT = "2026-06-01T01:02:03+00:00"
 TAG_CREATED_AT = "2026-06-01T01:03:04+00:00"
@@ -145,8 +150,8 @@ def _replace_legacy_blob(
     return store.get_import_record(asset_id)
 
 
-def _assert_zero_write(runtime, legacy_root, rm_before, legacy_before):
-    assert _counts(runtime.repository.db_path) == rm_before
+def _assert_zero_write(rm_root, legacy_root, rm_before, legacy_before):
+    assert _snapshot(rm_root) == rm_before
     assert _snapshot(legacy_root) == legacy_before
 
 
@@ -167,17 +172,6 @@ def _adapter(tmp_path, legacy_store, runtime=None):
         fixture_context=fixture,
     )
     return adapter, runtime
-
-
-def _counts(db_path):
-    with sqlite3.connect(db_path) as conn:
-        return {
-            "assets": conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0],
-            "tags": conn.execute("SELECT COUNT(*) FROM asset_tags").fetchone()[0],
-            "embeddings": conn.execute(
-                "SELECT COUNT(*) FROM asset_embeddings"
-            ).fetchone()[0],
-        }
 
 
 def _snapshot(root):
@@ -235,8 +229,9 @@ def test_host_adapter_uses_only_public_rm_core_and_is_not_server_wired():
     assert "remember_me_import_adapter" not in server_text
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
-def test_real_single_asset_import_preserves_identity_bytes_and_history(
+async def test_real_single_asset_import_preserves_identity_bytes_and_history(
     tmp_path,
     image_format,
 ):
@@ -266,15 +261,40 @@ def test_real_single_asset_import_preserves_identity_bytes_and_history(
     assert stored.tags == ("Legacy Tag",)
     assert runtime.blob_store.read(stored.stored_relpath) == legacy_blob
     assert hashlib.sha256(legacy_blob).hexdigest() == stored.stored_sha256
-    with sqlite3.connect(runtime.repository.db_path) as conn:
-        tag = conn.execute(
-            "SELECT tag_display, created_at FROM asset_tags WHERE asset_id = ?",
-            (record["asset_id"],),
-        ).fetchone()
-        assert tag == ("Legacy Tag", TAG_CREATED_AT)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM asset_embeddings"
-        ).fetchone()[0] == 0
+    snapshot = runtime.service.begin_asset_verification(
+        BeginAssetVerificationRequest(kind="image")
+    )
+    page = runtime.service.list_asset_verification_page(
+        ListAssetVerificationPageRequest(snapshot.snapshot_id)
+    )
+    assert page.total_count == 1
+    verified_record = page.records[0]
+    assert verified_record.asset_id == record["asset_id"]
+    assert len(verified_record.tags) == 1
+    assert verified_record.tags[0].value == "Legacy Tag"
+    assert verified_record.tags[0].created_at == TAG_CREATED_AT
+    runtime.service.verify_asset_blob(
+        VerifyAssetBlobRequest(
+            snapshot.snapshot_id,
+            verified_record.asset_id,
+            stored.stored_sha256,
+            len(legacy_blob),
+            legacy_blob,
+        )
+    )
+    completion = runtime.service.complete_asset_verification(
+        CompleteAssetVerificationRequest(snapshot.snapshot_id)
+    )
+    assert completion.complete is True
+    reindex = await runtime.service.reindex_embeddings(
+        ReindexEmbeddingsRequest(asset_id=record["asset_id"])
+    )
+    assert (
+        reindex.scanned,
+        reindex.indexed,
+        reindex.skipped,
+        reindex.failed,
+    ) == (1, 0, 1, 0)
 
 
 def test_dry_run_is_zero_write_for_rm_and_legacy(tmp_path, monkeypatch):
@@ -285,7 +305,6 @@ def test_dry_run_is_zero_write_for_rm_and_legacy(tmp_path, monkeypatch):
     adapter, runtime = _adapter(tmp_path, legacy)
     rm_before = _snapshot(tmp_path / "rm")
     legacy_before = _snapshot(tmp_path / "legacy")
-    counts_before = _counts(runtime.repository.db_path)
     server_before = sys.modules.get("server")
 
     result = adapter.import_asset(
@@ -294,7 +313,6 @@ def test_dry_run_is_zero_write_for_rm_and_legacy(tmp_path, monkeypatch):
 
     assert result.disposition is LegacyAssetImportDisposition.DRY_RUN_VALID
     assert result.rm_disposition == "would_import"
-    assert _counts(runtime.repository.db_path) == counts_before
     assert _snapshot(tmp_path / "rm") == rm_before
     assert _snapshot(tmp_path / "legacy") == legacy_before
     assert sys.modules.get("server") is server_before
@@ -302,9 +320,11 @@ def test_dry_run_is_zero_write_for_rm_and_legacy(tmp_path, monkeypatch):
     assert "OMBRE_RM_DATA_ROOT" not in os.environ
 
 
-def test_repeat_is_idempotent_and_dry_run_reports_would_skip(tmp_path):
+@pytest.mark.asyncio
+async def test_repeat_is_idempotent_and_dry_run_reports_would_skip(tmp_path):
     legacy = AssetStore(tmp_path / "legacy")
     record = _persist_image(legacy)
+    legacy_blob = legacy.resolve_file(record["asset_id"])[1].read_bytes()
     adapter, runtime = _adapter(tmp_path, legacy)
 
     first = adapter.import_asset(LegacyAssetImportRequest(record["asset_id"]))
@@ -317,11 +337,38 @@ def test_repeat_is_idempotent_and_dry_run_reports_would_skip(tmp_path):
     assert second.disposition is LegacyAssetImportDisposition.SKIPPED_IDEMPOTENT
     assert dry.disposition is LegacyAssetImportDisposition.DRY_RUN_VALID
     assert dry.rm_disposition == "would_skip_idempotent"
-    assert _counts(runtime.repository.db_path) == {
-        "assets": 1,
-        "tags": 1,
-        "embeddings": 0,
-    }
+    stored = runtime.service.get_asset(GetAssetRequest(record["asset_id"]))
+    assert stored.asset_id == record["asset_id"]
+    snapshot = runtime.service.begin_asset_verification(
+        BeginAssetVerificationRequest(kind="image")
+    )
+    page = runtime.service.list_asset_verification_page(
+        ListAssetVerificationPageRequest(snapshot.snapshot_id)
+    )
+    assert page.total_count == 1
+    assert tuple(item.asset_id for item in page.records) == (record["asset_id"],)
+    runtime.service.verify_asset_blob(
+        VerifyAssetBlobRequest(
+            snapshot.snapshot_id,
+            page.records[0].asset_id,
+            stored.stored_sha256,
+            len(legacy_blob),
+            legacy_blob,
+        )
+    )
+    completion = runtime.service.complete_asset_verification(
+        CompleteAssetVerificationRequest(snapshot.snapshot_id)
+    )
+    assert completion.complete is True
+    reindex = await runtime.service.reindex_embeddings(
+        ReindexEmbeddingsRequest(asset_id=record["asset_id"])
+    )
+    assert (reindex.scanned, reindex.indexed, reindex.skipped, reindex.failed) == (
+        1,
+        0,
+        1,
+        0,
+    )
 
 
 def test_same_id_different_metadata_is_structured_conflict(tmp_path):
@@ -353,7 +400,10 @@ def test_same_stored_sha_different_id_is_structured_conflict(tmp_path):
     result = adapter_two.import_asset(LegacyAssetImportRequest(second["asset_id"]))
 
     _reject(result, LegacyAssetImportErrorCode.STORED_SHA_OWNERSHIP_CONFLICT)
-    assert _counts(runtime.repository.db_path)["assets"] == 1
+    stored = runtime.service.get_asset(GetAssetRequest(first["asset_id"]))
+    assert stored.stored_sha256 == first["stored_sha256"]
+    with pytest.raises(AssetUnavailable):
+        runtime.service.get_asset(GetAssetRequest(second["asset_id"]))
 
 
 def test_legacy_file_and_invalid_asset_id_are_rejected_before_rm(tmp_path):
@@ -409,13 +459,13 @@ def test_unsupported_legacy_media_types_are_rejected_with_real_bytes(
         extension=extension,
     )
     adapter, runtime = _adapter(tmp_path, legacy)
-    rm_before = _counts(runtime.repository.db_path)
+    rm_before = _snapshot(tmp_path / "rm")
     legacy_before = _snapshot(legacy.data_root)
 
     result = adapter.import_asset(LegacyAssetImportRequest(record["asset_id"]))
 
     _reject(result, LegacyAssetImportErrorCode.UNSUPPORTED_MEDIA_TYPE)
-    _assert_zero_write(runtime, legacy.data_root, rm_before, legacy_before)
+    _assert_zero_write(tmp_path / "rm", legacy.data_root, rm_before, legacy_before)
 
 
 @pytest.mark.parametrize(
@@ -450,7 +500,7 @@ def test_masqueraded_unsupported_image_bytes_reach_rm_validation(
     assert record["decoded_bytes"] == len(content)
     assert record["stored_bytes"] == len(content)
     adapter, runtime = _adapter(tmp_path, legacy)
-    rm_before = _counts(runtime.repository.db_path)
+    rm_before = _snapshot(tmp_path / "rm")
     legacy_before = _snapshot(legacy.data_root)
 
     result = adapter.import_asset(LegacyAssetImportRequest(record["asset_id"]))
@@ -458,7 +508,7 @@ def test_masqueraded_unsupported_image_bytes_reach_rm_validation(
     _reject(result, LegacyAssetImportErrorCode.RM_IMPORT_VALIDATION_FAILURE)
     assert result.error_code is not LegacyAssetImportErrorCode.UNSUPPORTED_MEDIA_TYPE
     assert content.hex() not in json.dumps(result.to_dict())
-    _assert_zero_write(runtime, legacy.data_root, rm_before, legacy_before)
+    _assert_zero_write(tmp_path / "rm", legacy.data_root, rm_before, legacy_before)
 
 
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
