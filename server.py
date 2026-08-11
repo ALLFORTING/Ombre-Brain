@@ -1302,6 +1302,73 @@ def _normalize_archive_topics(topics: list[str] | None) -> list[str]:
     return normalized
 
 
+def _normalize_breath_filter(
+    value: list[str] | None,
+    parameter: str,
+    *,
+    apply_aliases: bool = False,
+) -> list[str]:
+    """Normalize one structured breath filter without broadening its match."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{parameter} must be a list of strings or null.")
+
+    normalized = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{parameter} must contain only strings.")
+        item = item.strip()
+        if not item:
+            raise ValueError(f"{parameter} cannot contain blank values.")
+        if apply_aliases:
+            item = _apply_display_aliases(item)
+        if item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _structured_metadata_values(metadata: dict, field: str) -> list[str]:
+    """Return safe structured values without stringifying malformed metadata."""
+    raw = metadata.get(field, [])
+    if field == "tags" and isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",") if part.strip()]
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _matches_any_structured_filter(
+    bucket: dict,
+    field: str,
+    values: list[str],
+) -> bool:
+    if not values:
+        return True
+    metadata = bucket.get("metadata", {})
+    stored_values = _structured_metadata_values(metadata, field)
+    wanted = set(values)
+    return any(item in wanted for item in stored_values)
+
+
+def _breath_recency_key(bucket: dict) -> tuple[str, str]:
+    """Return the canonical deterministic breath recency key."""
+    metadata = bucket.get("metadata", {})
+    return (
+        _bucket_date(
+            metadata,
+            "updated_at",
+            "last_active",
+            "created_at",
+            "created",
+        ),
+        str(bucket.get("id", "")),
+    )
+
+
 def _normalize_todos(raw) -> list[str]:
     if isinstance(raw, list):
         return [str(item).strip() for item in raw if str(item).strip()]
@@ -2085,6 +2152,275 @@ async def _digest_scheduler_loop() -> None:
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
+async def _breath_filtered_impl(
+    *,
+    query: str,
+    max_tokens: int,
+    domain: str,
+    valence: float,
+    arousal: float,
+    max_results: int,
+    mode: str,
+    recent_cutoff: str | None,
+    include_dormant: bool,
+    include_sealed: bool,
+    date_from: str,
+    date_to: str,
+    resonance_target: tuple[float, float] | None,
+    emotion_trend: bool,
+    tags_filter: list[str],
+    topic_filter: list[str],
+) -> str:
+    """Retrieve exact-filtered candidates without changing old breath paths."""
+    del mode
+    domain_values = [part.strip() for part in (domain or "").split(",") if part.strip()]
+    domain_set = {part.casefold() for part in domain_values}
+    query_text = query.strip()
+
+    def empty_result(message: str) -> str:
+        return _with_emotion_timeline(message, emotion_trend)
+
+    def is_session(bucket: dict) -> bool:
+        domains = bucket.get("metadata", {}).get("domain", [])
+        return isinstance(domains, list) and "session" in domains
+
+    def apply_common_filters(
+        buckets: list[dict],
+        *,
+        apply_domain: bool = True,
+        apply_dormant: bool = True,
+    ) -> list[dict]:
+        # Privacy is intentionally the first candidate gate. Hidden records
+        # never participate in structured matching or candidate ranking.
+        candidates = [
+            bucket
+            for bucket in buckets
+            if include_sealed or not _is_sealed(bucket)
+        ]
+        if apply_domain and domain_set:
+            candidates = [
+                bucket
+                for bucket in candidates
+                if domain_set
+                & {
+                    str(value).casefold()
+                    for value in bucket.get("metadata", {}).get("domain", [])
+                }
+            ]
+        if apply_dormant and not include_dormant:
+            candidates = [
+                bucket
+                for bucket in candidates
+                if not bucket.get("metadata", {}).get("dormant", False)
+            ]
+        candidates = [
+            bucket
+            for bucket in candidates
+            if _is_recent_bucket(bucket, recent_cutoff)
+            and _is_in_date_range(bucket, date_from, date_to)
+            and _matches_any_structured_filter(bucket, "tags", tags_filter)
+            and _matches_any_structured_filter(bucket, "topics", topic_filter)
+        ]
+        return candidates
+
+    # A topic filter is an archived-session constraint. A session domain is
+    # also allowed to select this route when only tags_filter is supplied.
+    session_route = bool(topic_filter) or domain_set == {"session"}
+    if session_route:
+        if domain_set and domain_set != {"session"}:
+            return empty_result("没有找到对话归档。")
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
+            sessions = apply_common_filters(
+                [bucket for bucket in all_buckets if is_session(bucket)],
+                apply_domain=False,
+                apply_dormant=False,
+            )
+            if query_text:
+                q = query_text.lower()
+                sessions = [
+                    bucket
+                    for bucket in sessions
+                    if q in str(bucket.get("metadata", {}).get("name", "")).lower()
+                    or q in bucket.get("content", "").lower()
+                ]
+            sessions.sort(key=_breath_recency_key, reverse=True)
+            sessions = sessions[:max_results]
+            if not sessions:
+                return empty_result("没有找到对话归档。")
+
+            results = []
+            for bucket in sessions:
+                metadata = bucket.get("metadata", {})
+                text = (
+                    f"[session] [bucket_id:{bucket['id']}] "
+                    f"{metadata.get('name', bucket['id'])}\n"
+                    f"{strip_wikilinks(bucket.get('content', '')[:1200])}"
+                )
+                result = await _append_bucket_extras(text, bucket, emotion_trend)
+                if results and count_tokens_approx("\n---\n".join(results + [result])) > max_tokens:
+                    break
+                results.append(result)
+            if not results:
+                return empty_result("没有找到对话归档。")
+            return _with_emotion_timeline("\n---\n".join(results), emotion_trend)
+        except Exception as exc:
+            logger.error(f"Filtered session retrieval failed: {exc}")
+            return "读取对话归档失败。"
+
+    if domain_set == {"feel"}:
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = apply_common_filters(
+                [
+                    bucket
+                    for bucket in all_buckets
+                    if bucket.get("metadata", {}).get("type") == "feel"
+                ],
+                apply_domain=False,
+                apply_dormant=False,
+            )
+            if query_text:
+                q = query_text.lower()
+                feels = [
+                    bucket
+                    for bucket in feels
+                    if q in str(bucket.get("metadata", {}).get("name", "")).lower()
+                    or q in bucket.get("content", "").lower()
+                    or any(
+                        q in str(tag).lower()
+                        for tag in _structured_metadata_values(
+                            bucket.get("metadata", {}), "tags"
+                        )
+                    )
+                ]
+            feels.sort(key=_breath_recency_key, reverse=True)
+            feels = feels[:max_results]
+            if not feels:
+                return empty_result("没有留下过 feel。")
+
+            results = []
+            for bucket in feels:
+                metadata = bucket["metadata"]
+                created = _bucket_date(metadata, "created_at", "created")
+                updated = _bucket_date(metadata, "updated_at", "last_active", "created")
+                entry = (
+                    f"[{created}] [bucket_id:{bucket['id']}] "
+                    f"name:{metadata.get('name', bucket['id'])} updated_at:{updated} "
+                    f"tags:{','.join(_structured_metadata_values(metadata, 'tags'))}\n"
+                    f"{strip_wikilinks(bucket['content'])}"
+                )
+                entry = await _append_bucket_extras(entry, bucket, emotion_trend)
+                if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
+                    break
+                results.append(entry)
+            if not results:
+                return empty_result("没有留下过 feel。")
+            return _with_emotion_timeline(
+                "=== 你留下的 feel ===\n" + "\n---\n".join(results),
+                emotion_trend,
+            )
+        except Exception as exc:
+            logger.error(f"Filtered feel retrieval failed: {exc}")
+            return "读取 feel 失败。"
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        candidates = apply_common_filters(all_buckets)
+        # Feel has a dedicated route. The historical no-query route also
+        # excludes feel buckets, so keep them out of deterministic tag-only
+        # retrieval unless domain="feel" explicitly selected that route.
+        if not query_text:
+            candidates = [
+                bucket
+                for bucket in candidates
+                if bucket.get("metadata", {}).get("type") != "feel"
+            ]
+    except Exception as exc:
+        logger.error(f"Filtered active retrieval failed: {exc}")
+        return "记忆系统暂时无法访问。"
+
+    async def format_active_matches(
+        matches: list[dict],
+        hidden_count: int,
+    ) -> str:
+        results = []
+        returned_ids = set()
+        token_used = 0
+        for bucket in matches:
+            if token_used >= max_tokens:
+                break
+            try:
+                clean_meta = {
+                    key: value
+                    for key, value in bucket["metadata"].items()
+                    if key != "tags"
+                }
+                if 0 <= valence <= 1 and "valence" in clean_meta:
+                    original_v = float(clean_meta.get("valence", 0.5))
+                    shift = (valence - 0.5) * 0.2
+                    clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
+                summary = await dehydrator.dehydrate(
+                    strip_wikilinks(bucket["content"]),
+                    clean_meta,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
+                    break
+                returned_ids.add(bucket["id"])
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    ripple_ids=returned_ids,
+                )
+                if bucket.get("vector_match"):
+                    summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+                else:
+                    summary = f"[bucket_id:{bucket['id']}] {summary}"
+                results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
+                token_used += summary_tokens
+            except Exception as exc:
+                logger.warning(f"Failed to format filtered search result: {exc}")
+                continue
+
+        if not results:
+            await _fire_webhook("breath", {"mode": "empty", "matches": 0})
+            return empty_result("未找到相关记忆。")
+        final_text = "\n---\n".join(results)
+        if hidden_count:
+            final_text += f"\n\n还有{hidden_count}个相关桶未显示"
+        await _fire_webhook(
+            "breath",
+            {"mode": "ok", "matches": len(results), "chars": len(final_text)},
+        )
+        return _with_emotion_timeline(final_text, emotion_trend)
+
+    if not query_text:
+        candidates.sort(key=_breath_recency_key, reverse=True)
+        hidden_count = max(0, len(candidates) - max_results)
+        return await format_active_matches(candidates[:max_results], hidden_count)
+
+    q_valence = valence if 0 <= valence <= 1 else None
+    q_arousal = arousal if 0 <= arousal <= 1 else None
+    try:
+        matches = await bucket_mgr.search(
+            query,
+            limit=max(1000, len(candidates)),
+            domain_filter=None,
+            query_valence=q_valence,
+            query_arousal=q_arousal,
+            include_dormant=True,
+            candidate_buckets=candidates,
+        )
+    except Exception as exc:
+        logger.error(f"Filtered search failed: {exc}")
+        return "搜索过程出错，请稍后重试。"
+
+    if resonance_target:
+        matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
+    hidden_count = max(0, len(matches) - max_results)
+    return await format_active_matches(matches[:max_results], hidden_count)
+
+
 async def _breath_impl(
     query: str = "",
     max_tokens: int = 10000,
@@ -2101,9 +2437,21 @@ async def _breath_impl(
     date_from: str = "",
     date_to: str = "",
     resonance: str = "",
+    tags_filter: list[str] | None = None,
+    topic_filter: list[str] | None = None,
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
+    try:
+        tags_filter = _normalize_breath_filter(
+            tags_filter,
+            "tags_filter",
+            apply_aliases=True,
+        )
+        topic_filter = _normalize_breath_filter(topic_filter, "topic_filter")
+    except ValueError as exc:
+        return str(exc)
+
     await decay_engine.ensure_started()
     query = _apply_display_aliases(query)
     max_results = max(1, min(max_results, 50))
@@ -2120,6 +2468,26 @@ async def _breath_impl(
         return str(exc)
     if date_from and date_to and date_from > date_to:
         return "date_from cannot be later than date_to."
+
+    if tags_filter or topic_filter:
+        return await _breath_filtered_impl(
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            mode=mode,
+            recent_cutoff=recent_cutoff,
+            include_dormant=include_dormant,
+            include_sealed=include_sealed,
+            date_from=date_from,
+            date_to=date_to,
+            resonance_target=resonance_target,
+            emotion_trend=emotion_trend,
+            tags_filter=tags_filter,
+            topic_filter=topic_filter,
+        )
 
     # --- Session archive retrieval: archived session buckets are searchable by domain ---
     if domain.strip().lower() == "session":
@@ -4877,8 +5245,21 @@ async def breath(
     mailbox: bool = False,
     mailbox_limit: int = 1,
     feels: bool = False,
+    tags_filter: Annotated[
+        list[str] | None,
+        Field(description="Optional exact bucket-tag filters. Any listed tag may match."),
+    ] = None,
+    topic_filter: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional exact archived-session topic filters. "
+                "Any listed topic may match."
+            )
+        ),
+    ] = None,
 ) -> str:
-    """Public MCP wrapper for memory retrieval plus optional mailbox access."""
+    """Retrieve memories with optional exact tag/topic filters before query ranking."""
     if mailbox:
         return _with_response_seal(
             _format_mailbox(mailbox_limit, include_sealed=include_sealed)
@@ -4901,6 +5282,8 @@ async def breath(
         date_from=date_from,
         date_to=date_to,
         resonance=resonance,
+        tags_filter=tags_filter,
+        topic_filter=topic_filter,
     )
     return _with_response_seal(result)
 

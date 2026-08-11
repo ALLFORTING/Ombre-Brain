@@ -67,7 +67,7 @@ FORMAL_TOOL_SIGNATURES = {
             "max_results", "importance_min", "mode", "recent_days",
             "emotion_trend", "include_dormant", "include_sealed",
             "date_from", "date_to", "resonance", "mailbox",
-            "mailbox_limit", "feels",
+            "mailbox_limit", "feels", "tags_filter", "topic_filter",
         ],
         [],
     ),

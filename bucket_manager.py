@@ -564,7 +564,11 @@ class BucketManager:
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
     @guarded_optional_async_mutation("bucket_touch")
-    async def touch(self, bucket_id: str) -> None:
+    async def touch(
+        self,
+        bucket_id: str,
+        ripple_ids: set[str] | None = None,
+    ) -> None:
         """
         Update a bucket's last activation time and count.
         Also triggers time ripple: nearby memories get a slight activation boost.
@@ -587,7 +591,11 @@ class BucketManager:
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
             current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
-            await self._time_ripple(bucket_id, current_time)
+            await self._time_ripple(
+                bucket_id,
+                current_time,
+                allowed_ids=ripple_ids,
+            )
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
             raise
@@ -609,7 +617,13 @@ class BucketManager:
             return False
 
     @guarded_optional_async_mutation("bucket_time_ripple")
-    async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
+    async def _time_ripple(
+        self,
+        source_id: str,
+        reference_time: datetime,
+        hours: float = 48.0,
+        allowed_ids: set[str] | None = None,
+    ) -> None:
         """
         Slightly boost activation_count of buckets created/activated near the reference time.
         轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
@@ -623,6 +637,8 @@ class BucketManager:
             if rippled >= max_ripple:
                 break
             if bucket["id"] == source_id:
+                continue
+            if allowed_ids is not None and bucket["id"] not in allowed_ids:
                 continue
             meta = bucket.get("metadata", {})
             # Skip pinned/permanent/feel
@@ -678,6 +694,7 @@ class BucketManager:
         query_valence: float = None,
         query_arousal: float = None,
         include_dormant: bool = False,
+        candidate_buckets: list[dict] = None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -690,14 +707,20 @@ class BucketManager:
             return []
 
         limit = limit or self.max_results
-        all_buckets = await self.list_all(include_archive=False)
+        all_buckets = (
+            list(candidate_buckets)
+            if candidate_buckets is not None
+            else await self.list_all(include_archive=False)
+        )
 
         if not all_buckets:
             return []
 
         # --- Layer 1: domain pre-filter (fast scope reduction) ---
         # --- 第一层：主题域预筛（快速缩小范围）---
-        if domain_filter:
+        if candidate_buckets is not None:
+            candidates = all_buckets
+        elif domain_filter:
             filter_set = {d.lower() for d in domain_filter}
             candidates = [
                 b for b in all_buckets
@@ -721,7 +744,18 @@ class BucketManager:
         vector_scores = {}
         if self.embedding_engine and self.embedding_engine.enabled:
             try:
-                vector_results = await self.embedding_engine.search_similar(query, top_k=50)
+                if candidate_buckets is None:
+                    vector_results = await self.embedding_engine.search_similar(
+                        query,
+                        top_k=50,
+                    )
+                else:
+                    candidate_ids = {str(bucket["id"]) for bucket in candidates}
+                    vector_results = await self.embedding_engine.search_similar(
+                        query,
+                        top_k=50,
+                        candidate_ids=candidate_ids,
+                    )
                 vector_scores = dict(vector_results)
             except Exception as e:
                 logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
