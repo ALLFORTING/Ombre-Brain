@@ -563,22 +563,71 @@ git clone https://github.com/ALLFORTING/Ombre-Brain.git
 cd Ombre-Brain
 
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+```
 
-pip install -r requirements.txt
+macOS / Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows Command Prompt (`cmd`):
+
+```bat
+.venv\Scripts\activate.bat
+```
+
+Install dependencies from the activated environment:
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 复制配置文件并按需修改 / Copy config and edit as needed:
+
+macOS / Linux:
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
+Windows PowerShell:
+
+```powershell
+Copy-Item config.example.yaml config.yaml
+```
+
+Windows Command Prompt (`cmd`):
+
+```bat
+copy config.example.yaml config.yaml
+```
+
 如果你要用 API 做脱水压缩和自动打标（推荐，效果好很多），设置环境变量：
 If you want API-powered dehydration and tagging (recommended, much better quality):
 
+macOS / Linux:
+
 ```bash
 export OMBRE_API_KEY="your-api-key"
+```
+
+Windows PowerShell:
+
+```powershell
+$env:OMBRE_API_KEY="your-api-key"
+```
+
+Windows Command Prompt (`cmd`):
+
+```bat
+set OMBRE_API_KEY=your-api-key
 ```
 
 支持任何 OpenAI 兼容 API。在 `config.yaml` 里改 `base_url` 和 `model` 就行。
@@ -590,8 +639,21 @@ Supports any OpenAI-compatible API. Just change `base_url` and `model` in `confi
 > 不配置 embedding 也能用，系统会降级到纯 fuzzy matching 模式。
 >
 > **已有存量桶需要补生成 embedding**：运行 `backfill_embeddings.py`：
+> macOS / Linux:
 > ```bash
 > OMBRE_API_KEY="your-key" python backfill_embeddings.py --batch-size 20
+> ```
+>
+> Windows PowerShell:
+> ```powershell
+> $env:OMBRE_API_KEY="your-key"
+> python backfill_embeddings.py --batch-size 20
+> ```
+>
+> Windows Command Prompt (`cmd`):
+> ```bat
+> set OMBRE_API_KEY=your-key
+> python backfill_embeddings.py --batch-size 20
 > ```
 > Docker 用户：`docker exec -e OMBRE_BUCKETS_DIR=/data ombre-brain python3 backfill_embeddings.py --batch-size 20`
 >
@@ -1144,7 +1206,7 @@ cd Ombre-Brain
 git pull origin main
 
 # 更新依赖（如有新增）
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 # 重启服务
 # Ctrl+C 停止旧进程，然后：
@@ -1194,7 +1256,7 @@ docker compose build
 docker compose up -d
 
 # 方式 B：直接 Python 运行
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 # 重启你的进程管理器（systemd / supervisord / pm2 等）
 sudo systemctl restart ombre-brain   # 示例
 ```
