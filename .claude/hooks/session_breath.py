@@ -12,6 +12,7 @@
 #
 # Config:
 #   OMBRE_HOOK_URL  — override the server URL (default: http://localhost:8000)
+#   OMBRE_HOOK_TOKEN — Bearer token for the hook endpoints; unset disables calls
 #   OMBRE_HOOK_SKIP — set to "1" to disable the hook temporarily
 # ============================================================
 
@@ -26,18 +27,24 @@ def main():
         sys.exit(0)
 
     base_url = os.environ.get("OMBRE_HOOK_URL", "http://localhost:8000").rstrip("/")
+    hook_token = os.environ.get("OMBRE_HOOK_TOKEN", "")
+    if not hook_token:
+        return
 
     # --- Step 1: Breath — surface unresolved memories ---
-    _call_endpoint(base_url, "/breath-hook")
+    _call_endpoint(base_url, "/breath-hook", hook_token)
 
     # --- Step 2: Dream — digest recent memories ---
-    _call_endpoint(base_url, "/dream-hook")
+    _call_endpoint(base_url, "/dream-hook", hook_token)
 
 
-def _call_endpoint(base_url, path):
+def _call_endpoint(base_url, path, hook_token):
     req = urllib.request.Request(
         f"{base_url}{path}",
-        headers={"Accept": "text/plain"},
+        headers={
+            "Accept": "text/plain",
+            "Authorization": f"Bearer {hook_token}",
+        },
         method="GET",
     )
     try:

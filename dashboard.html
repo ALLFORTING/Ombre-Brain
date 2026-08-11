@@ -916,6 +916,7 @@
 
     <!-- Setup form -->
     <div id="auth-setup-form" style="display:none;">
+      <input type="password" id="auth-setup-token" placeholder="Setup token" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
       <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">首次使用，请设置访问密码</p>
       <input type="password" id="auth-setup-pwd" placeholder="设置密码（至少6位）" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
       <input type="password" id="auth-setup-pwd2" placeholder="确认密码" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doSetup()" />
@@ -965,16 +966,18 @@ function showAuthError(msg) {
 }
 
 async function doSetup() {
+  const setupToken = document.getElementById('auth-setup-token').value;
   const p1 = document.getElementById('auth-setup-pwd').value;
   const p2 = document.getElementById('auth-setup-pwd2').value;
+  if (!setupToken) return showAuthError('Setup token is required');
   if (p1.length < 6) return showAuthError('密码至少6位');
   if (p1 !== p2) return showAuthError('两次密码不一致');
-  const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
+  const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json', 'X-Ombre-Setup-Token': setupToken}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     await checkAuth();
   } else {
     const d = await resp.json();
-    showAuthError(d.detail || '设置失败');
+    showAuthError(d.error || d.detail || '设置失败');
   }
 }
 
@@ -1616,7 +1619,8 @@ document.getElementById('breath-query').addEventListener('keydown', function(e) 
 
 async function loadConfig() {
   try {
-    var res = await fetch(BASE + '/api/config');
+    var res = await authFetch('/api/config');
+    if (!res) return;
     var cfg = await res.json();
     document.getElementById('cfg-dehy-model').value = cfg.dehydration.model || '';
     document.getElementById('cfg-dehy-url').value = cfg.dehydration.base_url || '';
@@ -1655,11 +1659,12 @@ async function saveConfig(persist) {
 
   var status = document.getElementById('config-status');
   try {
-    var res = await fetch(BASE + '/api/config', {
+    var res = await authFetch('/api/config', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
+    if (!res) return;
     var result = await res.json();
     if (result.ok) {
       status.innerHTML = '<span style="color:var(--positive)">✓ 已更新: ' + result.updated.join(', ') + '</span>';
@@ -1693,7 +1698,8 @@ async function startImport(file) {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    const res = await authFetch('/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    if (!res) return;
     const data = await res.json();
     if (data.error) { alert('导入失败: ' + data.error); return; }
     document.getElementById('import-progress').style.display = '';
@@ -1744,7 +1750,14 @@ function updateImportUI(s) {
 }
 
 async function pauseImport() {
-  try { await fetch(BASE + '/api/import/pause', { method: 'POST' }); } catch(e) {}
+  try {
+    const resp = await authFetch('/api/import/pause', { method: 'POST' });
+    if (!resp) return;
+    if (resp.ok) return;
+    alert('暂停失败: ' + await importResponseError(resp, '请稍后重试'));
+  } catch(e) {
+    alert('暂停失败: ' + e.message);
+  }
 }
 
 async function loadImportResults() {
@@ -1800,27 +1813,51 @@ async function detectPatterns() {
   } catch(e) { container.innerHTML = '<p style="color:var(--negative)">检测失败: ' + e.message + '</p>'; }
 }
 
+async function importResponseError(resp, fallback) {
+  try {
+    const data = await resp.json();
+    if (data.error === 'maintenance_in_progress') return '系统维护中，请稍后重试';
+    return data.error || data.detail || fallback;
+  } catch(e) {
+    return fallback;
+  }
+}
+
 async function reviewAction(bid, action) {
   try {
-    await fetch(BASE + '/api/import/review', {
+    const resp = await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
     });
+    if (!resp) return;
+    if (!resp.ok) {
+      alert('处理失败: ' + await importResponseError(resp, '请稍后重试'));
+      return;
+    }
     // Remove card from UI
     const card = document.getElementById('ir-' + bid);
     if (card) card.style.display = 'none';
-  } catch(e) {}
+  } catch(e) {
+    alert('处理失败: ' + e.message);
+  }
 }
 
 async function batchReview(idsJson, action) {
   try {
     const ids = JSON.parse(idsJson);
-    await fetch(BASE + '/api/import/review', {
+    const resp = await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: ids.map(id => ({ bucket_id: id, action })) })
     });
+    if (!resp) return;
+    if (!resp.ok) {
+      alert('批量处理失败: ' + await importResponseError(resp, '请稍后重试'));
+      return;
+    }
     detectPatterns();
-  } catch(e) {}
+  } catch(e) {
+    alert('批量处理失败: ' + e.message);
+  }
 }
 </script>
 </body>

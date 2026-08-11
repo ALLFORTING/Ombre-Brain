@@ -658,6 +658,7 @@ Sensitive config via env vars:
 | `OMBRE_TRANSPORT` | 否 / No | `stdio` | MCP 传输方式：本地 Claude Desktop 用 `stdio`；远程/Render 用 `streamable-http` / MCP transport |
 | `OMBRE_PORT` | 否 / No | `8000` | HTTP/SSE/streamable-http 监听端口 / HTTP port |
 | `OMBRE_AUTH_TOKEN` | 否 / No | 空 / empty | 远程 `/mcp` 访问令牌。未设置时匿名 MCP 访问保持旧行为；设置后 `/mcp` 必须带 Bearer 或 URL token / Remote `/mcp` access token. Anonymous MCP access remains unchanged when unset; when set, `/mcp` requires Bearer or URL token |
+| `OMBRE_HOOK_TOKEN` | 否 / No | 空 / empty | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时返回 `503 hook_not_configured`，不支持 query token 或匿名回退 / Dedicated Bearer token for the two hook endpoints; unset returns `503 hook_not_configured`, with no query-token or anonymous fallback |
 | `OMBRE_RESPONSE_SEAL` | 否 / No | 空 / empty | 防伪暗语。设置后 `boot`/`breath` 末尾带 `seal: ...`，用于 CI 判断返回是否来自可信通道 / Verification phrase appended to `boot`/`breath` |
 | `OMBRE_DIGEST_API_KEY` | 否 / No | — | `digest` 自动消化和 `hold`/`grow` 矛盾检测使用的 LLM key / Key used by `digest` and conflict detection |
 | `OMBRE_DIGEST_BASE_URL` | 否 / No | `https://api.deepseek.com/v1` | 消化/矛盾检测 API base URL / API base URL for digestion/conflict detection |
@@ -744,14 +745,33 @@ Since v1.3.0, the Dashboard and all `/api/*` endpoints are password-protected.
 **首次访问**：若未设置密码，浏览器会弹出设置向导，填写并确认密码后即可使用。
 **First visit**: If no password is set, a setup wizard will appear. Enter and confirm a password to get started.
 
+For a brand-new auth store, setup also requires the one-time startup token printed once in the service startup log. Submit it in the `X-Ombre-Setup-Token` header; it is kept in memory only and is consumed only after the auth file is published. Corrupt or unreadable auth stores do not receive a setup token. A `setup_completed_login_required` response means the password was committed and the normal login flow should be used; a `409` means another setup request won the race.
+
 **通过环境变量预设密码**：在 `docker-compose.user.yml` 中添加：
 **Pre-set via env var** in your `docker-compose.user.yml`:
 ```yaml
 environment:
   - OMBRE_DASHBOARD_PASSWORD=your_password_here
 ```
-设置后，Dashboard 的"修改密码"功能将被禁用，必须通过环境变量修改。
-When set, the in-Dashboard password change is disabled — modify the env var directly.
+设置后，valid auth store 的 Dashboard "修改密码"功能将被禁用，必须通过环境变量修改；如果 auth store corrupt/unreadable，则可用该 env 密码登录后通过现有 `/auth/change-password` 显式恢复文件。
+When set, in-Dashboard password change remains disabled for a valid auth store — modify the env var directly. If the auth store is corrupt or unreadable, the env password is an explicit recovery credential through the existing `/auth/change-password` route.
+
+#### Auth store states and recovery
+
+`{buckets_dir}/.dashboard_auth.json` has four possible states:
+
+- `missing`: the path is truly absent. Only this state permits setup.
+- `valid`: a regular file with a valid `password_hash`.
+- `corrupt`: the file exists but is empty, invalid JSON, or has a missing or wrong-type `password_hash`.
+- `unreadable`: the path is a symlink, dangling symlink, directory, non-regular node, or cannot be read.
+
+Only `missing` can enter setup. `corrupt` and `unreadable` fail closed, return `503` from setup, and do not generate a startup token. With `OMBRE_DASHBOARD_PASSWORD`, an operator can log in and explicitly rebuild the file through `/auth/change-password`; without it, recovery requires filesystem-level manual repair. The service never automatically rebuilds the file.
+
+The env password remains higher priority after recovery, so the new file password is not a login credential while `OMBRE_DASHBOARD_PASSWORD` remains configured. After verifying recovery, delete or rotate that env password and restart the service. Keeping it indefinitely preserves an additional login channel.
+
+For an existing `.dashboard_auth.json`, the deployment operator must verify and tighten permissions to `0600`. This is a manual deployment check; the application does not claim to migrate permissions on every pre-existing file.
+
+For a clean first deploy, use the one-time in-memory startup token printed once in the service startup log and send it in `X-Ombre-Setup-Token` with a same-origin request and a password without leading or trailing whitespace. The token is consumed only after the auth file is published. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
 
 完整环境变量说明见 [ENV_VARS.md](ENV_VARS.md)。
 Full env var reference: [ENV_VARS.md](ENV_VARS.md).
@@ -1026,9 +1046,15 @@ When connecting via tunnel, ensure:
 
 可以通过 `OMBRE_HOOK_URL` 环境变量指定服务器地址（默认 `http://localhost:8000`），或者设置 `OMBRE_HOOK_SKIP=1` 临时禁用。
 
+HTTP hook 还需要配置独立的 `OMBRE_HOOK_TOKEN`。仓库内 SessionStart 脚本会发送 `Authorization: Bearer <token>`；未配置 token 时会明确跳过 hook。token 应使用 `secrets.token_urlsafe(32)` 或等价密码学安全随机源生成，不要放入仓库或 URL。
+
 新窗口的推荐开局是 `boot()`；旧的 `breath` hook 仍可作为轻量自动浮现入口。
 
 If using Claude Code, `.claude/settings.json` configures a `SessionStart` hook that auto-calls `breath` on each new or resumed session, surfacing your highest-weight unresolved memories as context. The recommended current startup call is `boot()`, while the older `breath` hook remains a lightweight surfacing entry point. Only active in remote HTTP mode. Set `OMBRE_HOOK_SKIP=1` to disable temporarily.
+
+The hook also requires the independent `OMBRE_HOOK_TOKEN` and sends it as `Authorization: Bearer <token>`. The repository hook skips calls when the token is unset. Generate the token with `secrets.token_urlsafe(32)` or an equivalent cryptographically secure source; never put it in a URL or commit it.
+
+**Hook rollout order / Hook 发布顺序:** configure `OMBRE_HOOK_TOKEN` first; update every real caller or trusted reverse proxy to send `Authorization: Bearer <OMBRE_HOOK_TOKEN>`; then deploy the backend that enforces the token. After deployment, observe a complete caller cycle and confirm that breath/dream surfacing still succeeds. Do not make the backend mandatory before the caller has been updated.
 
 ## 更新 / How to Update
 

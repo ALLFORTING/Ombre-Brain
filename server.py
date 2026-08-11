@@ -36,6 +36,7 @@ import os
 import sys
 import base64
 import binascii
+import errno
 import io
 import random
 import logging
@@ -44,6 +45,7 @@ import hashlib
 import hmac
 import html
 import secrets
+import stat
 import time
 import threading
 import tempfile
@@ -92,6 +94,7 @@ from maintenance_write_gate import (
     guarded_async_mutation,
     guarded_http_mutation,
     guarded_mutation,
+    optional_async_writer_scope,
 )
 from utils import (
     DISPLAY_ALIASES,
@@ -137,6 +140,64 @@ def _with_response_seal(text: str) -> str:
 
 def _mcp_auth_token() -> str:
     return os.environ.get("OMBRE_AUTH_TOKEN", "").strip()
+
+
+_HOOK_OBVIOUS_TOKENS = frozenset({
+    "changeme",
+    "password",
+    "token",
+    "secret",
+    "example",
+    "test",
+})
+
+
+def _hook_token() -> str:
+    return os.environ.get("OMBRE_HOOK_TOKEN", "")
+
+
+def _validate_hook_token() -> None:
+    token = _hook_token()
+    if not token:
+        return
+    if len(token) < 32 or any(ord(char) < 0x21 or ord(char) > 0x7E for char in token):
+        raise RuntimeError("OMBRE_HOOK_TOKEN invalid")
+    if token.casefold() in _HOOK_OBVIOUS_TOKENS:
+        raise RuntimeError("OMBRE_HOOK_TOKEN invalid")
+
+
+def _hook_unauthorized_response():
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"error": "hook_unauthorized"}, status_code=401)
+
+
+def _require_hook_auth(request):
+    from starlette.responses import JSONResponse
+
+    expected = _hook_token()
+    if not expected:
+        return JSONResponse({"error": "hook_not_configured"}, status_code=503)
+
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, candidate = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not separator:
+        return _hook_unauthorized_response()
+    candidate = candidate.strip()
+    if not candidate:
+        return _hook_unauthorized_response()
+    if any(ord(char) > 0x7F for char in candidate):
+        return _hook_unauthorized_response()
+    try:
+        candidate_bytes = candidate.encode("utf-8")
+        expected_bytes = expected.encode("utf-8")
+        matched = hmac.compare_digest(candidate_bytes, expected_bytes)
+    except (UnicodeError, TypeError):
+        matched = False
+    return None if matched else _hook_unauthorized_response()
+
+
+_validate_hook_token()
 
 
 def _constant_time_token_match(candidate: str, expected: str) -> bool:
@@ -276,54 +337,265 @@ def diagnostic_tool(*args, **kwargs):
 # Sessions stored in memory (lost on restart, 7-day expiry).
 # =============================================================
 _sessions: dict[str, dict] = {}  # {token: {expires_at, csrf_token}}
+_setup_token: str | None = None
+_setup_lock = asyncio.Lock()
+
+_AUTH_STORE_MISSING = "missing"
+_AUTH_STORE_VALID = "valid"
+_AUTH_STORE_CORRUPT = "corrupt"
+_AUTH_STORE_UNREADABLE = "unreadable"
 
 
 def _get_auth_file() -> str:
     return os.path.join(config["buckets_dir"], ".dashboard_auth.json")
 
 
-def _load_password_hash() -> str | None:
+def _log_auth_store_error(state: str) -> None:
+    logger.error("auth_store_%s", state)
+
+
+def _valid_password_hash(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    salt, separator, digest = value.partition(":")
+    if not separator or len(salt) != 32 or len(digest) != 64:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in salt + digest)
+
+
+def _auth_store_state() -> tuple[str, str | None]:
+    """Return the auth file state without treating abnormal nodes as missing."""
+    auth_file = _get_auth_file()
     try:
-        auth_file = _get_auth_file()
-        if os.path.exists(auth_file):
-            with open(auth_file, "r", encoding="utf-8") as f:
-                return _json_lib.load(f).get("password_hash")
-    except Exception:
-        pass
-    return None
+        try:
+            file_stat = os.lstat(auth_file)
+        except FileNotFoundError:
+            try:
+                has_node = os.path.lexists(auth_file)
+            except OSError:
+                _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+                return _AUTH_STORE_UNREADABLE, None
+            if not has_node:
+                return _AUTH_STORE_MISSING, None
+            _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+            return _AUTH_STORE_UNREADABLE, None
+    except OSError:
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if (
+        stat.S_ISLNK(file_stat.st_mode)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or (
+            reparse_point
+            and getattr(file_stat, "st_file_attributes", 0) & reparse_point
+        )
+    ):
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+
+    try:
+        with open(auth_file, "r", encoding="utf-8") as handle:
+            payload = _json_lib.load(handle)
+    except (OSError, UnicodeError):
+        _log_auth_store_error(_AUTH_STORE_UNREADABLE)
+        return _AUTH_STORE_UNREADABLE, None
+    except (_json_lib.JSONDecodeError, TypeError, ValueError):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+
+    if not isinstance(payload, dict):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+    stored = payload.get("password_hash")
+    if not _valid_password_hash(stored):
+        _log_auth_store_error(_AUTH_STORE_CORRUPT)
+        return _AUTH_STORE_CORRUPT, None
+    return _AUTH_STORE_VALID, stored
+
+
+def _initialize_setup_token() -> None:
+    global _setup_token
+    state, _stored = _auth_store_state()
+    if state == _AUTH_STORE_MISSING:
+        _setup_token = secrets.token_urlsafe(32)
+        logger.info("dashboard_setup_token=%s", _setup_token)
+
+
+_initialize_setup_token()
+
+
+def _load_password_hash() -> str | None:
+    state, stored = _auth_store_state()
+    return stored if state == _AUTH_STORE_VALID else None
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush directory metadata where the platform exposes directory fsync."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_auth_payload(payload: dict) -> None:
+    auth_file = _get_auth_file()
+    parent = os.path.dirname(auth_file) or "."
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".dashboard_auth.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            _json_lib.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, auth_file)
+        _fsync_directory(parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+            _fsync_directory(parent)
+
+
+def _password_hash_record(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return f"{salt}:{h}"
 
 
 @guarded_mutation("dashboard_auth_write")
 def _save_password_hash(password: str) -> None:
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    _atomic_write_auth_payload({"password_hash": _password_hash_record(password)})
+
+
+_AUTH_PUBLISH_CREATED = "created"
+_AUTH_PUBLISH_EXISTS = "exists"
+_LINK_COMPAT_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EXDEV", None),  # cross-device link: use conservative fallback
+        # EINVAL is intentionally not treated as link incompatibility.
+        getattr(errno, "ENOSYS", None),
+    )
+    if errno_value is not None
+)
+
+
+def _write_fd_bytes(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(descriptor, payload[offset:])
+
+
+def _publish_auth_payload_exclusive(
+    auth_file: str, parent: str, payload: bytes
+) -> str:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        descriptor = os.open(auth_file, flags, 0o600)
+    except FileExistsError:
+        return _AUTH_PUBLISH_EXISTS
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return _AUTH_PUBLISH_EXISTS
+        raise
+
+    try:
+        os.chmod(auth_file, 0o600)
+        _write_fd_bytes(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(parent)
+    return _AUTH_PUBLISH_CREATED
+
+
+def _create_auth_file_if_absent(password_hash: str) -> str:
+    """Publish the initial auth file without ever replacing an existing target."""
     auth_file = _get_auth_file()
-    os.makedirs(os.path.dirname(auth_file), exist_ok=True)
-    with open(auth_file, "w", encoding="utf-8") as f:
-        _json_lib.dump({"password_hash": f"{salt}:{h}"}, f)
+    parent = os.path.dirname(auth_file) or "."
+    os.makedirs(parent, exist_ok=True)
+    payload = _json_lib.dumps(
+        {"password_hash": password_hash}, ensure_ascii=False
+    ).encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".dashboard_auth.setup.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            os.link(temporary, auth_file)
+        except FileExistsError:
+            return _AUTH_PUBLISH_EXISTS
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                return _AUTH_PUBLISH_EXISTS
+            if exc.errno not in _LINK_COMPAT_ERRNOS:
+                raise
+            return _publish_auth_payload_exclusive(auth_file, parent, payload)
+
+        _fsync_directory(parent)
+        os.unlink(temporary)
+        _fsync_directory(parent)
+        return _AUTH_PUBLISH_CREATED
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+            _fsync_directory(parent)
 
 
 def _verify_password_hash(password: str, stored: str) -> bool:
-    if ":" not in stored:
+    if not isinstance(password, str) or not _valid_password_hash(stored):
         return False
     salt, h = stored.split(":", 1)
-    return hmac.compare_digest(
-        h, hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    )
+    try:
+        actual = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+        return hmac.compare_digest(h.encode("ascii"), actual.encode("ascii"))
+    except (UnicodeError, TypeError):
+        return False
 
 
 def _is_setup_needed() -> bool:
-    """True if no password is configured (env var or file)."""
-    if os.environ.get("OMBRE_DASHBOARD_PASSWORD", ""):
-        return False
-    return _load_password_hash() is None
+    """Only a truly missing auth file permits setup."""
+    state, _stored = _auth_store_state()
+    return state == _AUTH_STORE_MISSING
 
 
 def _verify_any_password(password: str) -> bool:
     """Check password against env var (first) or stored hash."""
+    if not isinstance(password, str):
+        return False
     env_pwd = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
     if env_pwd:
-        return hmac.compare_digest(password, env_pwd)
+        try:
+            return hmac.compare_digest(
+                password.encode("utf-8"), env_pwd.encode("utf-8")
+            )
+        except (UnicodeError, TypeError):
+            return False
     stored = _load_password_hash()
     if not stored:
         return False
@@ -432,6 +704,14 @@ def _dashboard_write_error(route: str, status_code: int, code: str):
     return JSONResponse({"error": code}, status_code=status_code)
 
 
+def _require_same_origin(request, route: str):
+    origin = _normalize_origin(request.headers.get("origin", ""))
+    expected_origin = _dashboard_external_origin(request)
+    if origin is None or expected_origin is None or origin != expected_origin:
+        return _dashboard_write_error(route, 403, "same_origin_required")
+    return None
+
+
 def _require_dashboard_write(request, route: str):
     session = _session_data(request)
     if session is None:
@@ -441,7 +721,13 @@ def _require_dashboard_write(request, route: str):
         )
         return _require_auth(request)
     supplied = request.headers.get("x-ombre-csrf", "")
-    if not supplied or not hmac.compare_digest(supplied, session["csrf_token"]):
+    try:
+        csrf_valid = bool(supplied) and hmac.compare_digest(
+            supplied.encode("utf-8"), session["csrf_token"].encode("utf-8")
+        )
+    except (UnicodeError, TypeError, AttributeError):
+        csrf_valid = False
+    if not csrf_valid:
         return _dashboard_write_error(route, 403, "csrf_required")
     origin = _normalize_origin(request.headers.get("origin", ""))
     expected_origin = _dashboard_external_origin(request)
@@ -474,36 +760,98 @@ async def auth_status(request):
     })
 
 
+async def _auth_setup_impl(request):
+    from starlette.responses import JSONResponse
+    global _setup_token
+
+    err = _require_same_origin(request, "/auth/setup")
+    if err:
+        return err
+
+    async with _setup_lock:
+        auth_state, _stored = _auth_store_state()
+        if auth_state in {_AUTH_STORE_CORRUPT, _AUTH_STORE_UNREADABLE}:
+            return JSONResponse({"error": "auth_store_unreadable"}, status_code=503)
+        if auth_state != _AUTH_STORE_MISSING:
+            return JSONResponse({"error": "Already configured"}, status_code=400)
+
+        supplied_token = request.headers.get("x-ombre-setup-token", "")
+        expected_token = _setup_token
+        try:
+            token_valid = (
+                isinstance(supplied_token, str)
+                and isinstance(expected_token, str)
+                and hmac.compare_digest(
+                    supplied_token.encode("utf-8"), expected_token.encode("utf-8")
+                )
+            )
+        except (UnicodeError, TypeError, AttributeError):
+            token_valid = False
+        if not token_valid:
+            return JSONResponse({"error": "setup_token_invalid"}, status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "password_invalid"}, status_code=400)
+        password = body.get("password")
+        if not isinstance(password, str):
+            return JSONResponse({"error": "password_invalid"}, status_code=400)
+        if password != password.strip():
+            return JSONResponse({"error": "password_whitespace"}, status_code=400)
+        if len(password) < 6:
+            return JSONResponse({"error": "password_too_short"}, status_code=400)
+
+        try:
+            publish_result = _create_auth_file_if_absent(
+                _password_hash_record(password)
+            )
+        except Exception:
+            logger.error("dashboard_auth_setup_write_failed")
+            return JSONResponse({"error": "setup_failed"}, status_code=500)
+        if publish_result == _AUTH_PUBLISH_EXISTS:
+            return JSONResponse({"error": "setup_conflict"}, status_code=409)
+
+        _setup_token = None
+
+    try:
+        token = _create_session()
+    except Exception:
+        logger.error("dashboard_auth_setup_session_failed")
+        return JSONResponse(
+            {"error": "setup_completed_login_required"}, status_code=500
+        )
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        "ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7
+    )
+    return resp
+
+
 @mcp.custom_route("/auth/setup", methods=["POST"])
 @guarded_http_mutation("dashboard_auth_setup", methods=("POST",))
 async def auth_setup_endpoint(request):
-    """Initial password setup (only when no password is configured)."""
-    from starlette.responses import JSONResponse
-    if not _is_setup_needed():
-        return JSONResponse({"error": "Already configured"}, status_code=400)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    password = body.get("password", "").strip()
-    if len(password) < 6:
-        return JSONResponse({"error": "密码不能少于6位"}, status_code=400)
-    _save_password_hash(password)
-    token = _create_session()
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie("ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
-    return resp
+    return await _auth_setup_impl(request)
 
 
 @mcp.custom_route("/auth/login", methods=["POST"])
 async def auth_login(request):
     """Login with password."""
     from starlette.responses import JSONResponse
+    err = _require_same_origin(request, "/auth/login")
+    if err:
+        return err
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "password_invalid"}, status_code=400)
     password = body.get("password", "")
+    if not isinstance(password, str):
+        return JSONResponse({"error": "password_invalid"}, status_code=400)
     if _verify_any_password(password):
         token = _create_session()
         resp = JSONResponse({"ok": True})
@@ -529,22 +877,34 @@ async def auth_logout(request):
 async def auth_change_password(request):
     """Change dashboard password (requires current password)."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/auth/change-password")
     if err:
         return err
-    if os.environ.get("OMBRE_DASHBOARD_PASSWORD", ""):
+    auth_state, _stored = _auth_store_state()
+    env_password = os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")
+    if env_password and auth_state not in {
+        _AUTH_STORE_CORRUPT,
+        _AUTH_STORE_UNREADABLE,
+    }:
         return JSONResponse({"error": "当前使用环境变量密码，请直接修改 OMBRE_DASHBOARD_PASSWORD"}, status_code=400)
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     current = body.get("current", "")
-    new_pwd = body.get("new", "").strip()
+    new_pwd = body.get("new", "")
+    if not isinstance(current, str) or not isinstance(new_pwd, str):
+        return JSONResponse({"error": "密码必须是字符串"}, status_code=400)
     if not _verify_any_password(current):
         return JSONResponse({"error": "当前密码错误"}, status_code=401)
     if len(new_pwd) < 6:
         return JSONResponse({"error": "新密码不能少于6位"}, status_code=400)
     _save_password_hash(new_pwd)
+    if env_password and auth_state in {
+        _AUTH_STORE_CORRUPT,
+        _AUTH_STORE_UNREADABLE,
+    }:
+        logger.info("auth_store_recovered state=%s", auth_state)
     _sessions.clear()
     token = _create_session()
     resp = JSONResponse({"ok": True})
@@ -586,20 +946,29 @@ async def health_check(request):
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    auth_error = _require_hook_auth(request)
+    if auth_error:
+        return auth_error
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # pinned
-        pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
+        pinned = [
+            b for b in all_buckets
+            if (b["metadata"].get("pinned") or b["metadata"].get("protected"))
+            and not _is_sealed(b)
+        ]
         # top 2 unresolved by score
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
                       and b["metadata"].get("type") not in ("permanent", "feel")
                       and not b["metadata"].get("dormant", False)
                       and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
+                      and not b["metadata"].get("protected")
+                      and not _is_sealed(b)]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
 
         parts = []
+        touch_ids = []
         token_budget = 10000
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
@@ -624,13 +993,17 @@ async def breath_hook(request):
             if summary_tokens > token_budget:
                 break
             parts.append(summary)
-            await bucket_mgr.touch(b["id"])
+            touch_ids.append(b["id"])
             token_budget -= summary_tokens
-
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
             return PlainTextResponse("")
         body_text = "[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts)
+        if touch_ids:
+            async with optional_async_writer_scope("breath_hook_touch") as entered:
+                if entered:
+                    for bucket_id in touch_ids:
+                        await bucket_mgr.touch(bucket_id)
         await _fire_webhook("breath_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -645,6 +1018,9 @@ async def breath_hook(request):
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    auth_error = _require_hook_auth(request)
+    if auth_error:
+        return auth_error
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
@@ -653,6 +1029,7 @@ async def dream_hook(request):
             and not b["metadata"].get("dormant", False)
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and not _is_sealed(b)
         ]
         candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         recent = candidates[:10]
@@ -663,7 +1040,6 @@ async def dream_hook(request):
         parts = []
         for b in recent:
             meta = b["metadata"]
-            await bucket_mgr.touch(b["id"])
             resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
@@ -672,6 +1048,10 @@ async def dream_hook(request):
             )
 
         body_text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
+        async with optional_async_writer_scope("dream_hook_touch") as entered:
+            if entered:
+                for bucket_id in (b["id"] for b in recent):
+                    await bucket_mgr.touch(bucket_id)
         await _fire_webhook("dream_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -5892,7 +6272,7 @@ async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
     import yaml
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/config")
     if err: return err
     try:
         body = await request.json()
@@ -6064,7 +6444,7 @@ async def api_host_vault_set(request):
     Note: container restart is required for docker-compose to pick up the new mount.
     """
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/host-vault")
     if err: return err
     try:
         body = await request.json()
@@ -6103,7 +6483,7 @@ async def api_host_vault_set(request):
 async def api_import_upload(request):
     """Upload a conversation file and start import."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/upload")
     if err: return err
 
     if import_engine.is_running:
@@ -6162,10 +6542,11 @@ async def api_import_status(request):
 
 
 @mcp.custom_route("/api/import/pause", methods=["POST"])
+@guarded_http_mutation("dashboard_import_pause", methods=("POST",))
 async def api_import_pause(request):
     """Pause the running import."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/pause")
     if err: return err
     if not import_engine.is_running:
         return JSONResponse({"error": "No import running"}, status_code=400)
@@ -6215,10 +6596,11 @@ async def api_import_results(request):
 
 
 @mcp.custom_route("/api/import/review", methods=["POST"])
+@guarded_http_mutation("dashboard_import_review", methods=("POST",))
 async def api_import_review(request):
     """Apply review decisions: mark buckets as important/noise/pinned."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_dashboard_write(request, "/api/import/review")
     if err: return err
     try:
         body = await request.json()
