@@ -5368,7 +5368,7 @@ async def archive_session(
     """Archive the current conversation summary into archive/session.
 
     ``topics`` contains optional structured labels for the main subjects of
-    the archived session. When useful, provide roughly 3-5 moderately scoped
+    the archived session. When useful, provide roughly 3–8 moderately scoped
     labels, such as ``项目/OB``, ``项目/RM``, ``学习/生化``, ``关系/沟通``, or
     ``日常/作息``. Avoid labels that are too broad, such as ``闲聊``, or
     excessively narrow labels.
