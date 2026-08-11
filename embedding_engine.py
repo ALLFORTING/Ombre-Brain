@@ -244,7 +244,12 @@ class EmbeddingEngine:
                 return None
         return None
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+    async def search_similar(
+        self,
+        query: str,
+        top_k: int = 10,
+        candidate_ids: set[str] | list[str] | None = None,
+    ) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
@@ -252,6 +257,11 @@ class EmbeddingEngine:
         """
         if not self.enabled:
             return []
+
+        if candidate_ids is not None:
+            candidate_ids = {str(bucket_id) for bucket_id in candidate_ids}
+            if not candidate_ids:
+                return []
 
         try:
             query_embedding = await self._generate_embedding(query)
@@ -266,12 +276,22 @@ class EmbeddingEngine:
             )
             return []
 
-        # Load all embeddings from SQLite
+        # Load embeddings from SQLite. A candidate restriction is used by
+        # structured breath filters so a valid filtered candidate cannot be
+        # displaced by unrelated global top-N vectors.
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute(
-            "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
-            (self.model,),
-        ).fetchall()
+        if candidate_ids is None:
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
+                (self.model,),
+            ).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in candidate_ids)
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings "
+                f"WHERE model = ? AND bucket_id IN ({placeholders})",
+                (self.model, *sorted(candidate_ids)),
+            ).fetchall()
         conn.close()
 
         if not rows:

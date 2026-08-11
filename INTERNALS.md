@@ -78,7 +78,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 
 | 工具 | 关键参数 | 功能 |
 |---|---|---|
-| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min** | 检索/浮现记忆 |
+| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min**, tags_filter, topic_filter | 检索/浮现记忆；结构化过滤先于 query 排名 |
 | `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
 | `grow` | content | 日记拆分归档 |
 | `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |

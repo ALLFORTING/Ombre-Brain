@@ -371,6 +371,8 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 - `feels: bool = False` — 专门检索 feel 桶，相当于 `domain="feel"` / Search feel buckets only, equivalent to `domain="feel"`.
 - `include_dormant: bool = False` — 是否搜索自动沉底桶 / Include auto-dormant buckets.
 - `include_sealed: bool = False` — 是否显示手动封存桶；默认不返回桶名、ID、摘要，也不计入隐藏数量 / Include manually sealed buckets; hidden by default including name, ID, summary, and counts.
+- `tags_filter: list[str] | None = None` — 可选的桶标签精确过滤；列表内任一标签匹配即可，多个标签过滤与 `topic_filter` 之间按 AND 组合 / Optional exact bucket-tag filter; any listed tag may match, and it combines conjunctively with `topic_filter`.
+- `topic_filter: list[str] | None = None` — 可选的归档会话主题精确过滤；列表内任一主题匹配即可。过滤会先于 query 排名，单独使用时按最新记录优先 / Optional exact archived-session topic filter; any listed topic may match. Structured filtering happens before query ranking, and filter-only calls return newest first.
 
 #### `trace`
 
