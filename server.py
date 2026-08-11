@@ -10,10 +10,20 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Register the formal Ombre Brain / Remember-Me MCP tool surface
-#     注册正式的 Ombre Brain / Remember-Me MCP 工具面
-#     Diagnostic tools are controlled separately by OMBRE_DIAG_TOOLS.
-#     诊断工具由 OMBRE_DIAG_TOOLS 单独控制。
+#   - Expose 6 MCP tools:
+#     暴露 6 个 MCP 工具：
+#       breath — Surface unresolved memories or search by keyword
+#                浮现未解决记忆 或 按关键词检索
+#       hold   — Store a single memory (or write a `feel` reflection)
+#                存储单条记忆（或写 feel 反思）
+#       grow   — Diary digest, auto-split into multiple buckets
+#                日记归档，自动拆分多桶
+#       trace  — Modify metadata / resolved / delete
+#                修改元数据 / resolved 标记 / 删除
+#       pulse  — System status + bucket listing
+#                系统状态 + 所有桶列表
+#       dream  — Surface recent dynamic buckets for self-digestion
+#                返回最近桶 供模型自省/写 feel
 #
 # Startup:
 # 启动方式：
