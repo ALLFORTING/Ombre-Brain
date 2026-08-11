@@ -385,9 +385,9 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 
 #### `archive_session`
 
-`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="")` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。
+`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。`topics` 是可选的结构化主题标签列表；有帮助时可提供大约 3–8 个适度范围的标签。
 
-`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="")` creates a `session_YYYY-MM-DD_NN` archive bucket with `domain=["session"]`. When `letter` is provided, it is also stored in the independent `letters` mailbox table and surfaced by the next `boot()`.
+`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` creates a `session_YYYY-MM-DD_NN` archive bucket with `domain=["session"]`. When `letter` is provided, it is also stored in the independent `letters` mailbox table and surfaced by the next `boot()`. `topics` is an optional list of structured topic labels; when useful, provide roughly 3–8 moderately scoped labels such as `项目/OB`, `项目/RM`, `学习/生化`, `关系/沟通`, or `日常/作息`. Avoid labels that are too broad or excessively narrow.
 
 #### `digest` 与 `related_backfill`
 

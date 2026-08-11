@@ -260,6 +260,7 @@ class BucketManager:
         pinned: bool = False,
         protected: bool = False,
         sealed: bool = False,
+        topics: list[str] = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -315,6 +316,8 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        if topics is not None:
+            metadata["topics"] = topics
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
