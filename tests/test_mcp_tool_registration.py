@@ -54,7 +54,10 @@ FORMAL_TOOLS = {
 
 FORMAL_TOOL_SIGNATURES = {
     "archive_session": (
-        ["summary", "highlights", "mood", "valence", "arousal", "letter", "sealed"],
+        [
+            "summary", "highlights", "mood", "valence", "arousal",
+            "letter", "sealed", "topics",
+        ],
         ["summary"],
     ),
     "boot": (["pinned_chars", "max_tokens"], []),

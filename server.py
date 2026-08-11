@@ -1284,6 +1284,24 @@ def _parse_csv_ids(value: str) -> list[str]:
     return [part.strip() for part in (value or "").split(",") if part.strip()]
 
 
+def _normalize_archive_topics(topics: list[str] | None) -> list[str]:
+    """Normalize structured archive topics without changing their labels."""
+    if topics is None:
+        return []
+    if not isinstance(topics, list) or any(not isinstance(item, str) for item in topics):
+        raise ValueError("topics must be a list of strings.")
+
+    normalized = []
+    seen = set()
+    for item in topics:
+        topic = item.strip()
+        if not topic or topic in seen:
+            continue
+        seen.add(topic)
+        normalized.append(topic)
+    return normalized
+
+
 def _normalize_todos(raw) -> list[str]:
     if isinstance(raw, list):
         return [str(item).strip() for item in raw if str(item).strip()]
@@ -5336,12 +5354,32 @@ async def archive_session(
     ] = -1,
     letter: str = "",
     sealed: bool = False,
+    topics: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional structured topic labels describing the main subjects "
+                "covered by the archived session."
+            )
+        ),
+    ] = None,
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
-    """Archive the current conversation summary into archive/session."""
+    """Archive the current conversation summary into archive/session.
+
+    ``topics`` contains optional structured labels for the main subjects of
+    the archived session. When useful, provide roughly 3-5 moderately scoped
+    labels, such as ``项目/OB``, ``项目/RM``, ``学习/生化``, ``关系/沟通``, or
+    ``日常/作息``. Avoid labels that are too broad, such as ``闲聊``, or
+    excessively narrow labels.
+    """
     await decay_engine.ensure_started()
     if not summary or not summary.strip():
         return "summary 不能为空。"
+    try:
+        normalized_topics = _normalize_archive_topics(topics)
+    except ValueError as exc:
+        return str(exc)
 
     today = datetime.now().date().isoformat()
     all_buckets = await bucket_mgr.list_all(include_archive=True)
@@ -5371,6 +5409,7 @@ async def archive_session(
         bucket_type="dynamic",
         name=session_name,
         sealed=sealed,
+        topics=normalized_topics,
     )
     await bucket_mgr.archive(bucket_id)
     if letter.strip():
