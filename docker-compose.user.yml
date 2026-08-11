@@ -2,6 +2,12 @@
 # Ombre Brain — 用户快速部署版
 # User Quick Deploy (pre-built image, no local build needed)
 #
+# IMPORTANT: This compose file uses the upstream P0luz pre-built image.
+# It does not build the current ALLFORTING/Ombre-Brain fork.
+# It may not include features or fixes present in the current fork.
+# 注意：此文件使用上游 P0luz 预构建镜像，不会构建当前 ALLFORTING/Ombre-Brain fork。
+# 它不保证包含当前 fork 中的功能或修复。
+#
 # 使用方法 / Usage:
 #   1. 创建 .env: echo "OMBRE_API_KEY=your-key" > .env
 #   2. 按需修改下面的 volumes 路径

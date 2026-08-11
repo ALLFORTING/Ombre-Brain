@@ -7,12 +7,15 @@ A long-term emotional memory system for Claude. Tags memories using Russell's va
 > **⚠️ 备用链接 / Backup link**
 > Gitea 备用地址（GitHub 访问有问题时用）：
 > **https://git.p0lar1s.uk/P0lar1s/Ombre_Brain**
+> This is an upstream/original-project backup link, not the canonical source for `ALLFORTING/Ombre-Brain`.
+> 这是上游原项目的备用链接，不是 `ALLFORTING/Ombre-Brain` 的规范源码入口。
 
 ---
 
-## 快速开始 / Quick Start（Docker Hub 预构建镜像，最简单）
+## 快速开始 / Quick Start（运行当前 ALLFORTING fork / Run the current fork）
 
-> 不需要 clone 代码，不需要 build，三步搞定。
+> 主路径会 clone `ALLFORTING/Ombre-Brain` 当前源码，并使用仓库内的 `docker-compose.yml` 本地构建；不会拉取预构建镜像。
+> This primary path clones the current `ALLFORTING/Ombre-Brain` source and builds it locally with `docker-compose.yml`; it does not use a pre-built image.
 > 完全不会？没关系，往下看，一步一步跟着做。
 
 ### 第零步：装 Docker Desktop
@@ -32,13 +35,15 @@ A long-term emotional memory system for Claude. Tags memories using Russell's va
 
 打开后你会看到一个黑色/白色的窗口，可以输入命令。下面所有代码块里的内容，都是**复制粘贴到这个窗口里，然后按回车**。
 
-### 第二步：创建一个工作文件夹
+### 第二步：获取当前 fork 代码 / Clone the current fork
 
 ```bash
-mkdir ombre-brain && cd ombre-brain
+git clone https://github.com/ALLFORTING/Ombre-Brain.git
+cd Ombre-Brain
 ```
 
-> 这会在你当前位置创建一个叫 `ombre-brain` 的文件夹，并进入它。
+> 这会获取当前 `ALLFORTING/Ombre-Brain` 源码；要运行当前 fork，请使用这个仓库，而不是上游原项目。
+> This checks out the current fork source; use this repository when you want the current fork rather than the upstream project.
 
 ### 第三步：获取 API Key（免费）
 
@@ -49,13 +54,26 @@ mkdir ombre-brain && cd ombre-brain
 
 > 没有 Google 账号？也行，API Key 留空也能跑，只是脱水压缩效果差一点。
 
-### 第四步：创建配置文件并启动
+### 第四步：创建配置文件并启动当前 fork / Configure and start the current fork
 
-**一行一行复制粘贴执行：**
+**按你使用的终端执行 / Use the command for your terminal:**
+
+macOS / Linux:
 
 ```bash
-# 下载用户版 compose 文件
-curl -O https://raw.githubusercontent.com/P0luz/Ombre-Brain/main/docker-compose.user.yml
+cp config.example.yaml config.yaml
+```
+
+Windows PowerShell:
+
+```powershell
+Copy-Item config.example.yaml config.yaml
+```
+
+Windows Command Prompt (`cmd`):
+
+```bat
+copy config.example.yaml config.yaml
 ```
 
 ```bash
@@ -64,14 +82,14 @@ echo "OMBRE_API_KEY=your-key-here" > .env
 ```
 
 ```bash
-# 拉取镜像并启动（第一次会下载约 500MB，等一会儿）
-docker compose -f docker-compose.user.yml up -d
+# 本地构建当前 fork 并启动
+docker compose up -d --build
 ```
 
 ### 第五步：验证
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:18001/health
 ```
 
 看到类似这样的输出就是成功了：
@@ -79,10 +97,10 @@ curl http://localhost:8000/health
 {"status":"ok","buckets":0,"decay_engine":"stopped"}
 ```
 
-浏览器打开前端 Dashboard：**http://localhost:8000/dashboard**
+浏览器打开前端 Dashboard：**http://localhost:18001/dashboard**
 
-> 如果你用的是 `docker-compose.user.yml` 默认端口，地址就是 `http://localhost:8000/dashboard`。
-> 如果你改了端口映射（比如 `18001:8000`），则是 `http://localhost:18001/dashboard`。
+> `docker-compose.yml` 默认把本地 `18001` 映射到容器的 `8000`；如果你改了端口映射，请使用对应的本地端口。
+> `docker-compose.yml` maps local port `18001` to container port `8000` by default; use your mapped local port if you change it.
 
 > **看到错误？** 检查 Docker Desktop 是否正在运行（状态栏有图标）。
 
@@ -95,7 +113,7 @@ curl http://localhost:8000/health
   "mcpServers": {
     "ombre-brain": {
       "type": "streamable-http",
-      "url": "http://localhost:8000/mcp"
+      "url": "http://localhost:18001/mcp"
     }
   }
 }
@@ -103,20 +121,22 @@ curl http://localhost:8000/health
 
 重启 Claude Desktop，你应该能在工具列表里看到 `breath`、`hold`、`grow` 等工具了。
 
-> 如果你为本地 HTTP 模式设置了 `OMBRE_AUTH_TOKEN`，URL 需要改为 `http://localhost:8000/mcp?token=<你的token>`。
-> If you set `OMBRE_AUTH_TOKEN` for local HTTP mode, use `http://localhost:8000/mcp?token=<your-token>`.
+> 如果你为本地 HTTP 模式设置了 `OMBRE_AUTH_TOKEN`，URL 需要改为 `http://localhost:18001/mcp?token=<你的token>`。
+> If you set `OMBRE_AUTH_TOKEN` for local HTTP mode, use `http://localhost:18001/mcp?token=<your-token>`.
 
-> **想挂载 Obsidian？** 用任意文本编辑器打开 `docker-compose.user.yml`，把 `./buckets:/data` 改成你的 Vault 路径，例如：
-> ```yaml
-> - /Users/你的用户名/Documents/Obsidian Vault/Ombre Brain:/data
+> **想挂载 Obsidian？** 在 `.env` 中设置 `OMBRE_HOST_VAULT_DIR`，`docker-compose.yml` 会把它挂载到容器内的 `/data`，例如：
+> ```dotenv
+> OMBRE_HOST_VAULT_DIR=/Users/你的用户名/Documents/Obsidian Vault/Ombre Brain
 > ```
-> 然后 `docker compose -f docker-compose.user.yml down && docker compose -f docker-compose.user.yml up -d` 重启。
+> 然后运行 `docker compose down && docker compose up -d --build` 重启。
+> **Want to mount Obsidian?** Set `OMBRE_HOST_VAULT_DIR` in `.env`; `docker-compose.yml` mounts it at `/data`.
 
-> **后续更新镜像：**
+> **后续更新当前 fork：**
 > ```bash
-> docker pull p0luz/ombre-brain:latest
-> docker compose -f docker-compose.user.yml down && docker compose -f docker-compose.user.yml up -d
+> git pull origin main
+> docker compose up -d --build
 > ```
+> For the upstream pre-built image path, see **Upstream pre-built image (not the current fork)** below.
 
 ---
 
@@ -128,10 +148,11 @@ curl http://localhost:8000/health
 
 **第一步：拉取代码**
 
-(💡 如果主链接访问有困难，可用备用 Gitea 地址：https://git.p0lar1s.uk/P0lar1s/Ombre_Brain)
+> 💡 The Gitea URL above is an upstream/original-project backup only; it is not a source for this fork.
+> 💡 上面的 Gitea 地址仅是上游原项目备用地址，不是本 fork 的源码入口。
 
 ```bash
-git clone https://github.com/P0luz/Ombre-Brain.git
+git clone https://github.com/ALLFORTING/Ombre-Brain.git
 cd Ombre-Brain
 ```
 
@@ -215,9 +236,11 @@ docker logs ombre-brain
 
 ---
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/P0luz/Ombre-Brain)
-[![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/OMBRE-BRAIN?referralCode=P0luz)
-[![Docker Hub](https://img.shields.io/docker/v/p0luz/ombre-brain?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/p0luz/ombre-brain)
+> **上游专用入口 / Upstream-only links:** These links target the upstream `P0luz/Ombre-Brain` distribution. They do not deploy or install the current `ALLFORTING/Ombre-Brain` fork; use the source instructions above for the fork.
+
+[![Deploy upstream to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/P0luz/Ombre-Brain)
+[![Deploy upstream on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/OMBRE-BRAIN?referralCode=P0luz)
+[![Upstream Docker Hub image](https://img.shields.io/docker/v/p0luz/ombre-brain?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/p0luz/ombre-brain)
 
 ---
 
@@ -536,7 +559,7 @@ The 15 Stage 0 and diagnostic tools remain in the codebase but are not registere
 ### 步骤 / Steps
 
 ```bash
-git clone https://github.com/P0luz/Ombre-Brain.git
+git clone https://github.com/ALLFORTING/Ombre-Brain.git
 cd Ombre-Brain
 
 python -m venv .venv
@@ -900,13 +923,18 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 
 ## 部署 / Deploy
 
-### Docker Hub 预构建镜像
+### Upstream Docker Hub 预构建镜像（不是当前 fork / not the current fork）
 
-[![Docker Hub](https://img.shields.io/docker/v/p0luz/ombre-brain?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/p0luz/ombre-brain)
+[![Upstream Docker Hub image](https://img.shields.io/docker/v/p0luz/ombre-brain?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/p0luz/ombre-brain)
 
-不用 clone 代码、不用 build，直接拉取预构建镜像：
+> This image tracks the upstream `P0luz` distribution and may not include features or fixes present in `ALLFORTING/Ombre-Brain`.
+> 这是上游 `P0luz` 的预构建镜像，不保证包含 `ALLFORTING/Ombre-Brain` 当前 fork 的功能和修复。
+> 要运行当前 fork，请使用上面的 `ALLFORTING/Ombre-Brain` 源码部署路径；本仓库没有未经验证的 ALLFORTING Docker image 名称。
+
+不用 clone 代码、不用本地 build，直接使用上游预构建镜像：
 
 ```bash
+# Upstream-only image and compose; this does not build the current fork.
 docker pull p0luz/ombre-brain:latest
 curl -O https://raw.githubusercontent.com/P0luz/Ombre-Brain/main/docker-compose.user.yml
 echo "OMBRE_API_KEY=你的key" > .env
@@ -918,7 +946,10 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 
 ### Render
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/P0luz/Ombre-Brain)
+> The one-click button below targets the upstream `P0luz/Ombre-Brain` repository and does not deploy `ALLFORTING/Ombre-Brain`. For the current fork, use this repository's `render.yaml` with a Render service connected to `ALLFORTING/Ombre-Brain`; no fork-specific one-click URL is asserted here.
+> 下面的一键按钮指向上游 `P0luz/Ombre-Brain`，不会部署 `ALLFORTING/Ombre-Brain`。要运行当前 fork，请将 Render 服务连接到 `ALLFORTING/Ombre-Brain` 并使用本仓库的 `render.yaml`；这里不凭空声明 fork 专用一键链接。
+
+[![Deploy upstream to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/P0luz/Ombre-Brain)
 
 > ⚠️ **免费层不可用**：Render 免费层**不支持持久化磁盘**，服务重启后记忆数据会丢失，且会在无流量时休眠。**必须使用 Starter（$7/mo）或以上**才能正常使用。
 > **Free tier won't work**: Render free tier has **no persistent disk** — all memory data is lost on restart. It also sleeps on inactivity. **Starter plan ($7/mo) or above is required.**
@@ -1064,10 +1095,13 @@ The hook also requires the independent `OMBRE_HOOK_TOKEN` and sends it as `Autho
 
 Different update procedures depending on your deployment method.
 
-### Docker Hub 预构建镜像用户 / Docker Hub Pre-built Image
+### 上游 Docker Hub 预构建镜像用户 / Upstream Docker Hub Pre-built Image (not the current fork)
+
+> This update path tracks the upstream `P0luz` image only; it does not update or rebuild `ALLFORTING/Ombre-Brain` source.
+> 这条更新路径只跟踪上游 `P0luz` 镜像，不会更新或构建 `ALLFORTING/Ombre-Brain` 源码。
 
 ```bash
-# 拉取最新镜像
+# 拉取最新的上游镜像 / Pull the latest upstream image
 docker pull p0luz/ombre-brain:latest
 
 # 重启容器（记忆数据在 volume 里，不会丢失）
@@ -1079,6 +1113,9 @@ docker compose -f docker-compose.user.yml up -d
 > Your memory data is mounted at `./buckets:/data` — pull + restart won't affect existing data.
 
 ### 从源码部署用户 / Source Code Deploy (Docker)
+
+> This path updates a checkout whose `origin` is `https://github.com/ALLFORTING/Ombre-Brain.git`; it is the update path for the current fork.
+> 这条路径适用于 `origin` 指向 `https://github.com/ALLFORTING/Ombre-Brain.git` 的 checkout，是当前 fork 的更新方式。
 
 ```bash
 cd Ombre-Brain
@@ -1097,6 +1134,9 @@ docker compose up -d
 
 ### 本地 Python 用户 / Local Python (no Docker)
 
+> Keep this checkout's `origin` on `https://github.com/ALLFORTING/Ombre-Brain.git` when updating the current fork.
+> 更新当前 fork 时，请确保这个 checkout 的 `origin` 指向 `https://github.com/ALLFORTING/Ombre-Brain.git`。
+
 ```bash
 cd Ombre-Brain
 
@@ -1113,6 +1153,9 @@ python server.py
 
 ### Render
 
+> A Render service connected to `ALLFORTING/Ombre-Brain` updates the current fork; a service connected to `P0luz/Ombre-Brain` remains an upstream deployment.
+> 连接 `ALLFORTING/Ombre-Brain` 的 Render 服务更新当前 fork；连接 `P0luz/Ombre-Brain` 的服务仍是上游部署。
+
 Render 连接了你的 GitHub 仓库，**自动部署**：
 
 1. 如果你 Fork 了仓库 → 在 GitHub 上同步上游更新（Sync fork），Render 会自动重新部署
@@ -1123,6 +1166,9 @@ Render 连接了你的 GitHub 仓库，**自动部署**：
 
 ### Zeabur
 
+> Likewise, the Zeabur project must be connected to `ALLFORTING/Ombre-Brain` to deploy this fork; an upstream-connected project remains upstream-only.
+> 同样，Zeabur 项目必须连接 `ALLFORTING/Ombre-Brain` 才会部署本 fork；连接上游仓库的项目仍只部署上游版本。
+
 Zeabur 也连接了你的 GitHub 仓库：
 
 1. 在 GitHub 上同步 Fork 的最新代码 → Zeabur 自动触发重新构建部署
@@ -1132,6 +1178,9 @@ Zeabur 也连接了你的 GitHub 仓库：
 > Volume mounted at `/app/buckets` — data persists across redeploys.
 
 ### VPS / 自有服务器 / Self-hosted VPS
+
+> For the current fork, use a checkout whose `origin` is `https://github.com/ALLFORTING/Ombre-Brain.git`.
+> 运行当前 fork 时，请使用 `origin` 指向 `https://github.com/ALLFORTING/Ombre-Brain.git` 的 checkout。
 
 ```bash
 cd Ombre-Brain

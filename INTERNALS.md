@@ -162,7 +162,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 **部署选项**
 1. 本地 stdio（`python server.py`）
 2. Docker + Cloudflare Tunnel（`docker-compose.yml`）
-3. Docker Hub 预构建镜像（`docker-compose.user.yml`，`p0luz/ombre-brain`）
+3. 上游 Docker Hub 预构建镜像（`docker-compose.user.yml`，`p0luz/ombre-brain`；不代表当前 fork）
 4. Render.com 一键部署（`render.yaml`）
 5. Zeabur 部署（`zbpack.json`）
 6. GitHub Actions 自动构建推送 Docker Hub（`.github/workflows/docker-publish.yml`）
