@@ -42,6 +42,15 @@ def _auth_file(server):
     return os.path.join(server.config["buckets_dir"], ".dashboard_auth.json")
 
 
+def _assert_session_cookie(response, *, secure):
+    cookie = response.headers["set-cookie"].lower()
+    assert cookie.startswith("ombre_session=")
+    assert "; httponly" in cookie
+    assert "; samesite=lax" in cookie
+    assert "; max-age=604800" in cookie
+    assert ("; secure" in cookie) is secure
+
+
 @pytest.mark.security
 def test_setup_requires_same_origin_and_consumes_token_once(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
@@ -80,6 +89,25 @@ def test_setup_requires_same_origin_and_consumes_token_once(tmp_path, monkeypatc
     assert second.status_code == 400
     with open(_auth_file(server), encoding="utf-8") as handle:
         assert json.load(handle)["password_hash"]
+
+
+@pytest.mark.security
+def test_setup_https_proxy_issues_secure_session_cookie(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _auth_client(server)
+    response = client.post(
+        "/auth/setup",
+        headers={
+            **_setup_headers(server, server._setup_token, "https://example.test"),
+            "Host": "internal.service:8000",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "example.test",
+        },
+        json={"password": "setup-password"},
+    )
+
+    assert response.status_code == 200
+    _assert_session_cookie(response, secure=True)
 
 
 @pytest.mark.security

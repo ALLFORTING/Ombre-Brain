@@ -48,6 +48,106 @@ def _login_headers(server, client):
     }, session_token
 
 
+def _assert_session_cookie(response, *, secure):
+    cookie = response.headers["set-cookie"].lower()
+    assert cookie.startswith("ombre_session=")
+    assert "; httponly" in cookie
+    assert "; samesite=lax" in cookie
+    assert "; max-age=604800" in cookie
+    assert ("; secure" in cookie) is secure
+
+
+@pytest.mark.security
+def test_login_cookie_is_secure_for_https_and_usable_over_local_http(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    server._save_password_hash("dashboard-password")
+    client = _auth_client(server)
+
+    http_login = client.post(
+        "/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"password": "dashboard-password"},
+    )
+    assert http_login.status_code == 200
+    _assert_session_cookie(http_login, secure=False)
+    assert client.get("/auth/status").json()["authenticated"] is True
+
+    https_login = client.post(
+        "/auth/login",
+        headers={
+            "Origin": "https://example.test",
+            "Host": "internal.service:8000",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "example.test",
+        },
+        json={"password": "dashboard-password"},
+    )
+    assert https_login.status_code == 200
+    _assert_session_cookie(https_login, secure=True)
+
+
+@pytest.mark.security
+def test_login_rejects_malformed_forwarded_headers_fail_closed(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._save_password_hash("dashboard-password")
+    cases = [
+        {"X-Forwarded-Proto": "https, http"},
+        {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "example.test, other.test"},
+        {"X-Forwarded-Proto": ""},
+        {"X-Forwarded-Proto": "ftp"},
+    ]
+
+    for forwarded in cases:
+        client = _auth_client(server)
+        response = client.post(
+            "/auth/login",
+            headers={
+                "Origin": "https://example.test",
+                "Host": "example.test",
+                **forwarded,
+            },
+            json={"password": "dashboard-password"},
+        )
+
+        assert response.status_code == 403
+        assert response.json() == {"error": "same_origin_required"}
+        assert "set-cookie" not in response.headers
+
+
+@pytest.mark.security
+def test_change_password_https_rotation_issues_secure_session_cookie(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    server._save_password_hash("dashboard-password")
+    client = _auth_client(server)
+    proxy_headers = {
+        "Origin": "https://example.test",
+        "Host": "internal.service:8000",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "example.test",
+    }
+
+    login = client.post(
+        "/auth/login", headers=proxy_headers, json={"password": "dashboard-password"}
+    )
+    assert login.status_code == 200
+    old_session = next(iter(server._sessions))
+    csrf = server._sessions[old_session]["csrf_token"]
+    client.cookies.set("ombre_session", old_session)
+    rotated = client.post(
+        "/auth/change-password",
+        headers={**proxy_headers, "X-Ombre-CSRF": csrf},
+        json={"current": "dashboard-password", "new": "new-password"},
+    )
+
+    assert rotated.status_code == 200
+    _assert_session_cookie(rotated, secure=True)
+    assert old_session not in server._sessions
+
+
 @pytest.mark.security
 def test_auth_store_distinguishes_missing_valid_corrupt_and_abnormal_nodes(
     tmp_path, monkeypatch, caplog
