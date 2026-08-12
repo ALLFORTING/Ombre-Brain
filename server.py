@@ -10,20 +10,20 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 6 MCP tools:
-#     暴露 6 个 MCP 工具：
-#       breath — Surface unresolved memories or search by keyword
-#                浮现未解决记忆 或 按关键词检索
-#       hold   — Store a single memory (or write a `feel` reflection)
-#                存储单条记忆（或写 feel 反思）
-#       grow   — Diary digest, auto-split into multiple buckets
-#                日记归档，自动拆分多桶
-#       trace  — Modify metadata / resolved / delete
-#                修改元数据 / resolved 标记 / 删除
-#       pulse  — System status + bucket listing
-#                系统状态 + 所有桶列表
-#       dream  — Surface recent dynamic buckets for self-digestion
-#                返回最近桶 供模型自省/写 feel
+#   - Expose the current MCP tool and resource surface:
+#     注册当前 MCP 工具与资源表面：
+#       21 default tools; 15 optional diagnostic tools
+#                21 个默认工具；15 个可选诊断工具
+#       memory/session, Remember-Me, and maintenance operations
+#                记忆/会话、Remember-Me 与维护操作
+#       one viewer resource; diagnostics via OMBRE_DIAG_TOOLS
+#                一个 viewer resource；诊断由 OMBRE_DIAG_TOOLS 控制
+#   - Exact inventory: docs/mcp-public-contract.json
+#     详细清单：docs/mcp-public-contract.json
+#   - User onboarding: README.md and CLAUDE_PROMPT.md
+#     用户 onboarding：README.md 与 CLAUDE_PROMPT.md
+#   - Runtime behavior remains in the registered handlers below.
+#     运行时行为由下方已注册的 handler 保持。
 #
 # Startup:
 # 启动方式：
@@ -5204,7 +5204,7 @@ async def asset_vision_upload_challenge() -> str:
 
 @mcp.tool()
 async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
-    """Run automatic memory digestion. Defaults to dry-run and does not mutate data."""
+    """Controlled memory maintenance: plan by default; confirmed execution may mutate digestion state."""
     await decay_engine.ensure_started()
     try:
         return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token)
@@ -5215,7 +5215,7 @@ async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str 
 
 @mcp.tool()
 async def related_backfill(dry_run: bool = True, limit: int = 100, threshold: float = -1) -> str:
-    """Backfill semantic related links. Defaults to dry-run and skips sealed buckets."""
+    """Controlled related-link maintenance: dry-run by default; execution writes links and skips sealed buckets."""
     await decay_engine.ensure_started()
     try:
         actual_threshold = None if threshold < 0 else threshold
@@ -5259,7 +5259,7 @@ async def breath(
         ),
     ] = None,
 ) -> str:
-    """Retrieve memories with optional exact tag/topic filters before query ranking."""
+    """Retrieval-oriented memory search; surfacing may update bounded activation metadata."""
     if mailbox:
         return _with_response_seal(
             _format_mailbox(mailbox_limit, include_sealed=include_sealed)
@@ -5554,7 +5554,7 @@ async def trace(
     delete: bool = False,
 ) -> str:
     # MCP schema note: related must stay in the tool signature for bidirectional links.
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """Mixed memory operation: metadata/content, relations, merge, seal, and destructive delete; no MCP undo command."""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -5708,7 +5708,7 @@ async def trace(
 
 @mcp.tool()
 async def seal_letter(letter_id: int, sealed: int = 1) -> str:
-    """Hide or unhide a handoff letter by id."""
+    """Sealed-memory maintenance: change handoff-letter visibility by id."""
     if int(letter_id or 0) < 1:
         return "Please provide a valid letter_id."
     if sealed not in (0, 1):
@@ -5842,7 +5842,7 @@ async def todos() -> str:
 
 @mcp.tool()
 async def boot(pinned_chars: int = 2000, max_tokens: int = 8000) -> str:
-    """One-shot startup context: pinned summaries, latest letter, sessions, todos."""
+    """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
     await decay_engine.ensure_started()
     pinned_chars = max(80, min(int(pinned_chars or 2000), 2000))
     max_tokens = max(1000, min(int(max_tokens or 8000), 12000))
@@ -5920,7 +5920,7 @@ async def boot(pinned_chars: int = 2000, max_tokens: int = 8000) -> str:
 
 @mcp.tool()
 async def pulse(include_archive: bool = False, show_all: bool = False, include_sealed: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+    """Status/listing readout; listing may update bounded dormant metadata as part of maintenance."""
     await decay_engine.ensure_started()
     try:
         stats = await bucket_mgr.get_stats()
@@ -6052,7 +6052,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
 # =============================================================
 @mcp.tool()
 async def dream(detail_ids: str = "") -> str:
-    """做梦——默认返回最近 5 个记忆摘要；detail_ids 指定的桶返回全文。"""
+    """Optional reflection readout: recent memory summaries, or full details for selected buckets."""
     await decay_engine.ensure_started()
 
     requested_ids = list(dict.fromkeys(_parse_csv_ids(detail_ids)))

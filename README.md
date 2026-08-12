@@ -1,8 +1,8 @@
 # Ombre Brain
 
-一个给 Claude 用的长期情绪记忆系统。基于 Russell 效价/唤醒度坐标打标，Obsidian 做存储层，MCP 接入，带遗忘曲线和向量语义检索。
+一个给 Claude 或其他 MCP 客户端使用的长期情绪记忆系统。基于 Russell 效价/唤醒度坐标打标，Obsidian 做存储层，MCP 接入，带遗忘曲线和向量语义检索。
 
-A long-term emotional memory system for Claude. Tags memories using Russell's valence/arousal coordinates, stores them as Obsidian-compatible Markdown, connects via MCP, with forgetting curve and vector semantic search.
+A long-term emotional memory system for Claude or other MCP clients. Tags memories using Russell's valence/arousal coordinates, stores them as Obsidian-compatible Markdown, connects via MCP, with forgetting curve and vector semantic search.
 
 > **⚠️ 备用链接 / Backup link**
 > Gitea 备用地址（GitHub 访问有问题时用）：
@@ -265,8 +265,8 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **自然遗忘 / Natural forgetting**: 改进版艾宾浩斯遗忘曲线。不活跃的记忆自动衰减归档，高情绪强度的记忆衰减更慢。
   Modified Ebbinghaus forgetting curve. Inactive memories naturally decay and archive. High-arousal memories decay slower.
 
-- **权重池浮现 / Weight pool surfacing**: 记忆不是被动检索的，它们会主动浮现——未解决的、情绪强烈的记忆权重更高，会在对话开头自动推送。
-  Memories aren't just passively retrieved — they actively surface. Unresolved, emotionally intense memories carry higher weight and get pushed at conversation start.
+- **权重池浮现 / Weight pool surfacing**: 记忆不是被动检索的，它们会主动浮现——未解决的、情绪强烈的记忆权重更高，会在启动上下文或 `breath()` 中优先出现。
+  Memories aren't just passively retrieved — unresolved, emotionally intense memories carry higher weight and may be prioritized by startup context or `breath()`.
 
 - **记忆重构 / Memory reconstruction**: 检索时根据当前情绪状态微调记忆的 valence 展示值（±0.1），模拟人类"此刻的心情影响对过去的回忆"的认知偏差。
   During retrieval, memory valence display is subtly shifted (±0.1) based on current mood, simulating the human cognitive bias of "current mood colors past memories".
@@ -334,50 +334,44 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-默认注册 21 个正式 MCP 工具 / 21 formal MCP tools are registered by default:
+当前 MCP 表面包含 21 个默认工具、36 个诊断启用时的工具、1 个 resource、0 个 prompts 和 0 个 resource templates。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-另外 15 个 Stage 0 / 调试诊断工具仍保留在代码中，但默认不注册。只有开发或验收时显式设置 `OMBRE_DIAG_TOOLS=1`（也接受 `true`、`yes`、`on`，忽略大小写和首尾空白）才恢复全部 36 个工具。普通用户不应开启该变量。MCP resource（包括 `ui://remember-me/asset-viewer.html`）不受此开关影响。
+The current MCP surface has 21 default tools, 36 tools when diagnostics are enabled, 1 resource, 0 prompts, and 0 resource templates. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
-The 15 Stage 0 and diagnostic tools remain in the codebase but are not registered by default. Developers and acceptance testers can explicitly set `OMBRE_DIAG_TOOLS=1` (`true`, `yes`, and `on` are also accepted, case-insensitively with surrounding whitespace ignored) to restore all 36 tools. Ordinary users should leave this variable unset. MCP resources, including `ui://remember-me/asset-viewer.html`, are unaffected.
+### 默认 MCP 工具 / Default MCP tools
 
-| 工具 Tool | 作用 Purpose |
-|-----------|-------------|
-| `boot` | 一键开机上下文：钉选桶摘要、今日浮现、最新信箱、feel 回声、最近 session、未完成 todos，并按 token 预算截断 / One-shot startup context: pinned summaries, due triggers, latest mailbox letter, feel echo, recent sessions, todos, budget-capped |
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；`query`=关键词+向量语义双通道检索。支持 `mode`、日期范围、共鸣排序、信箱、feel、sealed/dormant 控制 / Surface or search memories. No args = surface unresolved; `query` = keyword + vector search. Supports modes, date range, resonance, mailbox, feel, sealed/dormant controls |
-| `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding，并在发现事实/日期/数字矛盾时返回 `conflict:` 警告。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, embeddings, and `conflict:` warnings for factual/date/number contradictions. `feel=True` for reflections |
-| `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
-| `trace` | 修改元数据、追加/替换正文、写前快照、批量操作、双向 related、merge、sealed/dormant、删除 / Modify metadata, append/replace content with write-ahead snapshots, batch edit, bidirectional related, merge, sealed/dormant, delete |
-| `seal_letter` | Hide or restore one handoff letter by ID; a sealed-memory maintenance operation, not ordinary retrieval |
-| `archive_session` | 归档一次对话摘要，可附 highlights/mood/VA 数值和 `letter` 信箱留言 / Archive a session summary with optional highlights, mood, valence/arousal, and mailbox `letter` |
-| `todos` | 汇总所有未 resolved 且非 sealed 桶的 todos 字段 / Summarize todos from unresolved, non-sealed buckets |
-| `related_backfill` | 为存量桶回填语义 related，默认 dry-run，跳过 sealed 桶 / Backfill semantic related links; dry-run by default; skips sealed buckets |
-| `digest` | 自动消化低重要度旧桶，默认 dry-run；正式执行会生成沉淀桶和日志桶 / Auto-digest old low-importance buckets; dry-run by default; real runs create distilled and log buckets |
-| `asset_attachment_context_probe` | Stage-4 diagnostic: report only whether the MCP host exposes attachment reference, byte, or MIME signals; persists and logs nothing, and never returns attachment values |
-| `asset_ingest_probe` | 阶段0实验工具：验证客户端向 MCP 传输 base64 参数；只解码、计算 SHA-256 并返回轻量元数据，不创建 asset ID，不持久化用户图片 / Phase-0 experimental tool for client-to-MCP base64 transport; decodes, hashes, returns lightweight metadata, creates no asset ID, and persists no user image |
-| `asset_ingest_begin` | Phase-0 chunked upload probe: creates a 10-minute in-memory upload session for files up to 2 MiB; persists nothing |
-| `asset_ingest_chunk` | Phase-0 chunk receiver: strictly decodes consecutive base64 chunks, with 8192 characters recommended and 16384 maximum per chunk |
-| `asset_ingest_finish` | Phase-0 chunked upload verifier: joins decoded bytes, checks size and SHA-256, then deletes the temporary session |
-| `asset_ingest_abort` | Phase-0 cleanup tool: safely discards a temporary chunked upload session and is idempotent |
-| `asset_browser_upload_link` | Phase-0 signed browser upload probe: creates a short-lived multipart upload page so raw file bytes bypass the model context |
-| `asset_browser_upload_status` | Phase-0 metadata-only status query for pending, completed, or expired browser uploads; returns no file bytes or base64 |
-| `rm_asset_upload_link` | Stage-1 persistent Remember-Me upload: accepts expected byte count plus optional filename/MIME, creates a short-lived browser upload page, and lets the server compute the authoritative source hash before persistence |
-| `rm_asset_upload_status` | Stage-1 metadata-only status for a persistent asset upload, including asset ID, hashes, size, dimensions, and deduplication result |
-| `rm_asset_get` | Return persistent asset metadata by asset ID without file bytes, base64, or disk paths |
-| `rm_asset_update_metadata` | Stage-2 transactional update for asset title, description, and normalized tags without changing file bytes or hashes |
-| `rm_asset_search` | Stage-2.1 hybrid asset search: local keyword/tag filtering plus optional vector semantic recall, with stable ranking and safe fallback |
-| `rm_asset_reindex_embeddings` | Explicitly backfill missing or stale asset embeddings for one asset or a bounded batch; never changes asset files or metadata |
-| `rm_asset_download_link` | Create a short-lived signed download link for a persistent asset; HEAD is free and at most three GET requests succeed |
-| `rm_asset_view` | Stage-3A MCP Apps probe: display one cleaned RM image inline, with a short-lived download-link fallback for clients without MCP Apps |
-| `rm_asset_inspect` | Stage-3A.2 model inspection: return the privacy-cleaned stored image as MCP ImageContent for actual visual understanding without changing metadata |
-| `asset_render_probe` | 阶段0实验工具：验证 MCP `image/png` content block 能否被客户端显示；返回仓库内置小 PNG，不代表正式图片存储功能上线 / Phase-0 experimental tool for MCP `image/png` content block rendering; returns a built-in tiny PNG and does not mean formal image storage is live |
-| `asset_export_probe` | Phase-0 tool returning JSON/base64 for caller-side decode, verification, and user-visible attachment presentation; writes nothing and returns no ImageContent |
-| `asset_vision_challenge` | Phase-0 machine-scored blind vision challenge returning answer-free TextContent plus a random PNG ImageContent |
-| `asset_vision_verify` | Phase-0 blind vision verifier; strictly parses answer JSON, scores fields, consumes the trial once, and never returns the correct answer |
-| `asset_vision_export` | Phase-0 file-view vision probe; exports the live trial PNG as JSON/base64 exactly once so clients can decode, SHA-check, and view the same bytes as a local file |
-| `asset_vision_upload_challenge` | Phase-0 user-upload vision control; creates the same blind trial but returns only JSON metadata so the client can request a signed download and re-upload it as a normal chat attachment |
-| `asset_vision_download_link` | Phase-0 signed short-lived HTTP download path for a live vision trial PNG; returns no base64 or ImageContent and is not a formal asset download system |
-| `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
-| `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
+这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `seal_letter` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
+
+| 工具 Tool | 作用与边界 Purpose and boundary |
+|-----------|-------------------------------|
+| `boot` | 推荐的一次性启动上下文：钉选摘要、到期 trigger、信箱、feel 回声、最近 session、todos，并按 token 预算截断 / Recommended one-shot startup context; observing due triggers may update bounded seen metadata |
+| `breath` | 检索或浮现记忆；`query` 用于定向检索。它是 retrieval-oriented，命中/排序可能更新 activation metadata / Retrieval or surfacing; targeted `query` is preferred when the topic is known, and bounded activation metadata may be updated |
+| `hold` | 写入单条记忆或模型自己的 `feel` 反思 / Store one memory or a model `feel` reflection |
+| `grow` | 将日记/长内容拆分并写入多个记忆桶 / Digest journal-style content into multiple memory buckets |
+| `trace` | 混合修改工具：元数据、正文替换/追加、related、merge、seal 以及 `delete=True`。delete 是正常工具流程中的 destructive 操作；仓库可能保留写前快照供人工恢复，但没有 MCP undo/restore 命令 / Mixed mutation tool; delete is destructive in the normal workflow, while write-ahead history may support manual recovery without providing an MCP undo command |
+| `pulse` | 系统状态和记忆桶列表；listing 可能更新 bounded dormant metadata / Status and bucket listing; listing may update bounded dormant metadata |
+| `dream` | 可选的最近记忆反思/详情读取，不要求每次启动调用 / Optional recent-memory reflection/detail readout; not required on every startup |
+| `seal_letter` | sealed-memory handoff-letter maintenance：改变一封 letter 的可见性，不是普通检索 / Changes handoff-letter visibility; not ordinary retrieval |
+| `archive_session` | 归档一次会话摘要，可附 highlights/mood/VA 和 mailbox letter / Archive a session summary with optional handoff letter |
+| `todos` | 汇总未 resolved 且非 sealed 桶中的 todos / Summarize todos from unresolved, non-sealed buckets |
+| `related_backfill` | 维护/回填 semantic related；默认 `dry_run=True`，执行模式会写 relation 并跳过 sealed 桶 / Maintenance backfill; `dry_run=True` by default, execution writes links |
+| `digest` | 维护/规划旧桶消化；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 / Controlled digestion maintenance; dry-run by default, confirmed execution may write results and incur provider/API cost |
+| `rm_asset_upload_link` / `rm_asset_upload_status` | Remember-Me 持久 asset 上传生命周期：短期 signed link 与 metadata-only 状态查询 / Persistent asset upload lifecycle: short-lived signed link plus metadata-only status |
+| `rm_asset_get` | 按 ID 读取持久 asset metadata，不返回 bytes / Read persistent asset metadata by ID; no file bytes |
+| `rm_asset_update_metadata` | 更新 title/description/tags，不改变 asset bytes 或 hashes / Update metadata without changing asset bytes or hashes |
+| `rm_asset_search` | 关键词、tag/filter 和可选 semantic search 的持久 asset 检索 / Persistent asset discovery through keyword, metadata, and optional semantic search |
+| `rm_asset_view` | 面向用户显示已清理图片；`rm_asset_inspect` 才是模型视觉检查 / Display a cleaned image to the user; use `rm_asset_inspect` for model vision |
+| `rm_asset_inspect` | 返回已清理图片的 MCP ImageContent，供模型实际理解，不改 metadata / Return cleaned image content for model inspection without changing metadata |
+| `rm_asset_download_link` | 创建短期 signed download link，是显式导出动作 / Create a short-lived signed download link for explicit export |
+| `rm_asset_reindex_embeddings` | Remember-Me maintenance/backfill：为缺失或过期 vector 做有界回填；不改 asset bytes 或 metadata / Bounded maintenance backfill for missing or stale vectors; asset bytes and metadata are unchanged |
+
+### 诊断工具 / Diagnostic tools
+
+另外 15 个工具仅在开发/验收时通过 `OMBRE_DIAG_TOOLS=1`（也接受 `true`、`yes`、`on`，忽略大小写和首尾空白）注册；普通用户应保持关闭。它们是 diagnostic/probe surface，不是普通 Remember-Me 持久工作流，也不应被当作正式上传路径。
+
+The 15 diagnostic tools are hidden by default and are registered only when `OMBRE_DIAG_TOOLS` is enabled. They are for diagnostics, acceptance probes, and transport/vision experiments—not the ordinary persistent Remember-Me workflow:
+
+`asset_attachment_context_probe`, `asset_browser_upload_link`, `asset_browser_upload_status`, `asset_export_probe`, `asset_ingest_abort`, `asset_ingest_begin`, `asset_ingest_chunk`, `asset_ingest_finish`, `asset_ingest_probe`, `asset_render_probe`, `asset_vision_challenge`, `asset_vision_download_link`, `asset_vision_export`, `asset_vision_upload_challenge`, `asset_vision_verify`.
 
 ### 工具参数速查 / Tool Parameter Quick Reference
 
@@ -933,9 +927,9 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 ## Dreaming 与 Feel / Dreaming & Feel
 
 ### Dreaming — 做梦
-每次新对话开始时，Claude 会自动执行 `dream()`——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
+`dream()` 是可选的反思/消化工具：当最近记忆确实值得展开时使用，用第一人称思考哪些事还有重量、哪些可以放下。运行时不会强制每次启动调用它。
 
-At the start of each conversation, Claude runs `dream()` — reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
+`dream()` is an optional reflection/digestion tool. Use it when recent memories genuinely benefit from reflection; the runtime does not require it on every startup.
 
 - 值得放下的 → `trace(resolved=1)` 让它沉底
 - 有沉淀的 → 写 `feel`，记录模型自己的感受
@@ -956,11 +950,16 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
-1. boot()                — 一键读取钉选摘要、今日浮现、信箱、回声、归档、todos
-2. breath(query="...")   — 按需精确/语义检索
-3. dream(detail_ids="")  — 需要展开最近或指定桶全文时使用
-4. 开始和用户说话
+1. boot()                 — 推荐的一次性启动上下文
+2. breath(query="...")    — 话题需要时做定向检索
+3. dream(detail_ids="")   — 确实需要反思/展开时可选
+4. breath(domain="feel")  — 只有既有 feel 对当前上下文有用时才读取
+5. 自然开始或回应用户；其余步骤不是协议要求
 ```
+
+这是推荐路径，不是 MCP 强制协议。客户端可以只提供工具，或以不同方式呈现 tools/resources；不要假设所有客户端都有 prompts，或 MCP 请求上下文包含聊天附件 bytes。
+
+This is a recommended portable path, not an MCP protocol requirement. Clients may expose tools and resources differently; do not assume prompt support or chat-attachment bytes in an MCP request.
 
 ## 给 Claude 的使用指南 / Usage Guide for Claude
 
