@@ -4,6 +4,14 @@ Audit date: July 24, 2026.
 
 Scope: tools registered through `@mcp.tool` in `server.py`. HTTP custom routes are excluded. The fixed `ui://remember-me/asset-viewer.html` MCP resource is noted separately.
 
+This file is a historical architecture audit and recommendation record, not a
+second machine-readable inventory. For the current exact contract, use
+[`docs/mcp-public-contract.json`](mcp-public-contract.json); for current
+architecture rationale, use
+[`docs/mcp-surface-architecture-audit.md`](mcp-surface-architecture-audit.md).
+User onboarding lives in [`README.md`](../README.md), and Claude-specific
+guidance lives in [`CLAUDE_PROMPT.md`](../CLAUDE_PROMPT.md).
+
 ## Inventory Summary
 
 The server registers **21 formal MCP tools by default**. The 15 diagnostic
