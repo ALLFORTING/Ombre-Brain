@@ -1303,5 +1303,15 @@
     }
   ],
   "resource_templates": [],
-  "prompts": []
+  "prompts": [
+    {
+      "name": "start_ombre_brain",
+      "primitive": "prompt",
+      "exposure": "default",
+      "audience": "ordinary_model_workflow",
+      "purpose": "Optional onboarding guidance for starting or resuming an Ombre Brain session.",
+      "arguments": [],
+      "compatibility_status": "stable"
+    }
+  ]
 }

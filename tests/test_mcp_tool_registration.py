@@ -86,7 +86,16 @@ async def main():
             for tool in tools
         ],
         "resources": [str(resource.uri) for resource in resources],
-        "prompts": [prompt.name for prompt in prompts],
+        "prompts": [
+            {
+                "name": prompt.name,
+                "arguments": [
+                    {"name": argument.name, "required": argument.required}
+                    for argument in (prompt.arguments or [])
+                ],
+            }
+            for prompt in prompts
+        ],
         "resource_templates": [template.uriTemplate for template in resource_templates],
     }))
 
@@ -116,6 +125,10 @@ def _registered_surface(tmp_path: Path, value=None):
 
 def _tool_names(surface):
     return [tool["name"] for tool in surface["tools"]]
+
+
+def _prompt_names(surface):
+    return [prompt["name"] for prompt in surface["prompts"]]
 
 
 def _normalize_schema(schema):
@@ -210,6 +223,22 @@ def _validate_manifest():
         assert entry["exposure"] in valid_exposure
         assert entry["compatibility_status"] in valid_compatibility
     assert isinstance(MANIFEST["prompts"], list)
+    assert len(PROMPT_NAMES) == len(MANIFEST["prompts"]), "duplicate prompt names"
+    for entry in MANIFEST["prompts"]:
+        assert entry["primitive"] == "prompt"
+        assert entry["exposure"] in valid_exposure
+        assert entry["compatibility_status"] in valid_compatibility
+        arguments = entry["arguments"]
+        assert isinstance(arguments, list)
+        argument_names = [argument["name"] for argument in arguments]
+        assert len(argument_names) == len(set(argument_names)), entry["name"]
+        for argument in arguments:
+            assert set(argument) <= {"name", "description", "required"}
+            assert isinstance(argument["name"], str)
+            if "description" in argument:
+                assert isinstance(argument["description"], str)
+            if "required" in argument:
+                assert isinstance(argument["required"], bool)
     assert isinstance(MANIFEST["resource_templates"], list)
 
 
@@ -230,7 +259,9 @@ def test_default_surface_matches_manifest_exactly(tmp_path):
     assert set(names) == DEFAULT_TOOLS
     assert DIAGNOSTIC_TOOLS.isdisjoint(names)
     assert set(surface["resources"]) == RESOURCE_URIS
-    assert set(surface["prompts"]) == PROMPT_NAMES
+    assert set(_prompt_names(surface)) == PROMPT_NAMES
+    assert len(surface["prompts"]) == 1
+    assert surface["prompts"][0]["arguments"] == []
     assert set(surface["resource_templates"]) == RESOURCE_TEMPLATE_URIS
 
 
@@ -257,7 +288,8 @@ def test_supported_values_enable_all_diagnostic_tools(tmp_path, value):
     assert len(names) == len(set(names))
     assert set(names) == DEFAULT_TOOLS | DIAGNOSTIC_TOOLS
     assert set(surface["resources"]) == RESOURCE_URIS
-    assert set(surface["prompts"]) == PROMPT_NAMES
+    assert set(_prompt_names(surface)) == PROMPT_NAMES
+    assert surface["prompts"][0]["arguments"] == []
     assert set(surface["resource_templates"]) == RESOURCE_TEMPLATE_URIS
 
 

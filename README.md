@@ -334,9 +334,9 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 21 个默认工具、36 个诊断启用时的工具、1 个 resource、0 个 prompts 和 0 个 resource templates。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 21 个默认工具、36 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 21 default tools, 36 tools when diagnostics are enabled, 1 resource, 0 prompts, and 0 resource templates. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 21 default tools, 36 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
 ### 默认 MCP 工具 / Default MCP tools
 

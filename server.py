@@ -7088,6 +7088,11 @@ async def api_system_status(request):
 
 
 # --- Entry point / 启动入口 ---
+from mcp_prompts import register_prompts
+
+register_prompts(mcp)
+
+
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
