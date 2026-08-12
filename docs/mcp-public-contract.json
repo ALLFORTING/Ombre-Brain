@@ -1,0 +1,1307 @@
+{
+  "manifest_version": 1,
+  "contract_status": "current",
+  "project": "Ombre-Brain",
+  "mcp_server": {
+    "name": "Ombre Brain",
+    "repository": "https://github.com/ALLFORTING/Ombre-Brain.git"
+  },
+  "diagnostic_flag": {
+    "name": "OMBRE_DIAG_TOOLS",
+    "enabled_values": [
+      "1",
+      "true",
+      "yes",
+      "on"
+    ],
+    "default_enabled": false,
+    "matching": "stringified, trimmed, case-insensitive",
+    "disabled_values": "unset, empty, 0, false, off, and other values"
+  },
+  "auth_policy": {
+    "scope": "endpoint",
+    "relevance": "optional endpoint-level token boundary",
+    "per_tool_registration_authorization": false
+  },
+  "compatibility_policy": {
+    "status": "active",
+    "rules": [
+      "Do not rename or remove a public tool in the same release as its replacement.",
+      "Do not add a required parameter to an existing public tool.",
+      "Optional additions must preserve the previous default behavior.",
+      "Input schema and output changes are contract changes and require review.",
+      "Deprecations require a compatibility window.",
+      "Public schema changes must remain separate from internal registration refactors."
+    ]
+  },
+  "vocabularies": {
+    "exposure": [
+      "default",
+      "diagnostic"
+    ],
+    "mutability": [
+      "read_only",
+      "read_with_side_effects",
+      "write",
+      "destructive",
+      "mixed",
+      "maintenance",
+      "transient_write"
+    ],
+    "compatibility_status": [
+      "stable",
+      "compatibility_sensitive",
+      "diagnostic",
+      "internal_diagnostic"
+    ]
+  },
+  "tools": [
+    {
+      "name": "archive_session",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "arousal": {
+            "anyOf": [
+              {
+                "const": -1,
+                "type": "integer"
+              },
+              {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              }
+            ],
+            "default": -1
+          },
+          "highlights": {
+            "default": "",
+            "type": "string"
+          },
+          "letter": {
+            "default": "",
+            "type": "string"
+          },
+          "mood": {
+            "default": "",
+            "type": "string"
+          },
+          "sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "topics": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "valence": {
+            "anyOf": [
+              {
+                "const": -1,
+                "type": "integer"
+              },
+              {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              }
+            ],
+            "default": -1
+          }
+        },
+        "required": [
+          "summary"
+        ]
+      }
+    },
+    {
+      "name": "asset_attachment_context_probe",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "internal_diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "attachment_mime_type": {
+            "default": "",
+            "type": "string"
+          },
+          "attachment_reference": {
+            "default": "",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "asset_browser_upload_link",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "expected_bytes": {
+            "type": "integer"
+          },
+          "expected_sha256": {
+            "default": "",
+            "type": "string"
+          },
+          "filename": {
+            "default": "",
+            "type": "string"
+          },
+          "mime_type": {
+            "default": "application/octet-stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_bytes"
+        ]
+      }
+    },
+    {
+      "name": "asset_browser_upload_status",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_export_probe",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "asset_ingest_abort",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_ingest_begin",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "expected_bytes": {
+            "type": "integer"
+          },
+          "expected_sha256": {
+            "type": "string"
+          },
+          "filename": {
+            "default": "",
+            "type": "string"
+          },
+          "mime_type": {
+            "default": "application/octet-stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_bytes",
+          "expected_sha256"
+        ]
+      }
+    },
+    {
+      "name": "asset_ingest_chunk",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "chunk_index": {
+            "type": "integer"
+          },
+          "data_base64": {
+            "type": "string"
+          },
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk_index",
+          "data_base64",
+          "upload_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_ingest_finish",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_ingest_probe",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "data_base64": {
+            "type": "string"
+          },
+          "expected_sha256": {
+            "default": "",
+            "type": "string"
+          },
+          "mime_type": {
+            "default": "application/octet-stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data_base64"
+        ]
+      }
+    },
+    {
+      "name": "asset_render_probe",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "image_content",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "asset_vision_challenge",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "image_content",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "asset_vision_download_link",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "trial_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "trial_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_vision_export",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "trial_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "trial_id"
+        ]
+      }
+    },
+    {
+      "name": "asset_vision_upload_challenge",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "asset_vision_verify",
+      "primitive": "tool",
+      "category": "diagnostic",
+      "audience": "diagnostic_operator",
+      "exposure": "diagnostic",
+      "diagnostic_only": true,
+      "feature_flag": "OMBRE_DIAG_TOOLS",
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_diagnostic_sensitive",
+      "compatibility_status": "diagnostic",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "answer_json": {
+            "type": "string"
+          },
+          "trial_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_json",
+          "trial_id"
+        ]
+      }
+    },
+    {
+      "name": "boot",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "max_tokens": {
+            "default": 8000,
+            "type": "integer"
+          },
+          "pinned_chars": {
+            "default": 2000,
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "breath",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "arousal": {
+            "default": -1,
+            "type": "number"
+          },
+          "date_from": {
+            "default": "",
+            "type": "string"
+          },
+          "date_to": {
+            "default": "",
+            "type": "string"
+          },
+          "domain": {
+            "default": "",
+            "type": "string"
+          },
+          "emotion_trend": {
+            "default": false,
+            "type": "boolean"
+          },
+          "feels": {
+            "default": false,
+            "type": "boolean"
+          },
+          "importance_min": {
+            "default": -1,
+            "type": "integer"
+          },
+          "include_dormant": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mailbox": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mailbox_limit": {
+            "default": 1,
+            "type": "integer"
+          },
+          "max_results": {
+            "default": 5,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "default": 10000,
+            "type": "integer"
+          },
+          "mode": {
+            "default": "summary",
+            "type": "string"
+          },
+          "query": {
+            "default": "",
+            "type": "string"
+          },
+          "recent_days": {
+            "default": -1,
+            "type": "integer"
+          },
+          "resonance": {
+            "default": "",
+            "type": "string"
+          },
+          "tags_filter": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "topic_filter": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "valence": {
+            "default": -1,
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "digest",
+      "primitive": "tool",
+      "category": "maintenance",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "maintenance",
+      "auth_relevance": "endpoint_auth_maintenance_sensitive",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "confirm_token": {
+            "default": "",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "type": "boolean"
+          },
+          "max_groups": {
+            "default": 10,
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "dream",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "detail_ids": {
+            "default": "",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "grow",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "hold",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "arousal": {
+            "default": -1,
+            "type": "number"
+          },
+          "content": {
+            "type": "string"
+          },
+          "feel": {
+            "default": false,
+            "type": "boolean"
+          },
+          "importance": {
+            "default": 5,
+            "type": "integer"
+          },
+          "pinned": {
+            "default": false,
+            "type": "boolean"
+          },
+          "source_bucket": {
+            "default": "",
+            "type": "string"
+          },
+          "tags": {
+            "default": "",
+            "type": "string"
+          },
+          "trigger_date": {
+            "default": "",
+            "type": "string"
+          },
+          "valence": {
+            "default": -1,
+            "type": "number"
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "pulse",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "include_archive": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "show_all": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "name": "related_backfill",
+      "primitive": "tool",
+      "category": "maintenance",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "maintenance",
+      "auth_relevance": "endpoint_auth_maintenance_sensitive",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "dry_run": {
+            "default": true,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 100,
+            "type": "integer"
+          },
+          "threshold": {
+            "default": -1,
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "rm_asset_download_link",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_get",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "stable",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_inspect",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "image_content",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_reindex_embeddings",
+      "primitive": "tool",
+      "category": "maintenance",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "maintenance",
+      "auth_relevance": "endpoint_auth_maintenance_sensitive",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "default": "",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "rm_asset_search",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "created_from": {
+            "default": "",
+            "type": "string"
+          },
+          "created_to": {
+            "default": "",
+            "type": "string"
+          },
+          "kind": {
+            "default": "",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "type": "integer"
+          },
+          "mime_type": {
+            "default": "",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          },
+          "query": {
+            "default": "",
+            "type": "string"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        }
+      }
+    },
+    {
+      "name": "rm_asset_update_metadata",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_upload_link",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "transient_write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "expected_bytes": {
+            "type": "integer"
+          },
+          "filename": {
+            "default": "",
+            "type": "string"
+          },
+          "mime_type": {
+            "default": "application/octet-stream",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_bytes"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_upload_status",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "stable",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_view",
+      "primitive": "tool",
+      "category": "remember_me_asset",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "resource_linked_ui",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "seal_letter",
+      "primitive": "tool",
+      "category": "sealed_memory",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_maintenance_sensitive",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "letter_id": {
+            "type": "integer"
+          },
+          "sealed": {
+            "default": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "letter_id"
+        ]
+      }
+    },
+    {
+      "name": "todos",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "stable",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "trace",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "append": {
+            "default": false,
+            "type": "boolean"
+          },
+          "arousal": {
+            "default": -1,
+            "type": "number"
+          },
+          "bucket_id": {
+            "type": "string"
+          },
+          "content": {
+            "default": "",
+            "type": "string"
+          },
+          "delete": {
+            "default": false,
+            "type": "boolean"
+          },
+          "digested": {
+            "default": -1,
+            "type": "integer"
+          },
+          "domain": {
+            "default": "",
+            "type": "string"
+          },
+          "dormant": {
+            "default": -1,
+            "type": "integer"
+          },
+          "importance": {
+            "default": -1,
+            "type": "integer"
+          },
+          "merge": {
+            "default": "",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "type": "string"
+          },
+          "pinned": {
+            "default": -1,
+            "type": "integer"
+          },
+          "related": {
+            "default": "",
+            "type": "string"
+          },
+          "resolved": {
+            "default": -1,
+            "type": "integer"
+          },
+          "sealed": {
+            "default": -1,
+            "type": "integer"
+          },
+          "tags": {
+            "default": "",
+            "type": "string"
+          },
+          "trigger_date": {
+            "default": "",
+            "type": "string"
+          },
+          "valence": {
+            "default": -1,
+            "type": "number"
+          }
+        },
+        "required": [
+          "bucket_id"
+        ]
+      }
+    }
+  ],
+  "resources": [
+    {
+      "name": "remember-me-asset-viewer",
+      "primitive": "resource",
+      "uri": "ui://remember-me/asset-viewer.html",
+      "exposure": "default",
+      "category": "remember_me_asset_viewer",
+      "purpose": "Static MCP Apps viewer resource paired with rm_asset_view.",
+      "output_kind": "resource_linked_ui",
+      "mime_type": "text/html;profile=mcp-app",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "stable"
+    }
+  ],
+  "resource_templates": [],
+  "prompts": []
+}
