@@ -14,6 +14,26 @@ on:
     - cron: '17 3 * * 1'
 
 jobs:
+  viewer-js:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/asset-viewer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ui/asset-viewer/package-lock.json
+
+      - name: Install viewer dependencies
+        run: npm ci
+
+      - name: Run Viewer JavaScript tests
+        run: npm test
   offline:
     runs-on: ubuntu-latest
     steps:
