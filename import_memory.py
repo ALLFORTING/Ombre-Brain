@@ -414,7 +414,7 @@ class ImportEngine:
 
     def get_status(self) -> dict:
         """Get current import status."""
-        return self.state.to_dict()
+        status = self.state.to_dict(); status["errors"] = ["import_failed"] * len(status.get("errors", [])); return status
 
     async def start(
         self,
@@ -466,9 +466,10 @@ class ImportEngine:
             logger.info(f"Starting import: {len(turns)} turns → {len(self._chunks)} chunks")
             return await self._process_chunks(preserve_raw)
 
-        except Exception as e:
+        except Exception:
             self.state.data["status"] = "error"
-            self.state.data["errors"].append(str(e))
+            logger.exception("Import failed")
+            self.state.data["errors"].append("import_failed")
             self.state.save()
             self._running = False
             raise
@@ -488,11 +489,9 @@ class ImportEngine:
             chunk = self._chunks[i]
             try:
                 await self._process_single_chunk(chunk, preserve_raw)
-            except Exception as e:
-                err_msg = f"Chunk {i}: {str(e)[:200]}"
-                logger.warning(f"Import chunk error: {err_msg}")
-                if len(self.state.data["errors"]) < 100:
-                    self.state.data["errors"].append(err_msg)
+            except Exception:
+                err_msg = "import_failed"; logger.exception("Import chunk failed index=%d", i)
+                if len(self.state.data["errors"]) < 100: self.state.data["errors"].append(err_msg)
 
             self.state.data["processed"] = i + 1
             # Save progress every chunk

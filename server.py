@@ -935,8 +935,8 @@ async def health_check(request):
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
         })
-    except Exception as e:
-        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+    except Exception: logger.exception("Health check failed"); return JSONResponse({"status": "error", "detail": "service_unavailable"}, status_code=500)
+# HTTP error response hardening keeps this status surface bounded.
 
 
 # =============================================================
@@ -2574,7 +2574,7 @@ async def _breath_impl(
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
-            return f"记忆系统暂时无法访问: {e}"
+            logger.error("Breath importance retrieval failed: %s", e); return "记忆系统暂时无法访问。"
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
@@ -4546,11 +4546,10 @@ async def asset_ingest_probe(
 
     try:
         raw = base64.b64decode((data_base64 or "").encode("ascii"), validate=True)
-    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+    except (binascii.Error, UnicodeEncodeError, ValueError):
         return _json_lib.dumps({
             "ok": False,
             "error": "invalid_base64",
-            "detail": str(exc),
             "base64_chars": base64_chars,
             "mime_type": mime_type,
         }, ensure_ascii=False, sort_keys=True)
@@ -4705,8 +4704,8 @@ async def rm_asset_update_metadata(
             description=description,
             tags=tags,
         )
-    except AssetStoreError as exc:
-        return _asset_ingest_response(False, error=str(exc))
+    except AssetStoreError as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
+    except Exception as exc: logger.warning("Asset metadata update failed error=%s", type(exc).__name__); return _asset_ingest_response(False, error="asset_unavailable")
     try:
         await asset_embedding_index.index_asset(asset)
     except Exception as exc:
@@ -4761,8 +4760,8 @@ async def rm_asset_search(
             limit=limit,
             offset=offset,
         )
-    except AssetStoreError as exc:
-        return _asset_ingest_response(False, error=str(exc))
+    except AssetStoreError as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc, "search_unavailable"))
+    except Exception as exc: logger.warning("Asset search failed error=%s", type(exc).__name__); return _asset_ingest_response(False, error="search_unavailable")
     if query.strip() and embedding_engine.enabled:
         try:
             semantic_scores = await asset_embedding_index.search(query)
@@ -4809,8 +4808,8 @@ async def rm_asset_reindex_embeddings(
             asset_id=(asset_id or "").strip(),
             limit=limit,
         )
-    except (AssetStoreError, ValueError) as exc:
-        return _asset_ingest_response(False, error=str(exc))
+    except (AssetStoreError, ValueError) as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
+    except Exception as exc: logger.warning("Asset embedding reindex failed error=%s", type(exc).__name__); return _asset_ingest_response(False, error="asset_unavailable")
     return _json_lib.dumps(
         {"ok": True, **result},
         ensure_ascii=False,
@@ -5210,7 +5209,7 @@ async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str 
         return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token)
     except Exception as exc:
         logger.error("Digest failed: %s", exc)
-        return f"自动消化失败: {exc}"
+        return "自动消化失败。"
 
 
 @mcp.tool()
@@ -5222,7 +5221,7 @@ async def related_backfill(dry_run: bool = True, limit: int = 100, threshold: fl
         return await _run_related_backfill(dry_run=dry_run, limit=limit, threshold=actual_threshold)
     except Exception as exc:
         logger.error("Related backfill failed: %s", exc)
-        return f"自动 related 回填失败: {exc}"
+        return "自动 related 回填失败。"
 
 
 @mcp.tool()
@@ -5292,6 +5291,7 @@ async def breath(
 # Tool 2: hold — Hold on to this
 # 工具 2：hold — 握住，留下来
 # =============================================================
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -5480,7 +5480,7 @@ async def grow(content: str) -> str:
         items = await dehydrator.digest(content)
     except Exception as e:
         logger.error(f"Diary digest failed / 日记整理失败: {e}")
-        return f"日记整理失败: {e}"
+        return "日记整理失败。"
 
     if not items:
         return "内容为空或整理失败。"
@@ -5925,7 +5925,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
-        return f"获取系统状态失败: {e}"
+        logger.error("Pulse stats failed: %s", e); return "获取系统状态失败。"
 
     status = (
         f"=== Ombre Brain 记忆系统 ===\n"
@@ -5940,7 +5940,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
     try:
         buckets = await bucket_mgr.list_all(include_archive=include_archive)
     except Exception as e:
-        return status + f"\n列出记忆桶失败: {e}"
+        logger.error("Pulse bucket listing failed: %s", e); return status + "\n列出记忆桶失败。"
 
     if not buckets:
         return status + "\n记忆库为空。"
@@ -6334,8 +6334,7 @@ async def api_search(request):
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
         return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception: logger.exception("Dashboard search failed"); return JSONResponse({"error": "search_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/network", methods=["GET"])
@@ -6379,8 +6378,7 @@ async def api_network(request):
                     edges.append({"source": id_a, "target": id_b, "similarity": round(sim, 3)})
 
         return JSONResponse({"nodes": nodes, "edges": edges})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception: logger.exception("Dashboard network failed"); return JSONResponse({"error": "network_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
@@ -6459,8 +6457,7 @@ async def api_breath_debug(request):
             "passed_count": len(passed),
             "results": results[:50],  # top 50 for debug
         })
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception: logger.exception("Dashboard breath debug failed"); return JSONResponse({"error": "breath_debug_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/assets", methods=["GET", "POST"])
@@ -6771,8 +6768,7 @@ async def api_config_update(request):
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True)
             updated.append("persisted_to_yaml")
-        except Exception as e:
-            return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)
+        except Exception: logger.exception("Dashboard config persistence failed"); return JSONResponse({"error": "persist_failed", "updated": updated}, status_code=500)
 
     return JSONResponse({"updated": updated, "ok": True})
 
@@ -6884,8 +6880,7 @@ async def api_host_vault_set(request):
 
     try:
         _write_env_var("OMBRE_HOST_VAULT_DIR", value)
-    except Exception as e:
-        return JSONResponse({"error": f"failed to write .env: {e}"}, status_code=500)
+    except Exception: logger.exception("Dashboard host vault write failed"); return JSONResponse({"error": "env_write_failed"}, status_code=500)
 
     return JSONResponse({
         "ok": True,
@@ -6935,8 +6930,7 @@ async def api_import_upload(request):
         preserve_raw = request.query_params.get("preserve_raw", "").lower() in ("1", "true")
         resume = request.query_params.get("resume", "").lower() in ("1", "true")
 
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to read upload: {e}"}, status_code=400)
+    except Exception: logger.exception("Dashboard import upload read failed"); return JSONResponse({"error": "upload_read_failed"}, status_code=400)
 
     # Start import in background
     async def _run_import():
@@ -6985,8 +6979,7 @@ async def api_import_patterns(request):
     try:
         patterns = await import_engine.detect_patterns()
         return JSONResponse({"patterns": patterns})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception: logger.exception("Dashboard import pattern detection failed"); return JSONResponse({"error": "pattern_detection_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/import/results", methods=["GET"])
@@ -7013,8 +7006,7 @@ async def api_import_results(request):
                 "created": b["metadata"].get("created", ""),
             })
         return JSONResponse({"buckets": results, "total": len(all_buckets)})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception: logger.exception("Dashboard import result listing failed"); return JSONResponse({"error": "import_results_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/import/review", methods=["POST"])
@@ -7083,11 +7075,42 @@ async def api_system_status(request):
             "using_env_password": bool(os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")),
             "version": "1.3.0",
         })
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+    except Exception: logger.exception("Dashboard system status failed"); return JSONResponse({"error": "status_unavailable"}, status_code=500)
 
 # --- Entry point / 启动入口 ---
+_ASSET_INGEST_ERROR_CODES = frozenset({
+    "asset_unavailable",
+    "asset_file_unavailable",
+    "asset_write_frozen",
+    "asset_write_gate_unavailable",
+    "invalid_asset_id",
+    "invalid_date_range",
+    "invalid_description",
+    "invalid_kind",
+    "invalid_limit",
+    "invalid_mime_type",
+    "invalid_offset",
+    "invalid_query",
+    "invalid_source_sha256",
+    "invalid_stored_path",
+    "invalid_tags",
+    "invalid_title",
+    "invalid_created_from",
+    "invalid_created_to",
+    "source_hash_mismatch",
+    "source_size_mismatch",
+    "stored_file_conflict",
+    "too_many_tags",
+    "title_too_long",
+    "description_too_long",
+})
+
+
+def _safe_asset_ingest_error(exc: Exception, fallback: str = "asset_unavailable") -> str:
+    code = str(exc)
+    return code if code in _ASSET_INGEST_ERROR_CODES else fallback
+
+
 from mcp_prompts import register_prompts
 
 register_prompts(mcp)

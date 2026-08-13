@@ -42,7 +42,7 @@ async def backup_export_endpoint(request):
         )
     except Exception as exc:
         logger.exception("Backup export failed")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "backup_export_failed"}, status_code=500)
 
     logger.info(
         "Backup export completed for %s run %s",
@@ -76,7 +76,7 @@ async def embeddings_backfill_endpoint(request):
         )
     except Exception as exc:
         logger.exception("Embedding backfill failed")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "embedding_backfill_failed"}, status_code=500)
 
     logger.info(
         "Embedding backfill completed for %s run %s: %s",
@@ -101,7 +101,7 @@ async def aliases_clean_endpoint(request):
         result = await server.bucket_mgr.clean_display_aliases()
     except Exception as exc:
         logger.exception("Alias cleanup failed")
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "alias_cleanup_failed"}, status_code=500)
 
     logger.info(
         "Alias cleanup completed for %s run %s: %s",
