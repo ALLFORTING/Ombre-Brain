@@ -747,6 +747,7 @@ Sensitive config via env vars:
 | `OMBRE_DIGEST_SCHEDULER` | 否 / No | `false` | 是否启用服务内自动消化定时循环；默认关闭 / Enable in-service digestion scheduler; disabled by default |
 | `OMBRE_DIGEST_DRY_RUN` | 否 / No | `true` | 定时消化是否只 dry-run；上线初期建议保持 true / Whether scheduled digestion only dry-runs; keep true during rollout |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 / No | — | Dashboard 和 `/api/*` 密码 / Dashboard and `/api/*` password |
+| `OMBRE_DASHBOARD_SETUP_TOKEN` | 否 / No | — | Operator-provided one-time token for first browser setup; required only when the auth store is missing and `OMBRE_DASHBOARD_PASSWORD` is not being used |
 | `OMBRE_HOOK_URL` | 否 / No | — | breath/dream 后异步 POST 的 webhook / Webhook target after breath/dream |
 | `OMBRE_HOOK_SKIP` | 否 / No | `false` | 临时禁用 webhook / Temporarily disable webhook |
 
@@ -826,7 +827,7 @@ Since v1.3.0, the Dashboard and all `/api/*` endpoints are password-protected.
 **首次访问**：若未设置密码，浏览器会弹出设置向导，填写并确认密码后即可使用。
 **First visit**: If no password is set, a setup wizard will appear. Enter and confirm a password to get started.
 
-For a brand-new auth store, setup also requires the one-time startup token printed once in the service startup log. Submit it in the `X-Ombre-Setup-Token` header; it is kept in memory only and is consumed only after the auth file is published. Corrupt or unreadable auth stores do not receive a setup token. A `setup_completed_login_required` response means the password was committed and the normal login flow should be used; a `409` means another setup request won the race.
+For a brand-new auth store, browser setup requires the operator-provided `OMBRE_DASHBOARD_SETUP_TOKEN` environment variable. Submit its value in the `X-Ombre-Setup-Token` header; it is kept in process memory only and is consumed only after the auth file is published. The service never generates or logs a setup token. If the auth store is missing and the variable is not configured, setup fails closed with `503 setup_token_not_configured`. Corrupt or unreadable auth stores do not receive a setup token. A `setup_completed_login_required` response means the password was committed and the normal login flow should be used; a `409` means another setup request won the race.
 
 **通过环境变量预设密码**：在 `docker-compose.user.yml` 中添加：
 **Pre-set via env var** in your `docker-compose.user.yml`:
@@ -846,13 +847,13 @@ When set, in-Dashboard password change remains disabled for a valid auth store �
 - `corrupt`: the file exists but is empty, invalid JSON, or has a missing or wrong-type `password_hash`.
 - `unreadable`: the path is a symlink, dangling symlink, directory, non-regular node, or cannot be read.
 
-Only `missing` can enter setup. `corrupt` and `unreadable` fail closed, return `503` from setup, and do not generate a startup token. With `OMBRE_DASHBOARD_PASSWORD`, an operator can log in and explicitly rebuild the file through `/auth/change-password`; without it, recovery requires filesystem-level manual repair. The service never automatically rebuilds the file.
+Only `missing` can enter setup. `corrupt` and `unreadable` fail closed, return `503` from setup, and do not receive a setup token. With `OMBRE_DASHBOARD_PASSWORD`, an operator can log in and explicitly rebuild the file through `/auth/change-password`; without it, recovery requires filesystem-level manual repair. The service never automatically rebuilds the file.
 
 The env password remains higher priority after recovery, so the new file password is not a login credential while `OMBRE_DASHBOARD_PASSWORD` remains configured. After verifying recovery, delete or rotate that env password and restart the service. Keeping it indefinitely preserves an additional login channel.
 
 For an existing `.dashboard_auth.json`, the deployment operator must verify and tighten permissions to `0600`. This is a manual deployment check; the application does not claim to migrate permissions on every pre-existing file.
 
-For a clean first deploy, use the one-time in-memory startup token printed once in the service startup log and send it in `X-Ombre-Setup-Token` with a same-origin request and a password without leading or trailing whitespace. The token is consumed only after the auth file is published. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
+For a clean first deploy, set `OMBRE_DASHBOARD_SETUP_TOKEN` to a long random secret before starting the service, then send that value in `X-Ombre-Setup-Token` with a same-origin request and a password without leading or trailing whitespace. Do not put the real token in repository documentation; use a placeholder such as `replace-with-a-long-random-secret`. The token is consumed only after the auth file is published and is never printed to logs, returned by HTTP, or persisted. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
 
 完整环境变量说明见 [ENV_VARS.md](ENV_VARS.md)。
 Full env var reference: [ENV_VARS.md](ENV_VARS.md).
