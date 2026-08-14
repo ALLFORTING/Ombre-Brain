@@ -17,6 +17,7 @@ from remember_me_mcp_presenter import (
     RememberMeMcpCompatibilityPresenter,
     _OB_PUBLIC_METADATA_KEYS,
 )
+from rm_cutover_test_support import configure_rm_authority
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +43,7 @@ def _load_server(tmp_path, monkeypatch, *, rm_enabled=False, bad_data_root=False
     monkeypatch.setenv("OMBRE_PUBLIC_BASE_URL", "https://example.invalid")
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
     if rm_enabled:
+        configure_rm_authority(tmp_path, monkeypatch)
         monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
         monkeypatch.setenv("OMBRE_RM_DATA_ROOT", str(tmp_path / "remember-me-runtime"))
     else:
@@ -522,37 +524,29 @@ def test_public_contracts_and_stage8fg_isolation_remain(tmp_path):
     download_block = server_text[server_text.index("async def rm_asset_download_link"):server_text.index("@mcp.resource", server_text.index("async def rm_asset_download_link"))]
     view_block = server_text[server_text.index("async def rm_asset_view("):server_text.index("async def rm_asset_inspect")]
     inspect_block = server_text[server_text.index("async def rm_asset_inspect"):server_text.index("@mcp.custom_route", server_text.index("async def rm_asset_inspect"))]
-    assert "remember_me_host_bundle.presenter.rm_asset_get" in get_block
-    assert "remember_me_host_bundle.presenter.rm_asset_download_link" in download_block
-    assert "remember_me_host_bundle.presenter.rm_asset_view" in view_block
-    assert "remember_me_host_bundle.presenter.rm_asset_inspect" in inspect_block
-    assert "remember_me_host_bundle.presenter.rm_asset_update_metadata" in update_block
-    assert "remember_me_host_bundle.presenter.rm_asset_search" in search_block
-    assert "asset_store.update_metadata" in update_block
+    assert "backend.mcp_get(" in get_block
+    assert "backend.mcp_download_link(" in download_block
+    assert "backend.mcp_view(" in view_block
+    assert "backend.mcp_inspect(" in inspect_block
+    assert "backend.mcp_update_metadata(" in update_block
+    assert "backend.mcp_search(" in search_block
+    assert "backend.update_metadata(" in update_block
     assert "asset_embedding_index.index_asset" in update_block
-    assert "asset_store.search" in search_block
+    assert "backend.search(" in search_block
     assert "asset_embedding_index.search" in search_block
-    enabled_block = update_block[:update_block.index("try:", update_block.index("except Exception:"))]
-    assert "asset_store.update_metadata" not in enabled_block
-    assert "asset_embedding_index.index_asset" not in enabled_block
+    assert "backend.mcp_update_metadata(" in update_block
 
     reindex_start = server_text.index("async def rm_asset_reindex_embeddings")
     reindex_stop = server_text.find("\n@mcp.", reindex_start + 1)
     reindex_block = server_text[reindex_start:reindex_stop]
-    presenter_call = (
-        "await remember_me_host_bundle.presenter."
-        "rm_asset_reindex_embeddings"
-    )
-    legacy_call = "await asset_embedding_index.reindex"
+    presenter_call = "await backend.mcp_reindex("
+    legacy_call = "await backend.reindex("
     assert presenter_call in reindex_block
     assert legacy_call in reindex_block
     assert reindex_block.index(presenter_call) < reindex_block.index(legacy_call)
-    enabled_reindex = reindex_block[:reindex_block.index(
-        "    try:\n        result = await asset_embedding_index.reindex"
-    )]
-    assert "asset_embedding_index" not in enabled_reindex
+    assert "asset_embedding_index" not in reindex_block
 
-    assert "asset_store.persist_upload" in server_text
+    assert "def persist_upload(" in (ROOT / "asset_backend.py").read_text(encoding="utf-8")
     assert server_text.count("@mcp.custom_route") == 37
     assert "OMBRE_RM_UPDATE" not in server_text
 

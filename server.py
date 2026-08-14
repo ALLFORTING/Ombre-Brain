@@ -77,6 +77,7 @@ from asset_store import (
     AssetStoreError,
     InvalidAssetImage,
 )
+from asset_backend import AssetBackendError, RuntimeAssetBackendRegistry
 from asset_dashboard import AssetDashboardError, AssetDashboardService
 from asset_embedding_index import AssetEmbeddingIndex
 from asset_viewer import (
@@ -110,6 +111,7 @@ config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 asset_store = AssetStore(config["buckets_dir"])
+asset_backend_registry = None
 
 def _apply_display_aliases(text: str) -> str:
     return apply_display_aliases(text)
@@ -2871,8 +2873,17 @@ ASSET_BROWSER_UPLOAD_MAX_UPLOADS = 100
 ASSET_BROWSER_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 ASSET_BROWSER_UPLOAD_MAX_WIRE_OVERHEAD = 64 * 1024
 RM_ASSET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+def _selected_asset_backend():
+    if asset_backend_registry is None:
+        raise AssetBackendError("asset_authority_unavailable")
+    return asset_backend_registry.selected_backend()
+
+
 asset_dashboard = AssetDashboardService(
     asset_store,
+    backend_provider=_selected_asset_backend,
     max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
     max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
 )
@@ -4331,6 +4342,11 @@ def _bootstrap_remember_me_host():
 
 
 remember_me_host_bundle = _bootstrap_remember_me_host()
+asset_backend_registry = RuntimeAssetBackendRegistry.from_runtime(
+    legacy_store=asset_store,
+    bundle_provider=lambda: remember_me_host_bundle,
+    embedding_index=asset_embedding_index,
+)
 
 def _asset_vision_download_payload(trial_id: str, png: bytes, sha256: str, token: str, expires_at: float, now: float) -> str:
     download_path = f"/rm/vision-download/{token}"
@@ -4654,26 +4670,41 @@ async def rm_asset_upload_link(
     mime_type: str = "application/octet-stream",
 ) -> str:
     """Create a short-lived browser upload URL; the server computes the file hash."""
-    source = "remember_me" if remember_me_host_bundle is not None else "legacy"
+    try:
+        source = _selected_asset_backend().name
+    except AssetBackendError:
+        return _asset_ingest_response(False, error="upload_unavailable")
+    source = "remember_me" if source == "rm" else "legacy"
     return _rm_create_asset_upload_link(expected_bytes, filename, mime_type, source=source)
 
 
 @mcp.tool()
 async def rm_asset_upload_status(upload_id: str) -> str:
     """Return metadata-only status for a persistent Remember-Me asset upload."""
-    source = "remember_me" if remember_me_host_bundle is not None else "legacy"
+    try:
+        source = _selected_asset_backend().name
+    except AssetBackendError:
+        return _asset_ingest_response(
+            False,
+            upload_id=upload_id,
+            error="upload_unavailable",
+        )
+    source = "remember_me" if source == "rm" else "legacy"
     return _rm_asset_upload_status_payload(upload_id, expected_source=source)
 
 
 @mcp.tool()
 async def rm_asset_get(asset_id: str) -> str:
     """Return persistent asset metadata without file bytes or disk paths."""
-    if remember_me_host_bundle is not None:
-        try:
-            return remember_me_host_bundle.presenter.rm_asset_get(asset_id)
-        except Exception:
-            return _asset_ingest_response(False, error="asset_unavailable")
-    asset = asset_store.get((asset_id or "").strip())
+    try:
+        backend = _selected_asset_backend()
+        if backend.name == "rm":
+            return backend.mcp_get(asset_id)
+        asset = backend.get((asset_id or "").strip())
+    except AssetBackendError:
+        return _asset_ingest_response(False, error="asset_unavailable")
+    except Exception:
+        return _asset_ingest_response(False, error="asset_unavailable")
     if not asset:
         return _asset_ingest_response(False, error="asset_unavailable")
     return _json_lib.dumps({"ok": True, **_rm_asset_public_metadata(asset)}, ensure_ascii=False, sort_keys=True)
@@ -4687,24 +4718,22 @@ async def rm_asset_update_metadata(
     tags: list[str] | None = None,
 ) -> str:
     """Update persistent asset title, description, and tags without changing file bytes."""
-    if remember_me_host_bundle is not None:
-        try:
-            return remember_me_host_bundle.presenter.rm_asset_update_metadata(
+    try:
+        backend = _selected_asset_backend()
+        if backend.name == "rm":
+            return backend.mcp_update_metadata(
                 asset_id,
                 title=title,
                 description=description,
                 tags=tags,
             )
-        except Exception:
-            return _asset_ingest_response(False, error="asset_unavailable")
-    try:
-        asset = asset_store.update_metadata(
+        asset = backend.update_metadata(
             asset_id,
             title=title,
             description=description,
             tags=tags,
         )
-    except AssetStoreError as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
+    except (AssetStoreError, AssetBackendError) as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
     except Exception as exc: logger.warning("Asset metadata update failed error=%s", type(exc).__name__); return _asset_ingest_response(False, error="asset_unavailable")
     try:
         await asset_embedding_index.index_asset(asset)
@@ -4732,9 +4761,10 @@ async def rm_asset_search(
     offset: int = 0,
 ) -> str:
     """Search persistent assets through keyword and optional semantic channels."""
-    if remember_me_host_bundle is not None:
-        try:
-            return await remember_me_host_bundle.presenter.rm_asset_search(
+    try:
+        backend = _selected_asset_backend()
+        if backend.name == "rm":
+            return await backend.mcp_search(
                 query=query,
                 tags=tags,
                 kind=kind,
@@ -4744,13 +4774,7 @@ async def rm_asset_search(
                 limit=limit,
                 offset=offset,
             )
-        except Exception:
-            return _asset_ingest_response(
-                False,
-                error="search_unavailable",
-            )
-    try:
-        result = asset_store.search(
+        result = backend.search(
             query=query,
             tags=tags,
             kind=kind,
@@ -4766,7 +4790,7 @@ async def rm_asset_search(
         try:
             semantic_scores = await asset_embedding_index.search(query)
             if semantic_scores:
-                result = asset_store.search(
+                result = backend.search(
                     query=query,
                     tags=tags,
                     kind=kind,
@@ -4795,20 +4819,18 @@ async def rm_asset_reindex_embeddings(
     limit: int = 100,
 ) -> str:
     """Backfill missing or stale Remember-Me asset embeddings without changing assets."""
-    if remember_me_host_bundle is not None:
-        try:
-            return await remember_me_host_bundle.presenter.rm_asset_reindex_embeddings(
+    try:
+        backend = _selected_asset_backend()
+        if backend.name == "rm":
+            return await backend.mcp_reindex(
                 asset_id=asset_id,
                 limit=limit,
             )
-        except Exception:
-            return _asset_ingest_response(False, error="asset_unavailable")
-    try:
-        result = await asset_embedding_index.reindex(
+        result = await backend.reindex(
             asset_id=(asset_id or "").strip(),
             limit=limit,
         )
-    except (AssetStoreError, ValueError) as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
+    except (AssetStoreError, AssetBackendError, ValueError) as exc: return _asset_ingest_response(False, error=_safe_asset_ingest_error(exc))
     except Exception as exc: logger.warning("Asset embedding reindex failed error=%s", type(exc).__name__); return _asset_ingest_response(False, error="asset_unavailable")
     return _json_lib.dumps(
         {"ok": True, **result},
@@ -4819,10 +4841,13 @@ async def rm_asset_reindex_embeddings(
 @mcp.tool()
 async def rm_asset_download_link(asset_id: str) -> str:
     """Create a five-minute signed download URL for one persistent asset."""
-    if remember_me_host_bundle is None:
-        return _rm_create_asset_download_link(asset_id)
     try:
-        return remember_me_host_bundle.presenter.rm_asset_download_link(asset_id)
+        backend = _selected_asset_backend()
+        if backend.name == "legacy":
+            return _rm_create_asset_download_link(asset_id)
+        return backend.mcp_download_link(asset_id)
+    except AssetBackendError:
+        return _asset_ingest_response(False, error="download_unavailable")
     except Exception:
         return _asset_ingest_response(False, error="download_unavailable")
 
@@ -4842,7 +4867,11 @@ async def rm_asset_viewer_resource() -> str:
 @mcp.tool(meta=ASSET_VIEWER_TOOL_META)
 async def rm_asset_view(asset_id: str) -> CallToolResult:
     """Display one cleaned Remember-Me image inline with a signed-link fallback."""
-    if remember_me_host_bundle is None:
+    try:
+        backend = _selected_asset_backend()
+    except AssetBackendError:
+        return _rm_asset_view_error("image_unavailable")
+    if backend.name == "legacy":
         verified = _rm_verified_view_image(asset_id)
         if isinstance(verified, str):
             return _rm_asset_view_error(verified)
@@ -4886,7 +4915,7 @@ async def rm_asset_view(asset_id: str) -> CallToolResult:
             },
         )
     try:
-        return remember_me_host_bundle.presenter.rm_asset_view(asset_id)
+        return backend.mcp_view(asset_id)
     except Exception:
         return _rm_asset_view_error("image_unavailable")
 
@@ -4899,7 +4928,11 @@ async def rm_asset_inspect(asset_id: str) -> CallToolResult:
     Never guess image content from metadata. This tool does not update metadata
     or embeddings.
     """
-    if remember_me_host_bundle is None:
+    try:
+        backend = _selected_asset_backend()
+    except AssetBackendError:
+        return _rm_asset_inspect_error("image_unavailable")
+    if backend.name == "legacy":
         verified = _rm_verified_view_image(asset_id)
         if isinstance(verified, str):
             return _rm_asset_inspect_error(verified)
@@ -4943,7 +4976,7 @@ async def rm_asset_inspect(asset_id: str) -> CallToolResult:
             structuredContent=structured,
         )
     try:
-        return remember_me_host_bundle.presenter.rm_asset_inspect(asset_id)
+        return backend.mcp_inspect(asset_id)
     except Exception:
         return _rm_asset_inspect_error("image_unavailable")
 
@@ -4966,10 +4999,20 @@ def _rm_core_upload_error_status(exc: Exception) -> int:
 
 
 async def _rm_persist_remember_me_upload(request, claim: dict) -> tuple[int, dict | None]:
-    if remember_me_host_bundle is None:
+    try:
+        backend = _selected_asset_backend()
+    except AssetBackendError:
+        return 503, None
+    if backend.name != "rm":
         return 503, None
     try:
+        # Keep the host-owned transient file helper for this browser route;
+        # authority and the persistent freeze gate are still enforced by the
+        # selected backend before Core receives the bytes.
+        backend.assert_public_mutation_allowed()
         temp_path = _rm_create_upload_temp_path()
+    except AssetBackendError as exc:
+        return (409 if exc.code == "asset_write_frozen" else 503), None
     except Exception:
         return 500, None
     try:
@@ -4996,7 +5039,7 @@ async def _rm_persist_remember_me_upload(request, claim: dict) -> tuple[int, dic
             return 500, None
         try:
             raw_result = await asyncio.to_thread(
-                remember_me_host_bundle.core_adapter.ingest_ob_public_metadata,
+                backend.ingest_public_metadata,
                 content,
                 claim["expected_bytes"],
                 claim["filename"],
@@ -5034,8 +5077,21 @@ async def rm_asset_upload_route(request):
         return Response(status_code=404, headers=headers)
 
     source = claim.get("source")
+    try:
+        backend = _selected_asset_backend()
+    except AssetBackendError:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=503, headers=headers)
+    expected_source = "remember_me" if backend.name == "rm" else "legacy"
+    if source != expected_source:
+        _rm_release_asset_upload(claim["upload_id"])
+        return Response(status_code=409, headers=headers)
     if source == "legacy":
-        temp_path = asset_store.create_temp_path()
+        try:
+            temp_path = backend.create_temp_path()
+        except AssetBackendError:
+            _rm_release_asset_upload(claim["upload_id"])
+            return Response(status_code=409, headers=headers)
         try:
             with temp_path.open("wb") as handle:
                 streamed = await _asset_stream_browser_upload(
@@ -5048,7 +5104,7 @@ async def rm_asset_upload_route(request):
                 _rm_release_asset_upload(claim["upload_id"])
                 return Response(status_code=422, headers=headers)
             asset = await asyncio.to_thread(
-                asset_store.persist_upload,
+                backend.persist_upload,
                 temp_path,
                 streamed["sha256"],
                 streamed["decoded_bytes"],
@@ -6474,12 +6530,14 @@ async def api_assets(request):
         try:
             upload = await asset_dashboard.parse_upload(request)
             asset = await asyncio.to_thread(asset_dashboard.create_asset, upload)
-            stored = asset_store.get(asset["asset_id"])
-            if stored:
-                try:
-                    await asset_embedding_index.index_asset(stored)
-                except Exception:
-                    logger.warning("Dashboard asset embedding refresh failed after upload")
+            backend = _selected_asset_backend()
+            if backend.name == "legacy":
+                stored = backend.get(asset["asset_id"])
+                if stored:
+                    try:
+                        await asset_embedding_index.index_asset(stored)
+                    except Exception:
+                        logger.warning("Dashboard asset embedding refresh failed after upload")
             return JSONResponse(asset, status_code=200 if asset["deduplicated"] else 201)
         except AssetDashboardError as exc:
             return _dashboard_write_error(route, exc.status_code, exc.code)
@@ -6495,7 +6553,8 @@ async def api_assets(request):
         return err
     try:
         limit, offset = _dashboard_pagination(request)
-        result = asset_dashboard.list_assets(
+        result = await asyncio.to_thread(
+            asset_dashboard.list_assets,
             query=request.query_params.get("q", ""),
             tag=request.query_params.get("tag", ""),
             limit=limit,
@@ -6539,12 +6598,14 @@ async def api_asset_detail(request):
                 asset_id,
                 payload,
             )
-            stored = asset_store.get(asset_id)
-            if stored:
-                try:
-                    await asset_embedding_index.index_asset(stored)
-                except Exception:
-                    logger.warning("Dashboard asset embedding refresh failed after metadata update")
+            backend = _selected_asset_backend()
+            if backend.name == "legacy":
+                stored = backend.get(asset_id)
+                if stored:
+                    try:
+                        await asset_embedding_index.index_asset(stored)
+                    except Exception:
+                        logger.warning("Dashboard asset embedding refresh failed after metadata update")
             return JSONResponse(asset)
         result = await asyncio.to_thread(asset_dashboard.delete_asset, asset_id)
         return JSONResponse(result)
@@ -6592,20 +6653,27 @@ async def api_asset_thumbnail(request):
 @mcp.custom_route("/api/assets/{asset_id}/image", methods=["GET", "HEAD"])
 async def api_asset_image(request):
     """Stream a cleaned stored image inside the Dashboard auth boundary."""
-    from starlette.responses import FileResponse, JSONResponse
+    from starlette.responses import FileResponse, JSONResponse, Response
     err = _require_auth(request)
     if err:
         return err
     try:
         image = asset_dashboard.resolve_image(request.path_params["asset_id"])
-        return FileResponse(
-            image.path,
+        headers = {
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
+        }
+        if image.path is not None:
+            return FileResponse(
+                image.path,
+                media_type=image.mime_type,
+                headers=headers,
+            )
+        return Response(
+            content=image.content,
             media_type=image.mime_type,
-            headers={
-                "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff",
-                "Content-Disposition": "inline",
-            },
+            headers=headers,
         )
     except AssetDashboardError as exc:
         return JSONResponse({"error": exc.code}, status_code=exc.status_code)

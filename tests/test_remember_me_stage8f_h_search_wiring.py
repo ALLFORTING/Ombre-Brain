@@ -11,6 +11,7 @@ import pytest
 
 from remember_me_core_adapter import RememberMeCoreAdapterError
 from remember_me_mcp_presenter import RememberMeMcpCompatibilityPresenter
+from rm_cutover_test_support import configure_rm_authority, install_fake_rm_backend
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +67,7 @@ def _load_server(tmp_path, monkeypatch, *, rm_enabled=False, bad_data_root=False
     monkeypatch.setenv("OMBRE_PUBLIC_BASE_URL", "https://example.invalid")
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
     if rm_enabled:
+        configure_rm_authority(tmp_path, monkeypatch)
         monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
         monkeypatch.setenv("OMBRE_RM_DATA_ROOT", str(tmp_path / "remember-me-runtime"))
     else:
@@ -261,7 +263,14 @@ async def test_enabled_search_calls_presenter_once_and_never_legacy(tmp_path, mo
     server = _load_server(tmp_path, monkeypatch)
     core = CountingCore()
     links = NullDownloadLinks()
-    server.remember_me_host_bundle = type("Bundle", (), {"presenter": _presenter(core, links)})()
+    install_fake_rm_backend(
+        server,
+        type(
+            "Bundle",
+            (),
+            {"core_adapter": core, "presenter": _presenter(core, links)},
+        )(),
+    )
     server.asset_store.search = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy search"))
     server.asset_store.get = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy get"))
     server.asset_embedding_index.search = AsyncMock(side_effect=AssertionError("legacy embedding search"))
@@ -408,7 +417,14 @@ async def test_enabled_search_has_no_legacy_fallback_when_core_has_no_asset(tmp_
     legacy = _persist(server, b"legacy bytes", "legacy.bin")
     server.asset_store.update_metadata(legacy["asset_id"], title="Legacy only")
     core = CountingCore(error=RememberMeCoreAdapterError("asset_not_found"))
-    server.remember_me_host_bundle = type("Bundle", (), {"presenter": _presenter(core)})()
+    install_fake_rm_backend(
+        server,
+        type(
+            "Bundle",
+            (),
+            {"core_adapter": core, "presenter": _presenter(core)},
+        )(),
+    )
 
     raw = await server.rm_asset_search(query="Legacy")
 
@@ -430,7 +446,10 @@ async def test_enabled_handler_unknown_presenter_exception_returns_stable_error(
             raise RuntimeError("boom C:/secret")
 
     presenter = Presenter()
-    server.remember_me_host_bundle = type("Bundle", (), {"presenter": presenter})()
+    install_fake_rm_backend(
+        server,
+        type("Bundle", (), {"core_adapter": object(), "presenter": presenter})(),
+    )
 
     raw = await server.rm_asset_search(query="anything")
 
@@ -463,14 +482,16 @@ def test_public_contracts_and_stage8fh_isolation_remain(tmp_path):
     search_start = server_text.index("async def rm_asset_search")
     search_stop = server_text.index("async def rm_asset_reindex_embeddings")
     search_block = server_text[search_start:search_stop]
-    assert "remember_me_host_bundle.presenter.rm_asset_search" in search_block
-    assert "asset_store.search" in search_block
+    assert "backend.mcp_search(" in search_block
+    assert "backend.search(" in search_block
     assert "asset_embedding_index.search" in search_block
-    enabled_block = search_block[:search_block.index("try:", search_block.index("except Exception:"))]
-    assert "asset_store.search" not in enabled_block
-    assert "asset_embedding_index.search" not in enabled_block
-    assert "asset_embedding_index.reindex" not in enabled_block
-    assert "embedding_engine" not in enabled_block
+    rm_search_branch = search_block[
+        search_block.index('if backend.name == "rm"'):
+        search_block.index("        result = backend.search")
+    ]
+    assert "backend.search" not in rm_search_branch
+    assert "asset_embedding_index" not in rm_search_branch
+    assert "embedding_engine" not in rm_search_branch
     assert "_rm_create_asset_download_link" not in search_block
     assert "_rm_asset_download_tokens" not in search_block
     assert "_rm_asset_download_sources" not in search_block
@@ -486,22 +507,16 @@ def test_public_contracts_and_stage8fh_isolation_remain(tmp_path):
         stop = server_text.find("\n@mcp.", start + 1)
         if stop == -1:
             stop = len(server_text)
-        assert "remember_me_host_bundle.presenter" in server_text[start:stop]
+    assert "backend.mcp_" in server_text[start:stop]
 
     reindex_start = server_text.index("async def rm_asset_reindex_embeddings(")
     reindex_stop = server_text.index("async def rm_asset_download_link", reindex_start)
     reindex_block = server_text[reindex_start:reindex_stop]
-    presenter_call = (
-        "await remember_me_host_bundle.presenter."
-        "rm_asset_reindex_embeddings"
-    )
+    presenter_call = "await backend.mcp_reindex("
     assert presenter_call in reindex_block
     assert reindex_block.index(presenter_call) < reindex_block.index(
-        "await asset_embedding_index.reindex"
+        "await backend.reindex("
     )
-    enabled_reindex = reindex_block[:reindex_block.index(
-        "    try:\n        result = await asset_embedding_index.reindex"
-    )]
-    assert "asset_embedding_index" not in enabled_reindex
+    assert "asset_embedding_index" not in reindex_block
     assert "RememberMeCoreAdapter" not in reindex_block
     assert "RememberMeMcpCompatibilityPresenter" not in reindex_block

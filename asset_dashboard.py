@@ -12,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 from python_multipart import MultipartParser
 from python_multipart.multipart import parse_options_header
 
+from asset_backend import AssetBackendError
 from asset_store import (
     MAX_IMAGE_PIXELS,
     AssetStore,
@@ -42,9 +43,10 @@ class AssetDashboardError(Exception):
 @dataclass(frozen=True)
 class AssetImage:
     asset: dict
-    path: Path
+    path: Path | None
     mime_type: str
     thumbnail_bytes: bytes | None = None
+    content: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -64,14 +66,27 @@ class AssetDashboardService:
 
     def __init__(
         self,
-        store: AssetStore,
+        store: AssetStore | None = None,
         *,
+        backend_provider=None,
         max_asset_bytes: int,
         max_image_pixels: int = MAX_IMAGE_PIXELS,
     ):
+        if store is None and backend_provider is None:
+            raise TypeError("asset_backend_required")
         self.store = store
+        self._backend_provider = backend_provider or (lambda: self.store)
         self.max_asset_bytes = max_asset_bytes
         self.max_image_pixels = max_image_pixels
+
+    def _backend(self):
+        try:
+            backend = self._backend_provider()
+        except AssetBackendError as exc:
+            raise AssetDashboardError("asset_authority_unavailable", 503) from exc
+        if backend is None:
+            raise AssetDashboardError("asset_authority_unavailable", 503)
+        return backend
 
     @staticmethod
     def parse_pagination(limit_value: str, offset_value: str) -> tuple[int, int]:
@@ -130,6 +145,7 @@ class AssetDashboardService:
         return parsed
 
     async def parse_upload(self, request) -> AssetUpload:
+        backend = self._backend()
         content_type = request.headers.get("content-type", "")
         kind, options = parse_options_header(
             content_type.encode("latin-1", errors="ignore")
@@ -146,7 +162,12 @@ class AssetDashboardService:
             except ValueError as exc:
                 raise AssetDashboardError("invalid_content_length") from exc
 
-        temp_path = self.store.create_temp_path()
+        try:
+            temp_path = backend.create_temp_path()
+        except (AssetBackendError, AssetStoreError) as exc:
+            code = getattr(exc, "code", str(exc))
+            status = 409 if code == "asset_write_frozen" else 503
+            raise AssetDashboardError(code, status) from exc
         state = {
             "headers": {},
             "header_name": bytearray(),
@@ -203,7 +224,7 @@ class AssetDashboardService:
                             raise AssetDashboardError("single_file_required")
                         state["file_count"] = 1
                         state["in_file"] = True
-                        state["filename"] = self.store.sanitize_filename(
+                        state["filename"] = backend.sanitize_filename(
                             self._decode_parameter(params.get(b"filename"), "image")
                         )
                         raw_mime = state["headers"].get(b"content-type", b"")
@@ -292,36 +313,41 @@ class AssetDashboardService:
         )
 
     def create_asset(self, upload: AssetUpload) -> dict:
+        backend = self._backend()
         try:
             clean_title = (
-                self.store._clean_metadata_text(upload.title, 200, "title")
+                backend.clean_metadata_text(upload.title, 200, "title")
                 if upload.title is not None
                 else None
             )
             clean_description = (
-                self.store._clean_metadata_text(upload.description, 4000, "description")
+                backend.clean_metadata_text(upload.description, 4000, "description")
                 if upload.description is not None
                 else None
             )
             clean_tags = (
-                [display for _, display in self.store._normalize_tags(upload.tags)]
+                backend.normalize_tags(upload.tags)
                 if upload.tags is not None
                 else None
             )
-            asset = self.store.persist_upload(
+            asset = backend.persist_upload(
                 upload.path,
                 upload.source_sha256,
                 upload.decoded_bytes,
                 upload.filename,
                 upload.mime_type,
+                require_image=True,
+                title=clean_title or "",
+                description=clean_description or "",
+                tags=clean_tags or [],
             )
             metadata_supplied = bool(
                 (clean_title is not None and clean_title)
                 or (clean_description is not None and clean_description)
                 or (clean_tags is not None and clean_tags)
             )
-            if metadata_supplied:
-                asset = self.store.update_metadata(
+            if metadata_supplied and getattr(backend, "name", "legacy") == "legacy":
+                asset = backend.update_metadata(
                     asset["asset_id"],
                     title=clean_title if clean_title else None,
                     description=(
@@ -337,37 +363,49 @@ class AssetDashboardService:
         except InvalidAssetImage as exc:
             upload.path.unlink(missing_ok=True)
             raise AssetDashboardError(str(exc), 422) from exc
-        except AssetStoreError as exc:
+        except (AssetStoreError, AssetBackendError) as exc:
             upload.path.unlink(missing_ok=True)
-            raise AssetDashboardError(str(exc)) from exc
+            code = getattr(exc, "code", str(exc))
+            status = 409 if code == "asset_write_frozen" else 400
+            raise AssetDashboardError(code, status) from exc
 
     def update_asset(self, asset_id: str, payload: dict) -> dict:
+        backend = self._backend()
         if not isinstance(payload, dict):
             raise AssetDashboardError("invalid_json")
         allowed = {"title", "description", "tags"}
         if not payload or set(payload) - allowed:
             raise AssetDashboardError("invalid_fields")
-        existing = self.store.get(asset_id)
+        try:
+            existing = backend.get(asset_id)
+        except (AssetStoreError, AssetBackendError) as exc:
+            raise AssetDashboardError("asset_unavailable", 404) from exc
         if not existing or existing.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
         try:
-            asset = self.store.update_metadata(asset_id, **payload)
-        except AssetStoreError as exc:
+            asset = backend.update_metadata(asset_id, **payload)
+        except (AssetStoreError, AssetBackendError) as exc:
             code = str(exc)
             status = 404 if code == "asset_unavailable" else 400
+            if code == "asset_write_frozen":
+                status = 409
             raise AssetDashboardError(code, status) from exc
         if asset.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
         return self._safe_metadata(asset)
 
     def delete_asset(self, asset_id: str) -> dict:
-        asset = self.store.get(asset_id)
+        backend = self._backend()
+        try:
+            asset = backend.get(asset_id)
+        except (AssetStoreError, AssetBackendError) as exc:
+            raise AssetDashboardError("asset_unavailable", 404) from exc
         if not asset or asset.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
         try:
-            return self.store.delete(asset_id)
-        except AssetStoreError as exc:
-            code = str(exc)
+            return backend.delete(asset_id)
+        except (AssetStoreError, AssetBackendError) as exc:
+            code = getattr(exc, "code", str(exc))
             status = 404 if code in {"asset_unavailable", "asset_file_unavailable"} else 409
             raise AssetDashboardError(code, status) from exc
 
@@ -379,17 +417,18 @@ class AssetDashboardService:
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> dict:
+        backend = self._backend()
         tags = [tag] if tag.strip() else None
         try:
-            result = self.store.search(
+            result = backend.search(
                 query=query,
                 tags=tags,
                 kind="image",
                 limit=limit,
                 offset=offset,
             )
-        except AssetStoreError as exc:
-            raise AssetDashboardError(str(exc)) from exc
+        except (AssetStoreError, AssetBackendError) as exc:
+            raise AssetDashboardError(getattr(exc, "code", str(exc))) from exc
         return {
             "total": result["total"],
             "offset": result["offset"],
@@ -406,7 +445,10 @@ class AssetDashboardService:
         }
 
     def get_asset(self, asset_id: str) -> dict:
-        asset = self.store.get(asset_id)
+        try:
+            asset = self._backend().get(asset_id)
+        except (AssetStoreError, AssetBackendError) as exc:
+            raise AssetDashboardError("asset_unavailable", 404) from exc
         if not asset or asset.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
         if asset.get("mime_type") not in ALLOWED_IMAGE_MIME_TYPES:
@@ -414,13 +456,15 @@ class AssetDashboardService:
         return self._safe_metadata(asset)
 
     def resolve_image(self, asset_id: str, *, thumbnail: bool = False) -> AssetImage:
+        backend = self._backend()
         try:
-            resolved = self.store.resolve_file(asset_id)
-        except AssetStoreError as exc:
+            resolved = backend.resolve(asset_id)
+        except (AssetStoreError, AssetBackendError) as exc:
             raise AssetDashboardError("asset_unavailable", 404) from exc
         if not resolved:
             raise AssetDashboardError("asset_not_found", 404)
-        asset, path = resolved
+        asset = resolved.asset
+        path = resolved.path
         mime_type = asset.get("mime_type", "")
         if asset.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
@@ -428,7 +472,11 @@ class AssetDashboardService:
         if not expected_format:
             raise AssetDashboardError("unsupported_image", 415)
         try:
-            actual_bytes = path.stat().st_size
+            actual_bytes = (
+                path.stat().st_size
+                if path is not None
+                else len(resolved.content or b"")
+            )
         except OSError as exc:
             raise AssetDashboardError("asset_unavailable", 404) from exc
         if actual_bytes <= 0 or actual_bytes > self.max_asset_bytes:
@@ -437,7 +485,8 @@ class AssetDashboardService:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(path) as opened:
+                source = path if path is not None else io.BytesIO(resolved.content or b"")
+                with Image.open(source) as opened:
                     opened.load()
                     actual_format = (opened.format or "").upper()
                     width, height = opened.size
@@ -451,7 +500,12 @@ class AssetDashboardService:
                     ):
                         raise AssetDashboardError("asset_unavailable", 422)
                     if not thumbnail:
-                        return AssetImage(asset, path, mime_type)
+                        return AssetImage(
+                            asset,
+                            path,
+                            mime_type,
+                            content=resolved.content,
+                        )
                     image = opened.copy()
         except AssetDashboardError:
             raise

@@ -236,7 +236,8 @@ class CutoverStateStore:
     def _initialize(self) -> None:
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            connection = self._connect()
+            try:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
                     """
@@ -313,6 +314,8 @@ class CutoverStateStore:
                     )
                 self._assert_schema(connection)
                 connection.commit()
+            finally:
+                connection.close()
         except CutoverStateError:
             raise
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
@@ -415,14 +418,16 @@ class CutoverStateStore:
         )
 
     def get_snapshot(self) -> CutoverSnapshot:
+        connection = self._connect()
         try:
-            with self._connect() as connection:
-                self._assert_schema(connection)
-                return self._snapshot_from_connection(connection)
+            self._assert_schema(connection)
+            return self._snapshot_from_connection(connection)
         except CutoverStateError:
             raise
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
 
     inspect = get_snapshot
 
@@ -837,14 +842,16 @@ class CutoverStateStore:
     def _assert_active_lease_handle(self, lease: FreezeLease) -> None:
         if not isinstance(lease, FreezeLease):
             raise CutoverStateError("freeze_lease_invalid")
+        connection = self._connect()
         try:
-            with self._connect() as connection:
-                self._assert_schema(connection)
-                self._assert_active_lease(connection, lease)
+            self._assert_schema(connection)
+            self._assert_active_lease(connection, lease)
         except CutoverStateError:
             raise
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
 
     def _begin(self) -> sqlite3.Connection:
         connection = self._connect()
@@ -1051,6 +1058,8 @@ def validate_cutover_boot(
         raise CutoverStateError("state_authority_ambiguous")
     if snapshot.freeze_status in {"expired", "missing", "unexpected"}:
         raise CutoverStateError("state_freeze_ambiguous")
+    if snapshot.authority is AssetAuthority.RM and not snapshot.rm_available:
+        raise CutoverStateError("rm_authority_unavailable")
     if configured is AssetAuthority.RM and not rm_available:
         raise CutoverStateError("rm_authority_unavailable")
     if snapshot.state in {
