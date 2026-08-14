@@ -167,6 +167,21 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
     "remember_me_import_adapter.py": {
         "__init__": "guarded_caller_only",
     },
+    "remember_me_cutover_migration.py": {
+        "_atomic_json_write": "isolated_offline_workspace",
+        "__init__": "guarded_caller_only",
+        "save": "guarded_caller_only",
+    },
+    "remember_me_cutover_operations.py": {
+        "_json_write": "isolated_offline_workspace",
+        "_sqlite_info": "dynamic_sql_read_only",
+        "_snapshot_sqlite": "isolated_offline_workspace",
+        "_copy_file": "isolated_offline_workspace",
+        "_asset_blob_records": "dynamic_sql_read_only",
+        "_vector_readiness": "dynamic_sql_read_only",
+        "create_backup": "isolated_offline_workspace",
+        "restore_backup": "isolated_offline_workspace",
+    },
     "remember_me_migration_rehearsal.py": {
         "prepare_rehearsal_workspace": "isolated_offline_workspace",
         "_atomic_write_json": "isolated_offline_workspace",
