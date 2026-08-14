@@ -419,8 +419,8 @@ def _initialize_setup_token() -> None:
     global _setup_token
     state, _stored = _auth_store_state()
     if state == _AUTH_STORE_MISSING:
-        _setup_token = secrets.token_urlsafe(32)
-        logger.info("dashboard_setup_token=%s", _setup_token)
+        _setup_token = (os.environ.get("OMBRE_DASHBOARD_SETUP_TOKEN") or "").strip() or None
+        # Setup credentials are operator-provided and are never logged.
 
 
 _initialize_setup_token()
@@ -788,7 +788,7 @@ async def _auth_setup_impl(request):
         except (UnicodeError, TypeError, AttributeError):
             token_valid = False
         if not token_valid:
-            return JSONResponse({"error": "setup_token_invalid"}, status_code=403)
+            return JSONResponse({"error": "setup_token_invalid" if _setup_token is not None else "setup_token_not_configured"}, status_code=403 if _setup_token is not None else 503)
 
         try:
             body = await request.json()

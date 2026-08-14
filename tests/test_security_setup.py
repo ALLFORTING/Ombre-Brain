@@ -13,11 +13,18 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 
-def _load_server(tmp_path, monkeypatch):
+SETUP_TOKEN = "synthetic-setup-secret-DO-NOT-LOG"
+
+
+def _load_server(tmp_path, monkeypatch, *, setup_token=SETUP_TOKEN):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_DASHBOARD_PASSWORD", raising=False)
     monkeypatch.delenv("OMBRE_HOOK_TOKEN", raising=False)
     monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    if setup_token is None:
+        monkeypatch.delenv("OMBRE_DASHBOARD_SETUP_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("OMBRE_DASHBOARD_SETUP_TOKEN", setup_token)
     sys.modules.pop("server", None)
     return importlib.import_module("server")
 
@@ -89,6 +96,71 @@ def test_setup_requires_same_origin_and_consumes_token_once(tmp_path, monkeypatc
     assert second.status_code == 400
     with open(_auth_file(server), encoding="utf-8") as handle:
         assert json.load(handle)["password_hash"]
+
+
+@pytest.mark.security
+def test_setup_token_is_configured_in_memory_and_never_logged(
+    tmp_path, monkeypatch, caplog
+):
+    with caplog.at_level("INFO", logger="ombre_brain"):
+        server = _load_server(tmp_path, monkeypatch)
+
+    assert server._setup_token == SETUP_TOKEN
+    assert SETUP_TOKEN not in caplog.text
+    assert "dashboard_setup_token=" not in caplog.text
+
+
+@pytest.mark.security
+def test_setup_with_configured_env_token_consumes_token(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _auth_client(server)
+
+    response = client.post(
+        "/auth/setup",
+        headers=_setup_headers(server, SETUP_TOKEN),
+        json={"password": "configured-password"},
+    )
+
+    assert response.status_code == 200
+    assert server._setup_token is None
+    assert os.path.exists(_auth_file(server))
+
+
+@pytest.mark.security
+def test_wrong_setup_token_is_bounded_and_does_not_log_secret(
+    tmp_path, monkeypatch, caplog
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _auth_client(server)
+
+    with caplog.at_level("INFO", logger="ombre_brain"):
+        response = client.post(
+            "/auth/setup",
+            headers=_setup_headers(server, "wrong-token"),
+            json={"password": "configured-password"},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "setup_token_invalid"}
+    assert SETUP_TOKEN not in response.text
+    assert SETUP_TOKEN not in caplog.text
+    assert not os.path.lexists(_auth_file(server))
+
+
+@pytest.mark.security
+def test_missing_setup_token_fails_closed_without_auth_file(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch, setup_token=None)
+    client = _auth_client(server)
+
+    response = client.post(
+        "/auth/setup",
+        headers={"Origin": "http://testserver"},
+        json={"password": "unconfigured-password"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "setup_token_not_configured"}
+    assert not os.path.lexists(_auth_file(server))
 
 
 @pytest.mark.security
