@@ -122,6 +122,18 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "record_asset_success": "guarded_mutation",
         "_connect": "dynamic_sql_read_only",
     },
+    "asset_cutover_state.py": {
+        "__init__": "startup_initialization",
+        "_initialize": "startup_initialization",
+        "_connect": "dynamic_sql_read_only",
+        "set_rm_available": "guarded_mutation",
+        "acquire_freeze": "guarded_mutation",
+        "renew_freeze": "guarded_mutation",
+        "transition": "guarded_mutation",
+        "release_freeze": "guarded_mutation",
+        "recover_expired_freeze": "guarded_mutation",
+        "_update_state": "guarded_caller_only",
+    },
     "import_memory.py": {
         "save": "guarded_mutation",
     },
@@ -179,6 +191,12 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
         ("remember_me_migration_runner.py", "__init__"),
         ("remember_me_migration_rehearsal.py", "__init__"),
     },
+    ("asset_cutover_state.py", "_update_state"): {
+        ("asset_cutover_state.py", "set_rm_available"),
+        ("asset_cutover_state.py", "acquire_freeze"),
+        ("asset_cutover_state.py", "transition"),
+        ("asset_cutover_state.py", "recover_expired_freeze"),
+    },
 }
 
 # Exact call-site exemptions for methods whose names overlap Path mutation
@@ -189,6 +207,8 @@ NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
     ("asset_migration_state.py", "_now", 313, "value.replace"): "datetime_timezone",
     ("asset_migration_state.py", "inspect_existing_migration_state", 1107, "now.replace"): "datetime_timezone",
     ("asset_migration_state.py", "_parse_timestamp", 1177, "replace"): "datetime_timezone",
+    ("asset_cutover_state.py", "_now", 329, "value.replace"): "datetime_timezone",
+    ("asset_cutover_state.py", "_parse_timestamp", 1144, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 250, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 257, "raw.replace"): "string_normalization",
     ("asset_store.py", "_parse_iso8601", 261, "parsed.replace"): "datetime_timezone",
