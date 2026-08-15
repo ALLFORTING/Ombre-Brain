@@ -906,6 +906,7 @@ def preflight(
             "topology_safe": topo["classification"] in {"SINGLE_PROCESS_CONFIRMED", "MULTI_PROCESS_SUPPORTED"},
         },
     }
+    payload["status"] = "PASS" if all(payload["gates"].values()) else "FAIL"
     if report is not None:
         _json_write(_canonical_path(report, "report"), payload)
     return payload

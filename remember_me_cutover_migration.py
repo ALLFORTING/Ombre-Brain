@@ -1336,7 +1336,9 @@ def verify(
         complete = adapter.complete_verification(snapshot)
         if not bool(getattr(complete, "complete", True)):
             failures["verification_incomplete"] += 1
-        failures["missing_target_asset"] += len(expected - ids)
+        missing_target_assets = len(expected - ids)
+        if missing_target_assets:
+            failures["missing_target_asset"] = missing_target_assets
         db = _db_integrity(inputs.rm_root)
         if db["failures"]:
             failures["rm_db_integrity"] += db["failures"]
