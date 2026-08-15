@@ -399,11 +399,8 @@ def test_stage8f_a_bootstrap_surface_remains_compatible_after_later_wiring():
     reindex_start = server_text.index("async def rm_asset_reindex_embeddings")
     reindex_stop = server_text.find("\n@mcp.", reindex_start + 1)
     reindex_block = server_text[reindex_start:reindex_stop]
-    assert (
-        "await remember_me_host_bundle.presenter."
-        "rm_asset_reindex_embeddings"
-    ) in reindex_block
-    assert "await asset_embedding_index.reindex" in reindex_block
+    assert "await backend.mcp_reindex(" in reindex_block
+    assert "await backend.reindex(" in reindex_block
 
     assert server_text.count("@mcp.custom_route") == 37
     assert "asset_store = AssetStore(config[\"buckets_dir\"])" in server_text

@@ -5,6 +5,7 @@ import io
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,10 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from remember_me_mcp_presenter import RememberMeMcpCompatibilityPresenter
+from rm_cutover_test_support import install_fake_rm_backend
+
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 ASSET_ID = "c" * 32
@@ -230,10 +235,11 @@ class UploadCore:
 def _enable_fake_rm(server, core):
     links = FakeLinks()
     presenter = RememberMeMcpCompatibilityPresenter(core, links)
-    server.remember_me_host_bundle = SimpleNamespace(
+    bundle = SimpleNamespace(
         core_adapter=core,
         presenter=presenter,
     )
+    install_fake_rm_backend(server, bundle)
     return links
 
 
@@ -342,6 +348,7 @@ async def test_status_is_strictly_source_isolated_and_unknown_source_retires(tmp
         "upload_id": rm["upload_id"],
     }
 
+    _enable_fake_rm(server, core)
     unknown = _payload(await server.rm_asset_upload_link(len(data), "unknown.png", "image/png"))
     server._rm_asset_upload_sources[unknown["upload_id"]] = "mystery"
     with _asset_client(server) as client:
@@ -477,7 +484,7 @@ def test_public_contract_static_scope_and_counts_remain_unchanged(tmp_path, monk
     server = _load_server(tmp_path, monkeypatch)
     server_text = (server.ROOT if hasattr(server, "ROOT") else None)
     text = __import__("pathlib").Path("server.py").read_text(encoding="utf-8")
-    assert "core_adapter.ingest_ob_public_metadata" in text
+    assert "ingest_public_metadata(" in (ROOT / "asset_backend.py").read_text(encoding="utf-8")
     assert "core_adapter.ingest_image" not in text[text.index("async def rm_asset_upload_route"):text.index("@mcp.custom_route(\"/rm/asset-download/{token}\"")]
     assert "_rm_asset_upload_sources" in text
     assert "async def rm_asset_reindex_embeddings" in text

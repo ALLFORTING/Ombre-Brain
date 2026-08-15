@@ -34,6 +34,7 @@ from remember_me_core_adapter import (
 )
 from remember_me_host_runtime import create_remember_me_host_bundle
 from remember_me_mcp_presenter import RememberMeMcpCompatibilityPresenter
+from rm_cutover_test_support import configure_rm_authority, install_fake_rm_backend
 from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
 
@@ -279,12 +280,16 @@ def _runtime(service):
     )
 
 
-def _load_server(tmp_path, monkeypatch):
+def _load_server(tmp_path, monkeypatch, *, rm_enabled=False):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "legacy"))
     monkeypatch.setenv("OMBRE_PUBLIC_BASE_URL", "https://example.invalid")
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
-    monkeypatch.delenv("OMBRE_RM_RUNTIME_ENABLED", raising=False)
-    monkeypatch.delenv("OMBRE_RM_DATA_ROOT", raising=False)
+    if rm_enabled:
+        configure_rm_authority(tmp_path, monkeypatch)
+    else:
+        monkeypatch.delenv("OMBRE_ASSET_AUTHORITY", raising=False)
+        monkeypatch.delenv("OMBRE_RM_RUNTIME_ENABLED", raising=False)
+        monkeypatch.delenv("OMBRE_RM_DATA_ROOT", raising=False)
     sys.modules.pop("server", None)
     return importlib.import_module("server")
 
@@ -1240,7 +1245,10 @@ async def test_server_reindex_enabled_calls_presenter_once_without_legacy(
             )
         )
     )
-    server.remember_me_host_bundle = SimpleNamespace(presenter=presenter)
+    install_fake_rm_backend(
+        server,
+        SimpleNamespace(core_adapter=object(), presenter=presenter),
+    )
     server.asset_embedding_index.reindex = AsyncMock(
         side_effect=AssertionError("legacy reindex")
     )
@@ -1597,18 +1605,11 @@ def test_static_ownership_has_no_migration_dual_write_or_schema_change():
     reindex_start = server_text.index("async def rm_asset_reindex_embeddings(")
     reindex_stop = server_text.index("async def rm_asset_download_link", reindex_start)
     reindex = server_text[reindex_start:reindex_stop]
-    enabled = reindex[:reindex.index(
-        "    try:\n        result = await asset_embedding_index.reindex"
-    )]
-
-    assert (
-        "await remember_me_host_bundle.presenter."
-        "rm_asset_reindex_embeddings"
-    ) in enabled
-    assert "asset_embedding_index" not in enabled
-    assert "repository" not in enabled
-    assert "embedding_engine" not in enabled
-    assert "await asset_embedding_index.reindex" in reindex
+    assert "await backend.mcp_reindex(" in reindex
+    assert "asset_embedding_index" not in reindex
+    assert "repository" not in reindex
+    assert "embedding_engine" not in reindex
+    assert "await backend.reindex(" in reindex
 
     combined = "\n".join(
         (ROOT / name).read_text(encoding="utf-8")
@@ -1649,23 +1650,20 @@ def test_nine_tool_names_order_and_input_schema_fixture_are_unchanged():
     markers = {
         "rm_asset_upload_link": 'source = "remember_me"',
         "rm_asset_upload_status": 'source = "remember_me"',
-        "rm_asset_get": "remember_me_host_bundle.presenter.rm_asset_get",
+        "rm_asset_get": "backend.mcp_get(",
         "rm_asset_update_metadata": (
-            "remember_me_host_bundle.presenter.rm_asset_update_metadata"
+            "backend.mcp_update_metadata("
         ),
         "rm_asset_reindex_embeddings": (
-            "await remember_me_host_bundle.presenter."
-            "rm_asset_reindex_embeddings"
+            "await backend.mcp_reindex("
         ),
         "rm_asset_search": (
-            "await remember_me_host_bundle.presenter.rm_asset_search"
+            "await backend.mcp_search("
         ),
-        "rm_asset_download_link": (
-            "remember_me_host_bundle.presenter.rm_asset_download_link"
-        ),
-        "rm_asset_view": "remember_me_host_bundle.presenter.rm_asset_view",
+        "rm_asset_download_link": "backend.mcp_download_link(",
+        "rm_asset_view": "backend.mcp_view(",
         "rm_asset_inspect": (
-            "remember_me_host_bundle.presenter.rm_asset_inspect"
+            "backend.mcp_inspect("
         ),
     }
     for name, marker in markers.items():
