@@ -431,6 +431,43 @@ class CutoverStateStore:
 
     inspect = get_snapshot
 
+    def load_lease(self, lease_id: str, token: str) -> FreezeLease:
+        """Rehydrate and validate one active lease without changing state.
+
+        The token is accepted only in memory.  The database stores and checks
+        its hash, generation, lease identity, and expiry; no caller should
+        persist or report the plaintext value.
+        """
+        if _LEASE_ID.fullmatch(lease_id or "") is None:
+            raise CutoverStateError("freeze_lease_invalid")
+        if not isinstance(token, str) or not token:
+            raise CutoverStateError("freeze_lease_invalid")
+        connection = self._connect()
+        try:
+            self._assert_schema(connection)
+            row = self._lease_row(connection)
+            self._assert_active_lease(connection, FreezeLease(
+                lease_id=lease_id,
+                token=token,
+                generation=int(row["generation"]) if row is not None else -1,
+                acquired_at=str(row["acquired_at"]) if row is not None else "",
+                expires_at=str(row["expires_at"]) if row is not None else "",
+            ))
+            assert row is not None
+            return FreezeLease(
+                lease_id=lease_id,
+                token=token,
+                generation=int(row["generation"]),
+                acquired_at=str(row["acquired_at"]),
+                expires_at=str(row["expires_at"]),
+            )
+        except CutoverStateError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
     def _snapshot_from_connection(
         self,
         connection: sqlite3.Connection,

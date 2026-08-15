@@ -35,6 +35,14 @@ from asset_cutover_state import (
 )
 from asset_storage_layout import AssetStorageLayoutError, validate_asset_storage_layout
 from asset_migration_state import canonical_path_identity
+from cutover_lease_capability import (
+    LeaseCapability,
+    LeaseCapabilityError,
+    capability_path,
+    read_capability,
+    remove_capability,
+    write_capability,
+)
 from remember_me_adapter import (
     EXPECTED_DATA_COMPATIBILITY,
     EXPECTED_MCP_TOOLS,
@@ -43,6 +51,7 @@ from remember_me_adapter import (
     EXPECTED_SANITIZER_ID,
     RememberMeAdapter,
     inspect_remember_me_contract,
+    validate_remember_me_contract,
 )
 
 
@@ -826,6 +835,33 @@ def _acquire_lease(state: CutoverStateStore, inputs: MigrationInputs, snapshot: 
         raise CutoverMigrationError(code, exit_code=EXIT_LEASE_LOST if code == "migration_freeze_lost" else EXIT_WORKSPACE_INVALID) from exc
 
 
+def _load_or_acquire_lease(
+    state: CutoverStateStore,
+    inputs: MigrationInputs,
+    source_snapshot: SourceSnapshot,
+    ttl_seconds: int,
+    *,
+    lease_capability_file: str | Path | None,
+    allowed_states: set[CutoverState],
+) -> tuple[FreezeLease, MutationCapability]:
+    """Use the one operator capability for every C phase when supplied."""
+    if lease_capability_file is None:
+        return _acquire_lease(state, inputs, source_snapshot, ttl_seconds)
+    try:
+        cap = read_capability(lease_capability_file, state_root=inputs.state_db_path.parent)
+        lease = state.load_lease(cap.lease_id, cap.token)
+        snapshot = state.get_snapshot()
+        if snapshot.state not in allowed_states or snapshot.migration_identity != _migration_identity(inputs, source_snapshot):
+            raise CutoverMigrationError("migration_identity_mismatch", exit_code=EXIT_WORKSPACE_INVALID)
+        lease = _renew(state, lease, ttl_seconds)
+        return lease, state.issue_privileged_capability(lease, purpose="rm-migration-write")
+    except LeaseCapabilityError as exc:
+        raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
+    except CutoverStateError as exc:
+        code = "migration_freeze_lost" if exc.code.startswith("freeze_") or exc.code == "capability_invalid" else exc.code
+        raise CutoverMigrationError(code, exit_code=EXIT_LEASE_LOST if code == "migration_freeze_lost" else EXIT_WORKSPACE_INVALID) from exc
+
+
 def _renew(state: CutoverStateStore, lease: FreezeLease, ttl_seconds: int) -> FreezeLease:
     try:
         return state.renew_freeze(lease, ttl_seconds=ttl_seconds)
@@ -836,6 +872,174 @@ def _renew(state: CutoverStateStore, lease: FreezeLease, ttl_seconds: int) -> Fr
 def _load_progress(inputs: MigrationInputs, *, read_only: bool = False) -> tuple[ProgressStore, Checkpoint | None]:
     store = ProgressStore(inputs.progress_db_path, read_only=read_only)
     return store, store.load()
+
+
+def _exact_contract() -> dict[str, Any]:
+    try:
+        actual = validate_remember_me_contract(inspect_remember_me_contract())
+    except Exception as exc:
+        raise CutoverMigrationError("remember_me_contract_invalid", exit_code=EXIT_WORKSPACE_INVALID) from exc
+    if (
+        actual.package_version != EXPECTED_PACKAGE_VERSION
+        or actual.data_compatibility != EXPECTED_DATA_COMPATIBILITY
+        or actual.sanitizer_id != EXPECTED_SANITIZER_ID
+        or actual.pillow_range != EXPECTED_PILLOW_RANGE
+        or tuple(actual.mcp_tools) != tuple(EXPECTED_MCP_TOOLS)
+    ):
+        raise CutoverMigrationError("remember_me_contract_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+    return {
+        "status": "PASS",
+        "package_version": actual.package_version,
+        "data_compatibility": actual.data_compatibility,
+        "sanitizer_id": actual.sanitizer_id,
+        "pillow_range": actual.pillow_range,
+        "mcp_tool_count": len(actual.mcp_tools),
+    }
+
+
+def _execution_roots(legacy_root: str | Path, rm_root: str | Path, state_db: str | Path) -> tuple[Path, Path, Path]:
+    legacy = _validate_absolute_file(legacy_root, "legacy_root")
+    rm = _validate_absolute_file(rm_root, "rm_root")
+    state_path = _validate_absolute_file(state_db, "state_db")
+    if state_path.name != "migration.sqlite3":
+        raise CutoverMigrationError("state_db_name_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+    try:
+        layout = validate_asset_storage_layout(legacy, rm, state_path.parent)
+    except AssetStorageLayoutError as exc:
+        raise CutoverMigrationError(exc.code, exit_code=EXIT_WORKSPACE_INVALID) from exc
+    return layout.legacy_root, layout.rm_root, layout.state_root
+
+
+def initialize_cutover(
+    *,
+    legacy_root: str | Path,
+    rm_root: str | Path,
+    state_db: str | Path,
+    report: str | Path | None = None,
+) -> dict[str, Any]:
+    """Explicitly create the RM root and state DB after bootstrap backup PASS."""
+    legacy, rm, state_root = _execution_roots(legacy_root, rm_root, state_db)
+    if not legacy.is_dir():
+        raise CutoverMigrationError("legacy_root_missing", exit_code=EXIT_WORKSPACE_INVALID)
+    contract = _exact_contract()
+    state_path = state_root / "migration.sqlite3"
+    if rm.exists():
+        if rm.is_symlink() or not rm.is_dir():
+            raise CutoverMigrationError("rm_root_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+        try:
+            if any(rm.iterdir()):
+                raise CutoverMigrationError("rm_root_preexisting_content", exit_code=EXIT_WORKSPACE_INVALID)
+        except OSError as exc:
+            raise CutoverMigrationError("rm_root_unreadable", exit_code=EXIT_WORKSPACE_INVALID) from exc
+    if state_root.exists():
+        if state_root.is_symlink() or not state_root.is_dir():
+            raise CutoverMigrationError("state_root_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+        try:
+            unexpected = [item for item in state_root.iterdir() if item != state_path]
+        except OSError as exc:
+            raise CutoverMigrationError("state_root_unreadable", exit_code=EXIT_WORKSPACE_INVALID) from exc
+        if unexpected:
+            raise CutoverMigrationError("state_root_preexisting_content", exit_code=EXIT_WORKSPACE_INVALID)
+    if state_path.exists() and not state_path.is_file():
+        raise CutoverMigrationError("state_db_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+    try:
+        if not rm.exists():
+            rm.mkdir(parents=False, exist_ok=False)
+        if state_path.is_file():
+            state = CutoverStateStore(state_path)
+            snapshot = state.get_snapshot()
+            if not (
+                snapshot.state is CutoverState.LEGACY_AUTHORITY_RM_READY
+                and snapshot.authority.value == "legacy"
+                and snapshot.rm_available
+                and snapshot.freeze_status == "open"
+                and snapshot.lease_id is None
+                and snapshot.migration_identity is None
+            ):
+                raise CutoverMigrationError("cutover_state_not_idempotent", exit_code=EXIT_WORKSPACE_INVALID)
+            initialized = False
+        else:
+            state = CutoverStateStore(state_path)
+            state.set_rm_available(True)
+            state.transition(CutoverState.LEGACY_AUTHORITY_RM_READY)
+            snapshot = state.get_snapshot()
+            initialized = True
+    except CutoverStateError as exc:
+        raise CutoverMigrationError(exc.code, exit_code=EXIT_WORKSPACE_INVALID) from exc
+    result = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "phase": "initialize-cutover",
+        "status": "success",
+        "initialized": initialized,
+        "contract": contract,
+        "cutover_state": {
+            "state": snapshot.state.value,
+            "authority": snapshot.authority.value,
+            "rm_available": snapshot.rm_available,
+            "freeze_status": snapshot.freeze_status,
+        },
+        "production_access_occurred": False,
+        "authority_switch_implemented": False,
+    }
+    if report is not None:
+        _atomic_json_write(_validate_absolute_file(report, "report"), result)
+    return result
+
+
+def acquire_freeze(
+    inputs: MigrationInputs,
+    *,
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+    lease_capability_file: str | Path | None = None,
+) -> dict[str, Any]:
+    """Acquire the sole migration lease and publish its local capability."""
+    started = _timestamp()
+    if lease_capability_file is None:
+        lease_capability_file = capability_path(inputs.state_db_path.parent)
+    state: CutoverStateStore | None = None
+    try:
+        if not isinstance(lease_ttl_seconds, int) or isinstance(lease_ttl_seconds, bool) or lease_ttl_seconds <= 0:
+            raise CutoverMigrationError("freeze_ttl_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+        source = ReadOnlyLegacySource(inputs.legacy_root)
+        source_snapshot = source.snapshot()
+        if not inputs.state_db_path.is_file():
+            raise CutoverMigrationError("state_db_missing", exit_code=EXIT_WORKSPACE_INVALID)
+        state = _state_store(inputs)
+        snapshot = state.get_snapshot()
+        if snapshot.state is not CutoverState.LEGACY_AUTHORITY_RM_READY or snapshot.freeze_status != "open" or not snapshot.rm_available:
+            raise CutoverMigrationError("cutover_state_not_migration_ready", exit_code=EXIT_WORKSPACE_INVALID)
+        cap_path = Path(lease_capability_file).expanduser().resolve(strict=False)
+        if cap_path.exists():
+            raise CutoverMigrationError("capability_exists", exit_code=EXIT_LEASE_LOST)
+        identity = _migration_identity(inputs, source_snapshot)
+        try:
+            lease = state.acquire_freeze(
+                expected_state=CutoverState.LEGACY_AUTHORITY_RM_READY,
+                frozen_state=CutoverState.FROZEN_LEGACY_MIGRATION,
+                ttl_seconds=lease_ttl_seconds,
+                migration_identity=identity,
+            )
+            write_capability(cap_path, LeaseCapability(lease.lease_id, lease.token), state_root=inputs.state_db_path.parent)
+        except LeaseCapabilityError as exc:
+            try:
+                state.release_freeze(lease, target_state=CutoverState.LEGACY_AUTHORITY_RM_READY)
+            except Exception:
+                pass
+            raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
+        except CutoverStateError as exc:
+            raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
+        report = _base_report(inputs, started, status="success", exit_code=EXIT_SUCCESS)
+        report.update({
+            "phase": "acquire-freeze",
+            "freeze_lease_id": lease.lease_id,
+            "cutover_state": _read_cutover_snapshot(inputs.state_db_path),
+            "capability_file": "created",
+        })
+        return report
+    except CutoverMigrationError as exc:
+        return _error_report(inputs, started, "acquire-freeze", exc)
 
 
 def preflight_local(inputs: MigrationInputs) -> dict[str, Any]:
@@ -915,6 +1119,7 @@ def migrate(
     max_batches: int | None = None,
     resume: bool = False,
     runtime: Any | None = None,
+    lease_capability_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = _timestamp()
     state: CutoverStateStore | None = None
@@ -936,8 +1141,14 @@ def migrate(
             return report
         elif not resume and checkpoint.status in {"paused", "blocked", "failed"}:
             raise CutoverMigrationError("explicit_resume_required", exit_code=EXIT_MIGRATION_BLOCKED)
+        if lease_capability_file is not None and not inputs.state_db_path.is_file():
+            raise CutoverMigrationError("state_db_missing", exit_code=EXIT_WORKSPACE_INVALID)
         state = _state_store(inputs)
-        lease, capability = _acquire_lease(state, inputs, source_snapshot, lease_ttl_seconds)
+        lease, capability = _load_or_acquire_lease(
+            state, inputs, source_snapshot, lease_ttl_seconds,
+            lease_capability_file=lease_capability_file,
+            allowed_states={CutoverState.FROZEN_LEGACY_MIGRATION},
+        )
         if runtime is None:
             runtime = _create_runtime(inputs)
         target = CapabilityBoundRmTarget(runtime.service, state, capability)
@@ -996,6 +1207,7 @@ def reconcile(
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
     runtime: Any | None = None,
     resume: bool = False,
+    lease_capability_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = _timestamp()
     state: CutoverStateStore | None = None
@@ -1009,10 +1221,16 @@ def reconcile(
         _check_checkpoint_identity(checkpoint, inputs, source_snapshot)
         if checkpoint.status != "completed":
             raise CutoverMigrationError("migration_not_completed", exit_code=EXIT_RECONCILIATION_FAILED)
+        if lease_capability_file is not None and not inputs.state_db_path.is_file():
+            raise CutoverMigrationError("state_db_missing", exit_code=EXIT_WORKSPACE_INVALID)
         state = _state_store(inputs)
-        if state.get_snapshot().freeze_status == "active" and not resume:
+        if state.get_snapshot().freeze_status == "active" and not resume and lease_capability_file is None:
             raise CutoverMigrationError("freeze_active_resume_required", exit_code=EXIT_LEASE_LOST)
-        lease, capability = _acquire_lease(state, inputs, source_snapshot, lease_ttl_seconds)
+        lease, capability = _load_or_acquire_lease(
+            state, inputs, source_snapshot, lease_ttl_seconds,
+            lease_capability_file=lease_capability_file,
+            allowed_states={CutoverState.FROZEN_LEGACY_MIGRATION},
+        )
         if runtime is None:
             runtime = _create_runtime(inputs)
         target = CapabilityBoundRmTarget(runtime.service, state, capability)
@@ -1073,6 +1291,7 @@ def verify(
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
     runtime: Any | None = None,
     resume: bool = False,
+    lease_capability_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = _timestamp()
     progress: ProgressStore | None = None
@@ -1085,10 +1304,16 @@ def verify(
         _check_checkpoint_identity(checkpoint, inputs, source_snapshot)
         if checkpoint.reconciliation_status != "passed":
             raise CutoverMigrationError("reconciliation_gate_not_passed", exit_code=EXIT_RECONCILIATION_FAILED)
+        if lease_capability_file is not None and not inputs.state_db_path.is_file():
+            raise CutoverMigrationError("state_db_missing", exit_code=EXIT_WORKSPACE_INVALID)
         state = _state_store(inputs)
-        if state.get_snapshot().freeze_status == "active" and not resume:
+        if state.get_snapshot().freeze_status == "active" and not resume and lease_capability_file is None:
             raise CutoverMigrationError("freeze_active_resume_required", exit_code=EXIT_LEASE_LOST)
-        lease, capability = _acquire_lease(state, inputs, source_snapshot, lease_ttl_seconds)
+        lease, capability = _load_or_acquire_lease(
+            state, inputs, source_snapshot, lease_ttl_seconds,
+            lease_capability_file=lease_capability_file,
+            allowed_states={CutoverState.FROZEN_READY_FOR_RM_SWITCH},
+        )
         if runtime is None:
             runtime = _create_runtime(inputs)
         adapter = ProductionImportAdapter(source, CapabilityBoundRmTarget(runtime.service, state, capability))
@@ -1141,6 +1366,7 @@ def reindex(
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
     runtime: Any | None = None,
     resume: bool = False,
+    lease_capability_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = _timestamp()
     progress: ProgressStore | None = None
@@ -1155,10 +1381,16 @@ def reindex(
         _check_checkpoint_identity(checkpoint, inputs, source_snapshot)
         if checkpoint.reconciliation_status != "passed" or checkpoint.verification_status != "passed":
             raise CutoverMigrationError("vector_reindex_gate_not_passed", exit_code=EXIT_MIGRATION_FAILED)
+        if lease_capability_file is not None and not inputs.state_db_path.is_file():
+            raise CutoverMigrationError("state_db_missing", exit_code=EXIT_WORKSPACE_INVALID)
         state = _state_store(inputs)
-        if state.get_snapshot().freeze_status == "active" and not resume:
+        if state.get_snapshot().freeze_status == "active" and not resume and lease_capability_file is None:
             raise CutoverMigrationError("freeze_active_resume_required", exit_code=EXIT_LEASE_LOST)
-        lease, capability = _acquire_lease(state, inputs, source_snapshot, lease_ttl_seconds)
+        lease, capability = _load_or_acquire_lease(
+            state, inputs, source_snapshot, lease_ttl_seconds,
+            lease_capability_file=lease_capability_file,
+            allowed_states={CutoverState.FROZEN_READY_FOR_RM_SWITCH},
+        )
         if runtime is None:
             runtime = _create_runtime(inputs)
         target = CapabilityBoundRmTarget(runtime.service, state, capability)
@@ -1258,27 +1490,61 @@ def inspect(inputs: MigrationInputs) -> dict[str, Any]:
             progress.close()
 
 
-def abort(inputs: MigrationInputs, *, reason: str, lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS) -> dict[str, Any]:
+def abort(
+    inputs: MigrationInputs,
+    *,
+    reason: str,
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+    lease_capability_file: str | Path | None = None,
+) -> dict[str, Any]:
     started = _timestamp()
     progress: ProgressStore | None = None
     try:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
             raise CutoverMigrationError("abort_reason_invalid", exit_code=EXIT_WORKSPACE_INVALID)
+        source = ReadOnlyLegacySource(inputs.legacy_root)
+        source_snapshot = source.snapshot()
         progress, checkpoint = _load_progress(inputs)
+        if checkpoint is not None:
+            _check_checkpoint_identity(checkpoint, inputs, source_snapshot)
         state = _state_store(inputs)
         snapshot = state.get_snapshot()
         if snapshot.state not in {CutoverState.FROZEN_LEGACY_MIGRATION, CutoverState.FROZEN_READY_FOR_RM_SWITCH}:
             raise CutoverMigrationError("abort_state_invalid", exit_code=EXIT_WORKSPACE_INVALID)
-        if checkpoint is not None:
-            progress.save(_replace_checkpoint(checkpoint, status="aborted", abort_reason=reason.strip(), error_code="operator_abort"))
+        expected_identity = _migration_identity(inputs, source_snapshot)
+        if snapshot.migration_identity != expected_identity:
+            raise CutoverMigrationError("migration_identity_mismatch", exit_code=EXIT_WORKSPACE_INVALID)
         if snapshot.freeze_status == "expired" and snapshot.lease_id:
             state.recover_expired_freeze(expected_lease_id=snapshot.lease_id, target_state=CutoverState.LEGACY_AUTHORITY_RM_READY)
         elif snapshot.freeze_status == "active":
-            raise CutoverMigrationError("abort_requires_active_lease", exit_code=EXIT_LEASE_LOST)
+            if lease_capability_file is None:
+                raise CutoverMigrationError("abort_capability_required", exit_code=EXIT_LEASE_LOST)
+            try:
+                cap = read_capability(lease_capability_file, state_root=inputs.state_db_path.parent)
+                lease = state.load_lease(cap.lease_id, cap.token)
+                if lease.lease_id != snapshot.lease_id:
+                    raise CutoverMigrationError("freeze_lease_invalid", exit_code=EXIT_LEASE_LOST)
+                lease = _renew(state, lease, lease_ttl_seconds)
+                state.transition(CutoverState.LEGACY_AUTHORITY_RM_READY, lease=lease, migration_identity=expected_identity)
+            except LeaseCapabilityError as exc:
+                raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
+            except CutoverStateError as exc:
+                raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
         else:
             raise CutoverMigrationError("freeze_lease_missing", exit_code=EXIT_LEASE_LOST)
+        if checkpoint is not None:
+            checkpoint = _replace_checkpoint(checkpoint, status="aborted", abort_reason=reason.strip(), error_code="operator_abort")
+            progress.save(checkpoint)
+        cleanup = "NOT_REQUESTED"
+        if lease_capability_file is not None:
+            try:
+                remove_capability(lease_capability_file, state_root=inputs.state_db_path.parent)
+                cleanup = "PASS"
+            except LeaseCapabilityError as exc:
+                cleanup = "FAIL"
+                raise CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST) from exc
         report = _base_report(inputs, started, status="success", exit_code=EXIT_SUCCESS)
-        report.update({"phase": "abort", "abort_reason": reason.strip(), "cutover_state": _read_cutover_snapshot(inputs.state_db_path), "checkpoint": progress.load().to_dict() if progress.load() else None})
+        report.update({"phase": "abort", "abort_reason": reason.strip(), "lease_cleanup": cleanup, "cutover_state": _read_cutover_snapshot(inputs.state_db_path), "checkpoint": checkpoint.to_dict() if checkpoint else None})
         return report
     except (CutoverMigrationError, CutoverStateError) as exc:
         error = exc if isinstance(exc, CutoverMigrationError) else CutoverMigrationError(exc.code, exit_code=EXIT_LEASE_LOST if "freeze" in exc.code else EXIT_WORKSPACE_INVALID)
@@ -1370,6 +1636,15 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=TOOL_NAME)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    initialize = subparsers.add_parser("initialize-cutover")
+    initialize.add_argument("--legacy-root", required=True, type=Path)
+    initialize.add_argument("--rm-root", required=True, type=Path)
+    initialize.add_argument("--state-db", required=True, type=Path)
+    initialize.add_argument("--report", required=True, type=Path)
+    acquire = subparsers.add_parser("acquire-freeze")
+    _add_common_arguments(acquire)
+    acquire.add_argument("--lease-ttl-seconds", type=int, default=DEFAULT_LEASE_TTL_SECONDS)
+    acquire.add_argument("--lease-capability-file", type=Path)
     for name in ("preflight-local", "migrate", "reconcile", "verify", "reindex", "inspect", "abort"):
         sub = subparsers.add_parser(name)
         _add_common_arguments(sub)
@@ -1385,6 +1660,8 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--max-new-index-work", type=int, default=DEFAULT_MAX_NEW_INDEX_WORK)
         if name == "abort":
             sub.add_argument("--reason", required=True)
+        if name in {"migrate", "reconcile", "verify", "reindex", "abort"}:
+            sub.add_argument("--lease-capability-file", type=Path)
     return parser
 
 
@@ -1392,21 +1669,32 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "initialize-cutover":
+            result = initialize_cutover(
+                legacy_root=args.legacy_root,
+                rm_root=args.rm_root,
+                state_db=args.state_db,
+                report=args.report,
+            )
+            print(json.dumps(result, ensure_ascii=True, sort_keys=True, indent=2))
+            return 0 if result.get("status") == "success" else EXIT_WORKSPACE_INVALID
         inputs = _inputs_from_args(args)
-        if args.command == "preflight-local":
+        if args.command == "acquire-freeze":
+            report = acquire_freeze(inputs, lease_ttl_seconds=args.lease_ttl_seconds, lease_capability_file=args.lease_capability_file)
+        elif args.command == "preflight-local":
             report = preflight_local(inputs)
         elif args.command == "migrate":
-            report = migrate(inputs, batch_size=args.batch_size, lease_ttl_seconds=args.lease_ttl_seconds, max_batches=args.max_batches, resume=args.resume)
+            report = migrate(inputs, batch_size=args.batch_size, lease_ttl_seconds=args.lease_ttl_seconds, max_batches=args.max_batches, resume=args.resume, lease_capability_file=args.lease_capability_file)
         elif args.command == "reconcile":
-            report = reconcile(inputs, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume)
+            report = reconcile(inputs, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume, lease_capability_file=args.lease_capability_file)
         elif args.command == "verify":
-            report = verify(inputs, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume)
+            report = verify(inputs, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume, lease_capability_file=args.lease_capability_file)
         elif args.command == "reindex":
-            report = reindex(inputs, max_new_index_work=args.max_new_index_work, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume)
+            report = reindex(inputs, max_new_index_work=args.max_new_index_work, lease_ttl_seconds=args.lease_ttl_seconds, resume=args.resume, lease_capability_file=args.lease_capability_file)
         elif args.command == "inspect":
             report = inspect(inputs)
         else:
-            report = abort(inputs, reason=args.reason)
+            report = abort(inputs, reason=args.reason, lease_capability_file=args.lease_capability_file)
         _atomic_json_write(inputs.report_path, report)
         _print_human(report)
         return int(report.get("exit_code", EXIT_INTERNAL_ERROR))
@@ -1437,7 +1725,9 @@ __all__ = [
     "ProgressStore",
     "ReadOnlyLegacySource",
     "abort",
+    "acquire_freeze",
     "build_parser",
+    "initialize_cutover",
     "inspect",
     "main",
     "migrate",

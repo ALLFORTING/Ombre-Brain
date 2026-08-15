@@ -44,6 +44,11 @@ from remember_me_cutover_operations import (
     evaluate_readiness,
     run_frozen_acceptance_checks,
 )
+from cutover_lease_capability import (
+    LeaseCapabilityError,
+    read_capability,
+    remove_capability,
+)
 
 
 TOOL_NAME = "ombre-rm-cutover-transition"
@@ -318,7 +323,7 @@ def _simple_acceptance(checks: Mapping[str, Any], names: tuple[str, ...]) -> dic
 class CutoverTransitionController:
     """Durable D2 transition coordinator for one local cutover state DB."""
 
-    def __init__(self, state_db: str | Path, *, state_store: CutoverStateStore | None = None) -> None:
+    def __init__(self, state_db: str | Path, *, state_store: CutoverStateStore | None = None, capability_file: str | Path | None = None) -> None:
         if isinstance(state_db, bool):
             raise CutoverTransitionError("state_db_invalid")
         try:
@@ -328,6 +333,13 @@ class CutoverTransitionController:
         if not path.is_absolute():
             raise CutoverTransitionError("state_db_not_absolute")
         self.state_db = path.resolve(strict=False)
+        if state_store is None and not self.state_db.is_file():
+            raise CutoverTransitionError("state_db_missing")
+        self.capability_file = (
+            Path(capability_file).expanduser().resolve(strict=False)
+            if capability_file is not None
+            else self.state_db.parent / "operator" / "lease-token.json"
+        )
         try:
             self.state = state_store or CutoverStateStore(self.state_db)
         except CutoverStateError as exc:
@@ -478,24 +490,30 @@ class CutoverTransitionController:
         _safe_id(lease_id, "freeze_lease_invalid")
         if not isinstance(token, str) or not token:
             raise CutoverTransitionError("freeze_lease_invalid")
-        connection = self._connect()
         try:
-            row = connection.execute("SELECT * FROM cutover_freeze WHERE singleton = 1").fetchone()
-            if row is None or str(row["lease_id"]) != lease_id:
-                raise CutoverTransitionError("freeze_lease_invalid")
-            return FreezeLease(
-                lease_id=lease_id,
-                token=token,
-                generation=int(row["generation"]),
-                acquired_at=str(row["acquired_at"]),
-                expires_at=str(row["expires_at"]),
-            )
+            return self.state.load_lease(lease_id, token)
         except CutoverTransitionError:
             raise
-        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
-            raise CutoverTransitionError("transition_db_unavailable") from exc
-        finally:
-            connection.close()
+        except CutoverStateError as exc:
+            raise CutoverTransitionError(exc.code) from exc
+
+    def load_capability(self, path: str | Path | None = None) -> FreezeLease:
+        capability_path = path or self.capability_file
+        if capability_path is None:
+            raise CutoverTransitionError("capability_file_required")
+        try:
+            capability = read_capability(capability_path, state_root=self.state_db.parent)
+        except LeaseCapabilityError as exc:
+            raise CutoverTransitionError(exc.code) from exc
+        return self.load_lease(capability.lease_id, capability.token)
+
+    def _cleanup_capability(self) -> None:
+        if self.capability_file is None:
+            return
+        try:
+            remove_capability(self.capability_file, state_root=self.state_db.parent)
+        except LeaseCapabilityError as exc:
+            raise CutoverTransitionError(exc.code) from exc
 
     def _assert_lease(self, lease: FreezeLease, snapshot: CutoverSnapshot) -> None:
         if not isinstance(lease, FreezeLease) or snapshot.lease_id != lease.lease_id:
@@ -747,6 +765,7 @@ class CutoverTransitionController:
                 freeze_released_at=_now(),
             )
         )
+        self._cleanup_capability()
         return self.status(configured_authority=configured_authority)
 
     def begin_class_a_rollback(
@@ -879,6 +898,7 @@ class CutoverTransitionController:
                 freeze_released_at=_now(),
             )
         )
+        self._cleanup_capability()
         return self.status(configured_authority=configured_authority)
 
     def status(self, *, configured_authority: AssetAuthority | str | None = None) -> dict[str, Any]:
@@ -963,32 +983,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = sub.add_parser("prepare-rm")
     common(prepare)
-    prepare.add_argument("--lease-id", required=True)
-    prepare.add_argument("--lease-token", required=True)
+    prepare.add_argument("--lease-id")
+    prepare.add_argument("--lease-token")
+    prepare.add_argument("--lease-capability-file", type=Path)
     prepare.add_argument("--evidence", required=True, type=Path)
 
     switch = sub.add_parser("switch-to-rm")
     common(switch)
-    switch.add_argument("--lease-id", required=True)
-    switch.add_argument("--lease-token", required=True)
+    switch.add_argument("--lease-id")
+    switch.add_argument("--lease-token")
+    switch.add_argument("--lease-capability-file", type=Path)
     switch.add_argument("--restart-validated", action="store_true")
     switch.add_argument("--rm-available", choices=("true", "false"), default="true")
 
     accept = sub.add_parser("accept-rm")
     common(accept)
-    accept.add_argument("--lease-id", required=True)
-    accept.add_argument("--lease-token", required=True)
+    accept.add_argument("--lease-id")
+    accept.add_argument("--lease-token")
+    accept.add_argument("--lease-capability-file", type=Path)
     accept.add_argument("--checks", required=True, type=Path)
 
     release = sub.add_parser("release-freeze-to-rm")
     common(release)
-    release.add_argument("--lease-id", required=True)
-    release.add_argument("--lease-token", required=True)
+    release.add_argument("--lease-id")
+    release.add_argument("--lease-token")
+    release.add_argument("--lease-capability-file", type=Path)
 
     rollback = sub.add_parser("class-a-rollback")
     common(rollback)
-    rollback.add_argument("--lease-id", required=True)
-    rollback.add_argument("--lease-token", required=True)
+    rollback.add_argument("--lease-id")
+    rollback.add_argument("--lease-token")
+    rollback.add_argument("--lease-capability-file", type=Path)
     rollback.add_argument("--reason", required=True)
     rollback.add_argument("--mode", choices=("prepare", "finalize"), required=True)
     rollback.add_argument("--restart-validated", action="store_true")
@@ -996,26 +1021,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     accept_legacy = sub.add_parser("accept-legacy")
     common(accept_legacy)
-    accept_legacy.add_argument("--lease-id", required=True)
-    accept_legacy.add_argument("--lease-token", required=True)
+    accept_legacy.add_argument("--lease-id")
+    accept_legacy.add_argument("--lease-token")
+    accept_legacy.add_argument("--lease-capability-file", type=Path)
     accept_legacy.add_argument("--checks", required=True, type=Path)
 
     release_legacy = sub.add_parser("release-freeze-to-legacy")
     common(release_legacy)
-    release_legacy.add_argument("--lease-id", required=True)
-    release_legacy.add_argument("--lease-token", required=True)
+    release_legacy.add_argument("--lease-id")
+    release_legacy.add_argument("--lease-token")
+    release_legacy.add_argument("--lease-capability-file", type=Path)
     return parser
+
+
+def _lease_from_args(controller: CutoverTransitionController, args: argparse.Namespace) -> FreezeLease:
+    if args.lease_capability_file is not None:
+        if args.lease_id is not None or args.lease_token is not None:
+            raise CutoverTransitionError("lease_argument_conflict")
+        return controller.load_capability(args.lease_capability_file)
+    if args.lease_id is None or args.lease_token is None:
+        raise CutoverTransitionError("capability_file_required")
+    return controller.load_lease(args.lease_id, args.lease_token)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        controller = CutoverTransitionController(args.state_db)
+        controller = CutoverTransitionController(args.state_db, capability_file=args.lease_capability_file if args.command != "status" else None)
         configured = args.configured_authority
         if args.command == "status":
             result = controller.status(configured_authority=configured)
         else:
-            lease = controller.load_lease(args.lease_id, args.lease_token)
+            lease = _lease_from_args(controller, args)
             if args.command == "prepare-rm":
                 result = controller.prepare_rm_switch(lease, evidence=_json_file(args.evidence), configured_authority=configured)
             elif args.command == "switch-to-rm":

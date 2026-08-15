@@ -137,6 +137,10 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "recover_expired_freeze": "guarded_mutation",
         "_update_state": "guarded_caller_only",
     },
+    "cutover_lease_capability.py": {
+        "write_capability": "isolated_offline_workspace",
+        "remove_capability": "isolated_offline_workspace",
+    },
     "import_memory.py": {
         "save": "guarded_mutation",
     },
@@ -169,6 +173,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
     },
     "remember_me_cutover_migration.py": {
         "_atomic_json_write": "isolated_offline_workspace",
+        "initialize_cutover": "isolated_offline_workspace",
         "__init__": "guarded_caller_only",
         "save": "guarded_caller_only",
     },
@@ -231,6 +236,7 @@ NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
     ("asset_migration_state.py", "_parse_timestamp", 1177, "replace"): "datetime_timezone",
     ("asset_cutover_state.py", "_now", 332, "value.replace"): "datetime_timezone",
     ("asset_cutover_state.py", "_parse_timestamp", 1153, "parsed.replace"): "datetime_timezone",
+    ("asset_cutover_state.py", "_parse_timestamp", 1190, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 250, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 257, "raw.replace"): "string_normalization",
     ("asset_store.py", "_parse_iso8601", 261, "parsed.replace"): "datetime_timezone",
@@ -261,6 +267,7 @@ NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
     ("server.py", "dream", 6137, "bucket_mgr.touch"): "incidental_bucket_activation",
     ("server.py", "dream", 6163, "bucket_mgr.touch"): "incidental_bucket_activation",
     ("utils.py", "apply_display_aliases", 27, "text.replace"): "string_alias_replacement",
+    ("remember_me_cutover_operations.py", "_exclusion_reason", 230, "relative.replace"): "string_normalization",
 }
 
 _CALL_NAMES = {

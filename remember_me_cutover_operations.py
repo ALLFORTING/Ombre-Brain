@@ -41,7 +41,8 @@ from remember_me_cutover_migration import SOURCE_DB_NAME, ReadOnlyLegacySource
 
 TOOL_NAME = "ombre-rm-cutover-operations"
 TOOL_VERSION = "1.0.0-d1"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2})
 BACKUP_FORMAT_VERSION = 1
 PROFILES = frozenset({"legacy-authoritative", "frozen-ready"})
 SHA256_LENGTH = 64
@@ -223,6 +224,13 @@ def _secret_material(relative: str) -> bool:
         or any(token in name for token in ("token", "secret", "password"))
         or name.endswith((".pem", ".key", ".p12", ".pfx"))
     )
+
+
+def _exclusion_reason(relative: str) -> str:
+    lowered = relative.replace("\\", "/").lower()
+    if lowered.endswith("/operator/lease-token.json") or lowered == "operator/lease-token.json":
+        return "lease_capability"
+    return "credential_material"
 
 
 def _sqlite_path(path: Path) -> str:
@@ -432,7 +440,7 @@ def _component_files(
     sqlite_suffixes = (".sqlite", ".sqlite3", ".db")
     for source, relative in candidates:
         if _secret_material(relative):
-            exclusions.append({"relative_path": f"{namespace}/{relative}", "reason": "credential_material"})
+            exclusions.append({"relative_path": f"{namespace}/{relative}", "reason": _exclusion_reason(relative)})
             continue
         if relative.endswith(("-wal", "-shm", "-journal")):
             exclusions.append({"relative_path": f"{namespace}/{relative}", "reason": "sqlite_sidecar"})
@@ -555,7 +563,8 @@ def _manifest_digest(manifest: Mapping[str, Any]) -> str:
 def _validate_manifest(manifest: Any) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         raise CutoverOperationsError("manifest_invalid")
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION or manifest.get("backup_format_version") != BACKUP_FORMAT_VERSION:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS or manifest.get("backup_format_version") != BACKUP_FORMAT_VERSION:
         raise CutoverOperationsError("manifest_version_invalid")
     digest = manifest.get("manifest_sha256")
     if not isinstance(digest, str) or len(digest) != SHA256_LENGTH or _manifest_digest(manifest) != digest:
@@ -569,7 +578,19 @@ def _validate_manifest(manifest: Any) -> dict[str, Any]:
             raise CutoverOperationsError("manifest_invalid")
     if manifest["profile"] not in PROFILES:
         raise CutoverOperationsError("manifest_profile_invalid")
-    _safe_relative(manifest["state_db_relative_path"])
+    state_relative = manifest["state_db_relative_path"]
+    if state_relative is None:
+        if schema_version != 2 or manifest.get("components", {}).get("state", {}).get("present"):
+            raise CutoverOperationsError("manifest_path_invalid")
+    else:
+        _safe_relative(state_relative)
+    components = manifest.get("components")
+    if not isinstance(components, dict):
+        raise CutoverOperationsError("manifest_components_invalid")
+    for name in ("legacy", "remember_me", "state"):
+        component = components.get(name)
+        if not isinstance(component, dict) or not isinstance(component.get("present"), bool):
+            raise CutoverOperationsError("manifest_components_invalid")
     entries = manifest.get("entries")
     if not isinstance(entries, list):
         raise CutoverOperationsError("manifest_entries_invalid")
@@ -636,12 +657,25 @@ def verify_backup(backup_root: str | Path) -> dict[str, Any]:
     for blob in manifest.get("blob_manifest", []):
         if blob.get("status") != "ok":
             failures.append("blob:" + str(blob.get("relative_path", "unknown")))
+    leaked_capabilities = [
+        str(entry.get("relative_path", ""))
+        for entry in manifest["entries"]
+        if str(entry.get("relative_path", "")).lower().endswith("/operator/lease-token.json")
+    ]
+    if leaked_capabilities:
+        failures.append("capability_material_in_backup")
+    capability_excluded = any(
+        item.get("reason") == "lease_capability"
+        for item in manifest.get("exclusions", [])
+        if isinstance(item, dict)
+    )
     return {
         "status": "PASS" if not failures else "FAIL",
         "backup_root": str(root),
         "manifest_sha256": manifest["manifest_sha256"],
         "entry_count": len(manifest["entries"]),
         "failures": failures,
+        "capability_exclusion": "PASS" if capability_excluded else "NOT_PRESENT",
     }
 
 
@@ -900,10 +934,13 @@ def create_backup(
     state_path = _canonical_path(state_db, "state_db")
     roots = _validate_managed_roots(legacy_root, rm_root, state_path.parent)
     legacy, rm, state_root = roots
-    if not legacy.is_dir() or not state_path.is_file():
+    if not legacy.is_dir():
         raise CutoverOperationsError("backup_source_missing")
     if profile == "frozen-ready" and not rm.is_dir():
         raise CutoverOperationsError("rm_source_missing")
+    state_present = state_path.is_file()
+    if profile == "frozen-ready" and not state_present:
+        raise CutoverOperationsError("state_source_missing")
     backup_root = _canonical_path(destination, "backup_destination")
     _safe_destination(backup_root, roots)
     parent = backup_root.parent
@@ -940,7 +977,15 @@ def create_backup(
                 blob = dict(blob)
                 blob["namespace"] = namespace
                 blob_manifest.append(blob)
-        state_info = _read_state_snapshot(state_path)
+        state_info = _read_state_snapshot(state_path) if state_present else {
+            "status": "ABSENT",
+            "authority": AssetAuthority.LEGACY.value,
+            "state": "absent",
+            "freeze_status": "open",
+            "lease_id_present": False,
+            "lease_expires_at_present": False,
+            "migration_identity_hash": None,
+        }
         contract = _contract_info()
         if contract["status"] != "PASS":
             raise CutoverOperationsError("remember_me_contract_invalid")
@@ -958,11 +1003,11 @@ def create_backup(
             },
             "package_contract": contract,
             "state": state_info,
-            "state_db_relative_path": _relative(state_path, state_root),
+            "state_db_relative_path": _relative(state_path, state_root) if state_present else None,
             "components": {
                 "legacy": {"present": legacy.is_dir(), "bytes": _root_bytes(legacy)},
                 "remember_me": {"present": rm.is_dir(), "bytes": _root_bytes(rm)},
-                "state": {"present": state_root.is_dir(), "bytes": _root_bytes(state_root)},
+                "state": {"present": state_present, "bytes": _root_bytes(state_root) if state_present else 0},
             },
             "sqlite": sorted(sqlite_infos, key=lambda item: item["source_relative_path"]),
             "entries": entries,
@@ -973,6 +1018,11 @@ def create_backup(
                 "state": state_info.get("state"),
                 "freeze_status": state_info.get("freeze_status"),
                 "migration_identity_hash": state_info.get("migration_identity_hash"),
+            },
+            "bootstrap": {
+                "state_database": "present" if state_present else "absent",
+                "remember_me_root": "present" if rm.is_dir() else "absent",
+                "restore_preserves_absence": True,
             },
         }
         manifest["manifest_sha256"] = _manifest_digest(manifest)
@@ -1031,8 +1081,20 @@ def restore_backup(
     if any(_is_within(source, path) or _is_within(path, source) for path in destinations):
         raise CutoverOperationsError("restore_backup_collision")
     namespace_roots = {"legacy": destinations[0], "remember-me": destinations[1], "state": destinations[2]}
-    for path in destinations:
-        path.mkdir(parents=True, exist_ok=True)
+    presence = {
+        "legacy": bool(manifest["components"]["legacy"].get("present")),
+        "remember-me": bool(manifest["components"]["remember_me"].get("present")),
+        "state": bool(manifest["components"]["state"].get("present")),
+    }
+    for namespace, path in namespace_roots.items():
+        if presence[namespace]:
+            path.mkdir(parents=True, exist_ok=True)
+        elif path.exists():
+            raise CutoverOperationsError("restore_absent_root_exists")
+    if presence["legacy"]:
+        # The legacy reader owns this directory even when the asset table is
+        # empty; restore the structural directory without inventing content.
+        (destinations[0] / "assets").mkdir(parents=True, exist_ok=True)
     try:
         for entry in manifest["entries"]:
             relative = _safe_relative(entry["relative_path"])
@@ -1046,8 +1108,11 @@ def restore_backup(
             copied = _copy_file(source_file, target)
             if copied["sha256"] != entry["sha256"] or copied["size_bytes"] != entry["size_bytes"]:
                 raise CutoverOperationsError("restore_hash_mismatch")
-        state_relative = _safe_relative(manifest["state_db_relative_path"])
-        restored_state_db = destinations[2] / Path(*state_relative.parts)
+        state_relative_value = manifest["state_db_relative_path"]
+        restored_state_db = (
+            destinations[2] / Path(*_safe_relative(state_relative_value).parts)
+            if state_relative_value is not None else destinations[2] / SOURCE_DB_NAME
+        )
         verification = verify_restored(
             manifest=manifest,
             legacy_root=destinations[0],
@@ -1099,11 +1164,17 @@ def verify_restored(
     except Exception:
         legacy_count = None
         failures.append("legacy_reader")
-    try:
-        state_info = _read_state_snapshot(state_db)
-    except CutoverOperationsError:
+    state_expected = bool(manifest["components"]["state"].get("present"))
+    if state_expected:
+        try:
+            state_info = _read_state_snapshot(state_db)
+        except CutoverOperationsError:
+            state_info = None
+            failures.append("state_reader")
+    else:
         state_info = None
-        failures.append("state_reader")
+        if state_root.exists() or state_db.exists():
+            failures.append("state_absence_not_preserved")
     rm_summary = _source_summary(rm_root, "remember-me")
     if rm_summary["present"] and rm_summary["database"] is not None:
         try:
@@ -1126,7 +1197,7 @@ def verify_restored(
         "sqlite_integrity": "PASS" if not any(item.endswith("reader") for item in failures) else "FAIL",
         "legacy_reader": "PASS" if legacy_count is not None else "FAIL",
         "remember_me_reader": rm_reader,
-        "state_reader": "PASS" if state_info is not None else "FAIL",
+        "state_reader": "PASS" if state_info is not None or not state_expected else "FAIL",
         "legacy_asset_count": legacy_count,
         "remember_me_asset_count": rm_count,
         "rm_authoritative_capable": bool(rm_reader in {"PASS", "NOT_APPLICABLE"} and state_info is not None),
