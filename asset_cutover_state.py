@@ -179,6 +179,27 @@ class BootValidationResult:
     frozen: bool
     requires_recovery: bool
     rm_ready_pending: bool = False
+    coordination_pending: bool = False
+
+
+@dataclass(frozen=True)
+class RmPreparedBootCoordination:
+    """Verified D2 proof for the narrow RM_PREPARED restart window.
+
+    This is intentionally limited to redacted state/lease identity metadata;
+    it never carries a lease token or capability.  The runtime boot seam
+    constructs it only after reading the durable D2 record and matching it to
+    the current cutover snapshot.
+    """
+
+    phase: str
+    expected_authority: AssetAuthority
+    authority_before: AssetAuthority
+    authority_after: AssetAuthority
+    state_before: CutoverState
+    state_after: CutoverState
+    lease_id: str
+    migration_identity: MigrationIdentity
 
 
 class CutoverStateStore:
@@ -1070,12 +1091,14 @@ def validate_cutover_boot(
     snapshot: CutoverSnapshot | None,
     *,
     rm_available: bool,
+    coordination: RmPreparedBootCoordination | None = None,
 ) -> BootValidationResult:
     """Validate a later server boot without mutating state or routing.
 
     With no initialized state, only the legacy selector is accepted.  This is
-    the backward-compatible v1.4.0 behavior; Implementation A does not call
-    this function from server startup.
+    the backward-compatible v1.4.0 behavior.  The optional coordination proof
+    is the one narrow exception for a verified D2 RM_PREPARED restart; all
+    other authority mismatches remain fail-closed.
     """
 
     configured = _coerce_authority(authority)
@@ -1092,7 +1115,32 @@ def validate_cutover_boot(
             requires_recovery=False,
         )
     if snapshot.authority is not configured:
-        raise CutoverStateError("state_authority_ambiguous")
+        if not (
+            configured is AssetAuthority.RM
+            and isinstance(coordination, RmPreparedBootCoordination)
+            and coordination.phase == "RM_PREPARED"
+            and coordination.expected_authority is AssetAuthority.RM
+            and coordination.authority_before is AssetAuthority.LEGACY
+            and coordination.authority_after is AssetAuthority.RM
+            and coordination.state_before is CutoverState.FROZEN_READY_FOR_RM_SWITCH
+            and coordination.state_after is CutoverState.FROZEN_RM_ACCEPTANCE
+            and snapshot.state is CutoverState.FROZEN_READY_FOR_RM_SWITCH
+            and snapshot.authority is AssetAuthority.LEGACY
+            and snapshot.freeze_status == "active"
+            and snapshot.lease_id == coordination.lease_id
+            and snapshot.migration_identity == coordination.migration_identity
+        ):
+            raise CutoverStateError("state_authority_ambiguous")
+        if not snapshot.rm_available or not rm_available:
+            raise CutoverStateError("rm_authority_unavailable")
+        return BootValidationResult(
+            state=snapshot.state,
+            authority=AssetAuthority.RM,
+            writes_allowed=False,
+            frozen=True,
+            requires_recovery=False,
+            coordination_pending=True,
+        )
     if snapshot.freeze_status in {"expired", "missing", "unexpected"}:
         raise CutoverStateError("state_freeze_ambiguous")
     if snapshot.authority is AssetAuthority.RM and not snapshot.rm_available:
@@ -1203,6 +1251,7 @@ __all__ = [
     "MigrationIdentity",
     "MutationCapability",
     "OPEN_STATES",
+    "RmPreparedBootCoordination",
     "VALID_TRANSITIONS",
     "validate_cutover_boot",
 ]

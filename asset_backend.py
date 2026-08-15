@@ -28,6 +28,7 @@ from asset_cutover_state import (
 from asset_mutation_gate import AssetMutationGate
 from asset_storage_layout import validate_asset_storage_layout
 from asset_store import AssetStore, AssetStoreError
+from cutover_boot_coordination import read_rm_prepared_boot_coordination
 
 
 class AssetBackendError(RuntimeError):
@@ -501,11 +502,18 @@ class RuntimeAssetBackendRegistry:
 
     def _validate_boot(self):
         snapshot = self.state_store.get_snapshot() if self.state_store else None
+        coordination = None
+        if snapshot is not None and self.config.authority is AssetAuthority.RM:
+            coordination = read_rm_prepared_boot_coordination(
+                self.state_store.db_path,
+                snapshot,
+            )
         try:
             return validate_cutover_boot(
                 self.config.authority,
                 snapshot,
                 rm_available=self._bundle_provider() is not None,
+                coordination=coordination,
             )
         except CutoverStateError as exc:
             raise AssetBackendError("asset_authority_unavailable") from exc

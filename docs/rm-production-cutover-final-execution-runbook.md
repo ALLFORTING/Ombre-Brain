@@ -266,8 +266,27 @@ OMBRE_RM_DATA_ROOT=/opt/render/project/src/buckets/remember-me
 ```
 
 Perform the controlled restart through the authenticated Render control plane.
-Keep the legacy mount, public contracts, service, disk, instance count, and
-deployment source unchanged. Then run:
+The real server boot must read the verified D2 `RM_PREPARED` coordination
+record and enter `COORDINATION_PENDING`; this is the required restart seam,
+not an optional rehearsal detail. During this boot:
+
+```text
+configured authority = rm
+boot mode            = COORDINATION_PENDING
+selected backend     = rm
+durable authority    = legacy
+durable state        = FROZEN_READY_FOR_RM_SWITCH
+public mutations     = blocked
+legacy fallback      = forbidden
+```
+
+Health/startup may remain available so the operator can complete the handoff,
+but the runtime must not change durable authority or open writes. The boot
+proof is accepted only when the D2 phase, frozen state, active lease identity,
+and migration identity all match; any ordinary authority mismatch remains
+fail-closed. Keep the legacy mount, public contracts, service, disk, instance
+count, and deployment source unchanged. Only after that fresh process has
+started successfully, run:
 
 ```sh
 python -m remember_me_cutover_transition switch-to-rm \
@@ -278,6 +297,13 @@ python -m remember_me_cutover_transition switch-to-rm \
 
 Required: `phase=RM_FROZEN_ACCEPTANCE`, RM authority, active freeze, and public
 mutations blocked.
+
+Do not run `switch-to-rm` before the restart as a workaround. That bypasses
+the restart-validation and frozen-coordination safety model. If a pre-D2 abort
+or expired recovery returns the durable state to
+`LEGACY_AUTHORITY_RM_READY`, D2 status must show no active `RM_PREPARED`
+phase; reacquire a fresh lease and repeat the migration/readiness/prepare
+sequence. Never edit SQLite manually or reuse the old lease/transition record.
 
 ## Phase 9 - Frozen RM acceptance and point of no return
 
@@ -387,12 +413,16 @@ is forbidden; use a separately approved Class B design.
 ## Local command-level rehearsals and restart boundaries
 
 The integration fixture starts with legacy present and RM/state absent and
-invokes the actual module CLIs in separate Python processes. It covers:
+invokes the actual module CLIs in separate Python processes. The restart
+rehearsal also starts the actual server boot path in a fresh Python process
+with the external RM environment, so module cache cannot hide a boot error.
+It covers:
 
 ```text
 backup -> verify-backup -> initialize-cutover -> acquire-freeze -> migrate
 -> reconcile -> verify -> reindex -> readiness-gate -> prepare-rm
--> simulated external authority/restart -> switch-to-rm -> frozen acceptance
+-> external RM authority + fresh server boot (coordination-pending)
+-> switch-to-rm -> frozen acceptance
 -> explicit point-of-no-return -> release -> RM status/read/write checks
 ```
 

@@ -24,6 +24,7 @@ from asset_cutover_state import (
 )
 from asset_dashboard import AssetDashboardService, AssetUpload
 from asset_store import AssetStore
+from remember_me_cutover_transition import CutoverTransitionController, RM_SOURCE_COMMIT
 
 
 def _png_bytes(size=(8, 6), color="purple") -> bytes:
@@ -174,6 +175,56 @@ def _open_rm_state(root: Path) -> CutoverStateStore:
     return store
 
 
+def _prepare_rm_coordination(root: Path) -> tuple[CutoverStateStore, object]:
+    store = CutoverStateStore(root / "state" / "migration.sqlite3")
+    store.set_rm_available(True)
+    store.transition(CutoverState.LEGACY_AUTHORITY_RM_READY)
+    identity = MigrationIdentity("routing-d2", 1, "source", 1, "target")
+    lease = store.acquire_freeze(
+        expected_state=CutoverState.LEGACY_AUTHORITY_RM_READY,
+        frozen_state=CutoverState.FROZEN_LEGACY_MIGRATION,
+        ttl_seconds=300,
+        migration_identity=identity,
+    )
+    store.transition(
+        CutoverState.FROZEN_READY_FOR_RM_SWITCH,
+        lease=lease,
+        migration_identity=identity,
+    )
+    CutoverTransitionController(store.db_path, state_store=store).prepare_rm_switch(
+        lease,
+        evidence={
+            "transition_identity": "routing-d2-transition",
+            "readiness_evidence_id": "routing-d2-readiness",
+            "migration_identity": {
+                "migration_key": "routing-d2",
+                "migration_version": 1,
+                "source_identity": "source",
+                "source_generation": 1,
+                "target_identity": "target",
+            },
+            "dependency": {
+                "version": "0.1.0.dev7",
+                "source_commit": RM_SOURCE_COMMIT,
+            },
+            "rm_runtime_healthy": True,
+            "rm_data_root_healthy": True,
+            "state_healthy": True,
+            "migration_complete": True,
+            "reconciliation_pass": True,
+            "verification_pass": True,
+            "vector_readiness_pass": True,
+            "backup_evidence_present": True,
+            "backup_evidence_id": "routing-d2-backup",
+            "storage_root_validation_pass": True,
+            "disk_readiness_pass": True,
+            "topology_readiness_pass": True,
+            "no_stale_authority": True,
+        },
+    )
+    return store, lease
+
+
 def test_backend_selection_uses_authority_not_rm_presence(tmp_path):
     legacy = AssetStore(tmp_path / "legacy")
     bundle = _bundle(_png_bytes())
@@ -197,6 +248,56 @@ def test_backend_selection_uses_authority_not_rm_presence(tmp_path):
     )
     assert rm_registry.authority is AssetAuthority.RM
     assert rm_registry.selected_backend().name == "rm"
+
+
+def test_rm_prepared_runtime_boot_is_coordination_pending_and_fail_closed(tmp_path):
+    legacy = AssetStore(tmp_path / "legacy")
+    bundle = _bundle(_png_bytes())
+    store, _ = _prepare_rm_coordination(legacy.data_root)
+
+    registry = RuntimeAssetBackendRegistry.from_runtime(
+        legacy_store=legacy,
+        bundle_provider=lambda: bundle,
+        authority_environ={
+            "OMBRE_ASSET_AUTHORITY": "rm",
+            "OMBRE_RM_RUNTIME_ENABLED": "true",
+            "OMBRE_RM_DATA_ROOT": str(legacy.data_root / "remember-me"),
+        },
+    )
+
+    validation = registry._validate_boot()
+    assert validation.coordination_pending is True
+    assert validation.writes_allowed is False
+    assert validation.authority is AssetAuthority.RM
+    assert registry.selected_backend().name == "rm"
+    assert registry.authority is AssetAuthority.RM
+    assert registry._bundle_provider() is bundle
+    assert not registry._validate_boot().requires_recovery
+    with pytest.raises(AssetBackendError, match="^asset_write_frozen$"):
+        registry.selected_backend().create_temp_path()
+
+    snapshot = store.get_snapshot()
+    assert snapshot.state is CutoverState.FROZEN_READY_FOR_RM_SWITCH
+    assert snapshot.authority is AssetAuthority.LEGACY
+    assert snapshot.freeze_status == "active"
+
+
+def test_non_coordination_authority_mismatch_still_fails_closed(tmp_path):
+    legacy = AssetStore(tmp_path / "legacy")
+    store = CutoverStateStore(legacy.data_root / "state" / "migration.sqlite3")
+    store.set_rm_available(True)
+    store.transition(CutoverState.LEGACY_AUTHORITY_RM_READY)
+
+    with pytest.raises(AssetBackendError, match="^asset_authority_unavailable$"):
+        RuntimeAssetBackendRegistry.from_runtime(
+            legacy_store=legacy,
+            bundle_provider=lambda: _bundle(_png_bytes()),
+            authority_environ={
+                "OMBRE_ASSET_AUTHORITY": "rm",
+                "OMBRE_RM_RUNTIME_ENABLED": "true",
+                "OMBRE_RM_DATA_ROOT": str(legacy.data_root / "remember-me"),
+            },
+        )
 
 
 def test_rm_authority_without_available_runtime_fails_closed(tmp_path):
