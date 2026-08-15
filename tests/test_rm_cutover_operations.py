@@ -177,7 +177,7 @@ def test_topology_classification_never_guesses_multiprocess_safety():
 def test_acceptance_primitives_and_readiness_gate_are_pure():
     spec = acceptance_check_spec()
     assert spec["status"] == "READY"
-    assert spec["authority_switch_implemented"] is False
+    assert spec["authority_switch_implemented"] is True
     evidence = {name: True for name in (
         "dependency_exact", "storage_layout", "state_healthy", "freeze_held",
         "legacy_authority_active", "migration_complete", "reconciliation_exact",
@@ -186,7 +186,7 @@ def test_acceptance_primitives_and_readiness_gate_are_pure():
     )}
     gate = evaluate_readiness(evidence)
     assert gate["READY_FOR_AUTHORITY_SWITCH"] == "YES"
-    assert gate["authority_switch_implemented"] is False
+    assert gate["authority_switch_implemented"] is True
     acceptance = run_frozen_acceptance_checks(
         state={"authority": "rm", "frozen": True},
         checks={name: True for name in spec["checks"]},

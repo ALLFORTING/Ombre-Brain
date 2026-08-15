@@ -236,6 +236,21 @@ def test_invalid_state_transitions_and_authority_combinations_fail_closed(tmp_pa
             lease,
             target_state=CutoverState.LEGACY_UNAVAILABLE_RM,
         )
+    with pytest.raises(CutoverStateError, match="^state_transition_invalid$"):
+        store.release_freeze(
+            lease,
+            target_state=CutoverState.LEGACY_AUTHORITY_RM_READY,
+        )
+    store.transition(
+        CutoverState.FROZEN_RM_ROLLBACK,
+        lease=lease,
+        migration_identity=_identity(),
+    )
+    store.transition(
+        CutoverState.FROZEN_LEGACY_ACCEPTANCE,
+        lease=lease,
+        migration_identity=_identity(),
+    )
     store.release_freeze(
         lease,
         target_state=CutoverState.LEGACY_AUTHORITY_RM_READY,

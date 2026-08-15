@@ -182,6 +182,10 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "create_backup": "isolated_offline_workspace",
         "restore_backup": "isolated_offline_workspace",
     },
+    "remember_me_cutover_transition.py": {
+        "_ensure_schema": "isolated_offline_workspace",
+        "_write_record": "isolated_offline_workspace",
+    },
     "remember_me_migration_rehearsal.py": {
         "prepare_rehearsal_workspace": "isolated_offline_workspace",
         "_atomic_write_json": "isolated_offline_workspace",

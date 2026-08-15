@@ -1135,10 +1135,36 @@ def verify_restored(
 
 
 ACCEPTANCE_CHECK_NAMES = (
+    "rm_runtime_healthy",
+    "rm_data_root_persists",
     "rm_healthy",
     "persistence_reopen",
     "authority_consistency",
+    "mcp_backend_selected",
+    "dashboard_backend_selected",
     "mcp_dashboard_routing",
+    "metadata_get",
+    "search",
+    "view",
+    "inspect",
+    "download",
+    "dashboard_list",
+    "dashboard_detail",
+    "dashboard_image",
+    "dashboard_thumbnail",
+    "authorization_privacy",
+    "mutation_freeze_active",
+    "dashboard_upload_rejected",
+    "dashboard_update_rejected",
+    "dashboard_delete_rejected",
+    "mcp_upload_rejected",
+    "mcp_update_rejected",
+    "public_reindex_rejected",
+    "direct_ordinary_rm_write_rejected",
+    "rm_failure_no_legacy_fallback",
+    "legacy_not_authoritative",
+    "restart_state_durable",
+    # Compatibility aliases retained for the D1 acceptance callers.
     "metadata_read",
     "search_read",
     "view_read",
@@ -1156,10 +1182,10 @@ ACCEPTANCE_CHECK_NAMES = (
 def acceptance_check_spec() -> dict[str, Any]:
     return {
         "status": "READY",
-        "authority_switch_implemented": False,
+        "authority_switch_implemented": True,
         "requires_frozen_state": True,
         "checks": list(ACCEPTANCE_CHECK_NAMES),
-        "result_states": ["PASS", "FAIL", "UNKNOWN"],
+        "result_states": ["PASS", "FAIL", "INCOMPLETE"],
     }
 
 
@@ -1184,15 +1210,15 @@ def run_frozen_acceptance_checks(
             observed = value() if callable(value) else value
         except Exception:
             observed = False
-        status = "PASS" if observed is True or (isinstance(observed, Mapping) and observed.get("status") == "PASS") else "FAIL" if observed is False or (isinstance(observed, Mapping) and observed.get("status") == "FAIL") else "UNKNOWN"
+        status = "PASS" if observed is True or (isinstance(observed, Mapping) and observed.get("status") == "PASS") else "FAIL" if observed is False or (isinstance(observed, Mapping) and observed.get("status") == "FAIL") else "INCOMPLETE"
         results[name] = {"status": status}
     state_pass = state.get("authority") == AssetAuthority.RM.value and bool(state.get("frozen"))
-    overall = "PASS" if state_pass and all(item["status"] == "PASS" for item in results.values()) else "FAIL" if any(item["status"] == "FAIL" for item in results.values()) else "UNKNOWN"
+    overall = "PASS" if state_pass and all(item["status"] == "PASS" for item in results.values()) else "FAIL" if any(item["status"] == "FAIL" for item in results.values()) or not state_pass else "INCOMPLETE"
     return {
         "status": overall,
         "checks": results,
         "state_prerequisite": "PASS" if state_pass else "FAIL",
-        "authority_switch_implemented": False,
+        "authority_switch_implemented": True,
         "production_access_occurred": False,
     }
 
@@ -1251,7 +1277,7 @@ def evaluate_readiness(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "status": "PASS" if not blockers else "FAIL",
         "hard_gates": {name: ("PASS" if value is True else "FAIL" if value is False else "UNKNOWN") for name, value in gate_values.items()},
         "blocking_gates": blockers,
-        "authority_switch_implemented": False,
+        "authority_switch_implemented": True,
         "production_access_occurred": False,
     }
     return result

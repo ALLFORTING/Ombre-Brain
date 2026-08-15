@@ -99,7 +99,7 @@ VALID_TRANSITIONS = {
     CutoverState.FROZEN_RM_ACCEPTANCE: {
         CutoverState.FROZEN_RM_ACCEPTANCE,
         CutoverState.RM_AUTHORITY_OPEN,
-        CutoverState.LEGACY_AUTHORITY_RM_READY,
+        CutoverState.FROZEN_RM_ROLLBACK,
     },
     CutoverState.RM_AUTHORITY_OPEN: {
         CutoverState.FROZEN_RM_ROLLBACK,
