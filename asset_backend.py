@@ -28,7 +28,10 @@ from asset_cutover_state import (
 from asset_mutation_gate import AssetMutationGate
 from asset_storage_layout import validate_asset_storage_layout
 from asset_store import AssetStore, AssetStoreError
-from cutover_boot_coordination import read_rm_prepared_boot_coordination
+from cutover_boot_coordination import (
+    read_expired_rm_acceptance_recovery_boot_proof,
+    read_rm_prepared_boot_coordination,
+)
 
 
 class AssetBackendError(RuntimeError):
@@ -503,8 +506,13 @@ class RuntimeAssetBackendRegistry:
     def _validate_boot(self):
         snapshot = self.state_store.get_snapshot() if self.state_store else None
         coordination = None
+        expired_rm_recovery = None
         if snapshot is not None and self.config.authority is AssetAuthority.RM:
             coordination = read_rm_prepared_boot_coordination(
+                self.state_store.db_path,
+                snapshot,
+            )
+            expired_rm_recovery = read_expired_rm_acceptance_recovery_boot_proof(
                 self.state_store.db_path,
                 snapshot,
             )
@@ -512,11 +520,23 @@ class RuntimeAssetBackendRegistry:
             return validate_cutover_boot(
                 self.config.authority,
                 snapshot,
-                rm_available=self._bundle_provider() is not None,
+                rm_available=self._rm_runtime_available(),
                 coordination=coordination,
+                expired_rm_recovery=expired_rm_recovery,
             )
         except CutoverStateError as exc:
             raise AssetBackendError("asset_authority_unavailable") from exc
+
+    def _rm_runtime_available(self) -> bool:
+        try:
+            bundle = self._bundle_provider()
+        except Exception:
+            return False
+        return bool(
+            bundle is not None
+            and getattr(bundle, "core_adapter", None) is not None
+            and getattr(bundle, "presenter", None) is not None
+        )
 
     @property
     def authority(self) -> AssetAuthority:
@@ -535,7 +555,7 @@ class RuntimeAssetBackendRegistry:
         authority = self._validate_boot().authority
         if authority is AssetAuthority.LEGACY:
             return self.legacy_backend
-        if self._bundle_provider() is None:
+        if not self._rm_runtime_available():
             raise AssetBackendError("rm_authority_unavailable")
         return self.rm_backend
 

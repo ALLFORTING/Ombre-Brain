@@ -395,6 +395,18 @@ wrong phase/authority, missing or corrupt transition record, stale or
 mismatched migration/transition identity, unavailable RM, or unsafe
 capability path fails closed.
 
+### Deploying or restarting while the D2 lease is expired
+
+If a deployment includes the recovery CLI while the durable state is already
+expired `FROZEN_RM_ACCEPTANCE`, a fresh process may boot only through the
+verified expired-RM recovery seam. The seam is read-only: it selects RM,
+reports `boot_mode=EXPIRED_RM_RECOVERY` and `recovery_required=true`, keeps
+the state frozen, blocks every public mutation, and forbids legacy fallback.
+It does not read the capability file, rotate a lease, write the D2 record, or
+change acceptance. Immediately run `recover-expired-rm`, verify the new active
+lease, and then continue the normal acceptance flow. Do not use a rollback
+deployment, switch to legacy, or edit SQLite manually to bypass this mode.
+
 ### Active Class A rollback
 
 Class A rollback is a different workflow. It is available only while
