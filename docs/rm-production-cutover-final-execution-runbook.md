@@ -48,7 +48,7 @@ operations: backup verify-backup restore preflight readiness-gate acceptance-che
 migration: preflight-local initialize-cutover acquire-freeze migrate reconcile
            verify reindex inspect abort
 transition: status prepare-rm switch-to-rm accept-rm release-freeze-to-rm
-            class-a-rollback accept-legacy release-freeze-to-legacy
+            recover-expired-rm class-a-rollback accept-legacy release-freeze-to-legacy
 ```
 
 There is no `validate-restart` CLI. `switch-to-rm --restart-validated`
@@ -64,6 +64,7 @@ RM_ROOT=/opt/render/project/src/buckets/remember-me
 STATE_ROOT=/opt/render/project/src/buckets/state
 STATE_DB=/opt/render/project/src/buckets/state/migration.sqlite3
 LEASE_CAPABILITY_FILE=/opt/render/project/src/buckets/state/operator/lease-token.json
+D2_TRANSITION_IDENTITY=<exact value from D2 status>
 MIGRATION_IDENTITY=ombre-rm-production-cutover
 MIGRATION_VERSION=1
 LEASE_TTL_SECONDS=60
@@ -87,6 +88,9 @@ commits; never copy it into the repository. D1 backup excludes it with the
 explicit `lease_capability` reason and verification fails if it appears as an
 entry. The state database stores only the token hash. C/D2 output is redacted.
 RM release, legacy release, and active pre-D2 abort remove the capability file.
+Expired D2 recovery atomically replaces the capability with mode `0600` and
+updates the durable lease hash and D2 binding in one SQLite transaction; it
+never revives the old token.
 
 ## Phase 0 - Identity and preflight
 
@@ -333,6 +337,77 @@ python -m remember_me_cutover_transition release-freeze-to-rm \
 Required after release: `phase=RM_OPEN`, `cutover_state=rm_authority_open`,
 freeze inactive, and `LOSSLESS_ROLLBACK_WINDOW_OPEN=NO`. Successful release
 cleans the capability file; Class A is then forbidden.
+
+## Expired retained lease recovery
+
+An expired retained lease is not an implicit rollback, an acceptance result,
+or permission to open legacy. Public mutations remain blocked while the lease
+is expired. Never edit SQLite, call an internal Python method, reuse the old
+token, or invoke pre-D2 recovery against `FROZEN_RM_ACCEPTANCE`.
+
+### Pre-D2 expired recovery
+
+When the durable phase is `FROZEN_LEGACY_MIGRATION` or
+`FROZEN_READY_FOR_RM_SWITCH`, the supported recovery remains the migration
+`abort` command. It verifies the migration/source identity, preserves RM data
+and evidence, returns to `LEGACY_AUTHORITY_RM_READY`, and removes the
+capability. This path requires the configured runtime to remain legacy during
+the controlled recovery.
+
+### D2 `RM_FROZEN_ACCEPTANCE` expired recovery
+
+When the durable state is `FROZEN_RM_ACCEPTANCE`, authority is `rm`, the
+retained lease is expired, RM is available, and the D2 transition/readiness/
+migration identities still match, run the explicit recovery command below:
+
+```sh
+python -m remember_me_cutover_transition recover-expired-rm \
+  --state-db "$STATE_DB" --configured-authority rm \
+  --lease-capability-file "$LEASE_CAPABILITY_FILE" \
+  --transition-identity "$D2_TRANSITION_IDENTITY" \
+  --lease-ttl-seconds "$LEASE_TTL_SECONDS" --rm-available true
+```
+
+The command requires the existing capability file as an in-memory continuity
+proof, then issues a new lease ID/token/generation. The old lease remains
+invalid. It atomically publishes the new `0600` capability and binds the new
+lease to the existing D2 transition record while preserving RM authority,
+`FROZEN_RM_ACCEPTANCE`, readiness evidence, migration identity, transition
+identity, and any legitimate acceptance result. It does not release the
+freeze, mark acceptance PASS, enter `RM_OPEN`, or enable public writes.
+
+After PASS, verify with the supported `status` command:
+
+```text
+phase=RM_FROZEN_ACCEPTANCE
+authority=rm
+freeze_status=active
+freeze_active=true
+lease_healthy=true
+LOSSLESS_ROLLBACK_WINDOW_OPEN=YES
+rollback_class_currently_available=CLASS_A
+acceptance_status=null (unless it legitimately passed already)
+```
+
+The operator may then run the normal frozen RM acceptance and separately
+obtain owner confirmation before `release-freeze-to-rm`. Any active lease,
+wrong phase/authority, missing or corrupt transition record, stale or
+mismatched migration/transition identity, unavailable RM, or unsafe
+capability path fails closed.
+
+### Active Class A rollback
+
+Class A rollback is a different workflow. It is available only while
+`FROZEN_RM_ACCEPTANCE` has an active retained lease. An expired lease must be
+recovered with `recover-expired-rm` first; it must not be treated as a usable
+Class A capability. After Class A has been prepared or the runtime reaches
+`FROZEN_RM_ROLLBACK`, use only the existing coordinated rollback commands.
+
+### Point of no return / `RM_OPEN`
+
+After `release-freeze-to-rm`, the phase is `RM_OPEN`, the lossless rollback
+window is closed, and expired retained-lease recovery is rejected. Any future
+reverse reconciliation requires a separately approved Class B design.
 
 ## Phase 10 - Post-cutover verification
 

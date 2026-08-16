@@ -124,6 +124,47 @@ def write_capability(path: str | Path, capability: LeaseCapability, *, state_roo
                 pass
 
 
+def replace_capability(path: str | Path, capability: LeaseCapability, *, state_root: str | Path) -> None:
+    """Atomically replace one existing operator capability.
+
+    Recovery rotates the durable lease and therefore must publish the new
+    capability without exposing a partially written file.  The target is
+    still constrained to the canonical operator path and symlink checks are
+    performed before replacement.
+    """
+
+    target = _safe_target(path, state_root)
+    if not isinstance(capability, LeaseCapability) or not capability.lease_id or not capability.token:
+        raise LeaseCapabilityError("capability_invalid")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    raw_path: str | None = None
+    fd: int | None = None
+    try:
+        fd, raw_path = tempfile.mkstemp(prefix=".lease-", dir=target.parent)
+        os.chmod(raw_path, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            fd = None
+            stream.write(_json(capability))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(raw_path, target)
+        raw_path = None
+        os.chmod(target, 0o600)
+    except (OSError, TypeError, ValueError) as exc:
+        raise LeaseCapabilityError("capability_replace_failed") from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if raw_path is not None:
+            try:
+                os.unlink(raw_path)
+            except OSError:
+                pass
+
+
 def remove_capability(path: str | Path, *, state_root: str | Path) -> bool:
     target = _safe_target(path, state_root)
     if not target.exists():
@@ -144,6 +185,7 @@ __all__ = [
     "LeaseCapabilityError",
     "capability_path",
     "read_capability",
+    "replace_capability",
     "remove_capability",
     "write_capability",
 ]

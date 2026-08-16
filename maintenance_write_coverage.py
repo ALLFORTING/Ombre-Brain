@@ -135,10 +135,13 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "transition": "guarded_mutation",
         "release_freeze": "guarded_mutation",
         "recover_expired_freeze": "guarded_mutation",
+        "begin_expired_rm_recovery": "guarded_mutation",
+        "rotate_expired_rm_acceptance": "guarded_mutation",
         "_update_state": "guarded_caller_only",
     },
     "cutover_lease_capability.py": {
         "write_capability": "isolated_offline_workspace",
+        "replace_capability": "isolated_offline_workspace",
         "remove_capability": "isolated_offline_workspace",
     },
     "import_memory.py": {
@@ -223,6 +226,7 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
         ("asset_cutover_state.py", "acquire_freeze"),
         ("asset_cutover_state.py", "transition"),
         ("asset_cutover_state.py", "recover_expired_freeze"),
+        ("asset_cutover_state.py", "rotate_expired_rm_acceptance"),
     },
 }
 
@@ -234,8 +238,8 @@ NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
     ("asset_migration_state.py", "_now", 313, "value.replace"): "datetime_timezone",
     ("asset_migration_state.py", "inspect_existing_migration_state", 1107, "now.replace"): "datetime_timezone",
     ("asset_migration_state.py", "_parse_timestamp", 1177, "replace"): "datetime_timezone",
-    ("asset_cutover_state.py", "_now", 353, "value.replace"): "datetime_timezone",
-    ("asset_cutover_state.py", "_parse_timestamp", 1238, "parsed.replace"): "datetime_timezone",
+    ("asset_cutover_state.py", "_now", 381, "value.replace"): "datetime_timezone",
+    ("asset_cutover_state.py", "_parse_timestamp", 1655, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 250, "parsed.replace"): "datetime_timezone",
     ("asset_store.py", "_parse_iso8601", 257, "raw.replace"): "string_normalization",
     ("asset_store.py", "_parse_iso8601", 261, "parsed.replace"): "datetime_timezone",

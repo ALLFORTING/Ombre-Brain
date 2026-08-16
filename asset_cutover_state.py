@@ -7,6 +7,7 @@ setting ``OMBRE_ASSET_AUTHORITY`` cannot activate RM production routing.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -150,6 +151,19 @@ class FreezeLease:
             self.generation,
             True,
         )
+
+
+@dataclass(frozen=True)
+class ExpiredRmRecoveryPending:
+    """Redacted journal for an interrupted D2 lease rotation."""
+
+    expected_lease_id: str
+    replacement_lease_id: str
+    replacement_token_hash: str
+    generation: int
+    acquired_at: str
+    expires_at: str
+    transition_identity: str
 
 
 @dataclass(frozen=True)
@@ -312,6 +326,20 @@ class CutoverStateStore:
                     )
                     """
                 )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cutover_expired_rm_recovery (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        expected_lease_id TEXT NOT NULL,
+                        replacement_lease_id TEXT NOT NULL,
+                        replacement_token_hash TEXT NOT NULL,
+                        generation INTEGER NOT NULL CHECK (generation >= 0),
+                        acquired_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        transition_identity TEXT NOT NULL
+                    )
+                    """
+                )
                 existing = connection.execute(
                     "SELECT singleton FROM cutover_state WHERE singleton = 1"
                 ).fetchone()
@@ -404,6 +432,21 @@ class CutoverStateStore:
                 raise CutoverStateError("freeze_lease_invalid")
             if int(freeze["generation"]) < 0:
                 raise CutoverStateError("freeze_lease_invalid")
+        pending = connection.execute(
+            "SELECT * FROM cutover_expired_rm_recovery WHERE singleton = 1"
+        ).fetchone()
+        if pending is not None:
+            if state is not CutoverState.FROZEN_RM_ACCEPTANCE:
+                raise CutoverStateError("recovery_marker_invalid")
+            if (
+                _LEASE_ID.fullmatch(str(pending["expected_lease_id"])) is None
+                or _LEASE_ID.fullmatch(str(pending["replacement_lease_id"])) is None
+                or _TOKEN_HASH.fullmatch(str(pending["replacement_token_hash"])) is None
+                or int(pending["generation"]) < 0
+                or not isinstance(pending["transition_identity"], str)
+                or not pending["transition_identity"]
+            ):
+                raise CutoverStateError("recovery_marker_invalid")
 
     def _read_identity(self, row: sqlite3.Row) -> MigrationIdentity | None:
         values = [
@@ -813,7 +856,6 @@ class CutoverStateStore:
             if current not in {
                 CutoverState.FROZEN_LEGACY_MIGRATION,
                 CutoverState.FROZEN_READY_FOR_RM_SWITCH,
-                CutoverState.FROZEN_RM_ACCEPTANCE,
             }:
                 raise CutoverStateError("recovery_state_invalid")
             lease_row = self._lease_row(connection)
@@ -842,6 +884,381 @@ class CutoverStateStore:
             )
             connection.commit()
             return self._snapshot_from_connection(connection)
+        except CutoverStateError:
+            connection.rollback()
+            raise
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            connection.rollback()
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
+    def load_expired_lease(self, lease_id: str, token: str) -> FreezeLease:
+        """Validate one expired lease handle without accepting it for writes."""
+
+        if _LEASE_ID.fullmatch(lease_id or "") is None:
+            raise CutoverStateError("freeze_lease_invalid")
+        if not isinstance(token, str) or not token:
+            raise CutoverStateError("freeze_lease_invalid")
+        connection = self._connect()
+        try:
+            self._assert_schema(connection)
+            row = self._lease_row(connection)
+            if row is None:
+                raise CutoverStateError("freeze_lease_invalid")
+            lease = FreezeLease(
+                lease_id=lease_id,
+                token=token,
+                generation=int(row["generation"]),
+                acquired_at=str(row["acquired_at"]),
+                expires_at=str(row["expires_at"]),
+            )
+            self._assert_lease(row, lease)
+            if _parse_timestamp(row["expires_at"]) > self._now():
+                raise CutoverStateError("freeze_lease_still_active")
+            return lease
+        except CutoverStateError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
+    def prepare_expired_rm_acceptance_lease(
+        self,
+        *,
+        expected_lease_id: str,
+        ttl_seconds: int,
+    ) -> FreezeLease:
+        """Create an in-memory replacement lease for expired D2 acceptance.
+
+        This is deliberately read-only.  The caller publishes the capability
+        before asking :meth:`rotate_expired_rm_acceptance` to commit the
+        durable rotation, so an interruption cannot turn the frozen state
+        into an open or legacy state.
+        """
+
+        if _LEASE_ID.fullmatch(expected_lease_id or "") is None:
+            raise CutoverStateError("freeze_lease_invalid")
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
+            raise CutoverStateError("freeze_ttl_invalid")
+        connection = self._connect()
+        try:
+            self._assert_schema(connection)
+            row = self._state_row(connection)
+            current = CutoverState(row["state"])
+            if current is not CutoverState.FROZEN_RM_ACCEPTANCE:
+                raise CutoverStateError("recovery_state_invalid")
+            if not bool(row["rm_available"]):
+                raise CutoverStateError("rm_authority_unavailable")
+            lease_row = self._lease_row(connection)
+            if lease_row is None or lease_row["lease_id"] != expected_lease_id:
+                raise CutoverStateError("freeze_lease_invalid")
+            now = self._now()
+            if _parse_timestamp(lease_row["expires_at"]) > now:
+                raise CutoverStateError("freeze_lease_still_active")
+            expires = now + timedelta(seconds=ttl_seconds)
+            return FreezeLease(
+                lease_id=uuid.uuid4().hex,
+                token=secrets.token_urlsafe(32),
+                generation=int(row["revision"]) + 1,
+                acquired_at=self._timestamp(now),
+                expires_at=self._timestamp(expires),
+            )
+        except CutoverStateError:
+            raise
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
+    def get_expired_rm_recovery_pending(self) -> ExpiredRmRecoveryPending | None:
+        """Return the redacted journal for an interrupted recovery, if any."""
+
+        connection = self._connect()
+        try:
+            self._assert_schema(connection)
+            row = connection.execute(
+                "SELECT * FROM cutover_expired_rm_recovery WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return ExpiredRmRecoveryPending(
+                expected_lease_id=str(row["expected_lease_id"]),
+                replacement_lease_id=str(row["replacement_lease_id"]),
+                replacement_token_hash=str(row["replacement_token_hash"]),
+                generation=int(row["generation"]),
+                acquired_at=str(row["acquired_at"]),
+                expires_at=str(row["expires_at"]),
+                transition_identity=str(row["transition_identity"]),
+            )
+        except CutoverStateError:
+            raise
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
+    def load_pending_expired_rm_recovery_lease(
+        self,
+        pending: ExpiredRmRecoveryPending,
+        token: str,
+    ) -> FreezeLease:
+        """Rehydrate a replacement lease from the redacted recovery journal."""
+
+        if not isinstance(pending, ExpiredRmRecoveryPending) or not isinstance(token, str) or not token:
+            raise CutoverStateError("freeze_lease_invalid")
+        if not secrets.compare_digest(pending.replacement_token_hash, _hash_token(token)):
+            raise CutoverStateError("freeze_lease_invalid")
+        if _parse_timestamp(pending.expires_at) <= self._now():
+            raise CutoverStateError("freeze_lease_expired")
+        return FreezeLease(
+            lease_id=pending.replacement_lease_id,
+            token=token,
+            generation=pending.generation,
+            acquired_at=pending.acquired_at,
+            expires_at=pending.expires_at,
+        )
+
+    @guarded_mutation("cutover_expired_rm_recovery_marker")
+    def begin_expired_rm_recovery(
+        self,
+        *,
+        expected_lease_id: str,
+        replacement_lease: FreezeLease,
+        transition_identity: str,
+    ) -> ExpiredRmRecoveryPending:
+        """Persist a token-free recovery journal while remaining expired/frozen."""
+
+        if _LEASE_ID.fullmatch(expected_lease_id or "") is None:
+            raise CutoverStateError("freeze_lease_invalid")
+        if (
+            not isinstance(replacement_lease, FreezeLease)
+            or _LEASE_ID.fullmatch(replacement_lease.lease_id or "") is None
+            or replacement_lease.lease_id == expected_lease_id
+            or not isinstance(replacement_lease.token, str)
+            or not replacement_lease.token
+            or type(replacement_lease.generation) is not int
+            or replacement_lease.generation < 0
+        ):
+            raise CutoverStateError("freeze_lease_invalid")
+        if not isinstance(transition_identity, str) or not transition_identity:
+            raise CutoverStateError("transition_identity_invalid")
+        connection = self._begin()
+        try:
+            self._assert_schema(connection)
+            row = self._state_row(connection)
+            if CutoverState(row["state"]) is not CutoverState.FROZEN_RM_ACCEPTANCE:
+                raise CutoverStateError("recovery_state_invalid")
+            lease_row = self._lease_row(connection)
+            if lease_row is None or lease_row["lease_id"] != expected_lease_id:
+                raise CutoverStateError("freeze_lease_invalid")
+            if _parse_timestamp(lease_row["expires_at"]) > self._now():
+                raise CutoverStateError("freeze_lease_still_active")
+            if replacement_lease.generation != int(row["revision"]) + 1:
+                raise CutoverStateError("recovery_state_changed")
+            pending = ExpiredRmRecoveryPending(
+                expected_lease_id=expected_lease_id,
+                replacement_lease_id=replacement_lease.lease_id,
+                replacement_token_hash=_hash_token(replacement_lease.token),
+                generation=replacement_lease.generation,
+                acquired_at=replacement_lease.acquired_at,
+                expires_at=replacement_lease.expires_at,
+                transition_identity=transition_identity,
+            )
+            connection.execute(
+                """
+                INSERT INTO cutover_expired_rm_recovery (
+                    singleton, expected_lease_id, replacement_lease_id,
+                    replacement_token_hash, generation, acquired_at,
+                    expires_at, transition_identity
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    expected_lease_id = excluded.expected_lease_id,
+                    replacement_lease_id = excluded.replacement_lease_id,
+                    replacement_token_hash = excluded.replacement_token_hash,
+                    generation = excluded.generation,
+                    acquired_at = excluded.acquired_at,
+                    expires_at = excluded.expires_at,
+                    transition_identity = excluded.transition_identity
+                """,
+                (
+                    pending.expected_lease_id,
+                    pending.replacement_lease_id,
+                    pending.replacement_token_hash,
+                    pending.generation,
+                    pending.acquired_at,
+                    pending.expires_at,
+                    pending.transition_identity,
+                ),
+            )
+            connection.commit()
+            return pending
+        except CutoverStateError:
+            connection.rollback()
+            raise
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            connection.rollback()
+            raise CutoverStateError("state_db_unavailable") from exc
+        finally:
+            connection.close()
+
+    @guarded_mutation("cutover_expired_rm_recovery")
+    def rotate_expired_rm_acceptance(
+        self,
+        *,
+        expected_lease_id: str,
+        replacement_lease: FreezeLease,
+        migration_identity: MigrationIdentity,
+        expected_transition_identity: str,
+        transition_schema_version: int,
+        transition_record_payload: str,
+    ) -> FreezeLease:
+        """Atomically bind a fresh lease to frozen RM acceptance and D2.
+
+        The state, lease generation, and D2 record are committed together in
+        one SQLite transaction.  No branch of this method can open the
+        freeze, change authority, clear migration identity, or fabricate
+        acceptance.
+        """
+
+        if _LEASE_ID.fullmatch(expected_lease_id or "") is None:
+            raise CutoverStateError("freeze_lease_invalid")
+        if not isinstance(replacement_lease, FreezeLease):
+            raise CutoverStateError("freeze_lease_invalid")
+        if (
+            _LEASE_ID.fullmatch(replacement_lease.lease_id or "") is None
+            or replacement_lease.lease_id == expected_lease_id
+            or not isinstance(replacement_lease.token, str)
+            or not replacement_lease.token
+            or type(replacement_lease.generation) is not int
+            or replacement_lease.generation < 0
+        ):
+            raise CutoverStateError("freeze_lease_invalid")
+        _validate_identity(migration_identity)
+        if (
+            not isinstance(expected_transition_identity, str)
+            or not expected_transition_identity
+            or not isinstance(transition_schema_version, int)
+            or isinstance(transition_schema_version, bool)
+            or transition_schema_version < 1
+            or not isinstance(transition_record_payload, str)
+            or not transition_record_payload
+        ):
+            raise CutoverStateError("transition_record_invalid")
+        connection = self._begin()
+        try:
+            self._assert_schema(connection)
+            row = self._state_row(connection)
+            current = CutoverState(row["state"])
+            if current is not CutoverState.FROZEN_RM_ACCEPTANCE:
+                raise CutoverStateError("recovery_state_invalid")
+            if not bool(row["rm_available"]):
+                raise CutoverStateError("rm_authority_unavailable")
+            self._validate_identity_for_transition(
+                row,
+                migration_identity,
+                CutoverState.FROZEN_RM_ACCEPTANCE,
+            )
+            lease_row = self._lease_row(connection)
+            if lease_row is None or lease_row["lease_id"] != expected_lease_id:
+                raise CutoverStateError("freeze_lease_invalid")
+            now = self._now()
+            if _parse_timestamp(lease_row["expires_at"]) > now:
+                raise CutoverStateError("freeze_lease_still_active")
+            if replacement_lease.generation != int(row["revision"]) + 1:
+                raise CutoverStateError("recovery_state_changed")
+            if _parse_timestamp(replacement_lease.expires_at) <= now:
+                raise CutoverStateError("freeze_ttl_invalid")
+
+            try:
+                d2_record = connection.execute(
+                    "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                raise CutoverStateError("transition_record_missing") from exc
+            if d2_record is None:
+                raise CutoverStateError("transition_record_missing")
+            if int(d2_record["schema_version"]) != transition_schema_version:
+                raise CutoverStateError("transition_schema_incompatible")
+            try:
+                current_payload = json.loads(d2_record["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CutoverStateError("transition_record_corrupt") from exc
+            if not isinstance(current_payload, dict):
+                raise CutoverStateError("transition_record_corrupt")
+            if (
+                current_payload.get("transition_identity") != expected_transition_identity
+                or current_payload.get("lease_id") != expected_lease_id
+            ):
+                raise CutoverStateError("transition_identity_mismatch")
+            try:
+                replacement_payload = json.loads(transition_record_payload)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CutoverStateError("transition_record_invalid") from exc
+            expected_migration = {
+                "migration_key": migration_identity.migration_key,
+                "migration_version": migration_identity.migration_version,
+                "source_identity": migration_identity.source_identity,
+                "source_generation": migration_identity.source_generation,
+                "target_identity": migration_identity.target_identity,
+            }
+            if (
+                not isinstance(replacement_payload, dict)
+                or replacement_payload.get("phase") != "RM_FROZEN_ACCEPTANCE"
+                or replacement_payload.get("transition_identity") != expected_transition_identity
+                or replacement_payload.get("lease_id") != replacement_lease.lease_id
+                or replacement_payload.get("lease_generation") != replacement_lease.generation
+                or replacement_payload.get("migration_identity") != expected_migration
+            ):
+                raise CutoverStateError("transition_record_invalid")
+            pending_row = connection.execute(
+                "SELECT * FROM cutover_expired_rm_recovery WHERE singleton = 1"
+            ).fetchone()
+            if (
+                pending_row is None
+                or pending_row["expected_lease_id"] != expected_lease_id
+                or pending_row["replacement_lease_id"] != replacement_lease.lease_id
+                or pending_row["replacement_token_hash"] != _hash_token(replacement_lease.token)
+                or int(pending_row["generation"]) != replacement_lease.generation
+                or pending_row["transition_identity"] != expected_transition_identity
+            ):
+                raise CutoverStateError("recovery_marker_missing")
+
+            revision = int(row["revision"]) + 1
+            connection.execute(
+                """
+                UPDATE cutover_freeze
+                SET lease_id = ?, token_hash = ?, generation = ?,
+                    acquired_at = ?, renewed_at = ?, expires_at = ?
+                WHERE singleton = 1 AND lease_id = ?
+                """,
+                (
+                    replacement_lease.lease_id,
+                    _hash_token(replacement_lease.token),
+                    replacement_lease.generation,
+                    replacement_lease.acquired_at,
+                    replacement_lease.acquired_at,
+                    replacement_lease.expires_at,
+                    expected_lease_id,
+                ),
+            )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise CutoverStateError("recovery_state_changed")
+            self._update_state(connection, revision=revision)
+            connection.execute(
+                """
+                UPDATE d2_transition_record
+                SET schema_version = ?, payload_json = ?
+                WHERE singleton = 1
+                """,
+                (transition_schema_version, transition_record_payload),
+            )
+            connection.execute(
+                "DELETE FROM cutover_expired_rm_recovery WHERE singleton = 1"
+            )
+            connection.commit()
+            return replacement_lease
         except CutoverStateError:
             connection.rollback()
             raise
@@ -1246,6 +1663,7 @@ __all__ = [
     "CutoverState",
     "CutoverStateError",
     "CutoverStateStore",
+    "ExpiredRmRecoveryPending",
     "FROZEN_STATES",
     "FreezeLease",
     "MigrationIdentity",

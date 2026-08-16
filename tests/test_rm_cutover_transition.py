@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sqlite3
 
@@ -13,6 +14,7 @@ from asset_cutover_state import (
     MigrationIdentity,
 )
 from asset_mutation_gate import AssetMutationGate
+from cutover_lease_capability import LeaseCapability, capability_path, write_capability
 from remember_me_cutover_operations import acceptance_check_spec
 from remember_me_cutover_transition import (
     CutoverTransitionController,
@@ -87,6 +89,20 @@ def _all_rm_checks() -> dict[str, bool]:
 
 def _all_legacy_checks() -> dict[str, bool]:
     return {name: True for name in LEGACY_ACCEPTANCE_NAMES}
+
+
+def _rm_acceptance_context(tmp_path: Path):
+    store, lease = _prepared_store(tmp_path)
+    cap = capability_path(store.db_path.parent)
+    write_capability(cap, LeaseCapability(lease.lease_id, lease.token), state_root=store.db_path.parent)
+    controller = CutoverTransitionController(
+        store.db_path,
+        state_store=store,
+        capability_file=cap,
+    )
+    controller.prepare_rm_switch(lease, evidence=_evidence("d2-expired-recovery"))
+    controller.switch_to_rm(lease, configured_authority=AssetAuthority.RM, restart_validated=True)
+    return store, lease, cap, controller
 
 
 def test_successful_cutover_is_restart_safe_and_opens_rm_only_after_acceptance(tmp_path):
@@ -233,6 +249,142 @@ def test_rm_unavailable_and_lease_loss_never_advance_authority(tmp_path):
     with pytest.raises(CutoverTransitionError, match="^freeze_lease_expired$"):
         controller.accept_rm(lease, checks=_all_rm_checks())
     assert CutoverStateStore(store.db_path).get_snapshot().state is CutoverState.FROZEN_RM_ACCEPTANCE
+
+
+def test_expired_rm_recovery_rejects_active_lease_and_naive_legacy_open(tmp_path):
+    store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+    with pytest.raises(CutoverTransitionError, match="^freeze_lease_still_active$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="d2-expired-recovery",
+            lease_capability_file=cap,
+        )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+    with pytest.raises(CutoverStateError, match="^recovery_state_invalid$"):
+        store.recover_expired_freeze(
+            expected_lease_id=lease.lease_id,
+            target_state=CutoverState.LEGACY_AUTHORITY_RM_READY,
+        )
+    assert store.get_snapshot().state is CutoverState.FROZEN_RM_ACCEPTANCE
+    assert store.get_snapshot().authority is AssetAuthority.RM
+    assert not AssetMutationGate(store).public_mutations_allowed()
+
+
+@pytest.mark.parametrize("wrong_phase", ["rm_open", "rm_prepared", "legacy", "rollback"])
+def test_expired_rm_recovery_rejects_wrong_phase(tmp_path, wrong_phase):
+    if wrong_phase == "rm_open":
+        store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+        controller.accept_rm(lease, checks=_all_rm_checks())
+        controller.release_to_rm(lease)
+    elif wrong_phase == "rm_prepared":
+        store, lease = _prepared_store(tmp_path)
+        cap = capability_path(store.db_path.parent)
+        write_capability(cap, LeaseCapability(lease.lease_id, lease.token), state_root=store.db_path.parent)
+        controller = CutoverTransitionController(store.db_path, state_store=store, capability_file=cap)
+        controller.prepare_rm_switch(lease, evidence=_evidence("d2-prepared-only"))
+    elif wrong_phase == "legacy":
+        store = CutoverStateStore(tmp_path / "state" / "migration.sqlite3")
+        store.set_rm_available(True)
+        store.transition(CutoverState.LEGACY_AUTHORITY_RM_READY)
+        lease = None
+        cap = capability_path(store.db_path.parent)
+        controller = CutoverTransitionController(store.db_path, state_store=store, capability_file=cap)
+    else:
+        store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+        controller.begin_class_a_rollback(lease, reason="rollback phase")
+
+    with pytest.raises(CutoverTransitionError, match="^recovery_state_invalid$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="d2-expired-recovery",
+            lease_capability_file=cap,
+        )
+
+
+def test_expired_rm_recovery_rejects_identity_mismatch_and_rm_unavailable(tmp_path):
+    store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+        payload = connection.execute(
+            "SELECT payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone()[0]
+        record = json.loads(payload)
+        record["migration_identity"]["source_generation"] = 999
+        connection.execute(
+            "UPDATE d2_transition_record SET payload_json = ? WHERE singleton = 1",
+            (json.dumps(record, sort_keys=True),),
+        )
+    with pytest.raises(CutoverTransitionError, match="^migration_identity_mismatch$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="d2-expired-recovery",
+            lease_capability_file=cap,
+        )
+
+    with sqlite3.connect(store.db_path) as connection:
+        record["migration_identity"] = {
+            "migration_key": _identity().migration_key,
+            "migration_version": _identity().migration_version,
+            "source_identity": _identity().source_identity,
+            "source_generation": _identity().source_generation,
+            "target_identity": _identity().target_identity,
+        }
+        connection.execute(
+            "UPDATE d2_transition_record SET payload_json = ? WHERE singleton = 1",
+            (json.dumps(record, sort_keys=True),),
+        )
+    with pytest.raises(CutoverTransitionError, match="^rm_authority_unavailable$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="d2-expired-recovery",
+            rm_available=False,
+            lease_capability_file=cap,
+        )
+
+
+def test_expired_rm_recovery_requires_matching_transition_identity(tmp_path):
+    store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+    with pytest.raises(CutoverTransitionError, match="^transition_identity_mismatch$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="stale-transition",
+            lease_capability_file=cap,
+        )
+
+
+def test_expired_rm_recovery_failure_after_capability_publish_stays_frozen(tmp_path, monkeypatch):
+    store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+
+    def fail_rotation(**kwargs):
+        raise CutoverStateError("state_db_unavailable")
+
+    monkeypatch.setattr(store, "rotate_expired_rm_acceptance", fail_rotation)
+    with pytest.raises(CutoverTransitionError, match="^state_db_unavailable$"):
+        controller.recover_expired_rm_acceptance(
+            transition_identity="d2-expired-recovery",
+            lease_capability_file=cap,
+        )
+    snapshot = store.get_snapshot()
+    assert snapshot.state is CutoverState.FROZEN_RM_ACCEPTANCE
+    assert snapshot.authority is AssetAuthority.RM
+    assert snapshot.freeze_status == "expired"
+    assert not AssetMutationGate(store).public_mutations_allowed()
+    assert store.get_expired_rm_recovery_pending() is not None
+    monkeypatch.undo()
+    resumed = controller.recover_expired_rm_acceptance(
+        transition_identity="d2-expired-recovery",
+        lease_capability_file=cap,
+    )
+    assert resumed["freeze_status"] == "active"
+    assert resumed["expired_recovery_pending"] is False
 
 
 def test_idempotency_and_invalid_boundaries_are_explicit(tmp_path):
