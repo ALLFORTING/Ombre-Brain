@@ -30,6 +30,7 @@ CUTOVER_SCHEMA_VERSION = 1
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _TOKEN_HASH = re.compile(r"[0-9a-f]{64}")
 _LEASE_ID = re.compile(r"[0-9a-f]{32}")
+_TRANSITION_ID = re.compile(r"[A-Za-z0-9_.:@/-]{1,160}\Z")
 
 
 class CutoverState(str, Enum):
@@ -194,6 +195,14 @@ class BootValidationResult:
     requires_recovery: bool
     rm_ready_pending: bool = False
     coordination_pending: bool = False
+    boot_mode: str = "NORMAL"
+    legacy_fallback_allowed: bool = True
+
+    @property
+    def recovery_required(self) -> bool:
+        """Operator-facing alias for the existing ``requires_recovery`` field."""
+
+        return self.requires_recovery
 
 
 @dataclass(frozen=True)
@@ -213,6 +222,24 @@ class RmPreparedBootCoordination:
     state_before: CutoverState
     state_after: CutoverState
     lease_id: str
+    migration_identity: MigrationIdentity
+
+
+@dataclass(frozen=True)
+class ExpiredRmAcceptanceRecoveryBootProof:
+    """Redacted proof for the one supported expired D2 restart seam.
+
+    The runtime boot path may use this proof to select RM while remaining
+    frozen and fail-closed.  It intentionally contains no capability or
+    token material and does not authorize any state transition.
+    """
+
+    phase: str
+    expected_authority: AssetAuthority
+    state: CutoverState
+    lease_id: str
+    lease_generation: int
+    transition_identity: str
     migration_identity: MigrationIdentity
 
 
@@ -1509,13 +1536,16 @@ def validate_cutover_boot(
     *,
     rm_available: bool,
     coordination: RmPreparedBootCoordination | None = None,
+    expired_rm_recovery: ExpiredRmAcceptanceRecoveryBootProof | None = None,
 ) -> BootValidationResult:
     """Validate a later server boot without mutating state or routing.
 
     With no initialized state, only the legacy selector is accepted.  This is
     the backward-compatible v1.4.0 behavior.  The optional coordination proof
-    is the one narrow exception for a verified D2 RM_PREPARED restart; all
-    other authority mismatches remain fail-closed.
+    is the one narrow exception for a verified D2 RM_PREPARED restart.  The
+    expired-RM proof is a separate, read-only exception that keeps a verified
+    RM/FROZEN_RM_ACCEPTANCE process available only for operator recovery.
+    All other authority and freeze mismatches remain fail-closed.
     """
 
     configured = _coerce_authority(authority)
@@ -1530,6 +1560,7 @@ def validate_cutover_boot(
             writes_allowed=True,
             frozen=False,
             requires_recovery=False,
+            legacy_fallback_allowed=True,
         )
     if snapshot.authority is not configured:
         if not (
@@ -1557,8 +1588,37 @@ def validate_cutover_boot(
             frozen=True,
             requires_recovery=False,
             coordination_pending=True,
+            boot_mode="COORDINATION_PENDING",
+            legacy_fallback_allowed=False,
         )
     if snapshot.freeze_status in {"expired", "missing", "unexpected"}:
+        if (
+            snapshot.freeze_status == "expired"
+            and configured is AssetAuthority.RM
+            and type(rm_available) is bool
+            and rm_available
+            and isinstance(expired_rm_recovery, ExpiredRmAcceptanceRecoveryBootProof)
+            and expired_rm_recovery.phase == "RM_FROZEN_ACCEPTANCE"
+            and expired_rm_recovery.expected_authority is AssetAuthority.RM
+            and expired_rm_recovery.state is CutoverState.FROZEN_RM_ACCEPTANCE
+            and snapshot.state is CutoverState.FROZEN_RM_ACCEPTANCE
+            and snapshot.authority is AssetAuthority.RM
+            and snapshot.rm_available
+            and snapshot.lease_id == expired_rm_recovery.lease_id
+            and type(expired_rm_recovery.lease_generation) is int
+            and expired_rm_recovery.lease_generation >= 0
+            and _TRANSITION_ID.fullmatch(expired_rm_recovery.transition_identity or "") is not None
+            and snapshot.migration_identity == expired_rm_recovery.migration_identity
+        ):
+            return BootValidationResult(
+                state=snapshot.state,
+                authority=AssetAuthority.RM,
+                writes_allowed=False,
+                frozen=True,
+                requires_recovery=True,
+                boot_mode="EXPIRED_RM_RECOVERY",
+                legacy_fallback_allowed=False,
+            )
         raise CutoverStateError("state_freeze_ambiguous")
     if snapshot.authority is AssetAuthority.RM and not snapshot.rm_available:
         raise CutoverStateError("rm_authority_unavailable")
@@ -1582,6 +1642,7 @@ def validate_cutover_boot(
             frozen=False,
             requires_recovery=False,
             rm_ready_pending=True,
+            legacy_fallback_allowed=configured is AssetAuthority.LEGACY,
         )
     if snapshot.state in FROZEN_STATES:
         return BootValidationResult(
@@ -1590,6 +1651,7 @@ def validate_cutover_boot(
             writes_allowed=False,
             frozen=True,
             requires_recovery=not rm_available,
+            legacy_fallback_allowed=False,
         )
     return BootValidationResult(
         state=snapshot.state,
@@ -1597,6 +1659,7 @@ def validate_cutover_boot(
         writes_allowed=True,
         frozen=False,
         requires_recovery=False,
+        legacy_fallback_allowed=configured is AssetAuthority.LEGACY,
     )
 
 
@@ -1664,6 +1727,7 @@ __all__ = [
     "CutoverStateError",
     "CutoverStateStore",
     "ExpiredRmRecoveryPending",
+    "ExpiredRmAcceptanceRecoveryBootProof",
     "FROZEN_STATES",
     "FreezeLease",
     "MigrationIdentity",

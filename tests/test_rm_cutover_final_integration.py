@@ -132,11 +132,13 @@ except AssetBackendError as exc:
     mutation_error = exc.code
 print(json.dumps({
     "boot": "ok",
+    "boot_mode": validation.boot_mode,
     "selected_backend": registry.selected_backend().name,
     "authority": registry.authority.value,
+    "recovery_required": validation.requires_recovery,
     "coordination_pending": validation.coordination_pending,
     "writes_allowed": validation.writes_allowed,
-    "legacy_fallback_allowed": validation.authority.value == "legacy",
+    "legacy_fallback_allowed": validation.legacy_fallback_allowed,
     "mutation_error": mutation_error,
     "state": registry.snapshot.state.value,
     "durable_authority": registry.snapshot.authority.value,
@@ -686,10 +688,12 @@ def test_true_server_restart_boots_rm_prepared_then_switches(tmp_path):
     assert payload == {
         "authority": "rm",
         "boot": "ok",
+        "boot_mode": "COORDINATION_PENDING",
         "coordination_pending": True,
         "durable_authority": "legacy",
         "legacy_fallback_allowed": False,
         "mutation_error": "asset_write_frozen",
+        "recovery_required": False,
         "selected_backend": "rm",
         "state": "frozen_ready_for_rm_switch",
         "writes_allowed": False,
@@ -980,6 +984,34 @@ def test_expired_d2_recovery_rotates_lease_and_survives_fresh_rm_boot(tmp_path):
     assert expired_status["next_legal_operator_actions"] == ["recover-expired-rm"]
     assert not AssetMutationGate(CutoverStateStore(ws["state_db"])).public_mutations_allowed()
 
+    before_recovery_boot = CutoverStateStore(ws["state_db"]).get_snapshot()
+    with sqlite3.connect(ws["state_db"]) as connection:
+        before_d2_record = connection.execute(
+            "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone()
+
+    recovery_boot = _run_fresh_server_boot(ws)
+    assert recovery_boot.returncode == 0, recovery_boot.stdout + recovery_boot.stderr
+    assert "state_freeze_ambiguous" not in (recovery_boot.stdout + recovery_boot.stderr)
+    assert json.loads(recovery_boot.stdout) == {
+        "authority": "rm",
+        "boot": "ok",
+        "boot_mode": "EXPIRED_RM_RECOVERY",
+        "coordination_pending": False,
+        "durable_authority": "rm",
+        "legacy_fallback_allowed": False,
+        "mutation_error": "asset_write_frozen",
+        "recovery_required": True,
+        "selected_backend": "rm",
+        "state": "frozen_rm_acceptance",
+        "writes_allowed": False,
+    }
+    assert CutoverStateStore(ws["state_db"]).get_snapshot() == before_recovery_boot
+    with sqlite3.connect(ws["state_db"]) as connection:
+        assert connection.execute(
+            "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone() == before_d2_record
+
     checks = _write_json(
         ws["reports"] / "expired-rm-checks.json",
         {name: True for name in acceptance_check_spec()["checks"]},
@@ -1081,10 +1113,12 @@ def test_expired_d2_recovery_rotates_lease_and_survives_fresh_rm_boot(tmp_path):
     assert json.loads(after_recovery_boot.stdout) == {
         "authority": "rm",
         "boot": "ok",
+        "boot_mode": "NORMAL",
         "coordination_pending": False,
         "durable_authority": "rm",
         "legacy_fallback_allowed": False,
         "mutation_error": "asset_write_frozen",
+        "recovery_required": False,
         "selected_backend": "rm",
         "state": "frozen_rm_acceptance",
         "writes_allowed": False,
