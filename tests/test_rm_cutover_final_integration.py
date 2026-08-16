@@ -92,7 +92,9 @@ def _run(
     return combined
 
 
-def _run_fresh_server_boot(ws: dict[str, Path]) -> subprocess.CompletedProcess[str]:
+def _run_fresh_server_boot(
+    ws: dict[str, Path], *, check_health: bool = False
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = os.pathsep.join(
@@ -118,7 +120,7 @@ def _run_fresh_server_boot(ws: dict[str, Path]) -> subprocess.CompletedProcess[s
         [
             sys.executable,
             "-c",
-            """
+            f"""
 import json
 import server
 from asset_backend import AssetBackendError
@@ -130,7 +132,12 @@ try:
     registry.selected_backend().create_temp_path()
 except AssetBackendError as exc:
     mutation_error = exc.code
-print(json.dumps({
+health_status = None
+if {check_health!r}:
+    import asyncio
+
+    health_status = asyncio.run(server.health_check(None)).status_code
+payload = {{
     "boot": "ok",
     "boot_mode": validation.boot_mode,
     "selected_backend": registry.selected_backend().name,
@@ -142,7 +149,10 @@ print(json.dumps({
     "mutation_error": mutation_error,
     "state": registry.snapshot.state.value,
     "durable_authority": registry.snapshot.authority.value,
-}))
+}}
+if health_status is not None:
+    payload["health_status"] = health_status
+print(json.dumps(payload))
 """,
         ],
         cwd=ROOT,
@@ -1146,3 +1156,68 @@ def test_expired_d2_recovery_rotates_lease_and_survives_fresh_rm_boot(tmp_path):
             assert old_token.encode("utf-8") not in path.read_bytes()
     if os.name != "nt":
         assert stat.S_IMODE(ws["cap"].stat().st_mode) == 0o600
+
+
+def test_legacy_expired_d2_record_boots_fresh_rm_runtime_without_writes(tmp_path):
+    ws = _workspace(tmp_path)
+    output: list[str] = []
+    _run_to_ready(ws, output, enter_rm_acceptance=False)
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "prepare-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "legacy",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--evidence",
+            str(ws["reports"] / "readiness-evidence.json"),
+        ],
+        output=output,
+    )
+    _run_rm_switch(ws, output)
+
+    with sqlite3.connect(ws["state_db"]) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+        row = connection.execute(
+            "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone()
+        assert row[0] == 1
+        payload = json.loads(row[1])
+        assert payload.pop("lease_generation") is not None
+        connection.execute(
+            "UPDATE d2_transition_record SET payload_json = ? WHERE singleton = 1",
+            (json.dumps(payload, sort_keys=True),),
+        )
+        before_record = connection.execute(
+            "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone()
+    before_snapshot = CutoverStateStore(ws["state_db"]).get_snapshot()
+
+    boot = _run_fresh_server_boot(ws, check_health=True)
+    combined = boot.stdout + boot.stderr
+    assert boot.returncode == 0, combined
+    assert "state_freeze_ambiguous" not in combined
+    assert json.loads(boot.stdout) == {
+        "authority": "rm",
+        "boot": "ok",
+        "boot_mode": "EXPIRED_RM_RECOVERY",
+        "coordination_pending": False,
+        "durable_authority": "rm",
+        "legacy_fallback_allowed": False,
+        "mutation_error": "asset_write_frozen",
+        "recovery_required": True,
+        "selected_backend": "rm",
+        "state": "frozen_rm_acceptance",
+        "writes_allowed": False,
+        "health_status": 200,
+    }
+    assert CutoverStateStore(ws["state_db"]).get_snapshot() == before_snapshot
+    with sqlite3.connect(ws["state_db"]) as connection:
+        assert connection.execute(
+            "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+        ).fetchone() == before_record
