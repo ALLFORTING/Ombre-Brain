@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
+import stat
 from types import SimpleNamespace
 
 import pytest
 
 from asset_authority import AssetAuthority
 from asset_cutover_state import CutoverState, CutoverStateStore, MigrationIdentity
-from cutover_lease_capability import LeaseCapability, capability_path, read_capability, write_capability
+from cutover_lease_capability import (
+    LeaseCapability,
+    capability_path,
+    read_capability,
+    replace_capability,
+    write_capability,
+)
 from remember_me.core import ImportAssetDisposition
 from remember_me_cutover_migration import (
     MigrationInputs,
@@ -117,6 +125,17 @@ def test_backup_excludes_capability_material_with_explicit_reason(tmp_path):
     assert verify_backup(backup)["capability_exclusion"] == "PASS"
     assert "local-test-capability" not in (backup / "manifest.json").read_text(encoding="utf-8")
     assert not any("lease-token.json" in str(path) for path in backup.rglob("*"))
+
+
+def test_capability_replacement_is_atomic_and_keeps_private_mode(tmp_path):
+    state_root = tmp_path / "state"
+    cap = capability_path(state_root)
+    write_capability(cap, LeaseCapability("0" * 32, "old-token"), state_root=state_root)
+    replace_capability(cap, LeaseCapability("1" * 32, "new-token"), state_root=state_root)
+    current = read_capability(cap, state_root=state_root)
+    assert current == LeaseCapability("1" * 32, "new-token")
+    if os.name != "nt":
+        assert stat.S_IMODE(cap.stat().st_mode) == 0o600
 
 
 def test_initialize_acquire_shared_lease_and_active_abort(tmp_path):

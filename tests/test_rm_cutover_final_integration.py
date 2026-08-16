@@ -11,8 +11,9 @@ import subprocess
 import sys
 
 from PIL import Image
+import pytest
 
-from asset_cutover_state import CutoverState, CutoverStateStore
+from asset_cutover_state import CutoverState, CutoverStateError, CutoverStateStore
 from asset_mutation_gate import AssetMutationGate
 from asset_store import AssetStore
 from cutover_lease_capability import read_capability
@@ -921,3 +922,193 @@ def test_cli_d2_class_a_rollback_preserves_rm_target(tmp_path):
     assert CutoverStateStore(ws["state_db"]).get_snapshot().state is CutoverState.LEGACY_AUTHORITY_RM_READY
     assert (ws["rm"] / "assets.sqlite3").is_file()
     _assert_no_secret_after_cleanup(ws, output, rollback_token)
+
+
+def test_expired_d2_recovery_rotates_lease_and_survives_fresh_rm_boot(tmp_path):
+    ws = _workspace(tmp_path)
+    output: list[str] = []
+    _run_to_ready(ws, output, enter_rm_acceptance=False)
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "prepare-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "legacy",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--evidence",
+            str(ws["reports"] / "readiness-evidence.json"),
+        ],
+        output=output,
+    )
+    coordination_boot = _run_fresh_server_boot(ws)
+    assert coordination_boot.returncode == 0, coordination_boot.stdout + coordination_boot.stderr
+    _run_rm_switch(ws, output)
+
+    old_capability = read_capability(ws["cap"], state_root=ws["state"])
+    old_lease_id = old_capability.lease_id
+    old_token = old_capability.token
+    with sqlite3.connect(ws["state_db"]) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+
+    expired_status = json.loads(
+        _run(
+            "remember_me_cutover_transition",
+            [
+                "status",
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "rm",
+                "--rm-available",
+                "true",
+            ],
+            output=output,
+        )
+    )
+    assert expired_status["phase"] == "RM_FROZEN_ACCEPTANCE"
+    assert expired_status["authority"] == "rm"
+    assert expired_status["freeze_status"] == "expired"
+    assert expired_status["freeze_active"] is False
+    assert expired_status["lease_healthy"] is False
+    assert expired_status["LOSSLESS_ROLLBACK_WINDOW_OPEN"] == "NO"
+    assert expired_status["rollback_class_currently_available"] == "NONE"
+    assert expired_status["next_legal_operator_actions"] == ["recover-expired-rm"]
+    assert not AssetMutationGate(CutoverStateStore(ws["state_db"])).public_mutations_allowed()
+
+    checks = _write_json(
+        ws["reports"] / "expired-rm-checks.json",
+        {name: True for name in acceptance_check_spec()["checks"]},
+    )
+    for command_args in (
+        [
+            "accept-rm",
+            "--checks",
+            str(checks),
+        ],
+        ["release-freeze-to-rm"],
+        [
+            "class-a-rollback",
+            "--reason",
+            "expired retained lease",
+            "--mode",
+            "prepare",
+            "--rm-available",
+            "true",
+        ],
+    ):
+        _run(
+            "remember_me_cutover_transition",
+            [
+                *command_args,
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "rm",
+                "--lease-capability-file",
+                str(ws["cap"]),
+            ],
+            expected=2,
+            output=output,
+        )
+
+    recovered_output = _run(
+        "remember_me_cutover_transition",
+        [
+            "recover-expired-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "rm",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--transition-identity",
+            expired_status["transition_identity"],
+            "--lease-ttl-seconds",
+            "120",
+            "--rm-available",
+            "true",
+        ],
+        output=output,
+    )
+    assert "token" not in recovered_output.lower()
+    new_capability = read_capability(ws["cap"], state_root=ws["state"])
+    assert new_capability.lease_id != old_lease_id
+    with pytest.raises(CutoverStateError, match="^freeze_lease_invalid$"):
+        CutoverStateStore(ws["state_db"]).load_lease(old_lease_id, old_token)
+    with sqlite3.connect(ws["state_db"]) as connection:
+        transition_payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM d2_transition_record WHERE singleton = 1"
+            ).fetchone()[0]
+        )
+        lease_generation = connection.execute(
+            "SELECT generation FROM cutover_freeze WHERE singleton = 1"
+        ).fetchone()[0]
+    assert transition_payload["lease_id"] == new_capability.lease_id
+    assert transition_payload["lease_generation"] == lease_generation
+
+    recovered_status = json.loads(
+        _run(
+            "remember_me_cutover_transition",
+            [
+                "status",
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "rm",
+                "--rm-available",
+                "true",
+            ],
+            output=output,
+        )
+    )
+    assert recovered_status["phase"] == "RM_FROZEN_ACCEPTANCE"
+    assert recovered_status["authority"] == "rm"
+    assert recovered_status["freeze_status"] == "active"
+    assert recovered_status["freeze_active"] is True
+    assert recovered_status["lease_healthy"] is True
+    assert recovered_status["LOSSLESS_ROLLBACK_WINDOW_OPEN"] == "YES"
+    assert recovered_status["rollback_class_currently_available"] == "CLASS_A"
+    assert recovered_status["acceptance_status"] is None
+
+    after_recovery_boot = _run_fresh_server_boot(ws)
+    assert after_recovery_boot.returncode == 0, after_recovery_boot.stdout + after_recovery_boot.stderr
+    assert json.loads(after_recovery_boot.stdout) == {
+        "authority": "rm",
+        "boot": "ok",
+        "coordination_pending": False,
+        "durable_authority": "rm",
+        "legacy_fallback_allowed": False,
+        "mutation_error": "asset_write_frozen",
+        "selected_backend": "rm",
+        "state": "frozen_rm_acceptance",
+        "writes_allowed": False,
+    }
+
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "release-freeze-to-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "rm",
+            "--lease-capability-file",
+            str(ws["cap"]),
+        ],
+        expected=2,
+        output=output,
+    )
+    _run_rm_acceptance(ws, output, passed=True)
+    assert CutoverStateStore(ws["state_db"]).get_snapshot().state is CutoverState.FROZEN_RM_ACCEPTANCE
+    assert old_token not in "\n".join(output)
+    for path in ws["root"].rglob("*"):
+        if path.is_file() and path != ws["cap"]:
+            assert old_token.encode("utf-8") not in path.read_bytes()
+    if os.name != "nt":
+        assert stat.S_IMODE(ws["cap"].stat().st_mode) == 0o600

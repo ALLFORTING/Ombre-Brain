@@ -46,8 +46,10 @@ from remember_me_cutover_operations import (
     run_frozen_acceptance_checks,
 )
 from cutover_lease_capability import (
+    LeaseCapability,
     LeaseCapabilityError,
     read_capability,
+    replace_capability,
     remove_capability,
 )
 
@@ -66,6 +68,7 @@ PHASE_RM_OPEN = "RM_OPEN"
 PHASE_ROLLBACK_PREPARED = "ROLLBACK_PREPARED"
 PHASE_LEGACY_FROZEN_ACCEPTANCE = "LEGACY_FROZEN_ACCEPTANCE"
 PHASE_LEGACY_OPEN = "LEGACY_OPEN"
+DEFAULT_EXPIRED_RM_RECOVERY_TTL_SECONDS = 300
 
 RM_COORDINATION_PHASES = frozenset({PHASE_RM_PREPARED})
 ROLLBACK_COORDINATION_PHASES = frozenset({PHASE_ROLLBACK_PREPARED})
@@ -100,6 +103,7 @@ class TransitionRecord:
     state_before: CutoverState | None
     state_after: CutoverState | None
     lease_id: str | None
+    lease_generation: int | None
     migration_identity: MigrationIdentity | None
     readiness: dict[str, Any]
     acceptance: dict[str, Any]
@@ -218,6 +222,7 @@ def _record_json(record: TransitionRecord) -> dict[str, Any]:
         "state_before": record.state_before.value if record.state_before else None,
         "state_after": record.state_after.value if record.state_after else None,
         "lease_id": record.lease_id,
+        "lease_generation": record.lease_generation,
         "migration_identity": _identity_payload(record.migration_identity),
         "readiness": record.readiness,
         "acceptance": record.acceptance,
@@ -398,6 +403,11 @@ class CutoverTransitionController:
             payload = json.loads(row["payload_json"])
             if not isinstance(payload, Mapping):
                 raise CutoverTransitionError("transition_record_corrupt")
+            lease_generation = payload.get("lease_generation")
+            if lease_generation is not None and (
+                type(lease_generation) is not int or lease_generation < 0
+            ):
+                raise CutoverTransitionError("transition_record_corrupt")
             return TransitionRecord(
                 phase=str(payload.get("phase")),
                 transition_identity=str(payload.get("transition_identity")),
@@ -407,6 +417,7 @@ class CutoverTransitionController:
                 state_before=_state(payload["state_before"]) if payload.get("state_before") else None,
                 state_after=_state(payload["state_after"]) if payload.get("state_after") else None,
                 lease_id=payload.get("lease_id"),
+                lease_generation=lease_generation,
                 migration_identity=_identity_from_payload(payload.get("migration_identity")),
                 readiness=dict(payload.get("readiness") or {}),
                 acceptance=dict(payload.get("acceptance") or {}),
@@ -486,6 +497,7 @@ class CutoverTransitionController:
             state_before=_state(values["state_before"]) if values.get("state_before") else None,
             state_after=_state(values["state_after"]) if values.get("state_after") else None,
             lease_id=values.get("lease_id"),
+            lease_generation=values.get("lease_generation"),
             migration_identity=_identity_from_payload(values.get("migration_identity")),
             readiness=dict(values.get("readiness") or {}),
             acceptance=dict(values.get("acceptance") or {}),
@@ -593,6 +605,7 @@ class CutoverTransitionController:
             state_before=snapshot.state,
             state_after=CutoverState.FROZEN_RM_ACCEPTANCE,
             lease_id=lease.lease_id,
+            lease_generation=lease.generation,
             migration_identity=identity,
             readiness=readiness,
             acceptance={},
@@ -709,6 +722,155 @@ class CutoverTransitionController:
             updated_at=_now(),
         )
         self._write_record(updated)
+        return self.status(configured_authority=configured_authority)
+
+    def _assert_expired_rm_recovery_record(
+        self,
+        snapshot: CutoverSnapshot,
+        record: TransitionRecord | None,
+    ) -> MigrationIdentity:
+        if snapshot.state is not CutoverState.FROZEN_RM_ACCEPTANCE:
+            raise CutoverTransitionError("recovery_state_invalid")
+        if snapshot.authority is not AssetAuthority.RM:
+            raise CutoverTransitionError("authority_coordination_required")
+        if snapshot.freeze_status == "active":
+            raise CutoverTransitionError("freeze_lease_still_active")
+        if snapshot.freeze_status != "expired":
+            raise CutoverTransitionError("freeze_lease_invalid")
+        if record is None:
+            raise CutoverTransitionError("transition_record_missing")
+        if (
+            record.phase != PHASE_RM_FROZEN_ACCEPTANCE
+            or record.expected_authority is not AssetAuthority.RM
+            or record.authority_before is not AssetAuthority.LEGACY
+            or record.authority_after is not AssetAuthority.RM
+            or record.state_before is not CutoverState.FROZEN_READY_FOR_RM_SWITCH
+            or record.state_after is not CutoverState.FROZEN_RM_ACCEPTANCE
+            or record.freeze_released_at is not None
+            or not record.transition_identity
+            or record.transition_identity == "None"
+        ):
+            raise CutoverTransitionError("transition_record_invalid")
+        if record.lease_id != snapshot.lease_id:
+            raise CutoverTransitionError("freeze_lease_invalid")
+        identity = self._assert_identity(snapshot, record)
+        if record.readiness.get("status") != "PASS" or record.readiness.get("READY_FOR_AUTHORITY_SWITCH") != "YES":
+            raise CutoverTransitionError("readiness_evidence_invalid")
+        hard_gates = record.readiness.get("hard_gates")
+        if not isinstance(hard_gates, Mapping) or not hard_gates or any(value != "PASS" for value in hard_gates.values()):
+            raise CutoverTransitionError("readiness_evidence_invalid")
+        return identity
+
+    def recover_expired_rm_acceptance(
+        self,
+        *,
+        configured_authority: AssetAuthority | str = AssetAuthority.RM,
+        rm_available: bool = True,
+        lease_ttl_seconds: int = DEFAULT_EXPIRED_RM_RECOVERY_TTL_SECONDS,
+        transition_identity: str | None = None,
+        lease_capability_file: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Rotate an expired D2 lease without leaving RM frozen acceptance.
+
+        The old capability is validated only as continuity proof and is never
+        renewed.  The replacement capability is atomically published before
+        the state/record transaction; every interruption therefore remains
+        frozen and fail-closed.
+        """
+
+        self._require_config(configured_authority, AssetAuthority.RM)
+        if type(rm_available) is not bool or not rm_available:
+            raise CutoverTransitionError("rm_authority_unavailable")
+        if not isinstance(lease_ttl_seconds, int) or isinstance(lease_ttl_seconds, bool) or lease_ttl_seconds <= 0:
+            raise CutoverTransitionError("freeze_ttl_invalid")
+        expected_transition_identity = _safe_id(transition_identity, "transition_identity_required")
+        snapshot = self.state.get_snapshot()
+        record = self._read_record()
+        identity = self._assert_expired_rm_recovery_record(snapshot, record)
+        assert record is not None
+        if record.transition_identity != expected_transition_identity:
+            raise CutoverTransitionError("transition_identity_mismatch")
+        if not snapshot.rm_available:
+            raise CutoverTransitionError("rm_authority_unavailable")
+        capability_path = lease_capability_file or self.capability_file
+        try:
+            old_capability = read_capability(capability_path, state_root=self.state_db.parent)
+            pending = self.state.get_expired_rm_recovery_pending()
+            if pending is not None:
+                if pending.expected_lease_id != snapshot.lease_id:
+                    raise CutoverTransitionError("recovery_state_changed")
+                if pending.transition_identity != expected_transition_identity:
+                    raise CutoverTransitionError("transition_identity_mismatch")
+                if old_capability.lease_id == pending.replacement_lease_id:
+                    try:
+                        replacement = self.state.load_pending_expired_rm_recovery_lease(
+                            pending,
+                            old_capability.token,
+                        )
+                    except CutoverStateError as exc:
+                        if exc.code != "freeze_lease_expired":
+                            raise
+                        replacement = self.state.prepare_expired_rm_acceptance_lease(
+                            expected_lease_id=snapshot.lease_id or "",
+                            ttl_seconds=lease_ttl_seconds,
+                        )
+                        self.state.begin_expired_rm_recovery(
+                            expected_lease_id=snapshot.lease_id or "",
+                            replacement_lease=replacement,
+                            transition_identity=expected_transition_identity,
+                        )
+                elif old_capability.lease_id == snapshot.lease_id:
+                    self.state.load_expired_lease(old_capability.lease_id, old_capability.token)
+                    replacement = self.state.prepare_expired_rm_acceptance_lease(
+                        expected_lease_id=snapshot.lease_id or "",
+                        ttl_seconds=lease_ttl_seconds,
+                    )
+                    self.state.begin_expired_rm_recovery(
+                        expected_lease_id=snapshot.lease_id or "",
+                        replacement_lease=replacement,
+                        transition_identity=expected_transition_identity,
+                    )
+                else:
+                    raise CutoverTransitionError("freeze_lease_invalid")
+            else:
+                if old_capability.lease_id != snapshot.lease_id:
+                    raise CutoverTransitionError("freeze_lease_invalid")
+                self.state.load_expired_lease(old_capability.lease_id, old_capability.token)
+                replacement = self.state.prepare_expired_rm_acceptance_lease(
+                    expected_lease_id=snapshot.lease_id or "",
+                    ttl_seconds=lease_ttl_seconds,
+                )
+                self.state.begin_expired_rm_recovery(
+                    expected_lease_id=snapshot.lease_id or "",
+                    replacement_lease=replacement,
+                    transition_identity=expected_transition_identity,
+                )
+            updated = self._record_with(
+                record,
+                lease_id=replacement.lease_id,
+                lease_generation=replacement.generation,
+                updated_at=_now(),
+            )
+            replace_capability(
+                capability_path,
+                LeaseCapability(replacement.lease_id, replacement.token),
+                state_root=self.state_db.parent,
+            )
+            try:
+                self.state.rotate_expired_rm_acceptance(
+                    expected_lease_id=snapshot.lease_id or "",
+                    replacement_lease=replacement,
+                    migration_identity=identity,
+                    expected_transition_identity=expected_transition_identity,
+                    transition_schema_version=D2_SCHEMA_VERSION,
+                    transition_record_payload=_canonical(_record_json(updated)),
+                )
+            except CutoverStateError as exc:
+                raise CutoverTransitionError(exc.code) from exc
+        except LeaseCapabilityError as exc:
+            raise CutoverTransitionError(exc.code) from exc
+        except CutoverStateError as exc:
+            raise CutoverTransitionError(exc.code) from exc
         return self.status(configured_authority=configured_authority)
 
     def accept_rm(
@@ -931,7 +1093,10 @@ class CutoverTransitionController:
         if phase == PHASE_RM_PREPARED:
             actions = ["set OMBRE_ASSET_AUTHORITY=rm externally", "controlled restart", "switch-to-rm"]
         elif phase == PHASE_RM_FROZEN_ACCEPTANCE:
-            actions = ["run frozen RM acceptance", "release-freeze-to-rm", "class-a-rollback"]
+            if snapshot.freeze_status == "expired":
+                actions = ["recover-expired-rm"]
+            else:
+                actions = ["run frozen RM acceptance", "release-freeze-to-rm", "class-a-rollback"]
         elif phase == PHASE_ROLLBACK_PREPARED:
             actions = ["set OMBRE_ASSET_AUTHORITY=legacy externally", "controlled restart", "finalize-class-a-rollback"]
         elif phase == PHASE_LEGACY_FROZEN_ACCEPTANCE:
@@ -943,6 +1108,8 @@ class CutoverTransitionController:
         else:
             actions = ["prepare RM switch only after D1 readiness is PASS"]
         lease_healthy = snapshot.freeze_status == "active" and bool(snapshot.lease_id)
+        recovery_pending = self.state.get_expired_rm_recovery_pending()
+        rollback_available = phase == PHASE_RM_FROZEN_ACCEPTANCE and lease_healthy
         return {
             "status": "PASS",
             "tool": TOOL_NAME,
@@ -961,8 +1128,10 @@ class CutoverTransitionController:
             "backup_readiness": current_record.readiness.get("hard_gates", {}).get("backup_evidence_present") if current_record else None,
             "acceptance_status": acceptance_status,
             "legacy_acceptance_status": legacy_acceptance_status,
-            "rollback_class_currently_available": "CLASS_A" if phase == PHASE_RM_FROZEN_ACCEPTANCE else "NONE",
-            "LOSSLESS_ROLLBACK_WINDOW_OPEN": "YES" if phase == PHASE_RM_FROZEN_ACCEPTANCE else "NO",
+            "lease_generation": current_record.lease_generation if current_record else None,
+            "expired_recovery_pending": recovery_pending is not None,
+            "rollback_class_currently_available": "CLASS_A" if rollback_available else "NONE",
+            "LOSSLESS_ROLLBACK_WINDOW_OPEN": "YES" if rollback_available else "NO",
             "legacy_fallback_allowed": phase in {PHASE_NONE, PHASE_LEGACY_OPEN},
             "transition_identity": current_record.transition_identity if current_record else None,
             "migration_identity": _identity_payload(current_record.migration_identity) if current_record else None,
@@ -1021,6 +1190,13 @@ def build_parser() -> argparse.ArgumentParser:
     accept.add_argument("--lease-capability-file", type=Path)
     accept.add_argument("--checks", required=True, type=Path)
 
+    recover = sub.add_parser("recover-expired-rm")
+    common(recover)
+    recover.add_argument("--lease-capability-file", type=Path)
+    recover.add_argument("--transition-identity", required=True)
+    recover.add_argument("--lease-ttl-seconds", type=int, default=DEFAULT_EXPIRED_RM_RECOVERY_TTL_SECONDS)
+    recover.add_argument("--rm-available", choices=("true", "false"), default="true")
+
     release = sub.add_parser("release-freeze-to-rm")
     common(release)
     release.add_argument("--lease-id")
@@ -1069,6 +1245,14 @@ def main(argv: list[str] | None = None) -> int:
         configured = args.configured_authority
         if args.command == "status":
             result = controller.status(configured_authority=configured)
+        elif args.command == "recover-expired-rm":
+            result = controller.recover_expired_rm_acceptance(
+                configured_authority=configured,
+                rm_available=args.rm_available == "true",
+                lease_ttl_seconds=args.lease_ttl_seconds,
+                transition_identity=args.transition_identity,
+                lease_capability_file=args.lease_capability_file,
+            )
         else:
             lease = _lease_from_args(controller, args)
             if args.command == "prepare-rm":
@@ -1115,6 +1299,7 @@ if __name__ == "__main__":
 __all__ = [
     "CutoverTransitionController",
     "CutoverTransitionError",
+    "DEFAULT_EXPIRED_RM_RECOVERY_TTL_SECONDS",
     "LEGACY_ACCEPTANCE_NAMES",
     "PHASE_LEGACY_FROZEN_ACCEPTANCE",
     "PHASE_LEGACY_OPEN",
