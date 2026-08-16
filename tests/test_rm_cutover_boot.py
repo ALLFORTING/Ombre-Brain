@@ -74,8 +74,14 @@ def _proof(snapshot: CutoverSnapshot) -> ExpiredRmAcceptanceRecoveryBootProof:
     )
 
 
-def _record(lease_id: str, generation: int, *, phase: str = "RM_FROZEN_ACCEPTANCE") -> dict[str, object]:
-    return {
+def _record(
+    lease_id: str,
+    generation: int,
+    *,
+    phase: str = "RM_FROZEN_ACCEPTANCE",
+    include_lease_generation: bool = True,
+) -> dict[str, object]:
+    record = {
         "phase": phase,
         "transition_identity": "d2-transition-1",
         "expected_authority": "rm",
@@ -84,7 +90,6 @@ def _record(lease_id: str, generation: int, *, phase: str = "RM_FROZEN_ACCEPTANC
         "state_before": "frozen_ready_for_rm_switch",
         "state_after": "frozen_rm_acceptance",
         "lease_id": lease_id,
-        "lease_generation": generation,
         "migration_identity": _identity_payload(),
         "readiness": {
             "status": "PASS",
@@ -101,9 +106,17 @@ def _record(lease_id: str, generation: int, *, phase: str = "RM_FROZEN_ACCEPTANC
         "updated_at": "2026-08-16T00:00:00+00:00",
         "freeze_released_at": None,
     }
+    if include_lease_generation:
+        record["lease_generation"] = generation
+    return record
 
 
-def _expired_d2_db(tmp_path: Path) -> tuple[CutoverStateStore, dict[str, object]]:
+def _expired_d2_db(
+    tmp_path: Path,
+    *,
+    include_lease_generation: bool = True,
+    freeze_generation: int | None = None,
+) -> tuple[CutoverStateStore, dict[str, object]]:
     store = CutoverStateStore(tmp_path / "state" / "migration.sqlite3")
     store.set_rm_available(True)
     store.transition(CutoverState.LEGACY_AUTHORITY_RM_READY)
@@ -128,7 +141,17 @@ def _expired_d2_db(tmp_path: Path) -> tuple[CutoverStateStore, dict[str, object]
         connection.execute(
             "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
         )
-        record = _record(lease.lease_id, lease.generation)
+        generation = lease.generation if freeze_generation is None else freeze_generation
+        if freeze_generation is not None:
+            connection.execute(
+                "UPDATE cutover_freeze SET generation = ? WHERE singleton = 1",
+                (freeze_generation,),
+            )
+        record = _record(
+            lease.lease_id,
+            generation,
+            include_lease_generation=include_lease_generation,
+        )
         connection.execute(
             "INSERT INTO d2_transition_record (singleton, schema_version, payload_json) VALUES (1, 1, ?)",
             (json.dumps(record, sort_keys=True),),
@@ -199,6 +222,114 @@ def test_read_only_bridge_accepts_only_complete_current_d2_record(tmp_path):
 
     with sqlite3.connect(store.db_path) as connection:
         connection.execute("DELETE FROM d2_transition_record WHERE singleton = 1")
+    assert read_expired_rm_acceptance_recovery_boot_proof(store.db_path, snapshot) is None
+
+
+def test_read_only_bridge_reconstructs_legacy_generation_and_preserves_d2_record(tmp_path):
+    store, record = _expired_d2_db(
+        tmp_path,
+        include_lease_generation=False,
+        freeze_generation=12,
+    )
+    assert "lease_generation" not in record
+
+    before = sqlite3.connect(store.db_path)
+    before_payload = before.execute(
+        "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+    ).fetchone()
+    before.close()
+
+    snapshot = store.get_snapshot()
+    proof = read_expired_rm_acceptance_recovery_boot_proof(store.db_path, snapshot)
+
+    assert proof is not None
+    assert proof.lease_generation == 12
+    result = validate_cutover_boot(
+        AssetAuthority.RM,
+        snapshot,
+        rm_available=True,
+        expired_rm_recovery=proof,
+    )
+    assert result.boot_mode == "EXPIRED_RM_RECOVERY"
+    assert result.writes_allowed is False
+    assert result.frozen is True
+    assert result.requires_recovery is True
+    assert result.legacy_fallback_allowed is False
+
+    after = sqlite3.connect(store.db_path)
+    after_payload = after.execute(
+        "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
+    ).fetchone()
+    after.close()
+    assert after_payload == before_payload
+    assert json.loads(after_payload[1]) == record
+
+
+@pytest.mark.parametrize("generation", [None, True, "12", -1, 13])
+def test_modern_generation_null_malformed_and_mismatch_fail_closed(tmp_path, generation):
+    store, record = _expired_d2_db(freeze_generation=12, tmp_path=tmp_path)
+    record["lease_generation"] = generation
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE d2_transition_record SET payload_json = ? WHERE singleton = 1",
+            (json.dumps(record, sort_keys=True),),
+        )
+    assert read_expired_rm_acceptance_recovery_boot_proof(store.db_path, store.get_snapshot()) is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_phase", "wrong_lease", "wrong_migration", "bad_readiness", "hard_gate", "freeze_released"],
+)
+def test_legacy_missing_generation_requires_all_other_proof_invariants(tmp_path, mutation):
+    store, record = _expired_d2_db(
+        tmp_path,
+        include_lease_generation=False,
+        freeze_generation=12,
+    )
+    changed = dict(record)
+    if mutation == "wrong_phase":
+        changed["phase"] = "RM_PREPARED"
+    elif mutation == "wrong_lease":
+        changed["lease_id"] = "b" * 32
+    elif mutation == "wrong_migration":
+        changed["migration_identity"] = _identity_payload()
+        changed["migration_identity"]["source_generation"] = 99
+    elif mutation == "bad_readiness":
+        changed["readiness"] = {"status": "FAIL"}
+    elif mutation == "hard_gate":
+        readiness = dict(changed["readiness"])
+        readiness["hard_gates"] = {"migration_complete": "PASS", "state_healthy": "FAIL"}
+        changed["readiness"] = readiness
+    else:
+        changed["freeze_released_at"] = "2026-08-16T00:00:00+00:00"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE d2_transition_record SET payload_json = ? WHERE singleton = 1",
+            (json.dumps(changed, sort_keys=True),),
+        )
+    assert "lease_generation" not in changed
+    assert read_expired_rm_acceptance_recovery_boot_proof(store.db_path, store.get_snapshot()) is None
+
+
+@pytest.mark.parametrize(
+    "snapshot_changes",
+    [
+        {"state": CutoverState.FROZEN_READY_FOR_RM_SWITCH},
+        {"authority": AssetAuthority.LEGACY},
+        {"rm_available": False},
+    ],
+)
+def test_legacy_missing_generation_rejects_wrong_snapshot_state_authority_or_rm_availability(
+    tmp_path,
+    snapshot_changes,
+):
+    store, _ = _expired_d2_db(
+        tmp_path,
+        include_lease_generation=False,
+        freeze_generation=12,
+    )
+    snapshot = replace(store.get_snapshot(), **snapshot_changes)
     assert read_expired_rm_acceptance_recovery_boot_proof(store.db_path, snapshot) is None
 
 

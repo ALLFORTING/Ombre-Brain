@@ -177,7 +177,6 @@ def _read_expired_rm_acceptance_proof(
         "state_before",
         "state_after",
         "lease_id",
-        "lease_generation",
         "migration_identity",
         "readiness",
         "acceptance",
@@ -197,10 +196,8 @@ def _read_expired_rm_acceptance_proof(
         or _text(record.get("state_after")) != CutoverState.FROZEN_RM_ACCEPTANCE.value
         or record.get("lease_id") != snapshot.lease_id
         or record.get("lease_id") != str(freeze["lease_id"])
-        or type(record.get("lease_generation")) is not int
-        or record.get("lease_generation") < 0
         or type(freeze["generation"]) is not int
-        or record.get("lease_generation") != int(freeze["generation"])
+        or freeze["generation"] < 0
         or record.get("freeze_released_at") is not None
         or not _safe_identity(record.get("transition_identity"))
     ):
@@ -233,13 +230,22 @@ def _read_expired_rm_acceptance_proof(
     identity = _identity_from_record(record.get("migration_identity"))
     if identity is None or identity != snapshot.migration_identity:
         return None
+    effective_lease_generation = int(freeze["generation"])
+    if "lease_generation" in record:
+        if (
+            type(record["lease_generation"]) is not int
+            or record["lease_generation"] < 0
+            or record["lease_generation"] != effective_lease_generation
+        ):
+            return None
+        effective_lease_generation = int(record["lease_generation"])
     try:
         return ExpiredRmAcceptanceRecoveryBootProof(
             phase=RM_FROZEN_ACCEPTANCE_PHASE,
             expected_authority=AssetAuthority.RM,
             state=CutoverState.FROZEN_RM_ACCEPTANCE,
             lease_id=str(record["lease_id"]),
-            lease_generation=int(record["lease_generation"]),
+            lease_generation=effective_lease_generation,
             transition_identity=str(record["transition_identity"]),
             migration_identity=identity,
         )
