@@ -251,6 +251,44 @@ def test_idempotency_and_invalid_boundaries_are_explicit(tmp_path):
         controller.accept_legacy(lease, checks=_all_legacy_checks())
 
 
+def test_pre_d2_abort_does_not_leave_rm_prepared_as_current_phase(tmp_path):
+    store, lease = _prepared_store(tmp_path)
+    controller = CutoverTransitionController(store.db_path, state_store=store)
+    controller.prepare_rm_switch(lease, evidence=_evidence("d2-stale"))
+
+    store.transition(
+        CutoverState.LEGACY_AUTHORITY_RM_READY,
+        lease=lease,
+        migration_identity=_identity(),
+    )
+    stale_status = CutoverTransitionController(store.db_path).status(
+        configured_authority=AssetAuthority.LEGACY,
+    )
+    assert stale_status["cutover_state"] == CutoverState.LEGACY_AUTHORITY_RM_READY.value
+    assert stale_status["phase"] == "NONE"
+    assert stale_status["transition_identity"] is None
+    assert stale_status["next_legal_operator_actions"] == [
+        "prepare RM switch only after D1 readiness is PASS"
+    ]
+
+    new_lease = store.acquire_freeze(
+        expected_state=CutoverState.LEGACY_AUTHORITY_RM_READY,
+        frozen_state=CutoverState.FROZEN_LEGACY_MIGRATION,
+        ttl_seconds=300,
+        migration_identity=_identity(),
+    )
+    store.transition(
+        CutoverState.FROZEN_READY_FOR_RM_SWITCH,
+        lease=new_lease,
+        migration_identity=_identity(),
+    )
+    assert new_lease.lease_id != lease.lease_id
+    refreshed = controller.prepare_rm_switch(new_lease, evidence=_evidence("d2-fresh"))
+    assert refreshed["phase"] == "RM_PREPARED"
+    assert refreshed["transition_identity"] == "d2-fresh"
+    assert refreshed["freeze_lease_id"] == new_lease.lease_id
+
+
 @pytest.mark.parametrize(
     "configured,restart_validated,expected",
     [

@@ -38,6 +38,7 @@ from asset_cutover_state import (
     MigrationIdentity,
     validate_cutover_boot,
 )
+from cutover_boot_coordination import is_rm_prepared_coordination_record_active
 from remember_me_adapter import EXPECTED_PACKAGE_VERSION
 from remember_me_cutover_operations import (
     ACCEPTANCE_CHECK_NAMES,
@@ -456,8 +457,20 @@ class CutoverTransitionController:
             return PHASE_ROLLBACK_PREPARED
         if snapshot.state is CutoverState.FROZEN_LEGACY_ACCEPTANCE:
             return PHASE_LEGACY_FROZEN_ACCEPTANCE
-        if record is not None:
-            return record.phase
+        if snapshot.state is CutoverState.LEGACY_AUTHORITY_RM_READY:
+            if (
+                record is not None
+                and record.phase == PHASE_LEGACY_OPEN
+                and record.authority_after is AssetAuthority.LEGACY
+                and record.freeze_released_at is not None
+            ):
+                return PHASE_LEGACY_OPEN
+            return PHASE_NONE
+        if record is not None and is_rm_prepared_coordination_record_active(
+            _record_json(record),
+            snapshot,
+        ):
+            return PHASE_RM_PREPARED
         return PHASE_NONE
 
     @staticmethod
@@ -906,9 +919,14 @@ class CutoverTransitionController:
         snapshot = self.state.get_snapshot()
         record = self._read_record()
         phase = self._current_phase(record, snapshot)
+        current_record = (
+            record
+            if record is not None and phase != PHASE_NONE and record.phase == phase
+            else None
+        )
         configured = _authority(configured_authority) if configured_authority is not None else None
-        acceptance_status = record.acceptance.get("status") if record else None
-        legacy_acceptance_status = record.legacy_acceptance.get("status") if record else None
+        acceptance_status = current_record.acceptance.get("status") if current_record else None
+        legacy_acceptance_status = current_record.legacy_acceptance.get("status") if current_record else None
         actions: list[str] = []
         if phase == PHASE_RM_PREPARED:
             actions = ["set OMBRE_ASSET_AUTHORITY=rm externally", "controlled restart", "switch-to-rm"]
@@ -936,25 +954,25 @@ class CutoverTransitionController:
             "freeze_active": snapshot.freeze_status == "active",
             "freeze_status": snapshot.freeze_status,
             "lease_healthy": lease_healthy,
-            "migration_complete": record is not None and record.readiness.get("hard_gates", {}).get("migration_complete") == "PASS",
-            "reconciliation": record.readiness.get("hard_gates", {}).get("reconciliation_pass") if record else None,
-            "verification": record.readiness.get("hard_gates", {}).get("verification_pass") if record else None,
-            "vector_readiness": record.readiness.get("hard_gates", {}).get("vector_readiness_pass") if record else None,
-            "backup_readiness": record.readiness.get("hard_gates", {}).get("backup_evidence_present") if record else None,
+            "migration_complete": current_record is not None and current_record.readiness.get("hard_gates", {}).get("migration_complete") == "PASS",
+            "reconciliation": current_record.readiness.get("hard_gates", {}).get("reconciliation_pass") if current_record else None,
+            "verification": current_record.readiness.get("hard_gates", {}).get("verification_pass") if current_record else None,
+            "vector_readiness": current_record.readiness.get("hard_gates", {}).get("vector_readiness_pass") if current_record else None,
+            "backup_readiness": current_record.readiness.get("hard_gates", {}).get("backup_evidence_present") if current_record else None,
             "acceptance_status": acceptance_status,
             "legacy_acceptance_status": legacy_acceptance_status,
             "rollback_class_currently_available": "CLASS_A" if phase == PHASE_RM_FROZEN_ACCEPTANCE else "NONE",
             "LOSSLESS_ROLLBACK_WINDOW_OPEN": "YES" if phase == PHASE_RM_FROZEN_ACCEPTANCE else "NO",
             "legacy_fallback_allowed": phase in {PHASE_NONE, PHASE_LEGACY_OPEN},
-            "transition_identity": record.transition_identity if record else None,
-            "migration_identity": _identity_payload(record.migration_identity) if record else None,
+            "transition_identity": current_record.transition_identity if current_record else None,
+            "migration_identity": _identity_payload(current_record.migration_identity) if current_record else None,
             "freeze_lease_id": snapshot.lease_id,
             "next_legal_operator_actions": actions,
             "production_access_occurred": False,
             "evidence": {
-                "readiness_evidence_id": record.readiness.get("evidence_identity") if record else None,
-                "backup_evidence_id": record.readiness.get("backup_evidence_id") if record else None,
-                "acceptance_evidence_id": record.acceptance.get("evidence_identity") if record else None,
+                "readiness_evidence_id": current_record.readiness.get("evidence_identity") if current_record else None,
+                "backup_evidence_id": current_record.readiness.get("backup_evidence_id") if current_record else None,
+                "acceptance_evidence_id": current_record.acceptance.get("evidence_identity") if current_record else None,
             },
         }
 

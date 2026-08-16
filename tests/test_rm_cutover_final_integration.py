@@ -91,6 +91,65 @@ def _run(
     return combined
 
 
+def _run_fresh_server_boot(ws: dict[str, Path]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT), *(pythonpath.split(os.pathsep) if pythonpath else [])]
+    )
+    for key in (
+        "OMBRE_API_KEY",
+        "OMBRE_ASSET_AUTHORITY",
+        "OMBRE_RM_RUNTIME_ENABLED",
+        "OMBRE_RM_DATA_ROOT",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "OMBRE_BUCKETS_DIR": str(ws["legacy"]),
+            "OMBRE_ASSET_AUTHORITY": "rm",
+            "OMBRE_RM_RUNTIME_ENABLED": "true",
+            "OMBRE_RM_DATA_ROOT": str(ws["rm"]),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json
+import server
+from asset_backend import AssetBackendError
+
+registry = server.asset_backend_registry
+validation = registry._validate_boot()
+mutation_error = None
+try:
+    registry.selected_backend().create_temp_path()
+except AssetBackendError as exc:
+    mutation_error = exc.code
+print(json.dumps({
+    "boot": "ok",
+    "selected_backend": registry.selected_backend().name,
+    "authority": registry.authority.value,
+    "coordination_pending": validation.coordination_pending,
+    "writes_allowed": validation.writes_allowed,
+    "legacy_fallback_allowed": validation.authority.value == "legacy",
+    "mutation_error": mutation_error,
+    "state": registry.snapshot.state.value,
+    "durable_authority": registry.snapshot.authority.value,
+}))
+""",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _migration_args(ws: dict[str, Path], report_name: str) -> list[str]:
     return [
         "--legacy-root",
@@ -334,6 +393,10 @@ def _run_to_ready(
         ],
         output=output,
     )
+    _run_rm_switch(ws, output)
+
+
+def _run_rm_switch(ws: dict[str, Path], output: list[str]) -> None:
     _run(
         "remember_me_cutover_transition",
         [
@@ -352,6 +415,144 @@ def _run_to_ready(
     )
 
 
+def _rerun_to_ready_after_abort(ws: dict[str, Path], output: list[str]) -> None:
+    """Repeat the gated D1/D2 preparation on an existing aborted workspace."""
+    _run(
+        "remember_me_cutover_migration",
+        [
+            "acquire-freeze",
+            *_migration_args(ws, "reacquire-freeze.json"),
+            "--lease-ttl-seconds",
+            "300",
+            "--lease-capability-file",
+            str(ws["cap"]),
+        ],
+        output=output,
+    )
+    for command, report in (
+        ("migrate", "remigrate.json"),
+        ("reconcile", "rereconcile.json"),
+        ("verify", "reverify.json"),
+    ):
+        extra = ["--batch-size", "1"] if command == "migrate" else []
+        _run(
+            "remember_me_cutover_migration",
+            [
+                command,
+                *_migration_args(ws, report),
+                *extra,
+                "--lease-ttl-seconds",
+                "300",
+                "--lease-capability-file",
+                str(ws["cap"]),
+            ],
+            output=output,
+        )
+
+    _run(
+        "remember_me_cutover_operations",
+        [
+            "preflight",
+            "--legacy-root",
+            str(ws["legacy"]),
+            "--rm-root",
+            str(ws["rm"]),
+            "--state-db",
+            str(ws["state_db"]),
+            "--report",
+            str(ws["reports"] / "re-d1-preflight.json"),
+            "--backup-root",
+            str(ws["backup"]),
+            "--embedding-enabled",
+            "false",
+            "--estimated-vector-bytes",
+            "0",
+            "--headroom-bytes",
+            "0",
+            "--worker-count",
+            "1",
+            "--multiprocess",
+            "false",
+            "--shared-state",
+            "true",
+            "--service-instances",
+            "1",
+        ],
+        output=output,
+    )
+    _run(
+        "remember_me_cutover_migration",
+        [
+            "reindex",
+            *_migration_args(ws, "reindex-again.json"),
+            "--lease-ttl-seconds",
+            "300",
+            "--max-new-index-work",
+            "0",
+            "--lease-capability-file",
+            str(ws["cap"]),
+        ],
+        output=output,
+    )
+    readiness = {
+        "transition_identity": "local-transition-2",
+        "readiness_evidence_id": "local-readiness-evidence-2",
+        "dependency_exact": True,
+        "storage_layout": True,
+        "freeze_held": True,
+        "legacy_authority_active": True,
+        "reconciliation_exact": True,
+        "verification_passed": True,
+        "vector_profile": True,
+        "backup_verified": True,
+        "disk_acceptable": True,
+        "topology_safe": True,
+        "stale_authority_clear": True,
+        "dependency": {
+            "version": EXPECTED_PACKAGE_VERSION,
+            "source_commit": RM_SOURCE_COMMIT,
+        },
+        "rm_runtime_healthy": True,
+        "rm_data_root_healthy": True,
+        "state_healthy": True,
+        "migration_complete": True,
+        "reconciliation_pass": True,
+        "verification_pass": True,
+        "vector_readiness_pass": True,
+        "backup_evidence_present": True,
+        "backup_evidence_id": "local-backup-evidence-2",
+        "storage_root_validation_pass": True,
+        "disk_readiness_pass": True,
+        "topology_readiness_pass": True,
+        "no_stale_authority": True,
+    }
+    readiness_path = _write_json(ws["reports"] / "readiness-evidence-2.json", readiness)
+    _run(
+        "remember_me_cutover_operations",
+        [
+            "readiness-gate",
+            "--evidence",
+            str(readiness_path),
+            "--report",
+            str(ws["reports"] / "readiness-gate-2.json"),
+        ],
+        output=output,
+    )
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "prepare-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "legacy",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--evidence",
+            str(readiness_path),
+        ],
+        output=output,
+    )
 def _run_rm_acceptance(ws: dict[str, Path], output: list[str], *, passed: bool) -> None:
     checks = {name: passed for name in acceptance_check_spec()["checks"]}
     checks_path = _write_json(ws["reports"] / "rm-checks.json", checks)
@@ -450,6 +651,151 @@ def test_true_start_cli_rehearsal_reaches_rm_open(tmp_path):
     )
     _assert_rm_open_read_and_write_gate(ws)
     _assert_no_secret_after_cleanup(ws, output, success_token)
+
+
+def test_true_server_restart_boots_rm_prepared_then_switches(tmp_path):
+    ws = _workspace(tmp_path)
+    output: list[str] = []
+    _run_to_ready(ws, output, enter_rm_acceptance=False)
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "prepare-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "legacy",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--evidence",
+            str(ws["reports"] / "readiness-evidence.json"),
+        ],
+        output=output,
+    )
+
+    before = CutoverStateStore(ws["state_db"]).get_snapshot()
+    assert before.state is CutoverState.FROZEN_READY_FOR_RM_SWITCH
+    assert before.authority.value == "legacy"
+
+    completed = _run_fresh_server_boot(ws)
+    combined = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined
+    assert "state_authority_ambiguous" not in combined
+    payload = json.loads(completed.stdout)
+    assert payload == {
+        "authority": "rm",
+        "boot": "ok",
+        "coordination_pending": True,
+        "durable_authority": "legacy",
+        "legacy_fallback_allowed": False,
+        "mutation_error": "asset_write_frozen",
+        "selected_backend": "rm",
+        "state": "frozen_ready_for_rm_switch",
+        "writes_allowed": False,
+    }
+
+    after_boot = CutoverStateStore(ws["state_db"]).get_snapshot()
+    assert after_boot.state is CutoverState.FROZEN_READY_FOR_RM_SWITCH
+    assert after_boot.authority.value == "legacy"
+    _run_rm_switch(ws, output)
+    switched = CutoverStateStore(ws["state_db"]).get_snapshot()
+    assert switched.state is CutoverState.FROZEN_RM_ACCEPTANCE
+    assert switched.authority.value == "rm"
+
+
+def test_abort_invalidates_stale_d2_record_and_next_cycle_refreshes_it(tmp_path):
+    ws = _workspace(tmp_path)
+    output: list[str] = []
+    _run_to_ready(ws, output, enter_rm_acceptance=False)
+    _run(
+        "remember_me_cutover_transition",
+        [
+            "prepare-rm",
+            "--state-db",
+            str(ws["state_db"]),
+            "--configured-authority",
+            "legacy",
+            "--lease-capability-file",
+            str(ws["cap"]),
+            "--evidence",
+            str(ws["reports"] / "readiness-evidence.json"),
+        ],
+        output=output,
+    )
+    prepared = json.loads(
+        _run(
+            "remember_me_cutover_transition",
+            [
+                "status",
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "legacy",
+                "--rm-available",
+                "true",
+            ],
+            output=output,
+        )
+    )
+    assert prepared["phase"] == "RM_PREPARED"
+    old_lease_id = prepared["freeze_lease_id"]
+    old_transition_identity = prepared["transition_identity"]
+
+    _run(
+        "remember_me_cutover_migration",
+        [
+            "abort",
+            *_migration_args(ws, "abort-stale-d2.json"),
+            "--reason",
+            "local stale d2 rehearsal",
+            "--lease-capability-file",
+            str(ws["cap"]),
+        ],
+        output=output,
+    )
+    aborted = json.loads(
+        _run(
+            "remember_me_cutover_transition",
+            [
+                "status",
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "legacy",
+                "--rm-available",
+                "true",
+            ],
+            output=output,
+        )
+    )
+    assert aborted["cutover_state"] == CutoverState.LEGACY_AUTHORITY_RM_READY.value
+    assert aborted["phase"] == "NONE"
+    assert aborted["transition_identity"] is None
+    assert aborted["freeze_active"] is False
+    assert aborted["next_legal_operator_actions"] == [
+        "prepare RM switch only after D1 readiness is PASS"
+    ]
+
+    _rerun_to_ready_after_abort(ws, output)
+    refreshed = json.loads(
+        _run(
+            "remember_me_cutover_transition",
+            [
+                "status",
+                "--state-db",
+                str(ws["state_db"]),
+                "--configured-authority",
+                "legacy",
+                "--rm-available",
+                "true",
+            ],
+            output=output,
+        )
+    )
+    assert refreshed["phase"] == "RM_PREPARED"
+    assert refreshed["transition_identity"] == "local-transition-2"
+    assert refreshed["freeze_lease_id"] != old_lease_id
+    assert refreshed["transition_identity"] != old_transition_identity
 
 
 def test_cli_pre_d2_abort_from_both_frozen_states(tmp_path):
