@@ -12,6 +12,9 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from asset_backend import AssetBackendError
+from asset_dashboard import AssetDashboardError, AssetDashboardService
+
 
 def _png(color=(20, 40, 60), size=(48, 32)):
     output = io.BytesIO()
@@ -560,3 +563,58 @@ def test_embedding_failure_does_not_rollback_dashboard_write(tmp_path, monkeypat
     )
     assert updated.status_code == 200
     assert server.asset_store.get(asset_id)["description"] == "still updated"
+
+
+class _GateProbeBackend:
+    name = "rm"
+
+    def __init__(self, frozen):
+        self.frozen = frozen
+        self.calls = []
+
+    def assert_public_mutation_allowed(self):
+        self.calls.append("gate")
+        if self.frozen:
+            raise AssetBackendError("asset_write_frozen")
+
+    def get(self, asset_id):
+        self.calls.append(("get", asset_id))
+        return None
+
+
+@pytest.mark.parametrize("method", ["update_asset", "delete_asset"])
+def test_dashboard_missing_id_is_rejected_by_frozen_gate_before_lookup(method):
+    backend = _GateProbeBackend(frozen=True)
+    service = AssetDashboardService(
+        backend_provider=lambda: backend,
+        max_asset_bytes=1024,
+    )
+
+    with pytest.raises(AssetDashboardError) as raised:
+        if method == "update_asset":
+            service.update_asset("0" * 32, {"title": "probe"})
+        else:
+            service.delete_asset("0" * 32)
+
+    assert raised.value.code == "asset_write_frozen"
+    assert raised.value.status_code == 409
+    assert backend.calls == ["gate"]
+
+
+@pytest.mark.parametrize("method", ["update_asset", "delete_asset"])
+def test_dashboard_missing_id_keeps_open_state_not_found_semantics(method):
+    backend = _GateProbeBackend(frozen=False)
+    service = AssetDashboardService(
+        backend_provider=lambda: backend,
+        max_asset_bytes=1024,
+    )
+
+    with pytest.raises(AssetDashboardError) as raised:
+        if method == "update_asset":
+            service.update_asset("0" * 32, {"title": "probe"})
+        else:
+            service.delete_asset("0" * 32)
+
+    assert raised.value.code == "asset_not_found"
+    assert raised.value.status_code == 404
+    assert backend.calls == ["gate", ("get", "0" * 32)]

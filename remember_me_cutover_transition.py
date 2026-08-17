@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -69,6 +70,8 @@ PHASE_ROLLBACK_PREPARED = "ROLLBACK_PREPARED"
 PHASE_LEGACY_FROZEN_ACCEPTANCE = "LEGACY_FROZEN_ACCEPTANCE"
 PHASE_LEGACY_OPEN = "LEGACY_OPEN"
 DEFAULT_EXPIRED_RM_RECOVERY_TTL_SECONDS = 300
+ACCEPTANCE_ARTIFACT_SCHEMA_VERSION = 1
+ACCEPTANCE_EVIDENCE_FILENAME = "rm-acceptance-evidence.json"
 
 RM_COORDINATION_PHASES = frozenset({PHASE_RM_PREPARED})
 ROLLBACK_COORDINATION_PHASES = frozenset({PHASE_ROLLBACK_PREPARED})
@@ -126,6 +129,29 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _render_runtime_identity() -> dict[str, str]:
+    values = {
+        "instance_id": os.environ.get("RENDER_INSTANCE_ID", "").strip(),
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT", "").strip(),
+        "service_id": os.environ.get("RENDER_SERVICE_ID", "").strip(),
+    }
+    if any(not isinstance(value, str) or not value or SAFE_ID.fullmatch(value) is None for value in values.values()):
+        raise CutoverTransitionError("acceptance_runtime_identity_missing")
+    return values
+
+
+def _acceptance_timestamp(value: Any, code: str) -> datetime:
+    if not isinstance(value, str):
+        raise CutoverTransitionError(code)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise CutoverTransitionError(code) from exc
+    if parsed.tzinfo is None:
+        raise CutoverTransitionError(code)
+    return parsed.astimezone(timezone.utc)
 
 
 def _safe_id(value: Any, code: str) -> str:
@@ -548,6 +574,111 @@ class CutoverTransitionController:
         except CutoverStateError as exc:
             raise CutoverTransitionError(exc.code) from exc
 
+    def _current_freeze_metadata(self, snapshot: CutoverSnapshot) -> dict[str, Any]:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT lease_id, generation, acquired_at, expires_at "
+                "FROM cutover_freeze WHERE singleton = 1"
+            ).fetchone()
+            if row is None or snapshot.lease_id is None or row["lease_id"] != snapshot.lease_id:
+                raise CutoverTransitionError("acceptance_generation_invalid")
+            generation = row["generation"]
+            if type(generation) is not int or generation < 0:
+                raise CutoverTransitionError("acceptance_generation_invalid")
+            return {
+                "generation": generation,
+                "acquired_at": _acceptance_timestamp(row["acquired_at"], "acceptance_timestamp_invalid"),
+                "expires_at": _acceptance_timestamp(row["expires_at"], "acceptance_timestamp_invalid"),
+            }
+        except CutoverTransitionError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise CutoverTransitionError("acceptance_generation_invalid") from exc
+        finally:
+            connection.close()
+
+    def _validate_rm_acceptance_artifact(
+        self,
+        checks: Mapping[str, Any],
+        evidence: Mapping[str, Any] | None,
+        *,
+        snapshot: CutoverSnapshot,
+        record: TransitionRecord | None,
+    ) -> dict[str, Any]:
+        if not isinstance(checks, Mapping) or evidence is None or not isinstance(evidence, Mapping):
+            raise CutoverTransitionError("acceptance_evidence_required")
+        if checks.get("artifact_type") != "rm_acceptance_checks" or evidence.get("artifact_type") != "rm_acceptance_evidence":
+            raise CutoverTransitionError("acceptance_artifact_invalid")
+        if checks.get("schema_version") != ACCEPTANCE_ARTIFACT_SCHEMA_VERSION or evidence.get("schema_version") != ACCEPTANCE_ARTIFACT_SCHEMA_VERSION:
+            raise CutoverTransitionError("acceptance_artifact_version_invalid")
+        run_id = checks.get("acceptance_run_id")
+        if not isinstance(run_id, str) or SAFE_ID.fullmatch(run_id) is None:
+            raise CutoverTransitionError("acceptance_run_id_invalid")
+        if evidence.get("acceptance_run_id") != run_id:
+            raise CutoverTransitionError("acceptance_run_binding_invalid")
+        if checks.get("evidence_sha256") != _digest(evidence):
+            raise CutoverTransitionError("acceptance_evidence_digest_invalid")
+        for field in (
+            "created_at",
+            "completed_at",
+            "status",
+            "cutover_identity",
+            "runtime_identity",
+        ):
+            if checks.get(field) != evidence.get(field):
+                raise CutoverTransitionError("acceptance_artifact_binding_invalid")
+        if checks.get("status") not in {"PASS", "FAIL", "INCOMPLETE"} or evidence.get("status") != checks.get("status"):
+            raise CutoverTransitionError("acceptance_artifact_invalid")
+
+        check_values = checks.get("checks")
+        if not isinstance(check_values, Mapping) or set(check_values) != set(ACCEPTANCE_CHECK_NAMES):
+            raise CutoverTransitionError("acceptance_checks_invalid")
+        if any(type(check_values[name]) is not bool for name in ACCEPTANCE_CHECK_NAMES):
+            raise CutoverTransitionError("acceptance_checks_invalid")
+        if checks["status"] == "PASS" and any(check_values[name] is not True for name in ACCEPTANCE_CHECK_NAMES):
+            raise CutoverTransitionError("acceptance_artifact_invalid")
+        if checks["status"] == "FAIL" and not any(check_values[name] is False for name in ACCEPTANCE_CHECK_NAMES):
+            raise CutoverTransitionError("acceptance_artifact_invalid")
+        if checks["status"] == "INCOMPLETE" and not any(check_values[name] is not True for name in ACCEPTANCE_CHECK_NAMES):
+            raise CutoverTransitionError("acceptance_artifact_invalid")
+
+        current_phase = self._current_phase(record, snapshot)
+        freeze = self._current_freeze_metadata(snapshot)
+        current_identity = {
+            "revision": snapshot.revision,
+            "cutover_state": snapshot.state.value,
+            "phase": current_phase,
+            "authority": snapshot.authority.value,
+            "freeze_status": snapshot.freeze_status,
+            "lease_generation": freeze["generation"],
+            "lease_acquired_at": freeze["acquired_at"].isoformat(timespec="microseconds"),
+            "lease_expires_at": freeze["expires_at"].isoformat(timespec="microseconds"),
+        }
+        if evidence.get("cutover_identity") != current_identity:
+            raise CutoverTransitionError("acceptance_state_binding_invalid")
+        if (
+            current_phase != PHASE_RM_FROZEN_ACCEPTANCE
+            or snapshot.authority is not AssetAuthority.RM
+            or snapshot.freeze_status != "active"
+            or record is None
+            or record.lease_generation != freeze["generation"]
+        ):
+            raise CutoverTransitionError("acceptance_state_invalid")
+
+        runtime_identity = evidence.get("runtime_identity")
+        if runtime_identity != _render_runtime_identity():
+            raise CutoverTransitionError("acceptance_runtime_identity_mismatch")
+
+        created_at = _acceptance_timestamp(checks.get("created_at"), "acceptance_timestamp_invalid")
+        completed_at = _acceptance_timestamp(checks.get("completed_at"), "acceptance_timestamp_invalid")
+        now = datetime.now(timezone.utc)
+        if completed_at < created_at or created_at < freeze["acquired_at"] or completed_at < freeze["acquired_at"]:
+            raise CutoverTransitionError("acceptance_stale")
+        if completed_at > now or completed_at > freeze["expires_at"]:
+            raise CutoverTransitionError("acceptance_timestamp_invalid")
+        return dict(check_values)
+
     def _assert_identity(self, snapshot: CutoverSnapshot, record: TransitionRecord | None = None) -> MigrationIdentity:
         identity = snapshot.migration_identity
         if identity is None:
@@ -849,6 +980,7 @@ class CutoverTransitionController:
                 record,
                 lease_id=replacement.lease_id,
                 lease_generation=replacement.generation,
+                acceptance={},
                 updated_at=_now(),
             )
             replace_capability(
@@ -877,7 +1009,8 @@ class CutoverTransitionController:
         self,
         lease: FreezeLease,
         *,
-        checks: Mapping[str, Callable[[], Any] | bool],
+        checks: Mapping[str, Any],
+        evidence: Mapping[str, Any] | None = None,
         configured_authority: AssetAuthority | str = AssetAuthority.RM,
         acceptance_identity: str | None = None,
     ) -> dict[str, Any]:
@@ -888,15 +1021,30 @@ class CutoverTransitionController:
         if self._current_phase(record, snapshot) != PHASE_RM_FROZEN_ACCEPTANCE:
             raise CutoverTransitionError("rm_acceptance_state_invalid")
         self._assert_lease(lease, snapshot)
+        validated_checks = self._validate_rm_acceptance_artifact(
+            checks,
+            evidence,
+            snapshot=snapshot,
+            record=record,
+        )
         identity = _safe_id(
             acceptance_identity or (record.transition_identity + ":acceptance" if record else None),
             "acceptance_identity_invalid",
         )
         result = run_frozen_acceptance_checks(
             state={"authority": AssetAuthority.RM.value, "frozen": True},
-            checks=checks,
+            checks=validated_checks,
         )
         acceptance = _acceptance_payload(result, identity)
+        acceptance.update(
+            {
+                "schema_version": ACCEPTANCE_ARTIFACT_SCHEMA_VERSION,
+                "acceptance_run_id": checks["acceptance_run_id"],
+                "cutover_identity": checks["cutover_identity"],
+                "runtime_identity": checks["runtime_identity"],
+                "completed_at": checks["completed_at"],
+            }
+        )
         if record is None:
             raise CutoverTransitionError("transition_record_missing")
         self._write_record(self._record_with(record, acceptance=acceptance, updated_at=_now()))
@@ -1156,6 +1304,10 @@ def _json_file(path: Path) -> dict[str, Any]:
     return value
 
 
+def _acceptance_evidence_file(checks_path: Path) -> dict[str, Any]:
+    return _json_file(checks_path.with_name(ACCEPTANCE_EVIDENCE_FILENAME))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=TOOL_NAME)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1265,7 +1417,14 @@ def main(argv: list[str] | None = None) -> int:
                     restart_validated=args.restart_validated,
                 )
             elif args.command == "accept-rm":
-                result = controller.accept_rm(lease, checks=_json_file(args.checks), configured_authority=configured)
+                checks = _json_file(args.checks)
+                evidence = _acceptance_evidence_file(args.checks)
+                result = controller.accept_rm(
+                    lease,
+                    checks=checks,
+                    evidence=evidence,
+                    configured_authority=configured,
+                )
             elif args.command == "release-freeze-to-rm":
                 result = controller.release_to_rm(lease, configured_authority=configured)
             elif args.command == "class-a-rollback":

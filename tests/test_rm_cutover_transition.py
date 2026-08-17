@@ -21,7 +21,10 @@ from remember_me_cutover_transition import (
     CutoverTransitionError,
     LEGACY_ACCEPTANCE_NAMES,
     RM_SOURCE_COMMIT,
+    _digest,
+    main,
 )
+from tests._rm_acceptance_artifact import valid_rm_acceptance_artifact
 
 
 def _identity() -> MigrationIdentity:
@@ -87,6 +90,11 @@ def _all_rm_checks() -> dict[str, bool]:
     return {name: True for name in acceptance_check_spec()["checks"]}
 
 
+def _accept_rm(store, controller, lease, *, passed=True):
+    checks, evidence = valid_rm_acceptance_artifact(store, controller, passed=passed)
+    return controller.accept_rm(lease, checks=checks, evidence=evidence)
+
+
 def _all_legacy_checks() -> dict[str, bool]:
     return {name: True for name in LEGACY_ACCEPTANCE_NAMES}
 
@@ -131,10 +139,7 @@ def test_successful_cutover_is_restart_safe_and_opens_rm_only_after_acceptance(t
     assert reopened.get_snapshot().state is CutoverState.FROZEN_RM_ACCEPTANCE
     assert not AssetMutationGate(reopened).public_mutations_allowed()
 
-    accepted = CutoverTransitionController(store.db_path).accept_rm(
-        lease,
-        checks=_all_rm_checks(),
-    )
+    accepted = _accept_rm(store, CutoverTransitionController(store.db_path), lease)
     assert accepted["acceptance_status"] == "PASS"
     assert accepted["LOSSLESS_ROLLBACK_WINDOW_OPEN"] == "YES"
 
@@ -153,15 +158,81 @@ def test_successful_cutover_is_restart_safe_and_opens_rm_only_after_acceptance(t
         )
 
 
+def test_accept_rm_rejects_legacy_checks_only_artifact(tmp_path):
+    store, lease, _, controller = _rm_acceptance_context(tmp_path)
+    with pytest.raises(CutoverTransitionError, match="^acceptance_evidence_required$"):
+        controller.accept_rm(lease, checks=_all_rm_checks())
+
+
+def test_accept_rm_cli_rejects_legacy_checks_only_file(tmp_path, capsys):
+    store, lease, cap, _ = _rm_acceptance_context(tmp_path)
+    checks_path = tmp_path / "rm-acceptance-checks.json"
+    checks_path.write_text(json.dumps(_all_rm_checks()), encoding="utf-8")
+    result = main(
+        [
+            "accept-rm",
+            "--state-db",
+            str(store.db_path),
+            "--configured-authority",
+            "rm",
+            "--lease-capability-file",
+            str(cap),
+            "--checks",
+            str(checks_path),
+        ]
+    )
+    assert result == 2
+    assert "evidence_file_invalid" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mutation", ["run", "digest", "generation", "instance", "commit", "service", "timestamp"])
+def test_accept_rm_rejects_unbound_or_stale_artifact(tmp_path, mutation):
+    store, lease, _, controller = _rm_acceptance_context(tmp_path)
+    checks, evidence = valid_rm_acceptance_artifact(store, controller, run_id="bound-run")
+    if mutation == "run":
+        checks["acceptance_run_id"] = "other-run"
+    elif mutation == "digest":
+        evidence["summary"]["pass"] = 0
+    elif mutation == "generation":
+        checks["cutover_identity"]["lease_generation"] += 1
+        evidence["cutover_identity"]["lease_generation"] += 1
+    elif mutation in {"instance", "commit", "service"}:
+        field = {"instance": "instance_id", "commit": "git_commit", "service": "service_id"}[mutation]
+        checks["runtime_identity"][field] = "other-runtime"
+        evidence["runtime_identity"][field] = "other-runtime"
+    else:
+        checks["created_at"] = "2000-01-01T00:00:00.000000+00:00"
+        checks["completed_at"] = "2000-01-01T00:00:00.000000+00:00"
+        evidence["created_at"] = checks["created_at"]
+        evidence["completed_at"] = checks["completed_at"]
+    if mutation != "digest":
+        checks["evidence_sha256"] = _digest(evidence)
+    with pytest.raises(CutoverTransitionError):
+        controller.accept_rm(lease, checks=checks, evidence=evidence)
+
+
+def test_expired_rm_recovery_invalidates_prior_acceptance(tmp_path):
+    store, lease, cap, controller = _rm_acceptance_context(tmp_path)
+    _accept_rm(store, controller, lease)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
+        )
+    recovered = controller.recover_expired_rm_acceptance(
+        transition_identity="d2-expired-recovery",
+        lease_capability_file=cap,
+        lease_ttl_seconds=300,
+    )
+    assert recovered["acceptance_status"] is None
+
+
 def test_failed_frozen_acceptance_rehearses_lossless_class_a_rollback(tmp_path):
     store, lease = _prepared_store(tmp_path)
     controller = CutoverTransitionController(store.db_path, state_store=store)
     controller.prepare_rm_switch(lease, evidence=_evidence("d2-rollback-1"))
     controller.switch_to_rm(lease, configured_authority=AssetAuthority.RM, restart_validated=True)
 
-    checks = _all_rm_checks()
-    checks["dashboard_detail"] = False
-    failed = controller.accept_rm(lease, checks=checks)
+    failed = _accept_rm(store, controller, lease, passed=False)
     assert failed["acceptance_status"] == "FAIL"
     with pytest.raises(CutoverTransitionError, match="^rm_acceptance_not_passed$"):
         controller.release_to_rm(lease)
@@ -247,7 +318,7 @@ def test_rm_unavailable_and_lease_loss_never_advance_authority(tmp_path):
             "UPDATE cutover_freeze SET expires_at = '2000-01-01T00:00:00+00:00' WHERE singleton = 1"
         )
     with pytest.raises(CutoverTransitionError, match="^freeze_lease_expired$"):
-        controller.accept_rm(lease, checks=_all_rm_checks())
+        _accept_rm(store, controller, lease)
     assert CutoverStateStore(store.db_path).get_snapshot().state is CutoverState.FROZEN_RM_ACCEPTANCE
 
 
@@ -276,7 +347,7 @@ def test_expired_rm_recovery_rejects_active_lease_and_naive_legacy_open(tmp_path
 def test_expired_rm_recovery_rejects_wrong_phase(tmp_path, wrong_phase):
     if wrong_phase == "rm_open":
         store, lease, cap, controller = _rm_acceptance_context(tmp_path)
-        controller.accept_rm(lease, checks=_all_rm_checks())
+        _accept_rm(store, controller, lease)
         controller.release_to_rm(lease)
     elif wrong_phase == "rm_prepared":
         store, lease = _prepared_store(tmp_path)
