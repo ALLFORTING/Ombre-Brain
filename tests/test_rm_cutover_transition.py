@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import sys
 
 import pytest
 
@@ -25,6 +27,21 @@ from remember_me_cutover_transition import (
     main,
 )
 from tests._rm_acceptance_artifact import valid_rm_acceptance_artifact
+
+
+PROBE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "rm_frozen_acceptance_probe.py"
+
+
+def _probe_module():
+    spec = importlib.util.spec_from_file_location(
+        "rm_frozen_acceptance_probe_contract_test",
+        PROBE_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _identity() -> MigrationIdentity:
@@ -162,6 +179,49 @@ def test_accept_rm_rejects_legacy_checks_only_artifact(tmp_path):
     store, lease, _, controller = _rm_acceptance_context(tmp_path)
     with pytest.raises(CutoverTransitionError, match="^acceptance_evidence_required$"):
         controller.accept_rm(lease, checks=_all_rm_checks())
+
+
+def test_accept_rm_accepts_probe_produced_canonical_phase(monkeypatch, tmp_path):
+    store, lease, _, controller = _rm_acceptance_context(tmp_path)
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "test-instance")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "test-commit")
+    monkeypatch.setenv("RENDER_SERVICE_ID", "test-service")
+    monkeypatch.setenv("RM_PROBE_STATE_DB", str(store.db_path))
+
+    probe_identity = _probe_module().cutover_identity_observation()
+    assert probe_identity is not None
+    assert probe_identity["phase"] == "RM_FROZEN_ACCEPTANCE"
+
+    checks, evidence = valid_rm_acceptance_artifact(store, controller)
+    checks["cutover_identity"] = probe_identity
+    evidence["cutover_identity"] = probe_identity
+    checks["evidence_sha256"] = _digest(evidence)
+
+    accepted = controller.accept_rm(lease, checks=checks, evidence=evidence)
+
+    assert accepted["acceptance_status"] == "PASS"
+
+
+def test_accept_rm_rejects_lowercase_probe_phase(monkeypatch, tmp_path):
+    store, lease, _, controller = _rm_acceptance_context(tmp_path)
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "test-instance")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "test-commit")
+    monkeypatch.setenv("RENDER_SERVICE_ID", "test-service")
+    monkeypatch.setenv("RM_PROBE_STATE_DB", str(store.db_path))
+
+    probe_identity = _probe_module().cutover_identity_observation()
+    assert probe_identity is not None
+    bad_identity = {**probe_identity, "phase": "frozen_rm_acceptance"}
+    checks, evidence = valid_rm_acceptance_artifact(store, controller)
+    checks["cutover_identity"] = bad_identity
+    evidence["cutover_identity"] = bad_identity
+    checks["evidence_sha256"] = _digest(evidence)
+
+    with pytest.raises(
+        CutoverTransitionError,
+        match="^acceptance_state_binding_invalid$",
+    ):
+        controller.accept_rm(lease, checks=checks, evidence=evidence)
 
 
 def test_accept_rm_cli_rejects_legacy_checks_only_file(tmp_path, capsys):

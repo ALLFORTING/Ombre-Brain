@@ -425,7 +425,7 @@ def cutover_identity_observation() -> dict[str, Any] | None:
             "SELECT generation, acquired_at, expires_at "
             "FROM cutover_freeze WHERE singleton = 1"
         ).fetchone()
-        if state is None:
+        if state is None or state["state"] != RM_FROZEN_ACCEPTANCE_STATE or state["authority"] != "rm":
             return None
         if freeze is None:
             freeze_status = "open"
@@ -451,7 +451,7 @@ def cutover_identity_observation() -> dict[str, Any] | None:
         return {
             "revision": int(state["revision"]),
             "cutover_state": str(state["state"]),
-            "phase": str(state["state"]),
+            "phase": RM_FROZEN_ACCEPTANCE_PHASE,
             "authority": str(state["authority"]),
             "freeze_status": freeze_status,
             "lease_generation": int(generation) if generation is not None else None,
@@ -1233,6 +1233,10 @@ def _write_json(path: Path, payload: dict[str, Any], acceptance_run_id: str) -> 
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+RM_FROZEN_ACCEPTANCE_STATE = "frozen_rm_acceptance"
+RM_FROZEN_ACCEPTANCE_PHASE = "RM_FROZEN_ACCEPTANCE"
 
 
 def _is_compatibility_payload(value: Any) -> bool:
