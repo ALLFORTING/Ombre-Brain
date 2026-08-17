@@ -553,17 +553,17 @@ def _tool_payload(message: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(result, dict):
         return None
     structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
+    if isinstance(structured, dict) and _is_compatibility_payload(structured): return structured
+    if isinstance(structured, dict) and _is_compatibility_payload(structured.get("result")): return structured["result"]
     content = result.get("content")
     if isinstance(content, list):
         for item in reversed(content):
             if not isinstance(item, dict) or item.get("type") != "text":
                 continue
             parsed = _json_message(str(item.get("text", "")).encode("utf-8"))
-            if isinstance(parsed, dict):
+            if _is_compatibility_payload(parsed):
                 return parsed
-    return result if "ok" in result or "error" in result else None
+    return result if _is_compatibility_payload(result) else None
 
 
 def _safe_result_detail(result: HttpResult, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1233,6 +1233,24 @@ def _write_json(path: Path, payload: dict[str, Any], acceptance_run_id: str) -> 
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _is_compatibility_payload(value: Any) -> bool:
+    """Recognize one public RM compatibility response envelope."""
+
+    if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+        return False
+    if value["ok"] is False:
+        return isinstance(value.get("error"), str) and bool(value["error"])
+    if "error" in value and value["error"] is not None:
+        return isinstance(value["error"], str) and bool(value["error"])
+    if "total" in value or "results" in value:
+        return (
+            type(value.get("total")) is int
+            and value["total"] >= 0
+            and isinstance(value.get("results"), list)
+        )
+    return len(value) > 1
 
 
 def main() -> int:

@@ -48,6 +48,121 @@ def _snapshot():
     }
 
 
+def _mcp_message(*, structured=None, text_payload=None):
+    result = {
+        "content": [],
+        "isError": False,
+    }
+    if structured is not None:
+        result["structuredContent"] = structured
+    if text_payload is not None:
+        result["content"].append(
+            {"type": "text", "text": json.dumps(text_payload)}
+        )
+    return {"jsonrpc": "2.0", "id": "probe-test", "result": result}
+
+
+def test_tool_payload_accepts_direct_structured_compatibility_envelope():
+    probe = _probe_module()
+    payload = {"ok": False, "error": "asset_write_frozen"}
+    assert probe._tool_payload({"structuredContent": payload}) == payload
+
+
+def test_tool_payload_unwraps_nested_structured_error_envelope():
+    probe = _probe_module()
+    payload = {"ok": False, "error": "asset_unavailable"}
+    assert probe._tool_payload(_mcp_message(structured={"result": payload})) == payload
+
+
+def test_tool_payload_unwraps_nested_structured_empty_search_envelope():
+    probe = _probe_module()
+    payload = {"ok": True, "total": 0, "results": []}
+    assert probe._tool_payload(_mcp_message(structured={"result": payload})) == payload
+
+
+def test_tool_payload_unwraps_nested_structured_frozen_mutation_envelope():
+    probe = _probe_module()
+    payload = {"ok": False, "error": "asset_write_frozen"}
+    assert probe._tool_payload(_mcp_message(structured={"result": payload})) == payload
+
+
+def test_tool_payload_ignores_unusable_structured_content_and_uses_text():
+    probe = _probe_module()
+    payload = {"ok": False, "error": "asset_unavailable"}
+    message = _mcp_message(
+        structured={"result": {"unexpected": "wrapper"}},
+        text_payload=payload,
+    )
+    assert probe._tool_payload(message) == payload
+
+
+def test_tool_payload_accepts_text_only_compatibility_payload():
+    probe = _probe_module()
+    payload = {"ok": True, "total": 0, "results": []}
+    assert probe._tool_payload(_mcp_message(text_payload=payload)) == payload
+
+
+def test_tool_payload_preserves_direct_outer_result_fallback():
+    probe = _probe_module()
+    payload = {"ok": False, "error": "asset_unavailable"}
+    assert probe._tool_payload({"result": payload}) == payload
+
+
+def test_mcp_read_paths_accept_production_nested_fastmcp_responses(monkeypatch):
+    probe = _probe_module()
+    instance = probe.Probe()
+    instance.mcp_token = "operator-token"
+    missing = {"ok": False, "error": "asset_unavailable"}
+    search = {"ok": True, "total": 0, "results": []}
+    responses = {
+        "rm_asset_search": search,
+        "rm_asset_get": missing,
+        "rm_asset_view": missing,
+        "rm_asset_inspect": missing,
+        "rm_asset_download_link": missing,
+    }
+
+    def mcp_tool(name, arguments):
+        payload = responses[name]
+        return probe.HttpResult(200, {}, b""), _mcp_message(
+            structured={"result": payload},
+            text_payload=payload,
+        )
+
+    monkeypatch.setattr(instance, "mcp_tool", mcp_tool)
+    instance.run_mcp_reads()
+
+    for name in (
+        "metadata_get",
+        "search",
+        "download",
+    ):
+        assert instance.evidence[name]["status"] == "PASS"
+
+
+def test_mcp_mutation_paths_accept_production_nested_fastmcp_responses(monkeypatch):
+    probe = _probe_module()
+    instance = probe.Probe()
+    instance.mcp_token = "operator-token"
+    frozen = {"ok": False, "error": "asset_write_frozen"}
+
+    def mcp_tool(name, arguments):
+        return probe.HttpResult(200, {}, b""), _mcp_message(
+            structured={"result": frozen},
+            text_payload=frozen,
+        )
+
+    monkeypatch.setattr(instance, "mcp_tool", mcp_tool)
+    assert instance.run_mcp_mutations() is True
+
+    for name in (
+        "mcp_upload_rejected",
+        "mcp_update_rejected",
+        "public_reindex_rejected",
+    ):
+        assert instance.evidence[name]["status"] == "PASS"
+
+
 def test_sqlite_fingerprint_reopen_compares_complete_observations():
     probe = _probe_module()
     first = _sqlite(True)
