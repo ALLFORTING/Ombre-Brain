@@ -54,13 +54,19 @@ import zlib
 import re
 import json as _json_lib
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
 from typing_extensions import Annotated, Literal
 from pydantic import Field
 from PIL import Image, UnidentifiedImageError
+
+
+# This identity is process-local evidence only.  It is never used for
+# authentication, capability lookup, or durable state.
+_RM_PROCESS_BOOT_ID = secrets.token_hex(16)
+_RM_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -4348,6 +4354,402 @@ asset_backend_registry = RuntimeAssetBackendRegistry.from_runtime(
     embedding_index=asset_embedding_index,
 )
 
+
+def _rm_runtime_evidence_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _rm_process_platform_identity() -> dict[str, str | None]:
+    """Expose actual Render identity inputs; expected values stay probe-only.
+
+    The external acceptance process must obtain its expected values from
+    independent Render control-plane/log evidence.  This server-side helper
+    never reads ``RM_PROBE_TRUSTED_*`` and never turns a local fallback into a
+    production identity.
+    """
+
+    names = {
+        "instance_id": "RENDER_INSTANCE_ID",
+        "git_commit": "RENDER_GIT_COMMIT",
+        "service_id": "RENDER_SERVICE_ID",
+    }
+    identity: dict[str, str | None] = {}
+    for field, name in names.items():
+        value = os.environ.get(name, "").strip()
+        identity[field] = (
+            value if value and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", value) else None
+        )
+    return identity
+
+
+def _require_rm_runtime_evidence_auth(request):
+    from starlette.responses import JSONResponse
+
+    headers = _rm_runtime_evidence_headers()
+    expected = _mcp_auth_token()
+    if not expected:
+        return JSONResponse(
+            {"status": "unavailable", "error": "runtime_evidence_unavailable"},
+            status_code=503,
+            headers=headers,
+        )
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, candidate = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not separator or not candidate.strip():
+        return JSONResponse({"status": "unauthorized"}, status_code=401, headers=headers)
+    if not _constant_time_token_match(candidate.strip(), expected):
+        return JSONResponse({"status": "unauthorized"}, status_code=401, headers=headers)
+    return None
+
+
+async def _rm_runtime_evidence(request):
+    from starlette.responses import JSONResponse
+
+    headers = _rm_runtime_evidence_headers()
+    auth_error = _require_rm_runtime_evidence_auth(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        if asset_backend_registry is None:
+            raise AssetBackendError("asset_authority_unavailable")
+        validation = asset_backend_registry._validate_boot()
+        selected = asset_backend_registry.selected_backend()
+        snapshot = asset_backend_registry.snapshot
+        if snapshot is None:
+            raise AssetBackendError("asset_authority_unavailable")
+        return JSONResponse(
+            {
+                "status": "ok",
+                "authority": validation.authority.value,
+                "durable_authority": snapshot.authority.value,
+                "selected_backend": selected.name,
+                "cutover_state": snapshot.state.value,
+                "freeze_status": snapshot.freeze_status,
+                "boot_mode": validation.boot_mode,
+                "writes_allowed": validation.writes_allowed,
+                "frozen": validation.frozen,
+                "recovery_required": validation.recovery_required,
+                "legacy_fallback_allowed": validation.legacy_fallback_allowed,
+                "rm_available": snapshot.rm_available,
+                "process_boot_id": _RM_PROCESS_BOOT_ID,
+                "process_started_at": _RM_PROCESS_STARTED_AT,
+                "platform_identity": _rm_process_platform_identity(),
+                # This means only that the current registry's _validate_boot()
+                # completed successfully.  It is not restart provenance.
+                "runtime_boot_validation_passed": True,
+            },
+            headers=headers,
+        )
+    except Exception:
+        return JSONResponse(
+            {"status": "unavailable", "error": "runtime_evidence_unavailable"},
+            status_code=503,
+            headers=headers,
+        )
+
+
+# Register this operator-only read surface without adding a public MCP tool or
+# changing the decorated route inventory used by the compatibility contract.
+mcp.custom_route("/__operator/rm-runtime-evidence", methods=["GET"])(
+    _rm_runtime_evidence
+)
+
+
+def _rm_probe_upload_ticket() -> dict[str, object]:
+    """Exercise the host upload ticket lifecycle without invoking HTTP/Core."""
+
+    upload_id = ""
+    token = ""
+    result: dict[str, object] = {"status": "FAIL", "error": "upload_ticket_probe_failed"}
+    try:
+        raw = _rm_create_asset_upload_link(
+            0,
+            "__rm_acceptance_probe__.bin",
+            "application/octet-stream",
+            source="remember_me",
+        )
+        payload = _json_lib.loads(raw)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            result = {"status": "INCOMPLETE", "error": "upload_ticket_unavailable"}
+        else:
+            upload_id = payload.get("upload_id", "")
+            upload_path = payload.get("upload_path", "")
+            if not isinstance(upload_id, str) or not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+                result = {"status": "FAIL", "error": "upload_ticket_invalid"}
+            elif not isinstance(upload_path, str):
+                result = {"status": "FAIL", "error": "upload_ticket_invalid"}
+            else:
+                token = upload_path.rsplit("/", 1)[-1]
+                if not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", token):
+                    result = {"status": "FAIL", "error": "upload_ticket_invalid"}
+                else:
+                    pending = _rm_get_asset_upload(token)
+                    if not pending or pending.get("upload_id") != upload_id or pending.get("source") != "remember_me":
+                        result = {"status": "FAIL", "error": "upload_ticket_pending_missing"}
+                    else:
+                        claimed = _rm_claim_asset_upload(token)
+                        if not claimed or claimed.get("upload_id") != upload_id or claimed.get("source") != "remember_me":
+                            result = {"status": "FAIL", "error": "upload_ticket_claim_failed"}
+                        else:
+                            _rm_release_asset_upload(upload_id)
+                            restored = _rm_get_asset_upload(token)
+                            result = (
+                                {"status": "PASS", "error": None}
+                                if restored and restored.get("upload_id") == upload_id
+                                else {"status": "FAIL", "error": "upload_ticket_release_failed"}
+                            )
+    except Exception:
+        result = {"status": "FAIL", "error": "upload_ticket_probe_failed"}
+    finally:
+        if upload_id:
+            try:
+                with _rm_asset_upload_lock:
+                    _rm_retire_asset_upload_locked(upload_id)
+            except Exception:
+                result = {"status": "FAIL", "error": "upload_ticket_cleanup_failed"}
+    return result
+
+
+def _rm_probe_download_ticket() -> dict[str, object]:
+    """Exercise only the in-memory download ticket store with a sentinel."""
+
+    token = ""
+    sentinel = "__rm_acceptance_probe_sentinel__"
+    try:
+        current = time.time()
+        with _rm_asset_download_lock:
+            _rm_cleanup_asset_downloads(current)
+            if len(_rm_asset_download_tokens) >= RM_ASSET_DOWNLOAD_MAX_TOKENS:
+                return {"status": "INCOMPLETE", "error": "download_ticket_store_full"}
+            token = secrets.token_urlsafe(32)
+            if not _rm_store_asset_download_ticket_locked(
+                token,
+                sentinel,
+                current + RM_ASSET_DOWNLOAD_TTL_SECONDS,
+                "remember_me",
+            ):
+                return {"status": "FAIL", "error": "download_ticket_store_failed"}
+            present = (
+                token in _rm_asset_download_tokens
+                and _rm_asset_download_sources.get(token) == "remember_me"
+            )
+            _rm_retire_asset_download_locked(token)
+            removed = (
+                token not in _rm_asset_download_tokens
+                and token not in _rm_asset_download_sources
+            )
+        return {"status": "PASS" if present and removed else "FAIL", "error": None if present and removed else "download_ticket_cleanup_failed"}
+    except Exception:
+        return {"status": "FAIL", "error": "download_ticket_probe_failed"}
+    finally:
+        if token:
+            try:
+                with _rm_asset_download_lock:
+                    _rm_retire_asset_download_locked(token)
+            except Exception:
+                pass
+
+
+def _rm_probe_verification_session() -> dict[str, object]:
+    """Run the real RM zero-item verification lifecycle without exposing IDs."""
+
+    def remove_exact_closed_session(expected_service, expected_id, expected_session) -> bool:
+        sessions = getattr(expected_service, "_verification_sessions", None)
+        sessions_lock = getattr(expected_service, "_verification_sessions_lock", None)
+        if not isinstance(sessions, dict) or sessions_lock is None:
+            return False
+        with sessions_lock:
+            current = sessions.get(expected_id)
+            if current is not expected_session:
+                return False
+            session_lock = getattr(current, "lock", None)
+            if session_lock is None:
+                return False
+            with session_lock:
+                if getattr(current, "closed", False) is not True:
+                    return False
+            del sessions[expected_id]
+            return sessions.get(expected_id) is None
+
+    snapshot_id = ""
+    service = None
+    session = None
+    completed = False
+    removed = False
+    result: dict[str, object] = {"status": "FAIL", "error": "verification_probe_failed"}
+    try:
+        bundle = remember_me_host_bundle
+        adapter = getattr(bundle, "core_adapter", None)
+        runtime = getattr(adapter, "_runtime", None)
+        service = getattr(runtime, "service", None)
+        if service is None:
+            return {"status": "INCOMPLETE", "error": "verification_service_unavailable"}
+        from remember_me.core import (
+            BeginAssetVerificationRequest,
+            CompleteAssetVerificationRequest,
+            ListAssetVerificationPageRequest,
+        )
+
+        snapshot = service.begin_asset_verification(
+            BeginAssetVerificationRequest(kind="image")
+        )
+        snapshot_id = getattr(snapshot, "snapshot_id", "")
+        total_count = getattr(snapshot, "total_count", None)
+        if not isinstance(snapshot_id, str) or not snapshot_id or total_count != 0:
+            return {"status": "FAIL", "error": "verification_snapshot_invalid"}
+        sessions = getattr(service, "_verification_sessions", None)
+        sessions_lock = getattr(service, "_verification_sessions_lock", None)
+        if not isinstance(sessions, dict) or sessions_lock is None:
+            return {"status": "FAIL", "error": "verification_cleanup_failed"}
+        with sessions_lock:
+            session = sessions.get(snapshot_id)
+        if session is None:
+            return {"status": "FAIL", "error": "verification_cleanup_failed"}
+        page = service.list_asset_verification_page(
+            ListAssetVerificationPageRequest(
+                snapshot_id=snapshot_id,
+                cursor="",
+                limit=500,
+            )
+        )
+        page_ok = (
+            getattr(page, "snapshot_id", None) == snapshot_id
+            and getattr(page, "records", None) == ()
+            and getattr(page, "total_count", None) == 0
+            and getattr(page, "has_more", None) is False
+            and getattr(page, "next_cursor", None) == ""
+        )
+        if not page_ok:
+            return {"status": "FAIL", "error": "verification_page_invalid"}
+        completion = service.complete_asset_verification(
+            CompleteAssetVerificationRequest(snapshot_id=snapshot_id)
+        )
+        completed = True
+        complete_ok = (
+            getattr(completion, "complete", None) is True
+            and getattr(completion, "unchanged", None) is True
+            and getattr(completion, "total_count", None) == 0
+            and getattr(completion, "scanned_count", None) == 0
+            and getattr(completion, "blob_verified_count", None) == 0
+        )
+        cleanup_ok = (
+            session is not None
+            and getattr(session, "closed", False) is True
+            and remove_exact_closed_session(service, snapshot_id, session)
+        )
+        removed = cleanup_ok
+        result = {
+            "status": "PASS" if complete_ok and cleanup_ok else "FAIL",
+            "error": None if complete_ok and cleanup_ok else "verification_cleanup_failed",
+        }
+    except Exception:
+        result = {"status": "FAIL", "error": "verification_probe_failed"}
+    finally:
+        # A failure after begin must not leave an active process-local session.
+        # The completion API is the service-owned cleanup seam; IDs never leave
+        # this function and only stable status is returned to the caller.
+        if snapshot_id and service is not None and not removed:
+            if not completed:
+                try:
+                    from remember_me.core import CompleteAssetVerificationRequest
+
+                    service.complete_asset_verification(
+                        CompleteAssetVerificationRequest(snapshot_id=snapshot_id)
+                    )
+                    completed = True
+                except Exception:
+                    pass
+            if session is None:
+                result = {"status": "FAIL", "error": "verification_cleanup_failed"}
+            else:
+                session_lock = getattr(session, "lock", None)
+                if session_lock is None:
+                    result = {"status": "FAIL", "error": "verification_cleanup_failed"}
+                else:
+                    with session_lock:
+                        session.closed = True
+                    if getattr(session, "closed", False) is not True:
+                        result = {"status": "FAIL", "error": "verification_cleanup_failed"}
+            if session is not None and not removed:
+                removed = remove_exact_closed_session(service, snapshot_id, session)
+            if not removed:
+                result = {"status": "FAIL", "error": "verification_cleanup_failed"}
+    return result
+
+
+def _rm_ephemeral_runtime_probe() -> dict[str, object]:
+    """Run all cutover-relevant process-local lifecycle probes."""
+
+    try:
+        validation = asset_backend_registry._validate_boot()
+        snapshot = asset_backend_registry.snapshot
+        in_frozen_rm = bool(
+            snapshot is not None
+            and validation.authority.value == "rm"
+            and snapshot.authority.value == "rm"
+            and snapshot.state.value == "frozen_rm_acceptance"
+            and snapshot.freeze_status == "active"
+            and validation.frozen is True
+            and validation.writes_allowed is False
+            and validation.legacy_fallback_allowed is False
+            and snapshot.rm_available is True
+        )
+    except Exception:
+        in_frozen_rm = False
+    if not in_frozen_rm:
+        return {
+            "status": "INCOMPLETE",
+            "upload_ticket_recreated": False,
+            "download_ticket_recreated": False,
+            "verification_session_recreated": False,
+            "ephemeral_cleanup_complete": True,
+            "capability_not_exposed": True,
+            "durable_mutation_performed": False,
+        }
+
+    upload = _rm_probe_upload_ticket()
+    download = _rm_probe_download_ticket()
+    verification = _rm_probe_verification_session()
+    statuses = (upload["status"], download["status"], verification["status"])
+    overall = "FAIL" if "FAIL" in statuses else "INCOMPLETE" if "INCOMPLETE" in statuses else "PASS"
+    return {
+        "status": overall,
+        "upload_ticket_recreated": upload["status"] == "PASS",
+        "download_ticket_recreated": download["status"] == "PASS",
+        "verification_session_recreated": verification["status"] == "PASS",
+        "ephemeral_cleanup_complete": overall == "PASS",
+        "capability_not_exposed": True,
+        "durable_mutation_performed": False,
+    }
+
+
+async def _rm_ephemeral_runtime_evidence(request):
+    from starlette.responses import JSONResponse
+
+    headers = _rm_runtime_evidence_headers()
+    auth_error = _require_rm_runtime_evidence_auth(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        result = _rm_ephemeral_runtime_probe()
+        status_code = 200 if result["status"] == "PASS" else 409 if result["status"] == "FAIL" else 503
+        return JSONResponse(result, status_code=status_code, headers=headers)
+    except Exception:
+        return JSONResponse(
+            {"status": "INCOMPLETE", "error": "ephemeral_probe_unavailable"},
+            status_code=503,
+            headers=headers,
+        )
+
+
+mcp.custom_route("/__operator/rm-runtime-evidence/ephemeral-probe", methods=["POST"])(
+    _rm_ephemeral_runtime_evidence
+)
+
 def _asset_vision_download_payload(trial_id: str, png: bytes, sha256: str, token: str, expires_at: float, now: float) -> str:
     download_path = f"/rm/vision-download/{token}"
     base_url = _asset_public_base_url()
@@ -4671,9 +5073,14 @@ async def rm_asset_upload_link(
 ) -> str:
     """Create a short-lived browser upload URL; the server computes the file hash."""
     try:
-        source = _selected_asset_backend().name
-    except AssetBackendError:
-        return _asset_ingest_response(False, error="upload_unavailable")
+        backend = _selected_asset_backend()
+        backend.assert_public_mutation_allowed()
+        source = backend.name
+    except AssetBackendError as exc:
+        return _asset_ingest_response(
+            False,
+            error=_safe_asset_ingest_error(exc, "upload_unavailable"),
+        )
     source = "remember_me" if source == "rm" else "legacy"
     return _rm_create_asset_upload_link(expected_bytes, filename, mime_type, source=source)
 

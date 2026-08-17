@@ -377,8 +377,11 @@ class AssetDashboardService:
         if not payload or set(payload) - allowed:
             raise AssetDashboardError("invalid_fields")
         try:
+            backend.assert_public_mutation_allowed()
             existing = backend.get(asset_id)
         except (AssetStoreError, AssetBackendError) as exc:
+            if getattr(exc, "code", str(exc)) == "asset_write_frozen":
+                raise AssetDashboardError("asset_write_frozen", 409) from exc
             raise AssetDashboardError("asset_unavailable", 404) from exc
         if not existing or existing.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)
@@ -397,8 +400,11 @@ class AssetDashboardService:
     def delete_asset(self, asset_id: str) -> dict:
         backend = self._backend()
         try:
+            backend.assert_public_mutation_allowed()
             asset = backend.get(asset_id)
         except (AssetStoreError, AssetBackendError) as exc:
+            if getattr(exc, "code", str(exc)) == "asset_write_frozen":
+                raise AssetDashboardError("asset_write_frozen", 409) from exc
             raise AssetDashboardError("asset_unavailable", 404) from exc
         if not asset or asset.get("kind") != "image":
             raise AssetDashboardError("asset_not_found", 404)

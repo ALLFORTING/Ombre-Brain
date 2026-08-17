@@ -28,6 +28,7 @@ from remember_me_cutover_migration import (
 )
 from remember_me_cutover_operations import acceptance_check_spec, create_backup, verify_backup, restore_backup
 from remember_me_cutover_transition import CutoverTransitionController, RM_SOURCE_COMMIT, build_parser
+from tests._rm_acceptance_artifact import valid_rm_acceptance_artifact
 
 
 def _legacy(root: Path, *, with_asset: bool = False) -> Path:
@@ -215,8 +216,8 @@ def test_d2_handoff_releases_and_cleans_shared_capability(tmp_path):
     controller = CutoverTransitionController(state_db, capability_file=cap)
     controller.prepare_rm_switch(lease, evidence=evidence)
     controller.switch_to_rm(lease, configured_authority=AssetAuthority.RM, restart_validated=True)
-    checks = {name: True for name in acceptance_check_spec()["checks"]}
-    controller.accept_rm(lease, checks=checks)
+    checks, evidence = valid_rm_acceptance_artifact(store, controller)
+    controller.accept_rm(lease, checks=checks, evidence=evidence)
     opened = controller.release_to_rm(lease)
     assert opened["phase"] == "RM_OPEN"
     assert not cap.exists()

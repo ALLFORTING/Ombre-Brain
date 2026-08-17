@@ -19,7 +19,8 @@ from asset_store import AssetStore
 from cutover_lease_capability import read_capability
 from remember_me_adapter import EXPECTED_PACKAGE_VERSION
 from remember_me_cutover_operations import acceptance_check_spec
-from remember_me_cutover_transition import LEGACY_ACCEPTANCE_NAMES, RM_SOURCE_COMMIT
+from remember_me_cutover_transition import CutoverTransitionController, LEGACY_ACCEPTANCE_NAMES, RM_SOURCE_COMMIT
+from tests._rm_acceptance_artifact import valid_rm_acceptance_artifact
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +81,13 @@ def _run(
     result = subprocess.run(
         [sys.executable, "-m", module, *args],
         cwd=ROOT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env={
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            "RENDER_INSTANCE_ID": "test-instance",
+            "RENDER_GIT_COMMIT": "test-commit",
+            "RENDER_SERVICE_ID": "test-service",
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -567,12 +574,14 @@ def _rerun_to_ready_after_abort(ws: dict[str, Path], output: list[str]) -> None:
         output=output,
     )
 def _run_rm_acceptance(ws: dict[str, Path], output: list[str], *, passed: bool) -> None:
-    checks = {name: passed for name in acceptance_check_spec()["checks"]}
-    checks_path = _write_json(ws["reports"] / "rm-checks.json", checks)
-    evidence_path = _write_json(
-        ws["reports"] / "rm-acceptance-evidence.json",
-        {"state": {"authority": "rm", "frozen": True}, "checks": checks},
+    controller = CutoverTransitionController(ws["state_db"], capability_file=ws["cap"])
+    checks, evidence = valid_rm_acceptance_artifact(
+        CutoverStateStore(ws["state_db"]),
+        controller,
+        passed=passed,
     )
+    checks_path = _write_json(ws["reports"] / "rm-checks.json", checks)
+    evidence_path = _write_json(ws["reports"] / "rm-acceptance-evidence.json", evidence)
     _run(
         "remember_me_cutover_operations",
         [
@@ -1022,10 +1031,14 @@ def test_expired_d2_recovery_rotates_lease_and_survives_fresh_rm_boot(tmp_path):
             "SELECT schema_version, payload_json FROM d2_transition_record WHERE singleton = 1"
         ).fetchone() == before_d2_record
 
-    checks = _write_json(
-        ws["reports"] / "expired-rm-checks.json",
-        {name: True for name in acceptance_check_spec()["checks"]},
+    recovery_controller = CutoverTransitionController(ws["state_db"], capability_file=ws["cap"])
+    checks_payload, evidence_payload = valid_rm_acceptance_artifact(
+        CutoverStateStore(ws["state_db"]),
+        recovery_controller,
+        run_id="expired-acceptance-test-1",
     )
+    checks = _write_json(ws["reports"] / "expired-rm-checks.json", checks_payload)
+    _write_json(ws["reports"] / "rm-acceptance-evidence.json", evidence_payload)
     for command_args in (
         [
             "accept-rm",
