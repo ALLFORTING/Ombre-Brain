@@ -48,6 +48,48 @@ def _snapshot():
     }
 
 
+def _write_cutover_identity_db(path, *, state="frozen_rm_acceptance", authority="rm"):
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE cutover_state (
+            singleton INTEGER PRIMARY KEY,
+            revision INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            rm_available INTEGER NOT NULL,
+            freeze_status TEXT NOT NULL
+        );
+        CREATE TABLE cutover_freeze (
+            singleton INTEGER PRIMARY KEY,
+            lease_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            renewed_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO cutover_state VALUES (1, ?, ?, ?, 1, 'frozen')",
+        (18, state, authority),
+    )
+    connection.execute(
+        "INSERT INTO cutover_freeze VALUES (1, ?, ?, ?, ?, ?, ?)",
+        (
+            "lease-18",
+            "token-hash",
+            18,
+            "2099-08-17T10:23:30.353866+00:00",
+            "2099-08-17T10:23:30.353866+00:00",
+            "2099-08-17T11:23:30.353866+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+
 def _mcp_message(*, structured=None, text_payload=None):
     result = {
         "content": [],
@@ -60,6 +102,41 @@ def _mcp_message(*, structured=None, text_payload=None):
             {"type": "text", "text": json.dumps(text_payload)}
         )
     return {"jsonrpc": "2.0", "id": "probe-test", "result": result}
+
+
+def test_cutover_identity_observation_emits_canonical_rm_phase(monkeypatch, tmp_path):
+    probe = _probe_module()
+    state_db = tmp_path / "state" / "migration.sqlite3"
+    state_db.parent.mkdir()
+    _write_cutover_identity_db(state_db)
+    monkeypatch.setenv("RM_PROBE_STATE_DB", str(state_db))
+
+    assert probe.cutover_identity_observation() == {
+        "revision": 18,
+        "cutover_state": "frozen_rm_acceptance",
+        "phase": "RM_FROZEN_ACCEPTANCE",
+        "authority": "rm",
+        "freeze_status": "active",
+        "lease_generation": 18,
+        "lease_acquired_at": "2099-08-17T10:23:30.353866+00:00",
+        "lease_expires_at": "2099-08-17T11:23:30.353866+00:00",
+    }
+
+
+def test_cutover_identity_observation_rejects_non_frozen_rm_state(
+    monkeypatch, tmp_path
+):
+    probe = _probe_module()
+    state_db = tmp_path / "state" / "migration.sqlite3"
+    state_db.parent.mkdir()
+    _write_cutover_identity_db(
+        state_db,
+        state="frozen_ready_for_rm_switch",
+        authority="legacy",
+    )
+    monkeypatch.setenv("RM_PROBE_STATE_DB", str(state_db))
+
+    assert probe.cutover_identity_observation() is None
 
 
 def test_tool_payload_accepts_direct_structured_compatibility_envelope():
