@@ -2,6 +2,9 @@
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
 > 最后更新：2026-04-19
+>
+> Contract v1 边界说明：本文是内部实现快照。下文的评分、阈值、衰减、字段、目录和流程示例均不是稳定的公共保证；当前公共语义请参阅 [`docs/OB_MEMORY_LAYER_CONTRACT_v1.md`](docs/OB_MEMORY_LAYER_CONTRACT_v1.md)。模型启动流程是可选指导，不是强制的 boot/Breath/dream/feel 顺序。`/api/breath-debug` 的当前诊断保证仅覆盖 supported query runtime path；no-query、session/feel、importance 等特殊路由必须视为 unsupported/untraced。
+>
 
 ---
 
@@ -62,7 +65,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 **模型感受/反思系统**
 - **Feel 写入**（`hold(feel=True)`）：存模型第一人称感受，标记源记忆为 digested
 - **Dream 做梦**（`dream()`）：返回最近 10 条 + 自省引导 + 连接提示 + 结晶化提示
-- **对话启动流程**：breath() → dream() → breath(domain="feel") → 开始对话
+- **对话启动示例（可选、非强制顺序）**：按上下文需要使用 breath() → dream() → breath(domain="feel") → 开始对话
 
 **自动化处理**
 - 存入时 LLM 自动分析 domain/valence/arousal/tags/name
@@ -127,7 +130,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 | `/api/bucket/{id}` | GET | 桶详情 🔒 |
 | `/api/search?q=` | GET | 搜索 🔒 |
 | `/api/network` | GET | 向量相似网络 🔒 |
-| `/api/breath-debug` | GET | 评分调试 🔒 |
+| `/api/breath-debug` | GET | 支持 query Breath 的运行时诊断；特殊路由显式标为 unsupported/untraced 🔒 |
 | `/api/config` | GET | 配置查看（key 脱敏）🔒 |
 | `/api/config` | POST | 热更新配置 🔒 |
 | `/api/status` | GET | 系统状态（版本/桶数/引擎）🔒 |
@@ -153,7 +156,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 
 **Dashboard（6 个 Tab）**
 1. 记忆桶列表：6 种过滤器 + 主题域过滤 + 搜索 + 详情面板
-2. Breath 模拟：输入参数 → 可视化五步流程 → 四维条形图
+2. Breath 诊断：supported query runtime trace；no-query/session/feel/importance routes 显式标为 untraced
 3. 记忆网络：Canvas 力导向图（节点=桶，边=相似度）
 4. 配置：热更新脱水/embedding/合并参数
 5. 导入：历史对话拖拽上传 → 分块处理进度条 → 词频规律分析 → 导入结果审阅
@@ -433,7 +436,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 
 ### 5.8 为什么 dream 设计成对话开头自动执行？
 
-**决策**：每次新对话启动时，Claude 执行 `dream()` 消化最近记忆，有沉淀写 feel，能放下的 resolve。
+**历史设计（非当前强制行为）**：曾设想每次新对话启动时由 Claude 执行 `dream()` 消化最近记忆，有沉淀写 feel，能放下的 resolve。当前按上下文选择，详见 Contract v1 与 `CLAUDE_PROMPT.md`。
 
 **理由**：
 - 模拟睡眠中的记忆整理——人在睡觉时大脑会重放和整理白天的经历
