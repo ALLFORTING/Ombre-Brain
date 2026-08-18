@@ -1554,6 +1554,14 @@ async function runBreathDebug() {
     var res = await fetch(url);
     var data = await res.json();
 
+    if (data.status !== 'ok') {
+      info.style.display = '';
+      info.innerHTML = '<strong>未追踪路径</strong>&nbsp;' +
+        esc((data.unsupported_paths || []).join(', '));
+      results.innerHTML = '<div class="loading">此 Breath 路径未被当前诊断 trace 覆盖</div>';
+      return;
+    }
+
     document.getElementById('fs-input').classList.add('active');
     document.getElementById('fs-cand-n').textContent = data.total_candidates + ' 桶';
     document.getElementById('fs-candidates').classList.add('active');
@@ -1562,16 +1570,19 @@ async function runBreathDebug() {
     document.getElementById('fs-threshold').classList.add('active');
     document.getElementById('fs-sort').classList.add('active');
 
-    var w = data.weights;
+    var w = data.weights || {};
+    var semantic = data.semantic || {};
+    var composition = data.final_composition || {};
     info.style.display = '';
     info.innerHTML =
-      '<strong>权重配置</strong>&nbsp;' +
+      '<strong>Runtime Breath trace</strong>&nbsp;' +
       'topic=<code>' + w.topic + '</code> emotion=<code>' + w.emotion + '</code> ' +
       'time=<code>' + w.time + '</code> importance=<code>' + w.importance + '</code>' +
       ' &nbsp;|&nbsp; 阈值=<code>' + data.threshold + '</code>' +
       ' &nbsp;|&nbsp; 候选=<code>' + data.total_candidates + '</code> 桶' +
-      ' → 通过=<code>' + data.passed_count + '</code> 桶' +
-      (query ? '' : ' &nbsp;|&nbsp; <em>未输入 query，topic 分数全为 0</em>');
+      ' → admission=<code>' + data.passed_count + '</code> 桶' +
+      ' &nbsp;|&nbsp; semantic=<code>' + esc(semantic.status || 'unknown') + '</code>' +
+      ' &nbsp;|&nbsp; surfaced=<code>' + (composition.surfaced_count || 0) + '</code> 桶';
 
     if (!data.results.length) {
       results.innerHTML = '<div class="loading">无结果</div>';
@@ -1579,14 +1590,16 @@ async function runBreathDebug() {
     }
 
     var barColors = {
-      topic: '#2F4F4F',
+      fuzzy_lexical: '#2F4F4F',
+      exact_match: '#6B4E71',
       emotion: '#8B6A6A',
       time: '#9A7B4F',
       importance: '#4A7C59',
+      semantic: '#2C6E91',
     };
 
     results.innerHTML = data.results.map(function(r, i) {
-      var s = r.scores;
+      var s = r.scores || {};
       var passed = r.passed_threshold;
       var icon = r.pinned ? '📌' : r.resolved ? '💤' : r.type === 'feel' ? '🫧' : '💭';
       var bars = Object.entries(s).map(function(entry) {
@@ -1594,18 +1607,20 @@ async function runBreathDebug() {
         var pct = Math.round(val * 100);
         var wt = r.weights[key];
         return '<div class="score-bar-group">' +
-          '<div class="score-bar-label"><span>' + key + '×' + wt + '</span><span>' + val.toFixed(2) + '</span></div>' +
+          '<div class="score-bar-label"><span>' + key + (wt === undefined ? '' : '×' + wt) + '</span><span>' + val.toFixed(2) + '</span></div>' +
           '<div class="score-bar-track">' +
-            '<div class="score-bar-fill" style="width:' + pct + '%;background:' + barColors[key] + '"></div>' +
+            '<div class="score-bar-fill" style="width:' + pct + '%;background:' + (barColors[key] || '#777') + '"></div>' +
           '</div>' +
         '</div>';
       }).join('');
+      var score = Number(r.final_ranking_score ?? r.normalized ?? 0);
+      var decision = r.final_decision || (passed ? 'admitted_not_composed' : (r.exclusion_reasons || []).join(', '));
 
       return '<div class="score-row" title="' + esc(r.name) + '">' +
         '<span class="rank">' + (i < 9 ? '0' : '') + (i + 1) + '</span>' +
         '<span class="name">' + icon + ' ' + esc(r.name) + '</span>' +
         '<div class="score-bars">' + bars + '</div>' +
-        '<span class="score-final ' + (passed ? 'score-pass' : 'score-fail') + '">' + r.normalized.toFixed(1) + (r.resolved ? '<small>×0.3</small>' : '') + '</span>' +
+        '<span class="score-final ' + (passed ? 'score-pass' : 'score-fail') + '">' + score.toFixed(1) + (r.resolved ? '<small>×0.3</small>' : '') + '<small>' + esc(decision) + '</small></span>' +
       '</div>';
     }).join('');
   } catch (e) {
