@@ -250,7 +250,13 @@ class Dehydrator:
     # API only (no local fallback)
     # 仅通过 API 脱水（无本地回退）
     # ---------------------------------------------------------
-    async def dehydrate(self, content: str, metadata: dict = None) -> str:
+    async def dehydrate(
+        self,
+        content: str,
+        metadata: dict = None,
+        *,
+        cache: bool = True,
+    ) -> str:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
@@ -269,9 +275,10 @@ class Dehydrator:
 
         # --- Check cache first ---
         # --- 先查缓存 ---
-        cached = self._get_cached_summary(content)
-        if cached:
-            return self._format_output(cached, metadata)
+        if cache:
+            cached = self._get_cached_summary(content)
+            if cached:
+                return self._format_output(cached, metadata)
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
@@ -280,7 +287,8 @@ class Dehydrator:
 
         result = await self._api_dehydrate(content)
         # --- Cache the result ---
-        self._set_cached_summary(content, result)
+        if cache:
+            self._set_cached_summary(content, result)
         return self._format_output(result, metadata)
 
     # ---------------------------------------------------------

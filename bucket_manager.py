@@ -695,6 +695,7 @@ class BucketManager:
         query_arousal: float = None,
         include_dormant: bool = False,
         candidate_buckets: list[dict] = None,
+        trace: dict | None = None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -703,7 +704,29 @@ class BucketManager:
         domain_filter: pre-filter by domain (None = search all)
         query_valence/arousal: emotion coordinates for resonance scoring
         """
+        if trace is not None:
+            trace.clear()
+            trace.update({
+                "query": query,
+                "candidate_source": (
+                    "candidate_buckets"
+                    if candidate_buckets is not None
+                    else "active_buckets"
+                ),
+                "semantic": {
+                    "enabled": bool(
+                        self.embedding_engine
+                        and getattr(self.embedding_engine, "enabled", False)
+                    ),
+                    "status": "not_run",
+                },
+                "candidates": [],
+                "ranking": [],
+            })
+
         if not query or not query.strip():
+            if trace is not None:
+                trace["status"] = "empty_query"
             return []
 
         limit = limit or self.max_results
@@ -714,7 +737,21 @@ class BucketManager:
         )
 
         if not all_buckets:
+            if trace is not None:
+                trace["status"] = "no_candidates"
             return []
+
+        trace_entries = {}
+        if trace is not None:
+            for bucket in all_buckets:
+                bid = str(bucket.get("id", ""))
+                trace_entries[bid] = {
+                    "id": bid,
+                    "candidate_origin": trace["candidate_source"],
+                    "eligible": True,
+                    "admitted": False,
+                    "entered_ranking": False,
+                }
 
         # --- Layer 1: domain pre-filter (fast scope reduction) ---
         # --- 第一层：主题域预筛（快速缩小范围）---
@@ -733,16 +770,37 @@ class BucketManager:
         else:
             candidates = all_buckets
 
+        if trace is not None:
+            candidate_ids = {str(bucket.get("id", "")) for bucket in candidates}
+            for bid, entry in trace_entries.items():
+                if bid not in candidate_ids:
+                    entry["eligible"] = False
+                    entry["exclusion_reasons"] = ["domain_filter"]
+
         if not include_dormant:
+            before_dormant = candidates
             candidates = [
                 b for b in candidates
                 if not b.get("metadata", {}).get("dormant", False)
             ]
+            if trace is not None:
+                retained_ids = {str(bucket.get("id", "")) for bucket in candidates}
+                for bucket in before_dormant:
+                    bid = str(bucket.get("id", ""))
+                    if bid not in retained_ids:
+                        entry = trace_entries.get(bid)
+                        if entry is not None:
+                            entry["eligible"] = False
+                            entry.setdefault("exclusion_reasons", []).append("dormant")
 
         # --- Layer 1.5: semantic recall for hybrid keyword/vector ranking ---
         # --- 第1.5层：语义召回，与关键词分数混合排序 ---
         vector_scores = {}
+        semantic_before_error = ""
         if self.embedding_engine and self.embedding_engine.enabled:
+            semantic_before_error = str(
+                getattr(self.embedding_engine, "last_error", "") or ""
+            )
             try:
                 if candidate_buckets is None:
                     vector_results = await self.embedding_engine.search_similar(
@@ -759,6 +817,30 @@ class BucketManager:
                 vector_scores = dict(vector_results)
             except Exception as e:
                 logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
+
+        if trace is not None:
+            semantic_after_error = str(
+                getattr(self.embedding_engine, "last_error", "") or ""
+            ) if self.embedding_engine else ""
+            if not self.embedding_engine or not self.embedding_engine.enabled:
+                trace["semantic"] = {"enabled": False, "status": "disabled"}
+            elif semantic_after_error and semantic_after_error != semantic_before_error:
+                trace["semantic"] = {
+                    "enabled": True,
+                    "status": "provider_error",
+                    "error_code": semantic_after_error,
+                }
+            elif vector_scores:
+                trace["semantic"] = {
+                    "enabled": True,
+                    "status": "available",
+                    "matched_count": len(vector_scores),
+                }
+            else:
+                trace["semantic"] = {
+                    "enabled": True,
+                    "status": "unavailable_or_empty_index",
+                }
 
         # --- Layer 2: weighted multi-dim ranking ---
         # --- 第二层：多维加权精排 ---
@@ -797,6 +879,24 @@ class BucketManager:
                 weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
 
+                trace_entry = (
+                    trace_entries.get(str(bucket.get("id", "")))
+                    if trace is not None
+                    else None
+                )
+                if trace_entry is not None:
+                    trace_entry["scores"] = {
+                        "fuzzy_lexical": round(topic_score, 4),
+                        "exact_match": round(exact_score, 4),
+                        "emotion": round(emotion_score, 4),
+                        "time": round(time_score, 4),
+                        "importance": round(importance_score, 4),
+                        "semantic": round(semantic_score, 4),
+                    }
+                    trace_entry["pre_penalty_score"] = round(normalized, 2)
+                    trace_entry["semantic_threshold"] = semantic_score >= 0.42
+                    trace_entry["threshold"] = self.fuzzy_threshold
+
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
@@ -810,6 +910,18 @@ class BucketManager:
                         )
                     if meta.get("resolved", False):
                         hybrid_score *= 0.3
+                    if trace_entry is not None:
+                        trace_entry["admitted"] = True
+                        trace_entry["resolved"] = bool(meta.get("resolved", False))
+                        trace_entry["ranking_penalty"] = (
+                            0.3 if meta.get("resolved", False) else 1.0
+                        )
+                        trace_entry["final_ranking_score"] = round(hybrid_score, 2)
+                        trace_entry["match_tier"] = (
+                            3 if exact_score >= 0.95
+                            else 2 if exact_score > 0
+                            else 1
+                        )
                     bucket["score"] = round(hybrid_score, 2)
                     bucket["semantic_score"] = round(semantic_score, 4)
                     bucket["vector_match"] = semantic_score >= 0.42 and not exact_score
@@ -820,6 +932,8 @@ class BucketManager:
                     else:
                         bucket["match_tier"] = 1
                     scored.append(bucket)
+                elif trace_entry is not None:
+                    trace_entry["exclusion_reasons"] = ["threshold"]
             except Exception as e:
                 logger.warning(
                     f"Scoring failed for bucket {bucket.get('id', '?')} / "
@@ -831,6 +945,18 @@ class BucketManager:
             key=lambda x: (x.get("match_tier", 0), x["score"]),
             reverse=True,
         )
+        if trace is not None:
+            for rank, bucket in enumerate(scored, start=1):
+                trace_entry = trace_entries.get(str(bucket.get("id", "")))
+                if trace_entry is not None:
+                    trace_entry["entered_ranking"] = True
+                    trace_entry["rank"] = rank
+            trace["status"] = "ok"
+            trace["candidate_count"] = len(all_buckets)
+            trace["eligible_count"] = len(candidates)
+            trace["admitted_count"] = len(scored)
+            trace["candidates"] = list(trace_entries.values())
+            trace["ranking"] = [str(bucket.get("id", "")) for bucket in scored[:limit]]
         return scored[:limit]
 
     # ---------------------------------------------------------

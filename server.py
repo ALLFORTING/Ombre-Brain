@@ -1362,6 +1362,59 @@ def _matches_any_structured_filter(
     return any(item in wanted for item in stored_values)
 
 
+def _filter_breath_candidates(
+    buckets: list[dict],
+    *,
+    domain_values: list[str] | None = None,
+    recent_cutoff: str | None = None,
+    include_dormant: bool = False,
+    include_sealed: bool = False,
+    date_from: str = "",
+    date_to: str = "",
+    tags_filter: list[str] | None = None,
+    topic_filter: list[str] | None = None,
+    apply_domain: bool = True,
+    apply_dormant: bool = True,
+) -> list[dict]:
+    """Apply the shared privacy and structured Breath candidate gates."""
+    domain_set = {
+        str(value).casefold()
+        for value in (domain_values or [])
+        if str(value).strip()
+    }
+    tags_filter = tags_filter or []
+    topic_filter = topic_filter or []
+    candidates = [
+        bucket
+        for bucket in buckets
+        if include_sealed or not _is_sealed(bucket)
+    ]
+    if apply_domain and domain_set:
+        candidates = [
+            bucket
+            for bucket in candidates
+            if domain_set
+            & {
+                str(value).casefold()
+                for value in bucket.get("metadata", {}).get("domain", [])
+            }
+        ]
+    if apply_dormant and not include_dormant:
+        candidates = [
+            bucket
+            for bucket in candidates
+            if not bucket.get("metadata", {}).get("dormant", False)
+        ]
+    return [
+        bucket
+        for bucket in candidates
+        if _is_recent_bucket(bucket, recent_cutoff)
+        and _is_in_date_range(bucket, date_from, date_to)
+        and _matches_any_structured_filter(bucket, "tags", tags_filter)
+        and _matches_any_structured_filter(bucket, "topics", topic_filter)
+    ]
+
+
 def _breath_recency_key(bucket: dict) -> tuple[str, str]:
     """Return the canonical deterministic breath recency key."""
     metadata = bucket.get("metadata", {})
@@ -2198,38 +2251,19 @@ async def _breath_filtered_impl(
         apply_domain: bool = True,
         apply_dormant: bool = True,
     ) -> list[dict]:
-        # Privacy is intentionally the first candidate gate. Hidden records
-        # never participate in structured matching or candidate ranking.
-        candidates = [
-            bucket
-            for bucket in buckets
-            if include_sealed or not _is_sealed(bucket)
-        ]
-        if apply_domain and domain_set:
-            candidates = [
-                bucket
-                for bucket in candidates
-                if domain_set
-                & {
-                    str(value).casefold()
-                    for value in bucket.get("metadata", {}).get("domain", [])
-                }
-            ]
-        if apply_dormant and not include_dormant:
-            candidates = [
-                bucket
-                for bucket in candidates
-                if not bucket.get("metadata", {}).get("dormant", False)
-            ]
-        candidates = [
-            bucket
-            for bucket in candidates
-            if _is_recent_bucket(bucket, recent_cutoff)
-            and _is_in_date_range(bucket, date_from, date_to)
-            and _matches_any_structured_filter(bucket, "tags", tags_filter)
-            and _matches_any_structured_filter(bucket, "topics", topic_filter)
-        ]
-        return candidates
+        return _filter_breath_candidates(
+            buckets,
+            domain_values=domain_values,
+            recent_cutoff=recent_cutoff,
+            include_dormant=include_dormant,
+            include_sealed=include_sealed,
+            date_from=date_from,
+            date_to=date_to,
+            tags_filter=tags_filter,
+            topic_filter=topic_filter,
+            apply_domain=apply_domain,
+            apply_dormant=apply_dormant,
+        )
 
     # A topic filter is an archived-session constraint. A session domain is
     # also allowed to select this route when only tags_filter is supplied.
@@ -2427,6 +2461,104 @@ async def _breath_filtered_impl(
         matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
     hidden_count = max(0, len(matches) - max_results)
     return await format_active_matches(matches[:max_results], hidden_count)
+
+
+def _filter_breath_query_matches(
+    matches: list[dict],
+    *,
+    recent_cutoff: str | None,
+    date_from: str,
+    date_to: str,
+    include_sealed: bool,
+) -> list[dict]:
+    """Apply the post-search gates used by the ordinary query Breath path."""
+    return [
+        bucket
+        for bucket in matches
+        if _is_recent_bucket(bucket, recent_cutoff)
+        and _is_in_date_range(bucket, date_from, date_to)
+        and (include_sealed or not _is_sealed(bucket))
+    ]
+
+
+async def _compose_breath_query_matches(
+    matches: list[dict],
+    *,
+    max_tokens: int,
+    q_valence: float | None,
+    emotion_trend: bool,
+    hidden_count: int,
+    trace_by_id: dict[str, dict] | None = None,
+    touch: bool = True,
+    cache: bool = True,
+) -> tuple[str, dict]:
+    """Compose query results using the same path as normal Breath."""
+    results = []
+    token_used = 0
+    for bucket in matches:
+        bid = str(bucket.get("id", ""))
+        decision = trace_by_id.get(bid) if trace_by_id is not None else None
+        if token_used >= max_tokens:
+            if decision is not None:
+                decision["final_decision"] = "omitted_token_budget"
+            break
+        try:
+            clean_meta = {
+                key: value
+                for key, value in bucket["metadata"].items()
+                if key != "tags"
+            }
+            if q_valence is not None and "valence" in clean_meta:
+                original_v = float(clean_meta.get("valence", 0.5))
+                shift = (q_valence - 0.5) * 0.2
+                clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
+            content = strip_wikilinks(bucket["content"])
+            if cache:
+                summary = await dehydrator.dehydrate(content, clean_meta)
+            else:
+                summary = await dehydrator.dehydrate(
+                    content,
+                    clean_meta,
+                    cache=False,
+                )
+            summary_tokens = count_tokens_approx(summary)
+            if token_used + summary_tokens > max_tokens:
+                if decision is not None:
+                    decision["final_decision"] = "omitted_token_budget"
+                break
+            if touch:
+                await bucket_mgr.touch(bucket["id"])
+            if bucket.get("vector_match"):
+                summary = f"[璇箟鍏宠仈] [bucket_id:{bucket['id']}] {summary}"
+            else:
+                summary = f"[bucket_id:{bucket['id']}] {summary}"
+            results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
+            token_used += summary_tokens
+            if decision is not None:
+                decision["final_decision"] = "surfaced"
+                decision["surfaced_token_count"] = summary_tokens
+        except Exception:
+            if decision is not None:
+                decision["final_decision"] = "omitted_composition_error"
+            continue
+
+    if not results:
+        return "", {
+            "surfaced_count": 0,
+            "token_used": token_used,
+            "token_budget": max_tokens,
+            "hidden_count": hidden_count,
+        }
+
+    final_text = "\n---\n".join(results)
+    if hidden_count:
+        final_text += f"\n\n杩樻湁{hidden_count}涓浉鍏宠蹇嗘湭鏄剧ず"
+    return _with_emotion_timeline(final_text, emotion_trend), {
+        "surfaced_count": len(results),
+        "token_used": token_used,
+        "token_budget": max_tokens,
+        "hidden_count": hidden_count,
+    }
 
 
 async def _breath_impl(
@@ -2801,6 +2933,7 @@ async def _breath_impl(
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
     try:
+        search_trace = {}
         matches = await bucket_mgr.search(
             query,
             limit=1000,
@@ -2808,61 +2941,49 @@ async def _breath_impl(
             query_valence=q_valence,
             query_arousal=q_arousal,
             include_dormant=include_dormant,
+            trace=search_trace,
         )
     except Exception as e:
         logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    matches = [
-        bucket
-        for bucket in matches
-        if _is_recent_bucket(bucket, recent_cutoff)
-        and _is_in_date_range(bucket, date_from, date_to)
-        and (include_sealed or not _is_sealed(bucket))
-    ]
+    matches = _filter_breath_query_matches(
+        matches,
+        recent_cutoff=recent_cutoff,
+        date_from=date_from,
+        date_to=date_to,
+        include_sealed=include_sealed,
+    )
     if resonance_target:
         matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
     hidden_count = max(0, len(matches) - max_results)
     matches = matches[:max_results]
 
-    results = []
-    token_used = 0
-    for bucket in matches:
-        if token_used >= max_tokens:
-            break
-        try:
-            clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
-            # --- Memory reconstruction: shift displayed valence by current mood ---
-            # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
-            if q_valence is not None and "valence" in clean_meta:
-                original_v = float(clean_meta.get("valence", 0.5))
-                shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
-                clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if token_used + summary_tokens > max_tokens:
-                break
-            await bucket_mgr.touch(bucket["id"])
-            if bucket.get("vector_match"):
-                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
-            else:
-                summary = f"[bucket_id:{bucket['id']}] {summary}"
-            summary = await _append_bucket_extras(summary, bucket, emotion_trend)
-            results.append(summary)
-            token_used += summary_tokens
-        except Exception as e:
-            logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
-            continue
-
-    if not results:
+    final_text, composition = await _compose_breath_query_matches(
+        matches,
+        max_tokens=max_tokens,
+        q_valence=q_valence,
+        emotion_trend=emotion_trend,
+        hidden_count=hidden_count,
+        trace_by_id={
+            str(entry.get("id", "")): entry
+            for entry in search_trace.get("candidates", [])
+        },
+        touch=True,
+    )
+    if not final_text:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
         return _with_emotion_timeline("未找到相关记忆。", emotion_trend)
 
-    final_text = "\n---\n".join(results)
-    if hidden_count:
-        final_text += f"\n\n还有{hidden_count}个相关桶未显示"
-    await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
-    return _with_emotion_timeline(final_text, emotion_trend)
+    await _fire_webhook(
+        "breath",
+        {
+            "mode": "ok",
+            "matches": len(matches),
+            "chars": len(final_text),
+        },
+    )
+    return final_text
 
 
 ASSET_PROBE_MAX_BASE64_CHARS = 4 * 1024 * 1024
@@ -6846,81 +6967,278 @@ async def api_network(request):
 
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
-    """Debug endpoint: simulate breath scoring and return per-bucket breakdown."""
+    """Explain the real query Breath path without mutating memory state."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
-    if err: return err
-    query = request.query_params.get("q", "")
-    q_valence = request.query_params.get("valence")
-    q_arousal = request.query_params.get("arousal")
-    q_valence = float(q_valence) if q_valence else None
-    q_arousal = float(q_arousal) if q_arousal else None
+    if err:
+        return err
+    query = request.query_params.get("q", "").strip()
+
+    def parse_float(name: str) -> float | None:
+        value = request.query_params.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be numeric.") from exc
+
+    def parse_int(name: str, default: int) -> int:
+        value = request.query_params.get(name)
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer.") from exc
+
+    def parse_bool(name: str, default: bool = False) -> bool:
+        value = request.query_params.get(name)
+        if value in (None, ""):
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-        results = []
+        q_valence = parse_float("valence")
+        q_arousal = parse_float("arousal")
+        recent_days = parse_int("recent_days", -1)
+        max_results = max(1, min(parse_int("max_results", 5), 50))
+        max_tokens = max(1, min(parse_int("max_tokens", 10000), 20000))
+        date_from = _parse_date_filter(
+            request.query_params.get("date_from", ""), "date_from"
+        )
+        date_to = _parse_date_filter(
+            request.query_params.get("date_to", ""), "date_to"
+        )
+        if date_from and date_to and date_from > date_to:
+            raise ValueError("date_from cannot be later than date_to.")
+        tags_filter = _normalize_breath_filter(
+            [item for item in request.query_params.get("tags", "").split(",") if item.strip()],
+            "tags",
+            apply_aliases=True,
+        )
+        topic_filter = _normalize_breath_filter(
+            [item for item in request.query_params.get("topics", "").split(",") if item.strip()],
+            "topics",
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    domain_values = [
+        item.strip()
+        for item in request.query_params.get("domain", "").split(",")
+        if item.strip()
+    ]
+    domain_set = {item.casefold() for item in domain_values}
+    include_dormant = parse_bool("include_dormant")
+    include_sealed = parse_bool("include_sealed")
+    unsupported_paths = []
+    if not query:
+        unsupported_paths.append("no_query_surfacing")
+    if topic_filter:
+        unsupported_paths.append("session_archive_topic_route")
+    if domain_set & {"session", "feel"}:
+        unsupported_paths.append("session_or_feel_route")
+    if request.query_params.get("importance_min") not in (None, "", "-1"):
+        unsupported_paths.append("importance_route")
+    resonance = request.query_params.get("resonance", "").strip()
+    if resonance and not query:
+        unsupported_paths.append("no_query_resonance_route")
+    if unsupported_paths:
+        if not query:
+            try:
+                await bucket_mgr.list_all(include_archive=False)
+            except Exception:
+                logger.exception("Dashboard breath debug failed")
+                return JSONResponse(
+                    {"error": "breath_debug_failed"},
+                    status_code=500,
+                )
+        return JSONResponse({
+            "status": "unsupported_route",
+            "equivalence": "untraced",
+            "query": query,
+            "filters": {
+                "domain": domain_values,
+                "date_from": date_from,
+                "date_to": date_to,
+                "recent_days": recent_days,
+                "tags": tags_filter,
+                "topics": topic_filter,
+                "include_dormant": include_dormant,
+                "include_sealed": include_sealed,
+            },
+            "unsupported_paths": sorted(set(unsupported_paths)),
+            "results": [],
+        })
+
+    try:
         w = {
             "topic": bucket_mgr.w_topic,
             "emotion": bucket_mgr.w_emotion,
             "time": bucket_mgr.w_time,
             "importance": bucket_mgr.w_importance,
         }
-        w_sum = sum(w.values())
+        recent_cutoff = _recent_cutoff(recent_days)
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        visible_buckets = [
+            bucket
+            for bucket in all_buckets
+            if include_sealed or not _is_sealed(bucket)
+        ]
+        structured_filters = bool(tags_filter)
+        candidate_buckets = visible_buckets
+        search_domain_filter = domain_values or None
+        search_include_dormant = include_dormant
+        candidate_source = "privacy_filtered_active_buckets"
+        if structured_filters:
+            candidate_buckets = _filter_breath_candidates(
+                visible_buckets,
+                domain_values=domain_values,
+                recent_cutoff=recent_cutoff,
+                include_dormant=include_dormant,
+                include_sealed=True,
+                date_from=date_from,
+                date_to=date_to,
+                tags_filter=tags_filter,
+                topic_filter=[],
+            )
+            search_domain_filter = None
+            search_include_dormant = True
+            candidate_source = "structured_filtered_active_buckets"
 
-        for bucket in all_buckets:
-            meta = bucket.get("metadata", {})
-            bid = bucket["id"]
-            try:
-                topic = bucket_mgr._calc_topic_score(query, bucket) if query else 0.0
-                emotion = bucket_mgr._calc_emotion_score(q_valence, q_arousal, meta)
-                time_s = bucket_mgr._calc_time_score(meta)
-                imp = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
-
-                raw_total = (
-                    topic * w["topic"]
-                    + emotion * w["emotion"]
-                    + time_s * w["time"]
-                    + imp * w["importance"]
+        search_trace = {}
+        matches = await bucket_mgr.search(
+            query,
+            limit=1000,
+            domain_filter=search_domain_filter,
+            query_valence=q_valence,
+            query_arousal=q_arousal,
+            include_dormant=search_include_dormant,
+            candidate_buckets=candidate_buckets,
+            trace=search_trace,
+        )
+        search_trace["candidate_source"] = candidate_source
+        if not structured_filters:
+            matches = _filter_breath_query_matches(
+                matches,
+                recent_cutoff=recent_cutoff,
+                date_from=date_from,
+                date_to=date_to,
+                include_sealed=True,
+            )
+        if resonance:
+            resonance_target = _parse_resonance(resonance)
+            matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
+            search_trace["ranking"] = [
+                str(bucket.get("id", "")) for bucket in matches
+            ]
+            for route_rank, bucket in enumerate(matches, start=1):
+                entry = next(
+                    (
+                        item
+                        for item in search_trace.get("candidates", [])
+                        if item.get("id") == str(bucket.get("id", ""))
+                    ),
+                    None,
                 )
-                normalized = (raw_total / w_sum) * 100 if w_sum > 0 else 0
-                resolved = meta.get("resolved", False)
-                if resolved:
-                    normalized *= 0.3
+                if entry is not None:
+                    entry["route_rank"] = route_rank
+        hidden_count = max(0, len(matches) - max_results)
+        selected_matches = matches[:max_results]
+        trace_by_id = {
+            str(entry.get("id", "")): entry
+            for entry in search_trace.get("candidates", [])
+        }
+        selected_ids = {str(bucket.get("id", "")) for bucket in selected_matches}
+        matched_ids = {str(bucket.get("id", "")) for bucket in matches}
+        for entry in trace_by_id.values():
+            if entry.get("admitted") and entry["id"] not in matched_ids:
+                entry["final_decision"] = "excluded_post_search_filter"
+                entry.setdefault("exclusion_reasons", []).append("date_or_recent_filter")
+            elif entry.get("admitted") and entry["id"] not in selected_ids:
+                entry["final_decision"] = "omitted_max_results"
 
-                results.append({
-                    "id": bid,
-                    "name": meta.get("name", bid),
-                    "domain": meta.get("domain", []),
-                    "type": meta.get("type", "dynamic"),
-                    "resolved": resolved,
-                    "pinned": meta.get("pinned", False),
-                    "scores": {
-                        "topic": round(topic, 4),
-                        "emotion": round(emotion, 4),
-                        "time": round(time_s, 4),
-                        "importance": round(imp, 4),
-                    },
-                    "weights": w,
-                    "raw_total": round(raw_total, 4),
-                    "normalized": round(normalized, 2),
-                    "passed_threshold": normalized >= bucket_mgr.fuzzy_threshold,
-                })
-            except Exception:
+        final_text, composition = await _compose_breath_query_matches(
+            selected_matches,
+            max_tokens=max_tokens,
+            q_valence=q_valence,
+            emotion_trend=False,
+            hidden_count=hidden_count,
+            trace_by_id=trace_by_id,
+            touch=False,
+            cache=False,
+        )
+        bucket_by_id = {
+            str(bucket.get("id", "")): bucket for bucket in visible_buckets
+        }
+        results = []
+        for entry in trace_by_id.values():
+            if not entry.get("eligible", True):
                 continue
-
-        results.sort(key=lambda x: x["normalized"], reverse=True)
-        passed = [r for r in results if r["passed_threshold"]]
+            bucket = bucket_by_id.get(entry["id"])
+            if bucket is None:
+                continue
+            meta = bucket.get("metadata", {})
+            scores = entry.get("scores", {})
+            results.append({
+                **entry,
+                "name": meta.get("name", entry["id"]),
+                "domain": meta.get("domain", []),
+                "type": meta.get("type", "dynamic"),
+                "resolved": bool(meta.get("resolved", False)),
+                "pinned": bool(meta.get("pinned", False)),
+                "tags": _structured_metadata_values(meta, "tags"),
+                "weights": w,
+                "raw_total": entry.get("pre_penalty_score", 0),
+                "normalized": entry.get("final_ranking_score", entry.get("pre_penalty_score", 0)),
+                "semantic_score": scores.get("semantic", 0),
+                "passed_threshold": bool(entry.get("admitted", False)),
+            })
+        rank_order = {
+            bid: rank for rank, bid in enumerate(search_trace.get("ranking", []), start=1)
+        }
+        results.sort(
+            key=lambda item: (
+                0 if item.get("final_decision") == "surfaced" else 1,
+                rank_order.get(item["id"], 100000),
+                -float(item.get("final_ranking_score", item.get("pre_penalty_score", 0))),
+            )
+        )
         return JSONResponse({
+            "status": "ok",
+            "equivalence": "runtime_query_trace",
             "query": query,
             "valence": q_valence,
             "arousal": q_arousal,
+            "filters": {
+                "domain": domain_values,
+                "date_from": date_from,
+                "date_to": date_to,
+                "recent_days": recent_days,
+                "tags": tags_filter,
+                "include_dormant": include_dormant,
+                "include_sealed": include_sealed,
+                "resonance": resonance,
+            },
+            "candidate_source": candidate_source,
             "weights": w,
             "threshold": bucket_mgr.fuzzy_threshold,
+            "semantic": search_trace.get("semantic", {}),
             "total_candidates": len(results),
-            "passed_count": len(passed),
-            "results": results[:50],  # top 50 for debug
+            "passed_count": sum(1 for item in results if item["passed_threshold"]),
+            "final_composition": composition,
+            "trace": {
+                "candidate_count": search_trace.get("candidate_count", len(results)),
+                "eligible_count": search_trace.get("eligible_count", 0),
+                "admitted_count": search_trace.get("admitted_count", 0),
+                "ranking": search_trace.get("ranking", []),
+            },
+            "results": results[:50],
         })
-    except Exception: logger.exception("Dashboard breath debug failed"); return JSONResponse({"error": "breath_debug_failed"}, status_code=500)
+    except Exception:
+        logger.exception("Dashboard breath debug failed")
+        return JSONResponse({"error": "breath_debug_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/assets", methods=["GET", "POST"])
