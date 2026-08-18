@@ -700,6 +700,8 @@ If not set, defaults to `buckets/` in the project directory.
 
 ## 配置 / Configuration
 
+> 配置表中的默认值是当前部署/实现参考，不是 Contract v1 的稳定公共保证；尤其不要将衰减、归档或合并阈值当作兼容性承诺。
+
 所有参数在 `config.yaml`（从 `config.example.yaml` 复制）。关键的几个：
 All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
 
@@ -860,6 +862,10 @@ Full env var reference: [ENV_VARS.md](ENV_VARS.md).
 
 ## 衰减公式 / Decay Formula
 
+> 本节是当前实现/配置参考，不是稳定的公共保证。精确评分公式、权重、阈值、衰减系数和状态修正因子可能随实现变化；公共语义边界见 [`docs/OB_MEMORY_LAYER_CONTRACT_v1.md`](docs/OB_MEMORY_LAYER_CONTRACT_v1.md)。
+>
+> This section is a current implementation/configuration reference, not a stable public guarantee. Exact scoring, weights, thresholds, decay coefficients, and state factors may change; see the [Memory Layer Contract v1](docs/OB_MEMORY_LAYER_CONTRACT_v1.md) for the public boundary.
+
 $$final\_score = Importance \times activation\_count^{0.3} \times e^{-\lambda \times days} \times combined\_weight \times resolved\_factor \times urgency\_boost$$
 
 ### 短期/长期权重分离 / Short-term vs Long-term Weight Separation
@@ -911,6 +917,8 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 
 ### 自动沉底与封存 / Dormant and Sealed
 
+> 下列阈值、转换条件和路由列表是当前实现参考，不是 Contract v1 的精确公共保证；v1 只承诺其已明确限定的默认可见性和显式包含边界。
+
 - `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True)` 可管理它们。被 `breath` 命中或 `trace` 修改后会自动解除 dormant。
 - `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；需要显式 `include_sealed=True` 才显示。
 
@@ -926,6 +934,8 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 - `λ` (decay_lambda): 衰减速率，默认 0.05 / decay rate, default 0.05
 
 ## Dreaming 与 Feel / Dreaming & Feel
+
+> 本节描述当前实现和可选模型指导；feel 的精确存储、衰减和参与路由不是 Contract v1 的稳定公共保证。
 
 ### Dreaming — 做梦
 `dream()` 是可选的反思/消化工具：当最近记忆确实值得展开时使用，用第一人称思考哪些事还有重量、哪些可以放下。运行时不会强制每次启动调用它。

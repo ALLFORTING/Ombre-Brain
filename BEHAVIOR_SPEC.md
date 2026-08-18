@@ -1,6 +1,8 @@
 # Ombre Brain 用户全流程行为规格书
 
 > 版本：基于 server.py / bucket_manager.py / decay_engine.py / dehydrator.py / embedding_engine.py / CLAUDE_PROMPT.md / config.example.yaml
+>
+> 历史范围说明：本文保留原始流程、公式和 bug 记录，供历史审计和实现考证使用，不是当前公共合同。精确评分/阈值/衰减值属于实现细节；“必须调用 Breath”或自动 dream 的措辞属于历史模型指导，不是强制运行时语义。当前边界以 [`docs/OB_MEMORY_LAYER_CONTRACT_v1.md`](docs/OB_MEMORY_LAYER_CONTRACT_v1.md) 和现行实现为准。
 
 ---
 
@@ -15,7 +17,7 @@
 | **OB 服务端** | `server.py` + 各模块 | 接收 MCP 工具调用，执行持久化、搜索、衰减；对 Claude 不透明 |
 
 ### 1.2 Claude 端职责边界
-- **必须做**：每次新对话第一步无参调用 `breath()`；对话内容有记忆价值时主动调用 `hold` / `grow`
+- **历史建议（非强制）**：需要启动上下文时可调用 `boot()` 或 `breath()`；对话内容有记忆价值时主动调用 `hold` / `grow`
 - **不做**：不直接读写 `.md` 文件；不执行衰减计算；不操作 SQLite
 - **决策权**：Claude 决定是否存、存哪些、何时 resolve；OB 决定如何存（合并/新建）
 
@@ -40,7 +42,7 @@
 
 **用户操作**：打开新对话窗口，说第一句话
 
-**Claude 行为**：在任何回复之前，先调用 `breath()`（无参）
+**历史示例行为（非强制）**：在需要启动上下文时调用 `boot()` 或 `breath()`（无参）
 
 **OB 工具调用**：
 ```
@@ -256,7 +258,7 @@ trace(bucket_id="abc123", resolved=1)
 3. 后续 `breath()` 浮现时：该桶 `decay_engine.calculate_score()` 乘以 `resolved_factor=0.05`（若同时 `digested=True` 则 ×0.02），自然降权，最终由 decay 引擎在得分 < threshold 时归档
 4. `bucket_mgr.search()` 中该桶得分乘以 0.3 降权，但仍可被关键词激活
 
-> ⚠️ **代码 Bug B-01**：当前实现中 `update(resolved=True)` 会将桶**立即移入 `archive/`**，导致桶完全消失于所有搜索路径，与上述规格不符。需移除 `bucket_manager.py` `update()` 中 resolved → `_move_bucket(archive_dir)` 的自动归档逻辑。
+> ⚠️ **历史代码 Bug B-01 记录**：在本文对应的历史基线中，`update(resolved=True)` 曾被记录为会将桶立即移入 `archive/`。该记录不描述当前实现；当前 resolved 语义以现行代码和 Contract v1 为准。
 
 **返回**：`"已修改记忆桶 abc123: resolved=True → 已沉底，只在关键词触发时重新浮现"`
 
