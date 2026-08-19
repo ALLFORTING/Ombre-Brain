@@ -280,6 +280,44 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **历史对话导入 / Conversation history import**: 将过去与 Claude / ChatGPT / DeepSeek 等的对话批量导入为记忆桶。支持 Claude JSON 导出、ChatGPT 导出、Markdown、纯文本等格式，分块处理带断点续传，通过 Dashboard「导入」Tab 操作。
   Batch-import past conversations (Claude / ChatGPT / DeepSeek etc.) as memory buckets. Supports Claude JSON export, ChatGPT export, Markdown, and plain text. Chunked processing with resume support, via the Dashboard "Import" tab.
 
+- **可选原始证据层 / Opt-in Raw Evidence foundation**: 对明确选择的导入任务，在任何有损解码前保存隔离的原始输入，并提供完整性、来源链路、有限生命周期以及操作员备份/恢复基础设施；默认关闭，不影响普通记忆运行。
+  For explicitly selected imports, the foundation can retain the original input before lossy decoding and provide isolated storage, integrity, lineage, bounded lifecycle, and operator backup/restore controls. It is off by default and is not required for ordinary memory operation.
+
+## Raw Evidence / 原始证据层
+
+Raw Evidence 是可选的来源保全层，不是第二套普通记忆，也不是公开的检索产品。它把“收到的来源输入”和“从来源中提取、脱水并写入的记忆”分开管理：只有在导入时明确启用 capture，系统才会在有损解码之前保存原始字节。普通启动、普通导入和升级都不会自动要求或开启证据存储；历史来源也不会因为升级或相似性匹配而自动补建证据或 provenance。
+
+Raw Evidence is an optional source-preservation layer, not a second ordinary-memory store or a public retrieval product. It keeps source input separate from memories extracted, dehydrated, and written from that input. Capture must be explicitly enabled for an import, and the original bytes are saved before lossy decoding. Normal startup, ordinary imports, and upgrades do not require or enable evidence storage; legacy sources do not gain evidence or provenance through automatic matching or similarity inference.
+
+| Foundation boundary / 基础边界 | Current behavior / 当前行为 |
+|---|---|
+| Default / 默认状态 | **OFF**. Normal operation does not require `OMBRE_RAW_EVIDENCE_ROOT`; no evidence filesystem is initialized merely because the service starts. |
+| Storage and integrity / 存储与完整性 | Evidence uses an isolated, content-addressed store and registry with content hashes, bounded writes, and fail-closed integrity checks. It is separate from the Obsidian memory buckets. |
+| Identity and provenance / 身份与 provenance | Captured imports have a run identity and retry-safe item identity. A newly explicit capture may link to derived memory when the import path establishes that relationship; no legacy automatic provenance or similarity-based relationship is fabricated. |
+| Lifecycle / 生命周期 | Retention is finite and configurable; the current implementation default is 30 days. Lifecycle operations are explicit and bounded, not an automatically activated scheduler. |
+| Audit / 审计 | Operational audit records are metadata-only; they do not make raw payload content part of ordinary logs, recall, or model context. |
+| Backup and restore / 备份与恢复 | Raw Evidence backup is a separate encrypted operator workflow, with a current default backup retention of 7 days. Restore verifies the bundle and publishes only into a new target root; it never replaces the live root. |
+| Access surface / 访问面 | Foundation v1 has no public evidence browser in Dashboard, general evidence export, evidence retrieval/search, or evidence MCP tool. Sealed evidence is not ordinary model context; any inspection must use an explicitly authorized internal/operator path. |
+
+### Raw Evidence 与 `preserve_raw`
+
+两者不是同一个保证。Raw Evidence 保存的是已明确 capture 的上传/导入原始输入，并带有 run、revision 和 lineage 记录；`preserve_raw` 是记忆导入阶段的当前实现语义：先提取，再保留提取出的 item 内容，并跳过后续 merge/dehydration。`preserve_raw` 不承诺保存用户上传的原始字节、不可变 transcript、精确 quote/span、message ID 或可审计 provenance。
+
+They are different guarantees. Raw Evidence retains the explicitly captured upload/import input with run, revision, and lineage records. `preserve_raw` is an import-time implementation semantic: extract first, keep the extracted item content, and skip later merge/dehydration. `preserve_raw` does not promise the uploaded bytes, an immutable transcript, an exact quote/span, a message ID, or auditable provenance.
+
+### Lifecycle、删除与隔离 / Lifecycle, deletion, and isolation
+
+- Evidence retention is finite and bounded, not indefinite. The current default is 30 days; limits and purge work are bounded. This is not a legal-hold system, instantaneous physical deletion guarantee, or cryptographic-erasure guarantee.
+- Evidence redaction first restricts access and records a tombstone, then permits controlled purge. Deleting evidence does **not** automatically delete derived memory. Deleting derived memory does **not** automatically delete supporting evidence. Deleting an upstream source/document is a separate review and action; no automatic cascade is promised.
+- Raw Evidence never enters Breath, ordinary recall, embeddings, Dream, boot, or model context. It does not alter ordinary memory ranking or retrieval. The documented recall diagnostics describe supported traced query routes, not a claim that every Breath route is traced; see the [Memory Layer Contract v1](docs/OB_MEMORY_LAYER_CONTRACT_v1.md).
+- RM remains the authority for its image/blob assets. Raw Evidence does not duplicate RM bytes or replace RM cutover and authority rules.
+
+证据生命周期、普通记忆生命周期和 RM 生命周期彼此独立。升级不会自动启用生命周期；当前 Foundation 也没有 Dashboard 证据浏览、LLM 证据检索、全文/语义证据搜索或一般证据导出。O5E 备份不会自动初始化生产备份仓库，也不属于现有的普通明文 `/api/backup/export` memory snapshot 流程。
+
+Evidence, ordinary memory, and RM have independent lifecycles. Upgrades do not activate evidence lifecycle processing. The Foundation also has no Dashboard evidence browser, LLM evidence retrieval, full-text/semantic evidence search, or general evidence export. O5E backup does not auto-initialize a production backup repository and is separate from the existing ordinary plaintext `/api/backup/export` memory-snapshot flow.
+
+Configuration is documented in [ENV_VARS.md](ENV_VARS.md). The design and public boundary are documented in [Raw Evidence Design v1](docs/design/OB_RAW_EVIDENCE_DESIGN_v1.md) and the [Memory Layer Contract v1](docs/OB_MEMORY_LAYER_CONTRACT_v1.md). These documents describe the current Foundation boundary; they do not promise future Dashboard, search, export, retrieval, or automatic historical-provenance features.
+
 ## 边界说明 / Design boundaries
 
 官方记忆功能已经在做身份层的事了——你是谁，你有什么偏好，你们的关系是什么。那一层交给它，Ombre Brain不打算造重复的轮子。
