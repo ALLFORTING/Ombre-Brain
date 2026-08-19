@@ -26,13 +26,15 @@ from typing import Any, BinaryIO, Iterable
 from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR, guarded_mutation
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REVISION_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 HASH_ALGORITHM = "sha256-v1"
 IMPORT_RUN_SCHEMA_VERSION = 1
 RETENTION_POLICY_VERSION = "foundation_v1"
 DEFAULT_RETENTION_DAYS = 30
+BACKUP_CLAIM_DEFAULT_TTL_SECONDS = 300
+BACKUP_CLAIM_STATES = frozenset({"active", "released"})
 
 IMPORT_RUN_STATUSES = frozenset(
     {
@@ -213,6 +215,195 @@ class RawEvidenceStore:
 
         return None
 
+    def backup_repository_id(self) -> str | None:
+        """Return the bound O5E backup repository identity, if any."""
+
+        self._require_enabled()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT repository_id FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+        return row["repository_id"] if row is not None else None
+
+    @guarded_mutation("raw_evidence_backup_repository_bind")
+    def bind_backup_repository(self, repository_id: str) -> str:
+        """Bind the store to one operator-managed backup repository UUID."""
+
+        self._require_enabled()
+        if not isinstance(repository_id, str) or _ID_PATTERN.fullmatch(repository_id) is None:
+            raise RawEvidenceError("backup_repository_invalid")
+        with self._lock:
+            with self._connect() as conn:
+                self._begin_write(conn)
+                row = conn.execute(
+                    "SELECT repository_id FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+                existing = row["repository_id"] if row is not None else None
+                if existing is not None and existing != repository_id:
+                    conn.rollback()
+                    raise RawEvidenceError("backup_repository_mismatch")
+                conn.execute(
+                    "UPDATE o5e_coordination SET repository_id = ?, updated_at = ? "
+                    "WHERE singleton = 1",
+                    (repository_id, _now_iso()),
+                )
+                conn.commit()
+        return repository_id
+
+    @guarded_mutation("raw_evidence_backup_claim_acquire")
+    def acquire_backup_claim(
+        self,
+        operation_id: str,
+        *,
+        owner_class: str = "operator_backup",
+        ttl_seconds: int = BACKUP_CLAIM_DEFAULT_TTL_SECONDS,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Acquire the single bounded O5E snapshot fence for this store."""
+
+        self._require_enabled()
+        operation_id = _validate_id(operation_id, "backup_operation_id")
+        if (
+            not isinstance(owner_class, str)
+            or not owner_class
+            or len(owner_class) > 64
+            or not owner_class.replace("_", "").isalnum()
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not 1 <= ttl_seconds <= 3600
+        ):
+            raise RawEvidenceError("backup_claim_invalid")
+        started_at = now or _now_iso()
+        started = _parse_timestamp(started_at)
+        expires_at = (started + timedelta(seconds=ttl_seconds)).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    raise RawEvidenceError("backup_claim_invalid")
+                active = row["backup_state"] == "active"
+                if active and _parse_timestamp(row["backup_expires_at"]) > started:
+                    conn.rollback()
+                    raise RawEvidenceError("backup_busy")
+                conn.execute(
+                    """
+                    UPDATE o5e_coordination SET
+                        active_backup_operation_id = ?, backup_owner_class = ?,
+                        backup_started_at = ?, backup_heartbeat_at = ?,
+                        backup_expires_at = ?, backup_state = 'active',
+                        updated_at = ?
+                    WHERE singleton = 1
+                    """,
+                    (
+                        operation_id, owner_class, started_at, started_at,
+                        expires_at, started_at,
+                    ),
+                )
+                conn.commit()
+        return {
+            "operation_id": operation_id,
+            "owner_class": owner_class,
+            "started_at": started_at,
+            "heartbeat_at": started_at,
+            "expires_at": expires_at,
+            "state": "active",
+        }
+
+    @guarded_mutation("raw_evidence_backup_claim_heartbeat")
+    def heartbeat_backup_claim(
+        self,
+        operation_id: str,
+        *,
+        ttl_seconds: int = BACKUP_CLAIM_DEFAULT_TTL_SECONDS,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        operation_id = _validate_id(operation_id, "backup_operation_id")
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= 3600:
+            raise RawEvidenceError("backup_claim_invalid")
+        heartbeat_at = now or _now_iso()
+        expires_at = (
+            _parse_timestamp(heartbeat_at) + timedelta(seconds=ttl_seconds)
+        ).isoformat(timespec="seconds")
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+                if (
+                    row is None
+                    or row["backup_state"] != "active"
+                    or row["active_backup_operation_id"] != operation_id
+                    or _parse_timestamp(row["backup_expires_at"]) <= _parse_timestamp(heartbeat_at)
+                ):
+                    conn.rollback()
+                    raise RawEvidenceError("backup_claim_lost")
+                conn.execute(
+                    "UPDATE o5e_coordination SET backup_heartbeat_at = ?, "
+                    "backup_expires_at = ?, updated_at = ? WHERE singleton = 1",
+                    (heartbeat_at, expires_at, heartbeat_at),
+                )
+                conn.commit()
+        return {"operation_id": operation_id, "heartbeat_at": heartbeat_at, "expires_at": expires_at}
+
+    @guarded_mutation("raw_evidence_backup_claim_release")
+    def release_backup_claim(self, operation_id: str, *, now: str | None = None) -> bool:
+        operation_id = _validate_id(operation_id, "backup_operation_id")
+        released_at = now or _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    """
+                    UPDATE o5e_coordination SET
+                        active_backup_operation_id = NULL, backup_owner_class = NULL,
+                        backup_started_at = NULL, backup_heartbeat_at = NULL,
+                        backup_expires_at = NULL, backup_state = 'released',
+                        updated_at = ?
+                    WHERE singleton = 1 AND backup_state = 'active'
+                      AND active_backup_operation_id = ?
+                    """,
+                    (released_at, operation_id),
+                )
+                conn.commit()
+        return cursor.rowcount == 1
+
+    def assert_backup_claim(self, operation_id: str, *, now: str | None = None) -> None:
+        """Fail closed when a bounded backup has lost its registry authority."""
+
+        operation_id = _validate_id(operation_id, "backup_operation_id")
+        current = _parse_timestamp(now or _now_iso())
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+        if (
+            row is None
+            or row["backup_state"] != "active"
+            or row["active_backup_operation_id"] != operation_id
+            or _parse_timestamp(row["backup_expires_at"]) <= current
+        ):
+            raise RawEvidenceError("backup_claim_lost")
+
+    def backup_claim_status(self) -> dict[str, Any] | None:
+        self._require_enabled()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM o5e_coordination WHERE singleton = 1"
+                ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
     @guarded_mutation("raw_evidence_create")
     def create_evidence(
         self,
@@ -359,7 +550,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     row = conn.execute(
                         "SELECT * FROM import_runs WHERE run_id = ?",
                         (run_id,),
@@ -535,7 +726,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     cursor = conn.execute(
                         f"UPDATE import_runs SET {', '.join(assignments)} WHERE run_id = ?",
                         values,
@@ -636,7 +827,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     existing = conn.execute(
                         "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
                         (run_id, item_key),
@@ -752,7 +943,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     item = conn.execute(
                         """
                         SELECT evidence_id, revision_id
@@ -898,7 +1089,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     cursor = conn.execute(
                         """
                         UPDATE memory_lineage
@@ -963,7 +1154,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     run = conn.execute(
                         "SELECT * FROM import_runs WHERE run_id = ?",
                         (run_id,),
@@ -1218,7 +1409,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     if lifecycle_state is not None:
                         in_progress = conn.execute(
                             """
@@ -1353,6 +1544,27 @@ class RawEvidenceStore:
                         raise RawEvidenceError("schema_unsupported") from exc
                     if previous_schema_version < 1 or previous_schema_version > SCHEMA_VERSION:
                         raise RawEvidenceError("schema_unsupported")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS o5e_coordination (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        repository_id TEXT,
+                        active_backup_operation_id TEXT,
+                        backup_owner_class TEXT,
+                        backup_started_at TEXT,
+                        backup_heartbeat_at TEXT,
+                        backup_expires_at TEXT,
+                        backup_state TEXT NOT NULL DEFAULT 'released'
+                            CHECK (backup_state IN ('active', 'released')),
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO o5e_coordination "
+                    "(singleton, backup_state, updated_at) VALUES (1, 'released', ?)",
+                    (_now_iso(),),
+                )
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS evidence_objects (
@@ -1723,6 +1935,27 @@ class RawEvidenceStore:
                 ),
             )
 
+    def _begin_write(self, conn: sqlite3.Connection) -> None:
+        """Begin a registry write while honoring the bounded backup fence."""
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT backup_state, backup_expires_at FROM o5e_coordination "
+                "WHERE singleton = 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Schema initialization creates this table transactionally.
+            return
+        if (
+            row is not None
+            and row["backup_state"] == "active"
+            and row["backup_expires_at"]
+            and _parse_timestamp(row["backup_expires_at"]) > _parse_timestamp(_now_iso())
+        ):
+            conn.rollback()
+            raise RawEvidenceError("backup_in_progress")
+
     def _stage_content(
         self,
         content: bytes | bytearray | memoryview | BinaryIO,
@@ -1836,7 +2069,7 @@ class RawEvidenceStore:
         operation_id = uuid.uuid4().hex
         blob_relpath = self._relative_blob_path(self._cas_path(content_hash))
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_write(conn)
             cas = conn.execute(
                 """
                 SELECT * FROM cas_objects
@@ -1899,7 +2132,7 @@ class RawEvidenceStore:
 
         self._publish_blob(temp_path, content_hash, content_size)
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_write(conn)
             cas = conn.execute(
                 """
                 SELECT * FROM cas_objects
@@ -2187,7 +2420,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     conn.execute(
                         "UPDATE evidence_objects SET lifecycle_state = 'tombstoned', "
                         "updated_at = ? WHERE evidence_id = ?",
@@ -2218,7 +2451,7 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    self._begin_write(conn)
                     conn.execute(
                         "UPDATE evidence_revisions SET verification_state = 'failed' "
                         "WHERE revision_id = ? AND evidence_id = ?",
@@ -2428,6 +2661,16 @@ def _validate_choice(value: Any, choices: frozenset[str], label: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RawEvidenceError("timestamp_invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _add_days_iso(value: str, days: int) -> str:
