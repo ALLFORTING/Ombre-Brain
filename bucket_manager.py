@@ -196,11 +196,23 @@ class BucketManager:
                     payload_digest TEXT NOT NULL,
                     result_id TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('planned', 'applied')),
+                    memory_mutation_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(ob_import_operations)"
+                ).fetchall()
+            }
+            if "memory_mutation_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE ob_import_operations "
+                    "ADD COLUMN memory_mutation_id TEXT"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ob_import_operations_target "
                 "ON ob_import_operations(target_bucket_id)"
@@ -251,6 +263,7 @@ class BucketManager:
         target_bucket_id: str | None = None,
         payload: dict[str, Any] | None = None,
         payload_digest: str | None = None,
+        memory_mutation_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(operation_key, str) or not operation_key or len(operation_key) > 128:
             raise BucketIdempotencyError("operation_key_invalid")
@@ -258,6 +271,12 @@ class BucketManager:
             raise BucketIdempotencyError("operation_kind_invalid")
         if target_bucket_id is not None and not isinstance(target_bucket_id, str):
             raise BucketIdempotencyError("target_bucket_invalid")
+        if memory_mutation_id is not None and (
+            not isinstance(memory_mutation_id, str)
+            or len(memory_mutation_id) != 64
+            or any(char not in "0123456789abcdef" for char in memory_mutation_id)
+        ):
+            raise BucketIdempotencyError("memory_mutation_invalid")
         if payload is not None:
             serialized, computed_digest = self._canonical_import_payload(payload)
             if payload_digest is not None and payload_digest != computed_digest:
@@ -292,8 +311,8 @@ class BucketManager:
                     INSERT INTO ob_import_operations (
                         operation_key, operation_kind, target_bucket_id,
                         payload_json, payload_digest, result_id, status,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?)
+                        memory_mutation_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)
                     """,
                     (
                         operation_key,
@@ -302,6 +321,7 @@ class BucketManager:
                         serialized,
                         payload_digest,
                         result_id,
+                        memory_mutation_id,
                         now,
                         now,
                     ),
@@ -316,6 +336,23 @@ class BucketManager:
                 if payload_digest is not None and row["payload_digest"] != payload_digest:
                     conn.rollback()
                     raise BucketIdempotencyError("operation_payload_conflict")
+                if memory_mutation_id is not None:
+                    existing_mutation_id = row["memory_mutation_id"]
+                    if (
+                        existing_mutation_id is not None
+                        and existing_mutation_id != memory_mutation_id
+                    ):
+                        conn.rollback()
+                        raise BucketIdempotencyError("memory_mutation_conflict")
+                    if existing_mutation_id is None:
+                        conn.execute(
+                            """
+                            UPDATE ob_import_operations
+                            SET memory_mutation_id = ?, updated_at = ?
+                            WHERE operation_key = ?
+                            """,
+                            (memory_mutation_id, now, operation_key),
+                        )
             conn.commit()
         result = self._get_import_operation(operation_key)
         if result is None:
@@ -354,24 +391,31 @@ class BucketManager:
         operation_key: str,
         payload_digest: str,
         operation_kind: str,
+        memory_mutation_id: str | None = None,
     ) -> bool:
         existing = cls._operation_marker(post, operation_key)
         if existing is not None:
             if existing.get("payload_digest") != payload_digest:
                 raise BucketIdempotencyError("operation_payload_conflict")
+            if (
+                memory_mutation_id is not None
+                and existing.get("memory_mutation_id") != memory_mutation_id
+            ):
+                raise BucketIdempotencyError("memory_mutation_conflict")
             return False
         markers = post.get(_IMPORT_MARKER_FIELD, [])
         if markers in (None, ""):
             markers = []
         if not isinstance(markers, list):
             raise BucketIdempotencyError("operation_marker_invalid")
-        markers.append(
-            {
-                "operation_key": operation_key,
-                "payload_digest": payload_digest,
-                "operation_kind": operation_kind,
-            }
-        )
+        marker = {
+            "operation_key": operation_key,
+            "payload_digest": payload_digest,
+            "operation_kind": operation_kind,
+        }
+        if memory_mutation_id is not None:
+            marker["memory_mutation_id"] = memory_mutation_id
+        markers.append(marker)
         post[_IMPORT_MARKER_FIELD] = markers
         return True
 
@@ -406,6 +450,7 @@ class BucketManager:
         operation_kind: str,
         target_bucket_id: str | None = None,
         payload: dict[str, Any],
+        memory_mutation_id: str | None = None,
     ) -> dict[str, Any]:
         """Durably plan an O5B operation before any memory file mutation."""
 
@@ -414,6 +459,7 @@ class BucketManager:
             operation_kind=operation_kind,
             target_bucket_id=target_bucket_id,
             payload=payload,
+            memory_mutation_id=memory_mutation_id,
         )
 
     @guarded_async_mutation("bucket_import_idempotency_apply")
@@ -425,6 +471,7 @@ class BucketManager:
         target_bucket_id: str | None = None,
         payload: dict[str, Any] | None = None,
         payload_digest: str | None = None,
+        memory_mutation_id: str | None = None,
     ) -> dict[str, Any]:
         """Apply or replay one durable import memory operation."""
 
@@ -434,6 +481,7 @@ class BucketManager:
             target_bucket_id=target_bucket_id,
             payload=payload,
             payload_digest=payload_digest,
+            memory_mutation_id=memory_mutation_id,
         )
         stored_payload = operation["payload"]
         if operation["operation_kind"] == "create":
@@ -441,6 +489,7 @@ class BucketManager:
                 **stored_payload,
                 _o5b_operation_key=operation_key,
                 _o5b_payload_digest=operation["payload_digest"],
+                _o5c_memory_mutation_id=operation.get("memory_mutation_id"),
             )
             return {"operation_key": operation_key, "result_id": bucket_id, "kind": "create"}
 
@@ -455,10 +504,33 @@ class BucketManager:
             **update_kwargs,
             _o5b_operation_key=operation_key,
             _o5b_payload_digest=operation["payload_digest"],
+            _o5c_memory_mutation_id=operation.get("memory_mutation_id"),
         )
         if not applied:
             raise BucketIdempotencyError("target_bucket_missing")
         return {"operation_key": operation_key, "result_id": bucket_id, "kind": "update"}
+
+    def inspect_import_operation(self, operation_key: str) -> dict[str, Any] | None:
+        """Inspect an O5B operation and its hidden atomic marker read-only."""
+
+        operation = self._get_import_operation(operation_key)
+        if operation is None:
+            return None
+        result_id = operation.get("result_id")
+        file_path = self._find_bucket_file(result_id) if result_id else None
+        marker = None
+        if file_path:
+            try:
+                post = frontmatter.load(file_path)
+                marker = self._operation_marker(post, operation_key)
+            except Exception as exc:
+                raise BucketIdempotencyError("operation_marker_invalid") from exc
+        return {
+            **operation,
+            "memory_exists": file_path is not None,
+            "memory_path": file_path,
+            "marker": marker,
+        }
 
     @guarded_mutation("bucket_history_write")
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
@@ -555,6 +627,7 @@ class BucketManager:
         topics: list[str] = None,
         _o5b_operation_key: str | None = None,
         _o5b_payload_digest: str | None = None,
+        _o5c_memory_mutation_id: str | None = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -579,6 +652,7 @@ class BucketManager:
                     "name": name,
                 },
                 payload_digest=_o5b_payload_digest,
+                memory_mutation_id=_o5c_memory_mutation_id,
             )
             if operation["operation_kind"] != "create":
                 raise BucketIdempotencyError("operation_kind_conflict")
@@ -644,7 +718,15 @@ class BucketManager:
                 except Exception as exc:
                     raise BucketIdempotencyError("operation_marker_invalid") from exc
                 marker = self._operation_marker(existing_post, _o5b_operation_key)
-                if marker is None or marker.get("payload_digest") != operation["payload_digest"]:
+                if (
+                    marker is None
+                    or marker.get("payload_digest") != operation["payload_digest"]
+                    or (
+                        operation.get("memory_mutation_id") is not None
+                        and marker.get("memory_mutation_id")
+                        != operation["memory_mutation_id"]
+                    )
+                ):
                     raise BucketIdempotencyError("idempotency_conflict")
                 self._mark_import_operation_applied(_o5b_operation_key)
                 return bucket_id
@@ -655,6 +737,7 @@ class BucketManager:
                 operation_key=_o5b_operation_key,
                 payload_digest=operation["payload_digest"],
                 operation_kind="create",
+                memory_mutation_id=operation.get("memory_mutation_id"),
             )
 
         # --- Choose directory by type + primary domain ---
@@ -755,6 +838,7 @@ class BucketManager:
         history_change_type = kwargs.pop("_history_change_type", "replace")
         o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
         o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
+        o5c_memory_mutation_id = kwargs.pop("_o5c_memory_mutation_id", None)
         operation = None
         if o5b_operation_key is not None:
             operation = self._ensure_import_operation(
@@ -763,6 +847,7 @@ class BucketManager:
                 target_bucket_id=bucket_id,
                 payload={"kwargs": dict(kwargs)},
                 payload_digest=o5b_payload_digest,
+                memory_mutation_id=o5c_memory_mutation_id,
             )
             if operation["operation_kind"] != "update":
                 raise BucketIdempotencyError("operation_kind_conflict")
@@ -786,6 +871,12 @@ class BucketManager:
             if marker is not None:
                 if marker.get("payload_digest") != operation["payload_digest"]:
                     raise BucketIdempotencyError("operation_payload_conflict")
+                if (
+                    operation.get("memory_mutation_id") is not None
+                    and marker.get("memory_mutation_id")
+                    != operation["memory_mutation_id"]
+                ):
+                    raise BucketIdempotencyError("memory_mutation_conflict")
                 self._mark_import_operation_applied(o5b_operation_key)
                 return True
             if operation["status"] == "applied":
@@ -795,6 +886,7 @@ class BucketManager:
                 operation_key=o5b_operation_key,
                 payload_digest=operation["payload_digest"],
                 operation_kind="update",
+                memory_mutation_id=operation.get("memory_mutation_id"),
             )
 
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---

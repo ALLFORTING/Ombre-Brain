@@ -26,7 +26,7 @@ from typing import Any, BinaryIO, Iterable
 from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR, guarded_mutation
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REVISION_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 HASH_ALGORITHM = "sha256-v1"
@@ -57,6 +57,22 @@ IMPORT_ITEM_STATUSES = frozenset(
         "ambiguous",
     }
 )
+LINEAGE_KINDS = frozenset(
+    {"created", "preserve_raw_created", "contributed_update"}
+)
+LINEAGE_STATUSES = frozenset(
+    {
+        "pending",
+        "complete",
+        "source_redacted",
+        "source_expired",
+        "evidence_missing",
+        "integrity_failed",
+        "memory_deleted",
+        "needs_reconcile",
+        "provenance_broken",
+    }
+)
 
 FIDELITY_LEVELS = frozenset(
     {
@@ -75,6 +91,7 @@ VERIFICATION_STATES = frozenset({"verified", "quarantined", "failed"})
 IDENTITY_ORIGINS = frozenset({"upstream", "local", "unknown"})
 
 _ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_MEMORY_ID_PATTERN = re.compile(r"^[0-9a-f]{12,64}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RELATIVE_BLOB_PATTERN = re.compile(
     r"^blobs/sha256/[0-9a-f]{2}/[0-9a-f]{64}$"
@@ -737,6 +754,201 @@ class RawEvidenceStore:
         assert result is not None
         return result
 
+    @guarded_mutation("raw_evidence_lineage_intent")
+    def create_lineage_intent(
+        self,
+        *,
+        run_id: str,
+        run_item_key: str,
+        operation_key: str,
+        memory_id: str,
+        memory_mutation_id: str,
+        evidence_id: str,
+        revision_id: str,
+        lineage_kind: str,
+    ) -> dict[str, Any]:
+        """Durably record one capture-bound lineage intent before mutation."""
+
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        _validate_text(run_item_key, "run_item_key", self.limits.max_metadata_chars)
+        _validate_text(operation_key, "operation_key", 256)
+        memory_id = _validate_memory_id(memory_id, "memory_id")
+        memory_mutation_id = _validate_hash(memory_mutation_id, "memory_mutation_id")
+        evidence_id = _validate_id(evidence_id, "evidence_id")
+        revision_id = _validate_id(revision_id, "revision_id")
+        lineage_kind = _validate_choice(lineage_kind, LINEAGE_KINDS, "lineage_kind")
+
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    item = conn.execute(
+                        """
+                        SELECT evidence_id, revision_id
+                        FROM import_run_items
+                        WHERE run_id = ? AND item_key = ?
+                        """,
+                        (run_id, run_item_key),
+                    ).fetchone()
+                    if item is None:
+                        raise RawEvidenceError("not_found")
+                    if (
+                        item["evidence_id"] != evidence_id
+                        or item["revision_id"] != revision_id
+                    ):
+                        raise RawEvidenceError("lineage_identity_conflict")
+                    revision = conn.execute(
+                        """
+                        SELECT evidence_id
+                        FROM evidence_revisions
+                        WHERE revision_id = ?
+                        """,
+                        (revision_id,),
+                    ).fetchone()
+                    if revision is None or revision["evidence_id"] != evidence_id:
+                        raise RawEvidenceError("lineage_identity_conflict")
+                    existing = conn.execute(
+                        """
+                        SELECT * FROM memory_lineage
+                        WHERE run_id = ? AND run_item_key = ?
+                          AND operation_key = ? AND memory_id = ?
+                          AND evidence_id = ? AND revision_id = ?
+                          AND lineage_kind = ?
+                        """,
+                        (
+                            run_id,
+                            run_item_key,
+                            operation_key,
+                            memory_id,
+                            evidence_id,
+                            revision_id,
+                            lineage_kind,
+                        ),
+                    ).fetchone()
+                    if existing is not None:
+                        if existing["memory_mutation_id"] != memory_mutation_id:
+                            raise RawEvidenceError("lineage_identity_conflict")
+                        conn.commit()
+                        return dict(existing)
+
+                    now = _now_iso()
+                    lineage_id = uuid.uuid4().hex
+                    conn.execute(
+                        """
+                        INSERT INTO memory_lineage (
+                            lineage_id, memory_id, memory_mutation_id,
+                            run_id, run_item_key, operation_key,
+                            evidence_id, revision_id, lineage_kind, status,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                        """,
+                        (
+                            lineage_id,
+                            memory_id,
+                            memory_mutation_id,
+                            run_id,
+                            run_item_key,
+                            operation_key,
+                            evidence_id,
+                            revision_id,
+                            lineage_kind,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.IntegrityError as exc:
+                raise RawEvidenceError("lineage_identity_conflict") from exc
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+        result = self.get_lineage(lineage_id)
+        assert result is not None
+        return result
+
+    def get_lineage(self, lineage_id: str) -> dict[str, Any] | None:
+        self._require_enabled()
+        lineage_id = _validate_id(lineage_id, "lineage_id")
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM memory_lineage WHERE lineage_id = ?",
+                    (lineage_id,),
+                ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_lineage(
+        self,
+        *,
+        run_id: str | None = None,
+        status: str | None = None,
+        memory_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read bounded lineage metadata for internal reconciliation/tests."""
+
+        self._require_enabled()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if run_id is not None:
+            run_id = _validate_id(run_id, "run_id")
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        if status is not None:
+            status = _validate_choice(status, LINEAGE_STATUSES, "status")
+            clauses.append("status = ?")
+            values.append(status)
+        if memory_id is not None:
+            memory_id = _validate_memory_id(memory_id, "memory_id")
+            clauses.append("memory_id = ?")
+            values.append(memory_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM memory_lineage"
+                    + where
+                    + " ORDER BY created_at, lineage_id",
+                    values,
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    @guarded_mutation("raw_evidence_lineage_status_update")
+    def update_lineage_status(
+        self,
+        lineage_id: str,
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        self._require_enabled()
+        lineage_id = _validate_id(lineage_id, "lineage_id")
+        status = _validate_choice(status, LINEAGE_STATUSES, "status")
+        now = _now_iso()
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute(
+                        """
+                        UPDATE memory_lineage
+                        SET status = ?, updated_at = ?
+                        WHERE lineage_id = ?
+                        """,
+                        (status, now, lineage_id),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        raise RawEvidenceError("not_found")
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+        result = self.get_lineage(lineage_id)
+        assert result is not None
+        return result
+
     @guarded_mutation("raw_evidence_import_capture")
     def create_or_reuse_import_evidence(
         self,
@@ -1307,6 +1519,65 @@ class RawEvidenceStore:
                     "CREATE INDEX IF NOT EXISTS idx_import_run_items_operation "
                     "ON import_run_items(operation_key)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_lineage (
+                        lineage_id TEXT PRIMARY KEY,
+                        memory_id TEXT NOT NULL,
+                        memory_mutation_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        run_item_key TEXT NOT NULL,
+                        operation_key TEXT NOT NULL,
+                        evidence_id TEXT NOT NULL,
+                        revision_id TEXT NOT NULL,
+                        lineage_kind TEXT NOT NULL CHECK (
+                            lineage_kind IN (
+                                'created', 'preserve_raw_created',
+                                'contributed_update'
+                            )
+                        ),
+                        status TEXT NOT NULL CHECK (
+                            status IN (
+                                'pending', 'complete', 'source_redacted',
+                                'source_expired', 'evidence_missing',
+                                'integrity_failed', 'memory_deleted',
+                                'needs_reconcile', 'provenance_broken'
+                            )
+                        ),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE (
+                            run_id, run_item_key, operation_key, memory_id,
+                            evidence_id, revision_id, lineage_kind
+                        ),
+                        FOREIGN KEY (run_id, run_item_key)
+                            REFERENCES import_run_items(run_id, item_key)
+                            ON DELETE RESTRICT,
+                        FOREIGN KEY (evidence_id)
+                            REFERENCES evidence_objects(evidence_id)
+                            ON DELETE RESTRICT,
+                        FOREIGN KEY (revision_id)
+                            REFERENCES evidence_revisions(revision_id)
+                            ON DELETE RESTRICT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_lineage_memory_time "
+                    "ON memory_lineage(memory_id, created_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_lineage_evidence "
+                    "ON memory_lineage(evidence_id, revision_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_lineage_run_item "
+                    "ON memory_lineage(run_id, run_item_key)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_lineage_status "
+                    "ON memory_lineage(status, updated_at)"
+                )
                 if previous_schema_version is not None and previous_schema_version < SCHEMA_VERSION:
                     conn.execute(
                         "UPDATE store_schema SET schema_version = ?, updated_at = ? "
@@ -1736,6 +2007,12 @@ def _validate_id(value: Any, label: str) -> str:
     return value
 
 
+def _validate_memory_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _MEMORY_ID_PATTERN.fullmatch(value) is None:
+        raise RawEvidenceError(f"{label}_invalid")
+    return value
+
+
 def _validate_hash(value: Any, label: str) -> str:
     if not isinstance(value, str) or _HASH_PATTERN.fullmatch(value) is None:
         raise RawEvidenceError(f"{label}_invalid")
@@ -1766,6 +2043,8 @@ __all__ = [
     "IDENTITY_ORIGINS",
     "IMPORT_ITEM_STATUSES",
     "IMPORT_RUN_STATUSES",
+    "LINEAGE_KINDS",
+    "LINEAGE_STATUSES",
     "LIFECYCLE_STATES",
     "PRIVACY_CLASSES",
     "RawEvidenceError",
