@@ -26,10 +26,37 @@ from typing import Any, BinaryIO, Iterable
 from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR, guarded_mutation
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REVISION_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 HASH_ALGORITHM = "sha256-v1"
+IMPORT_RUN_SCHEMA_VERSION = 1
+
+IMPORT_RUN_STATUSES = frozenset(
+    {
+        "capture_pending",
+        "capture_succeeded",
+        "processing",
+        "paused",
+        "failed",
+        "completed",
+        "needs_reconcile",
+    }
+)
+IMPORT_ITEM_STATUSES = frozenset(
+    {
+        "capture_pending",
+        "capture_succeeded",
+        "extraction_pending",
+        "extraction_failed",
+        "extraction_ready",
+        "memory_planned",
+        "memory_applying",
+        "succeeded",
+        "failed",
+        "ambiguous",
+    }
+)
 
 FIDELITY_LEVELS = frozenset(
     {
@@ -268,6 +295,664 @@ class RawEvidenceStore:
 
         return self.create_evidence(content, **kwargs)
 
+    @guarded_mutation("raw_evidence_import_run_create")
+    def create_or_get_import_run(
+        self,
+        *,
+        run_id: str,
+        retry_key: str,
+        source_sha256: str,
+        source_size_bytes: int,
+        filename: str,
+        media_type: str,
+        source_system: str,
+        source_kind: str,
+        source_scope: str,
+        actor_id: str,
+        preserve_raw: bool,
+        importer_version: str,
+        parser_version: str,
+        chunker_version: str,
+        upstream_source_id: str | None = None,
+        upstream_item_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create one durable O5B run or return the exact existing run."""
+
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        retry_key = _validate_text(retry_key, "retry_key", self.limits.max_metadata_chars)
+        source_sha256 = _validate_hash(source_sha256, "source_sha256")
+        if (
+            isinstance(source_size_bytes, bool)
+            or not isinstance(source_size_bytes, int)
+            or source_size_bytes < 0
+            or source_size_bytes > self.limits.max_evidence_bytes
+        ):
+            raise RawEvidenceError("source_size_invalid")
+        for name, value in (
+            ("filename", filename or "upload"),
+            ("media_type", media_type or "application/octet-stream"),
+            ("source_system", source_system),
+            ("source_kind", source_kind),
+            ("source_scope", source_scope),
+            ("actor_id", actor_id),
+            ("importer_version", importer_version),
+            ("parser_version", parser_version),
+            ("chunker_version", chunker_version),
+        ):
+            _validate_text(value, name, self.limits.max_metadata_chars)
+        for name, value in (
+            ("upstream_source_id", upstream_source_id),
+            ("upstream_item_id", upstream_item_id),
+        ):
+            if value is not None:
+                _validate_text(value, name, self.limits.max_metadata_chars)
+        if not isinstance(preserve_raw, bool):
+            raise RawEvidenceError("preserve_raw_invalid")
+
+        now = _now_iso()
+        values = {
+            "run_id": run_id,
+            "retry_key": retry_key,
+            "source_sha256": source_sha256,
+            "source_size_bytes": source_size_bytes,
+            "filename": filename or "upload",
+            "media_type": media_type or "application/octet-stream",
+            "source_system": source_system,
+            "source_kind": source_kind,
+            "source_scope": source_scope,
+            "actor_id": actor_id,
+            "preserve_raw": 1 if preserve_raw else 0,
+            "importer_version": importer_version,
+            "parser_version": parser_version,
+            "chunker_version": chunker_version,
+            "upstream_source_id": upstream_source_id,
+            "upstream_item_id": upstream_item_id,
+        }
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT * FROM import_runs WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if row is None:
+                        duplicate = conn.execute(
+                            "SELECT run_id FROM import_runs WHERE retry_key = ?",
+                            (retry_key,),
+                        ).fetchone()
+                        if duplicate is not None:
+                            raise RawEvidenceError("idempotency_conflict")
+                        conn.execute(
+                            """
+                            INSERT INTO import_runs (
+                                run_id, retry_key, source_sha256, source_size_bytes,
+                                capture_mode, fidelity_level, filename, media_type,
+                                source_system, source_kind, source_scope,
+                                upstream_source_id, upstream_item_id, actor_id,
+                                importer_version, parser_version, chunker_version,
+                                preserve_raw, status, error_category,
+                                total_chunks, processed_chunks, started_at,
+                                updated_at, completed_at, retry_count,
+                                run_schema_version
+                            ) VALUES (?, ?, ?, ?, 'IMPORT_SNAPSHOT', 'IMPORT_SNAPSHOT',
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                'capture_pending', NULL, 0, 0, ?, ?, NULL, 0, ?)
+                            """,
+                            (
+                                run_id,
+                                retry_key,
+                                source_sha256,
+                                source_size_bytes,
+                                values["filename"],
+                                values["media_type"],
+                                values["source_system"],
+                                values["source_kind"],
+                                values["source_scope"],
+                                values["upstream_source_id"],
+                                values["upstream_item_id"],
+                                values["actor_id"],
+                                values["importer_version"],
+                                values["parser_version"],
+                                values["chunker_version"],
+                                values["preserve_raw"],
+                                now,
+                                now,
+                                IMPORT_RUN_SCHEMA_VERSION,
+                            ),
+                        )
+                    else:
+                        for field in (
+                            "retry_key",
+                            "source_sha256",
+                            "source_size_bytes",
+                            "filename",
+                            "media_type",
+                            "source_system",
+                            "source_kind",
+                            "source_scope",
+                            "actor_id",
+                            "preserve_raw",
+                            "importer_version",
+                            "parser_version",
+                            "chunker_version",
+                            "upstream_source_id",
+                            "upstream_item_id",
+                        ):
+                            if row[field] != values[field]:
+                                raise RawEvidenceError("idempotency_conflict")
+                        conn.execute(
+                            """
+                            UPDATE import_runs
+                            SET retry_count = retry_count + 1, updated_at = ?
+                            WHERE run_id = ?
+                            """,
+                            (now, run_id),
+                        )
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.IntegrityError as exc:
+                raise RawEvidenceError("idempotency_conflict") from exc
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+        return self.get_import_run(run_id)
+
+    def find_resumable_import_run(
+        self,
+        *,
+        source_sha256: str,
+        filename: str,
+        preserve_raw: bool,
+    ) -> dict[str, Any] | None:
+        """Find the newest incomplete run for the exact captured source."""
+
+        self._require_enabled()
+        source_sha256 = _validate_hash(source_sha256, "source_sha256")
+        filename = filename or "upload"
+        _validate_text(filename, "filename", self.limits.max_metadata_chars)
+        if not isinstance(preserve_raw, bool):
+            raise RawEvidenceError("preserve_raw_invalid")
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM import_runs
+                    WHERE source_sha256 = ? AND filename = ?
+                      AND preserve_raw = ?
+                      AND status IN (
+                          'capture_pending', 'capture_succeeded', 'processing',
+                          'paused', 'failed', 'needs_reconcile'
+                      )
+                    ORDER BY updated_at DESC, run_id DESC
+                    LIMIT 1
+                    """,
+                    (source_sha256, filename, 1 if preserve_raw else 0),
+                ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_import_run(self, run_id: str) -> dict[str, Any]:
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM import_runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+        if row is None:
+            raise RawEvidenceError("not_found")
+        return dict(row)
+
+    @guarded_mutation("raw_evidence_import_run_update")
+    def update_import_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        error_category: str | None = None,
+        total_chunks: int | None = None,
+        processed_chunks: int | None = None,
+    ) -> dict[str, Any]:
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        if status is not None:
+            status = _validate_choice(status, IMPORT_RUN_STATUSES, "status")
+        if error_category is not None:
+            _validate_text(error_category, "error_category", 128)
+        for name, value in (
+            ("total_chunks", total_chunks),
+            ("processed_chunks", processed_chunks),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise RawEvidenceError(f"{name}_invalid")
+        assignments = []
+        values: list[Any] = []
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if error_category is not None:
+            assignments.append("error_category = ?")
+            values.append(error_category)
+        if total_chunks is not None:
+            assignments.append("total_chunks = ?")
+            values.append(total_chunks)
+        if processed_chunks is not None:
+            assignments.append("processed_chunks = ?")
+            values.append(processed_chunks)
+        assignments.append("updated_at = ?")
+        values.extend((_now_iso(), run_id))
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute(
+                        f"UPDATE import_runs SET {', '.join(assignments)} WHERE run_id = ?",
+                        values,
+                    )
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        raise RawEvidenceError("not_found")
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+        return self.get_import_run(run_id)
+
+    def get_import_item(self, run_id: str, item_key: str) -> dict[str, Any] | None:
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        _validate_text(item_key, "item_key", self.limits.max_metadata_chars)
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
+                    (run_id, item_key),
+                ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_import_items(self, run_id: str, *, prefix: str | None = None) -> list[dict[str, Any]]:
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            with self._connect() as conn:
+                if prefix is None:
+                    rows = conn.execute(
+                        "SELECT * FROM import_run_items WHERE run_id = ? ORDER BY item_key",
+                        (run_id,),
+                    ).fetchall()
+                else:
+                    _validate_text(prefix, "item_prefix", self.limits.max_metadata_chars)
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM import_run_items
+                        WHERE run_id = ? AND item_key LIKE ?
+                        ORDER BY item_key
+                        """,
+                        (run_id, f"{prefix}%"),
+                    ).fetchall()
+        return [dict(row) for row in rows]
+
+    @guarded_mutation("raw_evidence_import_item_update")
+    def upsert_import_item(
+        self,
+        run_id: str,
+        item_key: str,
+        *,
+        item_kind: str,
+        input_digest: str,
+        status: str,
+        evidence_id: str | None = None,
+        revision_id: str | None = None,
+        operation_key: str | None = None,
+        operation_kind: str | None = None,
+        target_bucket_id: str | None = None,
+        payload_digest: str | None = None,
+        result_id: str | None = None,
+        item_count: int | None = None,
+        error_category: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        _validate_text(item_key, "item_key", self.limits.max_metadata_chars)
+        _validate_text(item_kind, "item_kind", 64)
+        input_digest = _validate_hash(input_digest, "input_digest")
+        status = _validate_choice(status, IMPORT_ITEM_STATUSES, "status")
+        if evidence_id is not None:
+            evidence_id = _validate_id(evidence_id, "evidence_id")
+        if revision_id is not None:
+            revision_id = _validate_id(revision_id, "revision_id")
+        for name, value in (
+            ("operation_key", operation_key),
+            ("operation_kind", operation_kind),
+            ("target_bucket_id", target_bucket_id),
+            ("result_id", result_id),
+        ):
+            if value is not None:
+                _validate_text(value, name, 256)
+        if operation_kind is not None and operation_kind not in {"create", "update"}:
+            raise RawEvidenceError("operation_kind_invalid")
+        if payload_digest is not None:
+            payload_digest = _validate_hash(payload_digest, "payload_digest")
+        if item_count is not None and (
+            isinstance(item_count, bool) or not isinstance(item_count, int) or item_count < 0
+        ):
+            raise RawEvidenceError("item_count_invalid")
+        if error_category is not None:
+            _validate_text(error_category, "error_category", 128)
+
+        now = _now_iso()
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    existing = conn.execute(
+                        "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
+                        (run_id, item_key),
+                    ).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            """
+                            INSERT INTO import_run_items (
+                                run_id, item_key, item_kind, input_digest, status,
+                                evidence_id, revision_id, operation_key, operation_kind,
+                                target_bucket_id, payload_digest, result_id, item_count,
+                                error_category, created_at, updated_at, item_schema_version
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                run_id,
+                                item_key,
+                                item_kind,
+                                input_digest,
+                                status,
+                                evidence_id,
+                                revision_id,
+                                operation_key,
+                                operation_kind,
+                                target_bucket_id,
+                                payload_digest,
+                                result_id,
+                                item_count,
+                                error_category,
+                                now,
+                                now,
+                                IMPORT_RUN_SCHEMA_VERSION,
+                            ),
+                        )
+                    else:
+                        if existing["input_digest"] != input_digest:
+                            raise RawEvidenceError("idempotency_conflict")
+                        if (
+                            existing["operation_key"] is not None
+                            and operation_key is not None
+                            and existing["operation_key"] != operation_key
+                        ):
+                            raise RawEvidenceError("idempotency_conflict")
+                        if existing["status"] == "succeeded" and status != "succeeded":
+                            conn.commit()
+                            return dict(existing)
+                        conn.execute(
+                            """
+                            UPDATE import_run_items SET
+                                item_kind = ?, status = ?,
+                                evidence_id = COALESCE(?, evidence_id),
+                                revision_id = COALESCE(?, revision_id),
+                                operation_key = COALESCE(?, operation_key),
+                                operation_kind = COALESCE(?, operation_kind),
+                                target_bucket_id = COALESCE(?, target_bucket_id),
+                                payload_digest = COALESCE(?, payload_digest),
+                                result_id = COALESCE(?, result_id),
+                                item_count = COALESCE(?, item_count),
+                                error_category = ?, updated_at = ?
+                            WHERE run_id = ? AND item_key = ?
+                            """,
+                            (
+                                item_kind,
+                                status,
+                                evidence_id,
+                                revision_id,
+                                operation_key,
+                                operation_kind,
+                                target_bucket_id,
+                                payload_digest,
+                                result_id,
+                                item_count,
+                                error_category,
+                                now,
+                                run_id,
+                                item_key,
+                            ),
+                        )
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+        result = self.get_import_item(run_id, item_key)
+        assert result is not None
+        return result
+
+    @guarded_mutation("raw_evidence_import_capture")
+    def create_or_reuse_import_evidence(
+        self,
+        content: bytes | bytearray | memoryview,
+        *,
+        run_id: str,
+        item_key: str = "source_snapshot",
+        source_system: str = "dashboard",
+        source_kind: str = "import_upload",
+        source_scope: str = "dashboard_upload",
+        filename: str = "upload",
+        media_type: str = "application/octet-stream",
+        source_occurrence_key: str | None = None,
+        captured_at: str | None = None,
+        privacy_class: str = "restricted_admin",
+    ) -> dict[str, Any]:
+        """Atomically create or reuse one run-bound logical snapshot."""
+
+        self._require_enabled()
+        run_id = _validate_id(run_id, "run_id")
+        _validate_text(item_key, "item_key", self.limits.max_metadata_chars)
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise RawEvidenceError("invalid_input")
+        content_bytes = bytes(content)
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+        content_size = len(content_bytes)
+        metadata = self._validate_metadata(
+            source_system=source_system,
+            source_kind=source_kind,
+            source_scope=source_scope,
+            upstream_source_id=None,
+            upstream_item_id=None,
+            source_occurrence_key=source_occurrence_key or f"{run_id}:{item_key}",
+            identity_origin="local",
+            fidelity_level="IMPORT_SNAPSHOT",
+            media_type=media_type or "application/octet-stream",
+            privacy_class=privacy_class,
+            captured_at=captured_at,
+        )
+        temp_path: Path | None = None
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    run = conn.execute(
+                        "SELECT * FROM import_runs WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if run is None:
+                        raise RawEvidenceError("not_found")
+                    if (
+                        run["source_sha256"] != content_hash
+                        or run["source_size_bytes"] != content_size
+                    ):
+                        raise RawEvidenceError("idempotency_conflict")
+                    item = conn.execute(
+                        "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
+                        (run_id, item_key),
+                    ).fetchone()
+                    if item is None:
+                        evidence_id = uuid.uuid4().hex
+                        revision_id = uuid.uuid4().hex
+                        conn.execute(
+                            """
+                            INSERT INTO import_run_items (
+                                run_id, item_key, item_kind, input_digest, status,
+                                evidence_id, revision_id, created_at, updated_at,
+                                item_schema_version
+                            ) VALUES (?, ?, 'snapshot', ?, 'capture_pending', ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                run_id,
+                                item_key,
+                                content_hash,
+                                evidence_id,
+                                revision_id,
+                                _now_iso(),
+                                _now_iso(),
+                                IMPORT_RUN_SCHEMA_VERSION,
+                            ),
+                        )
+                    else:
+                        if item["input_digest"] != content_hash:
+                            raise RawEvidenceError("idempotency_conflict")
+                        evidence_id = item["evidence_id"] or uuid.uuid4().hex
+                        revision_id = item["revision_id"] or uuid.uuid4().hex
+                        if item["status"] != "succeeded":
+                            conn.execute(
+                                """
+                                UPDATE import_run_items SET
+                                    status = 'capture_pending', evidence_id = ?,
+                                    revision_id = ?, error_category = NULL,
+                                    updated_at = ?
+                                WHERE run_id = ? AND item_key = ?
+                                """,
+                                (
+                                    evidence_id,
+                                    revision_id,
+                                    _now_iso(),
+                                    run_id,
+                                    item_key,
+                                ),
+                            )
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+
+            try:
+                temp_path, content_size, content_hash = self._stage_content(content_bytes)
+                blob_path = self._cas_path(content_hash)
+                if not blob_path.exists():
+                    self._ensure_store_capacity(content_size)
+                blob_relpath = self._publish_blob(temp_path, content_hash, content_size)
+                temp_path = None
+
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    item = conn.execute(
+                        "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
+                        (run_id, item_key),
+                    ).fetchone()
+                    if item is None:
+                        raise RawEvidenceError("not_found")
+                    if item["status"] == "succeeded":
+                        evidence_id = item["evidence_id"]
+                        revision_id = item["revision_id"]
+                    else:
+                        evidence_id = item["evidence_id"] or evidence_id
+                        revision_id = item["revision_id"] or revision_id
+                        now = _now_iso()
+                        conn.execute(
+                            """
+                            INSERT INTO evidence_objects (
+                                evidence_id, source_system, source_kind, source_scope,
+                                upstream_source_id, upstream_item_id,
+                                source_occurrence_key, identity_origin, privacy_class,
+                                lifecycle_state, captured_at, created_at, updated_at,
+                                record_schema_version
+                            ) VALUES (?, ?, ?, ?, NULL, NULL, ?, 'local', ?,
+                                'available', ?, ?, ?, ?)
+                            """,
+                            (
+                                evidence_id,
+                                metadata["source_system"],
+                                metadata["source_kind"],
+                                metadata["source_scope"],
+                                metadata["source_occurrence_key"],
+                                metadata["privacy_class"],
+                                metadata["captured_at"],
+                                now,
+                                now,
+                                RECORD_SCHEMA_VERSION,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO evidence_revisions (
+                                revision_id, evidence_id, fidelity_level, media_type,
+                                hash_algorithm, content_hash, content_size_bytes,
+                                blob_relpath, created_at, verification_state,
+                                revision_schema_version
+                            ) VALUES (?, ?, 'IMPORT_SNAPSHOT', ?, ?, ?, ?, ?, ?, 'verified', ?)
+                            """,
+                            (
+                                revision_id,
+                                evidence_id,
+                                metadata["media_type"],
+                                HASH_ALGORITHM,
+                                content_hash,
+                                content_size,
+                                blob_relpath,
+                                now,
+                                REVISION_SCHEMA_VERSION,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE import_run_items SET status = 'succeeded',
+                                evidence_id = ?, revision_id = ?, error_category = NULL,
+                                updated_at = ?
+                            WHERE run_id = ? AND item_key = ?
+                            """,
+                            (evidence_id, revision_id, now, run_id, item_key),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE import_runs SET evidence_id = ?, revision_id = ?
+                            WHERE run_id = ?
+                            """,
+                            (evidence_id, revision_id, run_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE import_runs SET status = 'capture_succeeded',
+                                updated_at = ?
+                            WHERE run_id = ? AND status = 'capture_pending'
+                            """,
+                            (now, run_id),
+                        )
+                    conn.commit()
+            except RawEvidenceError:
+                raise
+            except sqlite3.IntegrityError as exc:
+                raise RawEvidenceError("idempotency_conflict") from exc
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+            finally:
+                if temp_path is not None:
+                    self._remove_temp(temp_path)
+
+        result = self.get_evidence(evidence_id, allow_sealed=True)
+        self.verify_content(revision_id, allow_sealed=True)
+        return result
+
     def get_evidence(
         self,
         evidence_id: str,
@@ -448,6 +1133,7 @@ class RawEvidenceStore:
                 schema_row = conn.execute(
                     "SELECT schema_version FROM store_schema WHERE singleton = 1"
                 ).fetchone()
+                previous_schema_version: int | None = None
                 if schema_row is None:
                     now = _now_iso()
                     conn.execute(
@@ -456,8 +1142,13 @@ class RawEvidenceStore:
                         "VALUES (1, ?, ?, ?)",
                         (SCHEMA_VERSION, now, now),
                     )
-                elif schema_row["schema_version"] != SCHEMA_VERSION:
-                    raise RawEvidenceError("schema_unsupported")
+                else:
+                    try:
+                        previous_schema_version = int(schema_row["schema_version"])
+                    except (TypeError, ValueError) as exc:
+                        raise RawEvidenceError("schema_unsupported") from exc
+                    if previous_schema_version < 1 or previous_schema_version > SCHEMA_VERSION:
+                        raise RawEvidenceError("schema_unsupported")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS evidence_objects (
@@ -537,6 +1228,91 @@ class RawEvidenceStore:
                     "CREATE INDEX IF NOT EXISTS idx_evidence_revisions_evidence "
                     "ON evidence_revisions(evidence_id, created_at)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS import_runs (
+                        run_id TEXT PRIMARY KEY,
+                        retry_key TEXT NOT NULL UNIQUE,
+                        source_sha256 TEXT NOT NULL,
+                        source_size_bytes INTEGER NOT NULL CHECK (source_size_bytes >= 0),
+                        capture_mode TEXT NOT NULL CHECK (capture_mode = 'IMPORT_SNAPSHOT'),
+                        fidelity_level TEXT NOT NULL
+                            CHECK (fidelity_level = 'IMPORT_SNAPSHOT'),
+                        evidence_id TEXT,
+                        revision_id TEXT,
+                        filename TEXT NOT NULL,
+                        media_type TEXT NOT NULL,
+                        source_system TEXT NOT NULL,
+                        source_kind TEXT NOT NULL,
+                        source_scope TEXT NOT NULL,
+                        upstream_source_id TEXT,
+                        upstream_item_id TEXT,
+                        actor_id TEXT NOT NULL,
+                        importer_version TEXT NOT NULL,
+                        parser_version TEXT NOT NULL,
+                        chunker_version TEXT NOT NULL,
+                        preserve_raw INTEGER NOT NULL CHECK (preserve_raw IN (0, 1)),
+                        status TEXT NOT NULL,
+                        error_category TEXT,
+                        total_chunks INTEGER NOT NULL DEFAULT 0 CHECK (total_chunks >= 0),
+                        processed_chunks INTEGER NOT NULL DEFAULT 0 CHECK (processed_chunks >= 0),
+                        started_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                        run_schema_version INTEGER NOT NULL
+                    )
+                    """
+                )
+                import_run_columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(import_runs)").fetchall()
+                }
+                for column in ("evidence_id", "revision_id"):
+                    if column not in import_run_columns:
+                        conn.execute(
+                            f"ALTER TABLE import_runs ADD COLUMN {column} TEXT"
+                        )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS import_run_items (
+                        run_id TEXT NOT NULL,
+                        item_key TEXT NOT NULL,
+                        item_kind TEXT NOT NULL,
+                        input_digest TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        evidence_id TEXT,
+                        revision_id TEXT,
+                        operation_key TEXT,
+                        operation_kind TEXT,
+                        target_bucket_id TEXT,
+                        payload_digest TEXT,
+                        result_id TEXT,
+                        item_count INTEGER,
+                        error_category TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        item_schema_version INTEGER NOT NULL,
+                        PRIMARY KEY (run_id, item_key),
+                        FOREIGN KEY (run_id) REFERENCES import_runs(run_id)
+                            ON DELETE RESTRICT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_import_runs_source "
+                    "ON import_runs(source_sha256, filename, updated_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_import_run_items_operation "
+                    "ON import_run_items(operation_key)"
+                )
+                if previous_schema_version is not None and previous_schema_version < SCHEMA_VERSION:
+                    conn.execute(
+                        "UPDATE store_schema SET schema_version = ?, updated_at = ? "
+                        "WHERE singleton = 1",
+                        (SCHEMA_VERSION, _now_iso()),
+                    )
                 conn.commit()
                 assert self.registry_path is not None
                 _chmod_private(self.registry_path)
@@ -960,6 +1736,12 @@ def _validate_id(value: Any, label: str) -> str:
     return value
 
 
+def _validate_hash(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _HASH_PATTERN.fullmatch(value) is None:
+        raise RawEvidenceError(f"{label}_invalid")
+    return value
+
+
 def _validate_text(value: Any, label: str, max_chars: int) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise RawEvidenceError(f"{label}_invalid")
@@ -982,6 +1764,8 @@ __all__ = [
     "FIDELITY_LEVELS",
     "HASH_ALGORITHM",
     "IDENTITY_ORIGINS",
+    "IMPORT_ITEM_STATUSES",
+    "IMPORT_RUN_STATUSES",
     "LIFECYCLE_STATES",
     "PRIVACY_CLASSES",
     "RawEvidenceError",

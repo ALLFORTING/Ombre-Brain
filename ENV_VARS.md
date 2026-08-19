@@ -7,6 +7,7 @@
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
 | `OMBRE_BUCKETS_DIR` | 否 | `./buckets` | 记忆桶文件存放目录（绑定 Docker Volume 时务必设置） |
+| `OMBRE_RAW_EVIDENCE_ROOT` | 否 | 无 | O5B 明确启用后使用的 Raw Evidence 绝对路径；不得与 `OMBRE_BUCKETS_DIR` 或 Remember-Me 根目录重叠。默认关闭时不要求配置，也不会创建该目录。 |
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
 | `OMBRE_HOOK_TOKEN` | 否 | — | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时端点返回 503。使用 `secrets.token_urlsafe(32)` 或等价安全随机源生成，不要提交到仓库 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |

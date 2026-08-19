@@ -57,6 +57,7 @@ def load_config(config_path: str = None) -> dict:
         "transport": "stdio",
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
+        "raw_evidence_root": None,
         "merge_threshold": 75,
         "dehydration": {
             "model": "deepseek-chat",
@@ -122,6 +123,13 @@ def load_config(config_path: str = None) -> dict:
     env_buckets_dir = os.environ.get("OMBRE_BUCKETS_DIR", "")
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
+
+    # Raw Evidence is explicitly opt-in at the import boundary.  Keep the
+    # configured path inert here; the capture coordinator validates and opens
+    # it only after a request explicitly enables capture.
+    env_raw_evidence_root = os.environ.get("OMBRE_RAW_EVIDENCE_ROOT", "")
+    if env_raw_evidence_root:
+        config["raw_evidence_root"] = env_raw_evidence_root
 
     # OMBRE_DEHYDRATION_MODEL (with OMBRE_MODEL alias) overrides dehydration.model
     env_dehy_model = os.environ.get("OMBRE_DEHYDRATION_MODEL", "") or os.environ.get("OMBRE_MODEL", "")
