@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from maintenance_write_gate import guarded_mutation
@@ -21,6 +22,11 @@ from raw_evidence_store import (
     RawEvidenceError,
     RawEvidenceStore,
     _now_iso,
+)
+from raw_evidence_backup_authority import (
+    BACKUP_ROOT_ENV,
+    BackupAuthorityError,
+    RawEvidenceBackupAuthority,
 )
 
 
@@ -75,6 +81,25 @@ class RawEvidenceLifecycle:
         self.config = config or LifecycleConfig.from_env()
         self.config.validate()
 
+    def _bound_backup_authority(self) -> RawEvidenceBackupAuthority | None:
+        repository_id = self.store.backup_repository_id()
+        if repository_id is None:
+            return None
+        root = os.environ.get(BACKUP_ROOT_ENV, "")
+        if not root:
+            raise RawEvidenceError("backup_authority_unavailable")
+        try:
+            authority = RawEvidenceBackupAuthority.open(
+                root,
+                live_root=self.store.root,
+                forbidden_roots=(self.store.root or Path("."),),
+            )
+            if authority.repository_id() != repository_id:
+                raise BackupAuthorityError("backup_repository_mismatch")
+            return authority
+        except BackupAuthorityError as exc:
+            raise RawEvidenceError(exc.code) from exc
+
     @guarded_mutation("raw_evidence_lifecycle_redact")
     def redact(
         self,
@@ -90,10 +115,18 @@ class RawEvidenceLifecycle:
         reason = _bounded_reason(reason)
         actor_class = _bounded_actor(actor_class)
         now = _now_iso()
+        revocation = None
+        authority = self._bound_backup_authority()
+        if authority is not None:
+            revocation = authority.begin_revocation(
+                uuid.uuid4().hex,
+                target_evidence_id=evidence_id,
+                reason=reason,
+            )
         changed = 0
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 rows = conn.execute(
                     """
                     SELECT revision_id, lifecycle_state
@@ -167,6 +200,8 @@ class RawEvidenceLifecycle:
                         (now, evidence_id),
                     )
                 conn.commit()
+        if authority is not None and revocation is not None:
+            authority.apply_revocation(revocation["operation_id"])
         return {
             "evidence_id": evidence_id,
             "state": "tombstoned" if changed else "purged",
@@ -231,7 +266,7 @@ class RawEvidenceLifecycle:
         recovered = 0
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 rows = conn.execute(
                     """
                     SELECT * FROM cas_objects
@@ -322,7 +357,7 @@ class RawEvidenceLifecycle:
     def _expire_one(self, now: str) -> bool:
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 row = conn.execute(
                     """
                     SELECT revision_id, evidence_id, lifecycle_state
@@ -398,7 +433,7 @@ class RawEvidenceLifecycle:
     def _claim_purge(self, now: str):
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 row = conn.execute(
                     """
                     SELECT l.revision_id, l.evidence_id, r.content_hash,
@@ -492,7 +527,7 @@ class RawEvidenceLifecycle:
     def _finalize_purge(self, cas, revisions, now: str) -> dict[str, Any]:
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 current = conn.execute(
                     """
                     SELECT state, operation_id FROM cas_objects
@@ -547,7 +582,7 @@ class RawEvidenceLifecycle:
     def _mark_integrity_failure(self, cas, revisions, now: str) -> None:
         with self.store._lock:
             with self.store._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 conn.execute(
                     """
                     UPDATE cas_objects SET state = 'live', operation_id = NULL, updated_at = ?
@@ -587,7 +622,7 @@ class RawEvidenceLifecycle:
                         "SELECT COUNT(*) FROM lifecycle_audit WHERE occurred_at < ?",
                         (cutoff_iso,),
                     ).fetchone()[0])
-                conn.execute("BEGIN IMMEDIATE")
+                self.store._begin_write(conn)
                 cursor = conn.execute(
                     """
                     DELETE FROM lifecycle_audit

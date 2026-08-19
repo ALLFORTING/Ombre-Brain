@@ -11,6 +11,10 @@
 | `OMBRE_RAW_EVIDENCE_RETENTION_DAYS` | 否 | `30` | O5D 显式 lifecycle invocation 使用的有限证据 retention 天数；仅允许 `1..365`，不改变已保存 revision deadline。 |
 | `OMBRE_RAW_EVIDENCE_AUDIT_RETENTION_DAYS` | 否 | `365` | O5D metadata-only lifecycle audit 保留天数；仅允许 `30..3650`。 |
 | `OMBRE_RAW_EVIDENCE_PURGE_BATCH_SIZE` | 否 | `100` | O5D 单次显式 lifecycle pass 的 bounded purge batch；仅允许 `1..1000`。 |
+| `OMBRE_RAW_EVIDENCE_BACKUP_ROOT` | 否 | 无 | O5E 显式 operator backup/restore repository 的绝对路径；不得与代码仓库、live Raw Evidence、bucket 或 Remember-Me 根目录重叠。未配置时不创建、不要求 backup repository。 |
+| `OMBRE_RAW_EVIDENCE_BACKUP_RETENTION_DAYS` | 否 | `7` | O5E bundle retention 起算于 immutable `created_at`；仅允许 `1..30`。无自动生产 scheduler，需显式 operator prune。 |
+| `OMBRE_RAW_EVIDENCE_BACKUP_ROOT` | 否 | 无 | O5E 显式 operator backup/restore repository 的绝对路径；不得与代码仓库、live Raw Evidence、bucket 或 Remember-Me 根目录重叠。未配置时不创建、不要求 backup repository。 |
+| `OMBRE_RAW_EVIDENCE_BACKUP_RETENTION_DAYS` | 否 | `7` | O5E bundle retention 起算于 immutable `created_at`；仅允许 `1..30`。无自动生产 scheduler，需显式 operator prune。 |
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
 | `OMBRE_HOOK_TOKEN` | 否 | — | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时端点返回 503。使用 `secrets.token_urlsafe(32)` 或等价安全随机源生成，不要提交到仓库 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |

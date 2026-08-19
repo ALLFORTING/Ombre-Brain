@@ -64,7 +64,7 @@ def _item(coordinator, prepared, captured, *, operation_key, result_id, item_key
     )
 
 
-def test_v2_to_v4_migration_has_lineage_table_without_backfill(tmp_path):
+def test_v2_to_v5_migration_has_lineage_table_without_backfill(tmp_path):
     root = tmp_path / "raw-evidence"
     store = RawEvidenceStore(root)
     evidence = store.create(b"legacy evidence", source_system="fixture", source_kind="item")
@@ -78,7 +78,7 @@ def test_v2_to_v4_migration_has_lineage_table_without_backfill(tmp_path):
     with sqlite3.connect(migrated.registry_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM store_schema WHERE singleton = 1"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert conn.execute(
             "SELECT COUNT(*) FROM memory_lineage"
         ).fetchone()[0] == 0

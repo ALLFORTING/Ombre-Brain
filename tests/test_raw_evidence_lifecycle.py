@@ -46,7 +46,7 @@ def test_config_defaults_and_bounds(monkeypatch):
         LifecycleConfig.from_env()
 
 
-def test_schema_v3_to_v4_migration_preserves_identity_without_purge(tmp_path):
+def test_schema_v3_to_v5_migration_preserves_identity_without_purge(tmp_path):
     store = _store(tmp_path)
     created = store.create(
         b"migration-bytes",
@@ -69,7 +69,7 @@ def test_schema_v3_to_v4_migration_preserves_identity_without_purge(tmp_path):
     with sqlite3.connect(migrated.registry_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM store_schema WHERE singleton = 1"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
 
 
 def test_schema_v3_captured_state_migrates_as_readable_available(tmp_path):
