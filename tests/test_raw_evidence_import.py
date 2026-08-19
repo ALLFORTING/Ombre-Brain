@@ -42,7 +42,7 @@ def test_capture_option_is_strict_and_default_off():
         parse_capture_option("true")
 
 
-def test_v1_to_v3_migration_preserves_existing_evidence(tmp_path):
+def test_v1_to_v4_migration_preserves_existing_evidence(tmp_path):
     root = tmp_path / "raw-evidence"
     store = RawEvidenceStore(root)
     result = store.create(b"before migration", source_system="fixture", source_kind="item")
@@ -54,7 +54,7 @@ def test_v1_to_v3_migration_preserves_existing_evidence(tmp_path):
     with sqlite3.connect(migrated.registry_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM store_schema WHERE singleton = 1"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 4
         assert conn.execute(
             "SELECT COUNT(*) FROM import_runs"
         ).fetchone()[0] == 0

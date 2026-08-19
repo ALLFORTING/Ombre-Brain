@@ -19,18 +19,20 @@ import threading
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable
 
 from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR, guarded_mutation
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REVISION_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 HASH_ALGORITHM = "sha256-v1"
 IMPORT_RUN_SCHEMA_VERSION = 1
+RETENTION_POLICY_VERSION = "foundation_v1"
+DEFAULT_RETENTION_DAYS = 30
 
 IMPORT_RUN_STATUSES = frozenset(
     {
@@ -85,8 +87,28 @@ FIDELITY_LEVELS = frozenset(
 )
 PRIVACY_CLASSES = frozenset({"ordinary", "sealed", "restricted_admin"})
 LIFECYCLE_STATES = frozenset(
-    {"captured", "available", "quarantined", "integrity_failed", "tombstoned"}
+    {
+        "captured",
+        "available",
+        "quarantined",
+        "tombstoned",
+        "expired",
+        "purge_pending",
+        "purged",
+        "integrity_failed",
+        "missing",
+    }
 )
+MUTABLE_LIFECYCLE_STATES = frozenset(
+    {
+        "captured",
+        "available",
+        "quarantined",
+        "integrity_failed",
+        "tombstoned",
+    }
+)
+CAS_STATES = frozenset({"publish_pending", "live", "gc_pending", "purged"})
 VERIFICATION_STATES = frozenset({"verified", "quarantined", "failed"})
 IDENTITY_ORIGINS = frozenset({"upstream", "local", "unknown"})
 
@@ -232,69 +254,17 @@ class RawEvidenceStore:
         with self._lock:
             try:
                 temp_path, content_size, content_hash = self._stage_content(content)
-                blob_path = self._cas_path(content_hash)
-                if not blob_path.exists():
-                    self._ensure_store_capacity(content_size)
-                blob_relpath = self._publish_blob(
-                    temp_path,
-                    content_hash,
-                    content_size,
+                self._ensure_store_capacity(content_size)
+                blob_relpath = self._coordinate_capture(
+                    evidence_id=evidence_id,
+                    revision_id=revision_id,
+                    metadata=metadata,
+                    content_hash=content_hash,
+                    content_size=content_size,
+                    temp_path=temp_path,
+                    now=now,
                 )
                 temp_path = None
-
-                with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.execute(
-                        """
-                        INSERT INTO evidence_objects (
-                            evidence_id, source_system, source_kind, source_scope,
-                            upstream_source_id, upstream_item_id,
-                            source_occurrence_key, identity_origin, privacy_class,
-                            lifecycle_state, captured_at, created_at, updated_at,
-                            record_schema_version
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            evidence_id,
-                            metadata["source_system"],
-                            metadata["source_kind"],
-                            metadata["source_scope"],
-                            metadata["upstream_source_id"],
-                            metadata["upstream_item_id"],
-                            metadata["source_occurrence_key"],
-                            metadata["identity_origin"],
-                            metadata["privacy_class"],
-                            "available",
-                            metadata["captured_at"],
-                            now,
-                            now,
-                            RECORD_SCHEMA_VERSION,
-                        ),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO evidence_revisions (
-                            revision_id, evidence_id, fidelity_level, media_type,
-                            hash_algorithm, content_hash, content_size_bytes,
-                            blob_relpath, created_at, verification_state,
-                            revision_schema_version
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            revision_id,
-                            evidence_id,
-                            metadata["fidelity_level"],
-                            metadata["media_type"],
-                            HASH_ALGORITHM,
-                            content_hash,
-                            content_size,
-                            blob_relpath,
-                            now,
-                            "verified",
-                            REVISION_SCHEMA_VERSION,
-                        ),
-                    )
-                    conn.commit()
             except RawEvidenceError:
                 raise
             except sqlite3.Error as exc:
@@ -989,6 +959,7 @@ class RawEvidenceStore:
             captured_at=captured_at,
         )
         temp_path: Path | None = None
+        existing_succeeded = False
         with self._lock:
             try:
                 with self._connect() as conn:
@@ -1035,7 +1006,9 @@ class RawEvidenceStore:
                             raise RawEvidenceError("idempotency_conflict")
                         evidence_id = item["evidence_id"] or uuid.uuid4().hex
                         revision_id = item["revision_id"] or uuid.uuid4().hex
-                        if item["status"] != "succeeded":
+                        if item["status"] == "succeeded":
+                            existing_succeeded = True
+                        else:
                             conn.execute(
                                 """
                                 UPDATE import_run_items SET
@@ -1058,99 +1031,68 @@ class RawEvidenceStore:
             except sqlite3.Error as exc:
                 raise RawEvidenceError("storage_unavailable") from exc
 
+            if existing_succeeded:
+                self.verify_content(revision_id, allow_sealed=True)
+                return self.get_evidence(evidence_id, allow_sealed=True)
+
             try:
                 temp_path, content_size, content_hash = self._stage_content(content_bytes)
-                blob_path = self._cas_path(content_hash)
-                if not blob_path.exists():
-                    self._ensure_store_capacity(content_size)
-                blob_relpath = self._publish_blob(temp_path, content_hash, content_size)
-                temp_path = None
+                self._ensure_store_capacity(content_size)
 
-                with self._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                def finish_import(
+                    conn: sqlite3.Connection,
+                    registered_evidence_id: str,
+                    registered_revision_id: str,
+                    registered_at: str,
+                ) -> None:
                     item = conn.execute(
-                        "SELECT * FROM import_run_items WHERE run_id = ? AND item_key = ?",
+                        "SELECT status FROM import_run_items "
+                        "WHERE run_id = ? AND item_key = ?",
                         (run_id, item_key),
                     ).fetchone()
                     if item is None:
                         raise RawEvidenceError("not_found")
                     if item["status"] == "succeeded":
-                        evidence_id = item["evidence_id"]
-                        revision_id = item["revision_id"]
-                    else:
-                        evidence_id = item["evidence_id"] or evidence_id
-                        revision_id = item["revision_id"] or revision_id
-                        now = _now_iso()
-                        conn.execute(
-                            """
-                            INSERT INTO evidence_objects (
-                                evidence_id, source_system, source_kind, source_scope,
-                                upstream_source_id, upstream_item_id,
-                                source_occurrence_key, identity_origin, privacy_class,
-                                lifecycle_state, captured_at, created_at, updated_at,
-                                record_schema_version
-                            ) VALUES (?, ?, ?, ?, NULL, NULL, ?, 'local', ?,
-                                'available', ?, ?, ?, ?)
-                            """,
-                            (
-                                evidence_id,
-                                metadata["source_system"],
-                                metadata["source_kind"],
-                                metadata["source_scope"],
-                                metadata["source_occurrence_key"],
-                                metadata["privacy_class"],
-                                metadata["captured_at"],
-                                now,
-                                now,
-                                RECORD_SCHEMA_VERSION,
-                            ),
-                        )
-                        conn.execute(
-                            """
-                            INSERT INTO evidence_revisions (
-                                revision_id, evidence_id, fidelity_level, media_type,
-                                hash_algorithm, content_hash, content_size_bytes,
-                                blob_relpath, created_at, verification_state,
-                                revision_schema_version
-                            ) VALUES (?, ?, 'IMPORT_SNAPSHOT', ?, ?, ?, ?, ?, ?, 'verified', ?)
-                            """,
-                            (
-                                revision_id,
-                                evidence_id,
-                                metadata["media_type"],
-                                HASH_ALGORITHM,
-                                content_hash,
-                                content_size,
-                                blob_relpath,
-                                now,
-                                REVISION_SCHEMA_VERSION,
-                            ),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE import_run_items SET status = 'succeeded',
-                                evidence_id = ?, revision_id = ?, error_category = NULL,
-                                updated_at = ?
-                            WHERE run_id = ? AND item_key = ?
-                            """,
-                            (evidence_id, revision_id, now, run_id, item_key),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE import_runs SET evidence_id = ?, revision_id = ?
-                            WHERE run_id = ?
-                            """,
-                            (evidence_id, revision_id, run_id),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE import_runs SET status = 'capture_succeeded',
-                                updated_at = ?
-                            WHERE run_id = ? AND status = 'capture_pending'
-                            """,
-                            (now, run_id),
-                        )
-                    conn.commit()
+                        raise RawEvidenceError("idempotency_conflict")
+                    conn.execute(
+                        """
+                        UPDATE import_run_items SET status = 'succeeded',
+                            evidence_id = ?, revision_id = ?, error_category = NULL,
+                            updated_at = ?
+                        WHERE run_id = ? AND item_key = ?
+                        """,
+                        (
+                            registered_evidence_id, registered_revision_id,
+                            registered_at, run_id, item_key,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE import_runs SET evidence_id = ?, revision_id = ?
+                        WHERE run_id = ?
+                        """,
+                        (registered_evidence_id, registered_revision_id, run_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE import_runs SET status = 'capture_succeeded',
+                            updated_at = ?
+                        WHERE run_id = ? AND status = 'capture_pending'
+                        """,
+                        (registered_at, run_id),
+                    )
+
+                self._coordinate_capture(
+                    evidence_id=evidence_id,
+                    revision_id=revision_id,
+                    metadata=metadata,
+                    content_hash=content_hash,
+                    content_size=content_size,
+                    temp_path=temp_path,
+                    now=_now_iso(),
+                    post_register=finish_import,
+                )
+                temp_path = None
             except RawEvidenceError:
                 raise
             except sqlite3.IntegrityError as exc:
@@ -1181,7 +1123,11 @@ class RawEvidenceStore:
                         e.evidence_id, e.source_system, e.source_kind,
                         e.source_scope, e.upstream_source_id,
                         e.upstream_item_id, e.source_occurrence_key,
-                        e.identity_origin, e.privacy_class, e.lifecycle_state,
+                        e.identity_origin, e.privacy_class,
+                        COALESCE(l.lifecycle_state, e.lifecycle_state) AS lifecycle_state,
+                        l.retention_deadline, l.retention_policy_version,
+                        l.lifecycle_reason, l.tombstoned_at, l.expired_at,
+                        l.purge_started_at, l.purged_at, l.payload_deleted,
                         e.captured_at, e.created_at, e.updated_at,
                         e.record_schema_version, r.revision_id,
                         r.fidelity_level, r.media_type, r.hash_algorithm,
@@ -1191,6 +1137,8 @@ class RawEvidenceStore:
                     FROM evidence_objects AS e
                     JOIN evidence_revisions AS r
                       ON r.evidence_id = e.evidence_id
+                    LEFT JOIN evidence_lifecycle AS l
+                      ON l.revision_id = r.revision_id
                     WHERE e.evidence_id = ?
                     ORDER BY r.created_at DESC, r.revision_id DESC
                     LIMIT 1
@@ -1251,8 +1199,11 @@ class RawEvidenceStore:
             )
         if lifecycle_state is not None:
             lifecycle_state = _validate_choice(
-                lifecycle_state, LIFECYCLE_STATES, "lifecycle_state"
+                lifecycle_state, MUTABLE_LIFECYCLE_STATES, "lifecycle_state"
             )
+        legacy_lifecycle_state = lifecycle_state
+        if lifecycle_state in {"expired", "purge_pending", "purged", "missing"}:
+            legacy_lifecycle_state = "tombstoned"
         assignments: list[str] = []
         values: list[Any] = []
         if privacy_class is not None:
@@ -1260,7 +1211,7 @@ class RawEvidenceStore:
             values.append(privacy_class)
         if lifecycle_state is not None:
             assignments.append("lifecycle_state = ?")
-            values.append(lifecycle_state)
+            values.append(legacy_lifecycle_state)
         assignments.append("updated_at = ?")
         values.extend((_now_iso(), evidence_id))
 
@@ -1268,6 +1219,23 @@ class RawEvidenceStore:
             try:
                 with self._connect() as conn:
                     conn.execute("BEGIN IMMEDIATE")
+                    if lifecycle_state is not None:
+                        in_progress = conn.execute(
+                            """
+                            SELECT 1
+                            FROM evidence_revisions AS r
+                            JOIN cas_objects AS c
+                              ON c.hash_algorithm = r.hash_algorithm
+                             AND c.content_hash = r.content_hash
+                            WHERE r.evidence_id = ?
+                              AND c.state IN ('publish_pending', 'gc_pending')
+                            LIMIT 1
+                            """,
+                            (evidence_id,),
+                        ).fetchone()
+                        if in_progress is not None:
+                            conn.rollback()
+                            raise RawEvidenceError("lifecycle_operation_in_progress")
                     cursor = conn.execute(
                         f"UPDATE evidence_objects SET {', '.join(assignments)} "
                         "WHERE evidence_id = ?",
@@ -1276,6 +1244,30 @@ class RawEvidenceStore:
                     if cursor.rowcount != 1:
                         conn.rollback()
                         raise RawEvidenceError("not_found")
+                    if lifecycle_state is not None:
+                        revision = conn.execute(
+                            """
+                            SELECT revision_id FROM evidence_revisions
+                            WHERE evidence_id = ?
+                            ORDER BY created_at DESC, revision_id DESC
+                            LIMIT 1
+                            """,
+                            (evidence_id,),
+                        ).fetchone()
+                        if revision is not None:
+                            conn.execute(
+                                """
+                                UPDATE evidence_lifecycle
+                                SET lifecycle_state = ?, payload_deleted = ?, updated_at = ?
+                                WHERE revision_id = ?
+                                """,
+                                (
+                                    lifecycle_state,
+                                    1 if lifecycle_state == "purged" else 0,
+                                    _now_iso(),
+                                    revision["revision_id"],
+                                ),
+                            )
                     conn.commit()
             except RawEvidenceError:
                 raise
@@ -1578,6 +1570,90 @@ class RawEvidenceStore:
                     "CREATE INDEX IF NOT EXISTS idx_memory_lineage_status "
                     "ON memory_lineage(status, updated_at)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cas_objects (
+                        hash_algorithm TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        content_size_bytes INTEGER NOT NULL CHECK (content_size_bytes >= 0),
+                        blob_relpath TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('publish_pending', 'live', 'gc_pending', 'purged')
+                        ),
+                        operation_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (hash_algorithm, content_hash)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_lifecycle (
+                        revision_id TEXT PRIMARY KEY,
+                        evidence_id TEXT NOT NULL,
+                        lifecycle_state TEXT NOT NULL CHECK (
+                            lifecycle_state IN (
+                                'captured', 'available', 'quarantined',
+                                'tombstoned', 'expired', 'purge_pending',
+                                'purged', 'integrity_failed', 'missing'
+                            )
+                        ),
+                        retention_deadline TEXT NOT NULL,
+                        retention_policy_version TEXT NOT NULL,
+                        lifecycle_reason TEXT,
+                        tombstoned_at TEXT,
+                        expired_at TEXT,
+                        purge_started_at TEXT,
+                        purged_at TEXT,
+                        purge_operation_id TEXT,
+                        payload_deleted INTEGER NOT NULL DEFAULT 0
+                            CHECK (payload_deleted IN (0, 1)),
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY (revision_id)
+                            REFERENCES evidence_revisions(revision_id)
+                            ON DELETE RESTRICT,
+                        FOREIGN KEY (evidence_id)
+                            REFERENCES evidence_objects(evidence_id)
+                            ON DELETE RESTRICT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lifecycle_audit (
+                        lifecycle_operation_id TEXT PRIMARY KEY,
+                        evidence_id TEXT NOT NULL,
+                        revision_id TEXT NOT NULL,
+                        from_state TEXT NOT NULL,
+                        to_state TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        actor_class TEXT NOT NULL,
+                        payload_deleted INTEGER NOT NULL CHECK (payload_deleted IN (0, 1)),
+                        reconciliation_result TEXT,
+                        FOREIGN KEY (evidence_id)
+                            REFERENCES evidence_objects(evidence_id)
+                            ON DELETE RESTRICT,
+                        FOREIGN KEY (revision_id)
+                            REFERENCES evidence_revisions(revision_id)
+                            ON DELETE RESTRICT
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_evidence_lifecycle_deadline "
+                    "ON evidence_lifecycle(lifecycle_state, retention_deadline)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_evidence_lifecycle_purge "
+                    "ON evidence_lifecycle(purge_operation_id, lifecycle_state)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_audit_time "
+                    "ON lifecycle_audit(occurred_at)"
+                )
+                self._backfill_lifecycle_v4(conn)
                 if previous_schema_version is not None and previous_schema_version < SCHEMA_VERSION:
                     conn.execute(
                         "UPDATE store_schema SET schema_version = ?, updated_at = ? "
@@ -1593,6 +1669,59 @@ class RawEvidenceStore:
             except sqlite3.Error as exc:
                 conn.rollback()
                 raise RawEvidenceError("storage_unavailable") from exc
+
+    def _backfill_lifecycle_v4(self, conn: sqlite3.Connection) -> None:
+        """Create v4 lifecycle/CAS rows without applying lifecycle decisions."""
+
+        rows = conn.execute(
+            """
+            SELECT e.evidence_id, e.lifecycle_state AS legacy_state,
+                   e.captured_at, r.revision_id, r.hash_algorithm,
+                   r.content_hash, r.content_size_bytes, r.blob_relpath
+            FROM evidence_objects AS e
+            JOIN evidence_revisions AS r ON r.evidence_id = e.evidence_id
+            """
+        ).fetchall()
+        now = _now_iso()
+        for row in rows:
+            state = row["legacy_state"]
+            if state not in LIFECYCLE_STATES:
+                state = "available"
+            deadline = _add_days_iso(row["captured_at"], DEFAULT_RETENTION_DAYS)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO evidence_lifecycle (
+                    revision_id, evidence_id, lifecycle_state,
+                    retention_deadline, retention_policy_version,
+                    lifecycle_reason, payload_deleted, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, 0, ?)
+                """,
+                (
+                    row["revision_id"],
+                    row["evidence_id"],
+                    state if state in {"available", "quarantined", "integrity_failed", "tombstoned"}
+                    else "available",
+                    deadline,
+                    RETENTION_POLICY_VERSION,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cas_objects (
+                    hash_algorithm, content_hash, content_size_bytes,
+                    blob_relpath, state, operation_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'live', NULL, ?, ?)
+                """,
+                (
+                    row["hash_algorithm"],
+                    row["content_hash"],
+                    row["content_size_bytes"],
+                    row["blob_relpath"],
+                    now,
+                    now,
+                ),
+            )
 
     def _stage_content(
         self,
@@ -1684,7 +1813,207 @@ class RawEvidenceStore:
         except OSError as exc:
             raise RawEvidenceError("storage_unavailable") from exc
 
-    def _publish_blob(self, temp_path: Path, content_hash: str, size: int) -> str:
+    def _coordinate_capture(
+        self,
+        *,
+        evidence_id: str,
+        revision_id: str,
+        metadata: dict[str, Any],
+        content_hash: str,
+        content_size: int,
+        temp_path: Path,
+        now: str,
+        post_register: Any | None = None,
+    ) -> str:
+        """Coordinate CAS publication and logical registration.
+
+        ``publish_pending`` is committed before the filesystem publish.  A
+        later transaction makes the CAS live and registers the revision.  A
+        purge worker therefore cannot mistake an unregistered publication for
+        the last live reference.
+        """
+
+        operation_id = uuid.uuid4().hex
+        blob_relpath = self._relative_blob_path(self._cas_path(content_hash))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cas = conn.execute(
+                """
+                SELECT * FROM cas_objects
+                WHERE hash_algorithm = ? AND content_hash = ?
+                """,
+                (HASH_ALGORITHM, content_hash),
+            ).fetchone()
+            if cas is not None:
+                if cas["content_size_bytes"] != content_size or cas["blob_relpath"] != blob_relpath:
+                    conn.rollback()
+                    raise RawEvidenceError("integrity_conflict")
+                if cas["state"] == "gc_pending":
+                    conn.rollback()
+                    raise RawEvidenceError("cas_gc_pending")
+                if cas["state"] == "publish_pending":
+                    conn.rollback()
+                    raise RawEvidenceError("cas_publish_pending")
+                if cas["state"] == "live" and self._cas_file_is_valid(
+                    cas["blob_relpath"], content_hash, content_size
+                ):
+                    self._insert_capture_records(
+                        conn, evidence_id, revision_id, metadata,
+                        content_hash, content_size, blob_relpath, now,
+                    )
+                    if post_register is not None:
+                        post_register(conn, evidence_id, revision_id, now)
+                    conn.commit()
+                    self._remove_temp(temp_path)
+                    return blob_relpath
+                if cas["state"] == "live":
+                    conn.rollback()
+                    raise RawEvidenceError("cas_integrity_conflict")
+                conn.execute(
+                    """
+                    UPDATE cas_objects SET state = 'publish_pending',
+                        operation_id = ?, updated_at = ?
+                    WHERE hash_algorithm = ? AND content_hash = ?
+                    """,
+                    (operation_id, now, HASH_ALGORITHM, content_hash),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO cas_objects (
+                        hash_algorithm, content_hash, content_size_bytes,
+                        blob_relpath, state, operation_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'publish_pending', ?, ?, ?)
+                    """,
+                    (
+                        HASH_ALGORITHM,
+                        content_hash,
+                        content_size,
+                        blob_relpath,
+                        operation_id,
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+
+        self._publish_blob(temp_path, content_hash, content_size)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cas = conn.execute(
+                """
+                SELECT * FROM cas_objects
+                WHERE hash_algorithm = ? AND content_hash = ?
+                """,
+                (HASH_ALGORITHM, content_hash),
+            ).fetchone()
+            if cas is None or cas["state"] != "publish_pending":
+                conn.rollback()
+                raise RawEvidenceError("cas_publish_conflict")
+            if cas["operation_id"] != operation_id:
+                if not self._cas_file_is_valid(cas["blob_relpath"], content_hash, content_size):
+                    conn.rollback()
+                    raise RawEvidenceError("cas_publish_conflict")
+            if not self._cas_file_is_valid(cas["blob_relpath"], content_hash, content_size):
+                conn.rollback()
+                raise RawEvidenceError("integrity_conflict")
+            conn.execute(
+                """
+                UPDATE cas_objects SET state = 'live', operation_id = NULL,
+                    updated_at = ?
+                WHERE hash_algorithm = ? AND content_hash = ?
+                """,
+                (now, HASH_ALGORITHM, content_hash),
+            )
+            self._insert_capture_records(
+                conn, evidence_id, revision_id, metadata,
+                content_hash, content_size, blob_relpath, now,
+            )
+            if post_register is not None:
+                post_register(conn, evidence_id, revision_id, now)
+            conn.commit()
+        self._remove_temp(temp_path)
+        return blob_relpath
+
+    def _insert_capture_records(
+        self,
+        conn: sqlite3.Connection,
+        evidence_id: str,
+        revision_id: str,
+        metadata: dict[str, Any],
+        content_hash: str,
+        content_size: int,
+        blob_relpath: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO evidence_objects (
+                evidence_id, source_system, source_kind, source_scope,
+                upstream_source_id, upstream_item_id,
+                source_occurrence_key, identity_origin, privacy_class,
+                lifecycle_state, captured_at, created_at, updated_at,
+                record_schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, ?, ?)
+            """,
+            (
+                evidence_id,
+                metadata["source_system"], metadata["source_kind"],
+                metadata["source_scope"], metadata["upstream_source_id"],
+                metadata["upstream_item_id"], metadata["source_occurrence_key"],
+                metadata["identity_origin"], metadata["privacy_class"],
+                metadata["captured_at"], now, now, RECORD_SCHEMA_VERSION,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_revisions (
+                revision_id, evidence_id, fidelity_level, media_type,
+                hash_algorithm, content_hash, content_size_bytes,
+                blob_relpath, created_at, verification_state,
+                revision_schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?)
+            """,
+            (
+                revision_id, evidence_id, metadata["fidelity_level"],
+                metadata["media_type"], HASH_ALGORITHM, content_hash,
+                content_size, blob_relpath, now, REVISION_SCHEMA_VERSION,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_lifecycle (
+                revision_id, evidence_id, lifecycle_state,
+                retention_deadline, retention_policy_version,
+                lifecycle_reason, payload_deleted, updated_at
+            ) VALUES (?, ?, 'available', ?, ?, NULL, 0, ?)
+            """,
+            (
+                revision_id,
+                evidence_id,
+                _add_days_iso(
+                    metadata["captured_at"], _configured_retention_days()
+                ),
+                RETENTION_POLICY_VERSION,
+                now,
+            ),
+        )
+
+    def _cas_file_is_valid(self, relative: str, content_hash: str, size: int) -> bool:
+        try:
+            path = self._path_from_stored_reference(relative, content_hash)
+            return _verify_file(path, content_hash, size)
+        except RawEvidenceError:
+            return False
+
+    def _publish_blob(
+        self,
+        temp_path: Path,
+        content_hash: str,
+        size: int,
+        *,
+        remove_temp: bool = False,
+    ) -> str:
         assert self.blobs_root is not None
         if _HASH_PATTERN.fullmatch(content_hash) is None:
             raise RawEvidenceError("integrity_failed")
@@ -1695,7 +2024,8 @@ class RawEvidenceStore:
             if destination.exists():
                 if not _verify_file(destination, content_hash, size):
                     raise RawEvidenceError("integrity_conflict")
-                self._remove_temp(temp_path)
+                if remove_temp:
+                    self._remove_temp(temp_path)
                 return self._relative_blob_path(destination)
             try:
                 os.link(temp_path, destination)
@@ -1704,7 +2034,8 @@ class RawEvidenceStore:
                     raise RawEvidenceError("integrity_conflict")
             except OSError as exc:
                 raise RawEvidenceError("content_publish_failed") from exc
-            self._remove_temp(temp_path)
+            if remove_temp:
+                self._remove_temp(temp_path)
             _chmod_private(destination)
             return self._relative_blob_path(destination)
         except RawEvidenceError:
@@ -1742,9 +2073,14 @@ class RawEvidenceStore:
                         r.media_type, r.hash_algorithm, r.content_hash,
                         r.content_size_bytes, r.blob_relpath, r.created_at,
                         r.verification_state, r.revision_schema_version,
-                        e.privacy_class, e.lifecycle_state
+                        e.privacy_class,
+                        COALESCE(l.lifecycle_state, e.lifecycle_state) AS lifecycle_state,
+                        l.retention_deadline, l.retention_policy_version,
+                        l.lifecycle_reason, l.tombstoned_at, l.expired_at,
+                        l.purge_started_at, l.purged_at, l.payload_deleted
                     FROM evidence_revisions AS r
                     JOIN evidence_objects AS e ON e.evidence_id = r.evidence_id
+                    LEFT JOIN evidence_lifecycle AS l ON l.revision_id = r.revision_id
                     WHERE r.revision_id = ?
                     """,
                     (revision_id,),
@@ -1779,7 +2115,8 @@ class RawEvidenceStore:
         output = bytearray() if return_content else None
         try:
             if not path.is_file():
-                raise OSError
+                self._best_effort_mark_missing(row["evidence_id"], row["revision_id"])
+                raise RawEvidenceError("evidence_missing")
             with path.open("rb") as handle:
                 while True:
                     chunk = handle.read(_MAX_READ_CHUNK)
@@ -1791,8 +2128,11 @@ class RawEvidenceStore:
                     digest.update(chunk)
                     if output is not None:
                         output.extend(chunk)
-        except RawEvidenceError:
-            self._best_effort_mark_integrity_failed(row["evidence_id"], row["revision_id"])
+        except RawEvidenceError as exc:
+            if exc.code != "evidence_missing":
+                self._best_effort_mark_integrity_failed(
+                    row["evidence_id"], row["revision_id"]
+                )
             raise
         except (OSError, ValueError):
             self._best_effort_mark_integrity_failed(row["evidence_id"], row["revision_id"])
@@ -1830,6 +2170,49 @@ class RawEvidenceStore:
         except Exception:
             return
 
+    def _best_effort_mark_missing(
+        self,
+        evidence_id: str | None,
+        revision_id: str | None,
+    ) -> None:
+        if evidence_id is None or revision_id is None:
+            return
+        try:
+            self._mark_missing(evidence_id, revision_id)
+        except Exception:
+            return
+
+    @guarded_mutation("raw_evidence_missing_state")
+    def _mark_missing(self, evidence_id: str, revision_id: str) -> None:
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE evidence_objects SET lifecycle_state = 'tombstoned', "
+                        "updated_at = ? WHERE evidence_id = ?",
+                        (_now_iso(), evidence_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE evidence_lifecycle
+                        SET lifecycle_state = 'missing', lifecycle_reason = 'payload_missing',
+                            updated_at = ?
+                        WHERE revision_id = ? AND evidence_id = ?
+                        """,
+                        (_now_iso(), revision_id, evidence_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE memory_lineage SET status = 'evidence_missing', updated_at = ?
+                        WHERE evidence_id = ? AND status != 'memory_deleted'
+                        """,
+                        (_now_iso(), evidence_id),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                raise RawEvidenceError("storage_unavailable") from exc
+
     @guarded_mutation("raw_evidence_integrity_state")
     def _mark_integrity_failed(self, evidence_id: str, revision_id: str) -> None:
         with self._lock:
@@ -1845,6 +2228,16 @@ class RawEvidenceStore:
                         "UPDATE evidence_objects SET lifecycle_state = 'integrity_failed', "
                         "updated_at = ? WHERE evidence_id = ?",
                         (_now_iso(), evidence_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE evidence_lifecycle
+                        SET lifecycle_state = 'integrity_failed',
+                            lifecycle_reason = 'integrity_failure',
+                            updated_at = ?
+                        WHERE revision_id = ? AND evidence_id = ?
+                        """,
+                        (_now_iso(), revision_id, evidence_id),
                     )
                     conn.commit()
             except sqlite3.Error as exc:
@@ -2037,9 +2430,35 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _add_days_iso(value: str, days: int) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (parsed + timedelta(days=days)).astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+    except (TypeError, ValueError) as exc:
+        raise RawEvidenceError("captured_at_invalid") from exc
+
+
+def _configured_retention_days() -> int:
+    value = os.environ.get("OMBRE_RAW_EVIDENCE_RETENTION_DAYS")
+    if value is None or value == "":
+        return DEFAULT_RETENTION_DAYS
+    if not value.isdecimal():
+        raise RawEvidenceError("retention_config_invalid")
+    days = int(value)
+    if not 1 <= days <= 365:
+        raise RawEvidenceError("retention_config_invalid")
+    return days
+
+
 __all__ = [
     "FIDELITY_LEVELS",
     "HASH_ALGORITHM",
+    "CAS_STATES",
+    "DEFAULT_RETENTION_DAYS",
     "IDENTITY_ORIGINS",
     "IMPORT_ITEM_STATUSES",
     "IMPORT_RUN_STATUSES",
@@ -2050,6 +2469,7 @@ __all__ = [
     "RawEvidenceError",
     "RawEvidenceLimits",
     "RawEvidenceStore",
+    "RETENTION_POLICY_VERSION",
     "SCHEMA_VERSION",
     "VERIFICATION_STATES",
 ]
