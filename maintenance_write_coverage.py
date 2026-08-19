@@ -96,6 +96,16 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_tags_for_assets": "dynamic_sql_read_only",
         "search": "dynamic_sql_read_only",
     },
+    "raw_evidence_store.py": {
+        "_prepare_layout": "guarded_caller_only",
+        "_init_schema": "startup_initialization",
+        "create_evidence": "guarded_mutation",
+        "_stage_content": "guarded_caller_only",
+        "_publish_blob": "guarded_caller_only",
+        "update_metadata": "guarded_mutation",
+        "_mark_integrity_failed": "guarded_mutation",
+        "_remove_temp": "guarded_caller_only",
+    },
     "asset_embedding_index.py": {
         "_init_db": "startup_initialization",
         "delete": "guarded_mutation",
