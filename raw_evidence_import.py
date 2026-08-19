@@ -141,6 +141,95 @@ class RawEvidenceImportCoordinator:
     def upsert_item(self, run_id: str, item_key: str, **kwargs: Any) -> dict[str, Any]:
         return self.store.upsert_import_item(run_id, item_key, **kwargs)
 
+    def create_lineage_intent(
+        self,
+        *,
+        run_id: str,
+        run_item_key: str,
+        operation_key: str,
+        memory_id: str,
+        memory_mutation_id: str,
+        evidence_id: str,
+        revision_id: str,
+        lineage_kind: str,
+    ) -> dict[str, Any]:
+        return self.store.create_lineage_intent(
+            run_id=run_id,
+            run_item_key=run_item_key,
+            operation_key=operation_key,
+            memory_id=memory_id,
+            memory_mutation_id=memory_mutation_id,
+            evidence_id=evidence_id,
+            revision_id=revision_id,
+            lineage_kind=lineage_kind,
+        )
+
+    def complete_lineage(self, lineage_id: str) -> dict[str, Any]:
+        return self.store.update_lineage_status(lineage_id, status="complete")
+
+    def list_lineage(
+        self,
+        *,
+        run_id: str | None = None,
+        status: str | None = None,
+        memory_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_lineage(
+            run_id=run_id,
+            status=status,
+            memory_id=memory_id,
+        )
+
+    def reconcile_pending_lineage(self, bucket_manager, *, run_id: str) -> list[dict[str, Any]]:
+        """Complete only lineage intents proven by the O5B atomic marker."""
+
+        reconciled: list[dict[str, Any]] = []
+        pending = self.list_lineage(run_id=run_id, status="pending")
+        for lineage in pending:
+            inspection = bucket_manager.inspect_import_operation(
+                lineage["operation_key"]
+            )
+            if inspection is None:
+                reconciled.append(
+                    self.store.update_lineage_status(
+                        lineage["lineage_id"], status="needs_reconcile"
+                    )
+                )
+                continue
+            if (
+                inspection.get("result_id") != lineage["memory_id"]
+                or inspection.get("memory_mutation_id")
+                != lineage["memory_mutation_id"]
+                or inspection.get("operation_key") != lineage["operation_key"]
+            ):
+                reconciled.append(
+                    self.store.update_lineage_status(
+                        lineage["lineage_id"], status="provenance_broken"
+                    )
+                )
+                continue
+            marker = inspection.get("marker")
+            if marker is not None:
+                if (
+                    marker.get("operation_key") != lineage["operation_key"]
+                    or marker.get("memory_mutation_id")
+                    != lineage["memory_mutation_id"]
+                ):
+                    reconciled.append(
+                        self.store.update_lineage_status(
+                            lineage["lineage_id"], status="provenance_broken"
+                        )
+                    )
+                else:
+                    reconciled.append(self.complete_lineage(lineage["lineage_id"]))
+            elif inspection.get("status") == "applied":
+                reconciled.append(
+                    self.store.update_lineage_status(
+                        lineage["lineage_id"], status="provenance_broken"
+                    )
+                )
+        return reconciled
+
 
 __all__ = [
     "CAPTURE_MODE",

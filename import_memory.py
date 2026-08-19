@@ -510,6 +510,10 @@ class ImportEngine:
                 filename=filename,
                 media_type=media_type,
             )
+            coordinator.reconcile_pending_lineage(
+                self.bucket_mgr,
+                run_id=prepared.run_id,
+            )
 
             # Capture is verified before this lossy transformation is allowed.
             raw_content = raw_bytes.decode("utf-8", errors="replace")
@@ -611,6 +615,20 @@ class ImportEngine:
         return "o5b:" + hashlib.sha256(material).hexdigest()
 
     @staticmethod
+    def _o5c_memory_mutation_id(operation_key: str) -> str:
+        return hashlib.sha256(
+            f"ombre-brain:o5c:memory-mutation:{operation_key}".encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _o5c_lineage_kind(item_kind: str, operation_kind: str) -> str:
+        if item_kind == "memory_raw":
+            return "preserve_raw_created"
+        if operation_kind == "update":
+            return "contributed_update"
+        return "created"
+
+    @staticmethod
     def _o5b_create_payload(item: dict) -> dict:
         return {
             "content": item["content"],
@@ -690,35 +708,112 @@ class ImportEngine:
             item,
             preserve_raw,
         )
+        snapshot = coordinator.get_item(run_id, "source_snapshot")
+        if not snapshot or not snapshot.get("evidence_id") or not snapshot.get("revision_id"):
+            raise RuntimeError("source_snapshot_lineage_missing")
+        item_key = f"chunk:{chunk_index}:item:{item_index}"
+        item_kind = (
+            "memory_raw"
+            if preserve_raw or item.get("preserve_raw", False)
+            else "memory"
+        )
+        memory_mutation_id = self._o5c_memory_mutation_id(operation_key)
         operation = self.bucket_mgr.plan_import_operation(
             operation_key,
             operation_kind=operation_kind,
             target_bucket_id=target_bucket_id,
             payload=payload,
+            memory_mutation_id=memory_mutation_id,
         )
-        return coordinator.upsert_item(
+        record = coordinator.upsert_item(
             run_id,
-            f"chunk:{chunk_index}:item:{item_index}",
-            item_kind=(
-                "memory_raw"
-                if preserve_raw or item.get("preserve_raw", False)
-                else "memory"
-            ),
+            item_key,
+            item_kind=item_kind,
             input_digest=input_digest,
             status="memory_planned",
+            evidence_id=snapshot["evidence_id"],
+            revision_id=snapshot["revision_id"],
             operation_key=operation_key,
             operation_kind=operation_kind,
             target_bucket_id=target_bucket_id,
             payload_digest=operation["payload_digest"],
             result_id=operation["result_id"],
         )
+        lineage = coordinator.create_lineage_intent(
+            run_id=run_id,
+            run_item_key=item_key,
+            operation_key=operation_key,
+            memory_id=operation["result_id"],
+            memory_mutation_id=memory_mutation_id,
+            evidence_id=snapshot["evidence_id"],
+            revision_id=snapshot["revision_id"],
+            lineage_kind=self._o5c_lineage_kind(item_kind, operation_kind),
+        )
+        record["lineage_id"] = lineage["lineage_id"]
+        record["memory_mutation_id"] = memory_mutation_id
+        return record
+
+    async def _o5c_ensure_lineage(self, coordinator, run_id: str, record: dict) -> dict:
+        """Ensure a capture item has one durable lineage intent."""
+
+        operation_key = record.get("operation_key")
+        evidence_id = record.get("evidence_id")
+        revision_id = record.get("revision_id")
+        memory_id = record.get("result_id") or record.get("target_bucket_id")
+        if not operation_key or not evidence_id or not revision_id or not memory_id:
+            raise RuntimeError("lineage_identity_missing")
+        mutation_id = self._o5c_memory_mutation_id(operation_key)
+        lineage = coordinator.create_lineage_intent(
+            run_id=run_id,
+            run_item_key=record["item_key"],
+            operation_key=operation_key,
+            memory_id=memory_id,
+            memory_mutation_id=mutation_id,
+            evidence_id=evidence_id,
+            revision_id=revision_id,
+            lineage_kind=self._o5c_lineage_kind(
+                record["item_kind"], record["operation_kind"]
+            ),
+        )
+        record["lineage_id"] = lineage["lineage_id"]
+        record["memory_mutation_id"] = mutation_id
+        return lineage
 
     async def _o5b_apply_item(self, coordinator, run_id: str, record: dict) -> tuple[str, str]:
         if record["status"] == "succeeded":
+            lineage = await self._o5c_ensure_lineage(coordinator, run_id, record)
+            if lineage["status"] == "pending":
+                coordinator.reconcile_pending_lineage(
+                    self.bucket_mgr,
+                    run_id=run_id,
+                )
+                lineage = coordinator.store.get_lineage(lineage["lineage_id"])
+            if not lineage or lineage["status"] != "complete":
+                raise RuntimeError("lineage_pending")
             return record["operation_kind"], record.get("result_id") or ""
         operation_key = record.get("operation_key")
         if not operation_key:
             raise RuntimeError("operation_plan_missing")
+        lineage = await self._o5c_ensure_lineage(coordinator, run_id, record)
+        if lineage["status"] not in {"pending", "complete"}:
+            raise RuntimeError("lineage_provenance_broken")
+        if lineage["status"] == "complete":
+            result_id = record.get("result_id") or record.get("target_bucket_id") or ""
+            coordinator.upsert_item(
+                run_id,
+                record["item_key"],
+                item_kind=record["item_kind"],
+                input_digest=record["input_digest"],
+                status="succeeded",
+                evidence_id=record.get("evidence_id"),
+                revision_id=record.get("revision_id"),
+                operation_key=record["operation_key"],
+                operation_kind=record["operation_kind"],
+                target_bucket_id=record.get("target_bucket_id"),
+                payload_digest=record.get("payload_digest"),
+                result_id=result_id,
+            )
+            return record["operation_kind"], result_id
         coordinator.upsert_item(
             run_id,
             record["item_key"],
@@ -732,7 +827,10 @@ class ImportEngine:
             result_id=record.get("result_id"),
         )
         try:
-            result = await self.bucket_mgr.apply_import_operation(operation_key)
+            result = await self.bucket_mgr.apply_import_operation(
+                operation_key,
+                memory_mutation_id=record["memory_mutation_id"],
+            )
         except Exception:
             coordinator.upsert_item(
                 run_id,
@@ -749,6 +847,12 @@ class ImportEngine:
             )
             raise
         result_id = result.get("result_id") or record.get("result_id") or ""
+        if result_id != record.get("result_id"):
+            coordinator.store.update_lineage_status(
+                lineage["lineage_id"], status="provenance_broken"
+            )
+            raise RuntimeError("lineage_result_conflict")
+        coordinator.complete_lineage(lineage["lineage_id"])
         coordinator.upsert_item(
             run_id,
             record["item_key"],
