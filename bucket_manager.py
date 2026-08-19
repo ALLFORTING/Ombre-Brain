@@ -30,9 +30,12 @@ import math
 import logging
 import shutil
 import sqlite3
+import hashlib
+import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import frontmatter
 from rapidfuzz import fuzz
@@ -55,6 +58,17 @@ from utils import (
 )
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+_IMPORT_MARKER_FIELD = "_ob_import_operations"
+_IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
+
+
+class BucketIdempotencyError(RuntimeError):
+    """Content-free failure for the O5B memory idempotency seam."""
+
+    def __init__(self, code: str = "idempotency_conflict") -> None:
+        self.code = code
+        super().__init__(code)
 
 
 def _date_only(value: str | None = None) -> str:
@@ -168,6 +182,284 @@ class BucketManager:
                 "ON letters(created_at)"
             )
 
+    def _ensure_import_operation_table(self) -> None:
+        """Create the lazy O5B operation journal only when capture is used."""
+
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ob_import_operations (
+                    operation_key TEXT PRIMARY KEY,
+                    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('create', 'update')),
+                    target_bucket_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    result_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('planned', 'applied')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ob_import_operations_target "
+                "ON ob_import_operations(target_bucket_id)"
+            )
+
+    @staticmethod
+    def _canonical_import_payload(payload: dict[str, Any]) -> tuple[str, str]:
+        if not isinstance(payload, dict):
+            raise BucketIdempotencyError("operation_payload_invalid")
+        try:
+            serialized = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise BucketIdempotencyError("operation_payload_invalid") from exc
+        return serialized, hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _operation_result_id(operation_key: str) -> str:
+        return hashlib.sha256(
+            f"ombre-brain:o5b:bucket:{operation_key}".encode("utf-8")
+        ).hexdigest()[:32]
+
+    def _get_import_operation(self, operation_key: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM ob_import_operations WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["payload"] = json.loads(result.pop("payload_json"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BucketIdempotencyError("operation_payload_invalid") from exc
+        return result
+
+    def _ensure_import_operation(
+        self,
+        operation_key: str,
+        *,
+        operation_kind: str | None = None,
+        target_bucket_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        payload_digest: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(operation_key, str) or not operation_key or len(operation_key) > 128:
+            raise BucketIdempotencyError("operation_key_invalid")
+        if operation_kind is not None and operation_kind not in {"create", "update"}:
+            raise BucketIdempotencyError("operation_kind_invalid")
+        if target_bucket_id is not None and not isinstance(target_bucket_id, str):
+            raise BucketIdempotencyError("target_bucket_invalid")
+        if payload is not None:
+            serialized, computed_digest = self._canonical_import_payload(payload)
+            if payload_digest is not None and payload_digest != computed_digest:
+                raise BucketIdempotencyError("operation_payload_conflict")
+            payload_digest = computed_digest
+        else:
+            serialized = None
+
+        self._ensure_import_operation_table()
+        now = now_iso()
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM ob_import_operations WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if row is None:
+                if operation_kind is None or serialized is None or payload_digest is None:
+                    conn.rollback()
+                    raise BucketIdempotencyError("operation_plan_missing")
+                result_id = (
+                    self._operation_result_id(operation_key)
+                    if operation_kind == "create"
+                    else target_bucket_id
+                )
+                if not result_id:
+                    conn.rollback()
+                    raise BucketIdempotencyError("target_bucket_invalid")
+                conn.execute(
+                    """
+                    INSERT INTO ob_import_operations (
+                        operation_key, operation_kind, target_bucket_id,
+                        payload_json, payload_digest, result_id, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?)
+                    """,
+                    (
+                        operation_key,
+                        operation_kind,
+                        target_bucket_id,
+                        serialized,
+                        payload_digest,
+                        result_id,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                if operation_kind is not None and row["operation_kind"] != operation_kind:
+                    conn.rollback()
+                    raise BucketIdempotencyError("operation_payload_conflict")
+                if target_bucket_id is not None and row["target_bucket_id"] != target_bucket_id:
+                    conn.rollback()
+                    raise BucketIdempotencyError("operation_payload_conflict")
+                if payload_digest is not None and row["payload_digest"] != payload_digest:
+                    conn.rollback()
+                    raise BucketIdempotencyError("operation_payload_conflict")
+            conn.commit()
+        result = self._get_import_operation(operation_key)
+        if result is None:
+            raise BucketIdempotencyError("operation_not_found")
+        return result
+
+    def _mark_import_operation_applied(self, operation_key: str) -> None:
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                UPDATE ob_import_operations SET status = 'applied', updated_at = ?
+                WHERE operation_key = ?
+                """,
+                (now_iso(), operation_key),
+            )
+
+    @staticmethod
+    def _operation_marker(post: frontmatter.Post, operation_key: str) -> dict[str, Any] | None:
+        markers = post.get(_IMPORT_MARKER_FIELD, [])
+        if markers in (None, ""):
+            return None
+        if not isinstance(markers, list):
+            raise BucketIdempotencyError("operation_marker_invalid")
+        for marker in markers:
+            if not isinstance(marker, dict):
+                raise BucketIdempotencyError("operation_marker_invalid")
+            if marker.get("operation_key") == operation_key:
+                return marker
+        return None
+
+    @classmethod
+    def _append_operation_marker(
+        cls,
+        post: frontmatter.Post,
+        *,
+        operation_key: str,
+        payload_digest: str,
+        operation_kind: str,
+    ) -> bool:
+        existing = cls._operation_marker(post, operation_key)
+        if existing is not None:
+            if existing.get("payload_digest") != payload_digest:
+                raise BucketIdempotencyError("operation_payload_conflict")
+            return False
+        markers = post.get(_IMPORT_MARKER_FIELD, [])
+        if markers in (None, ""):
+            markers = []
+        if not isinstance(markers, list):
+            raise BucketIdempotencyError("operation_marker_invalid")
+        markers.append(
+            {
+                "operation_key": operation_key,
+                "payload_digest": payload_digest,
+                "operation_kind": operation_kind,
+            }
+        )
+        post[_IMPORT_MARKER_FIELD] = markers
+        return True
+
+    @staticmethod
+    def _write_post_atomic(file_path: str, post: frontmatter.Post) -> None:
+        """Atomically publish an O5B-marked memory file."""
+
+        parent = os.path.dirname(file_path)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(file_path)}.",
+            suffix=".tmp",
+            dir=parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(frontmatter.dumps(post))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, file_path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    @guarded_mutation("bucket_import_idempotency_plan")
+    def plan_import_operation(
+        self,
+        operation_key: str,
+        *,
+        operation_kind: str,
+        target_bucket_id: str | None = None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably plan an O5B operation before any memory file mutation."""
+
+        return self._ensure_import_operation(
+            operation_key,
+            operation_kind=operation_kind,
+            target_bucket_id=target_bucket_id,
+            payload=payload,
+        )
+
+    @guarded_async_mutation("bucket_import_idempotency_apply")
+    async def apply_import_operation(
+        self,
+        operation_key: str,
+        *,
+        operation_kind: str | None = None,
+        target_bucket_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        payload_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply or replay one durable import memory operation."""
+
+        operation = self._ensure_import_operation(
+            operation_key,
+            operation_kind=operation_kind,
+            target_bucket_id=target_bucket_id,
+            payload=payload,
+            payload_digest=payload_digest,
+        )
+        stored_payload = operation["payload"]
+        if operation["operation_kind"] == "create":
+            bucket_id = await self.create(
+                **stored_payload,
+                _o5b_operation_key=operation_key,
+                _o5b_payload_digest=operation["payload_digest"],
+            )
+            return {"operation_key": operation_key, "result_id": bucket_id, "kind": "create"}
+
+        bucket_id = operation["target_bucket_id"]
+        if not bucket_id or not isinstance(stored_payload, dict):
+            raise BucketIdempotencyError("operation_payload_invalid")
+        update_kwargs = stored_payload.get("kwargs")
+        if not isinstance(update_kwargs, dict):
+            raise BucketIdempotencyError("operation_payload_invalid")
+        applied = await self.update(
+            bucket_id,
+            **update_kwargs,
+            _o5b_operation_key=operation_key,
+            _o5b_payload_digest=operation["payload_digest"],
+        )
+        if not applied:
+            raise BucketIdempotencyError("target_bucket_missing")
+        return {"operation_key": operation_key, "result_id": bucket_id, "kind": "update"}
+
     @guarded_mutation("bucket_history_write")
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
         """Persist the old content before a destructive content change."""
@@ -261,6 +553,8 @@ class BucketManager:
         protected: bool = False,
         sealed: bool = False,
         topics: list[str] = None,
+        _o5b_operation_key: str | None = None,
+        _o5b_payload_digest: str | None = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -270,7 +564,27 @@ class BucketManager:
         Importance is locked to 10 for pinned/protected buckets.
         pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
         """
-        bucket_id = generate_bucket_id()
+        operation = None
+        if _o5b_operation_key is not None:
+            operation = self._ensure_import_operation(
+                _o5b_operation_key,
+                operation_kind="create",
+                payload={
+                    "content": content,
+                    "tags": tags or [],
+                    "importance": importance,
+                    "domain": domain,
+                    "valence": valence,
+                    "arousal": arousal,
+                    "name": name,
+                },
+                payload_digest=_o5b_payload_digest,
+            )
+            if operation["operation_kind"] != "create":
+                raise BucketIdempotencyError("operation_kind_conflict")
+            bucket_id = operation["result_id"]
+        else:
+            bucket_id = generate_bucket_id()
         content = apply_display_aliases(content)
         name = apply_display_aliases(name) if name else name
         tags = apply_display_aliases_to_value(tags or [])
@@ -322,6 +636,26 @@ class BucketManager:
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
         post = frontmatter.Post(linked_content, **metadata)
+        if operation is not None:
+            existing_path = self._find_bucket_file(bucket_id)
+            if existing_path:
+                try:
+                    existing_post = frontmatter.load(existing_path)
+                except Exception as exc:
+                    raise BucketIdempotencyError("operation_marker_invalid") from exc
+                marker = self._operation_marker(existing_post, _o5b_operation_key)
+                if marker is None or marker.get("payload_digest") != operation["payload_digest"]:
+                    raise BucketIdempotencyError("idempotency_conflict")
+                self._mark_import_operation_applied(_o5b_operation_key)
+                return bucket_id
+            if operation["status"] == "applied":
+                raise BucketIdempotencyError("target_bucket_missing")
+            self._append_operation_marker(
+                post,
+                operation_key=_o5b_operation_key,
+                payload_digest=operation["payload_digest"],
+                operation_kind="create",
+            )
 
         # --- Choose directory by type + primary domain ---
         # --- 按类型 + 主题域选择存储目录 ---
@@ -349,8 +683,12 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            if operation is not None:
+                self._write_post_atomic(file_path, post)
+                self._mark_import_operation_applied(_o5b_operation_key)
+            else:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
             raise
@@ -415,6 +753,24 @@ class BucketManager:
         更新桶的内容或元数据字段。
         """
         history_change_type = kwargs.pop("_history_change_type", "replace")
+        o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
+        o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
+        operation = None
+        if o5b_operation_key is not None:
+            operation = self._ensure_import_operation(
+                o5b_operation_key,
+                operation_kind="update",
+                target_bucket_id=bucket_id,
+                payload={"kwargs": dict(kwargs)},
+                payload_digest=o5b_payload_digest,
+            )
+            if operation["operation_kind"] != "update":
+                raise BucketIdempotencyError("operation_kind_conflict")
+            bucket_id = operation["target_bucket_id"]
+            stored_kwargs = operation["payload"].get("kwargs")
+            if not isinstance(stored_kwargs, dict):
+                raise BucketIdempotencyError("operation_payload_invalid")
+            kwargs = stored_kwargs
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -424,6 +780,22 @@ class BucketManager:
         except Exception as e:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
+
+        if operation is not None:
+            marker = self._operation_marker(post, o5b_operation_key)
+            if marker is not None:
+                if marker.get("payload_digest") != operation["payload_digest"]:
+                    raise BucketIdempotencyError("operation_payload_conflict")
+                self._mark_import_operation_applied(o5b_operation_key)
+                return True
+            if operation["status"] == "applied":
+                raise BucketIdempotencyError("operation_marker_missing")
+            self._append_operation_marker(
+                post,
+                operation_key=o5b_operation_key,
+                payload_digest=operation["payload_digest"],
+                operation_kind="update",
+            )
 
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
         # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
@@ -484,8 +856,12 @@ class BucketManager:
         post["updated_at"] = _date_only()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            if operation is not None:
+                self._write_post_atomic(file_path, post)
+                self._mark_import_operation_applied(o5b_operation_key)
+            else:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
@@ -1249,6 +1625,9 @@ class BucketManager:
         try:
             post = frontmatter.load(file_path)
             metadata = dict(post.metadata)
+            # O5B operation markers are durable write-control metadata only;
+            # never expose them through ordinary memory reads/search results.
+            metadata.pop(_IMPORT_MARKER_FIELD, None)
             if "name" in metadata:
                 metadata["name"] = apply_display_aliases(metadata["name"])
             if "tags" in metadata:

@@ -21,6 +21,7 @@ import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from utils import count_tokens_approx, now_iso
 from maintenance_write_gate import guarded_mutation
@@ -473,6 +474,414 @@ class ImportEngine:
             self.state.save()
             self._running = False
             raise
+
+    async def start_raw_evidence(
+        self,
+        raw_bytes: bytes,
+        filename: str = "",
+        preserve_raw: bool = False,
+        resume: bool = False,
+        media_type: str = "application/octet-stream",
+    ) -> dict:
+        """Run the opt-in O5B path; the legacy ``start`` path is untouched."""
+
+        if self._running:
+            return {"error": "Import already running"}
+
+        from raw_evidence_import import RawEvidenceImportCoordinator
+        from raw_evidence_store import RawEvidenceError
+
+        self._running = True
+        self._paused = False
+        coordinator = None
+        prepared = None
+        try:
+            coordinator = RawEvidenceImportCoordinator(self.config)
+            prepared = coordinator.prepare_run(
+                raw_bytes,
+                filename=filename,
+                media_type=media_type,
+                preserve_raw=preserve_raw,
+                resume=resume,
+            )
+            coordinator.capture(
+                prepared,
+                raw_bytes,
+                filename=filename,
+                media_type=media_type,
+            )
+
+            # Capture is verified before this lossy transformation is allowed.
+            raw_content = raw_bytes.decode("utf-8", errors="replace")
+            turns = detect_and_parse(raw_content, filename)
+            if not turns:
+                coordinator.update_run(
+                    prepared.run_id,
+                    status="failed",
+                    error_category="parse_no_turns",
+                )
+                self._running = False
+                return {"error": "No conversation turns found in file"}
+
+            self._chunks = chunk_turns(turns)
+            if not self._chunks:
+                coordinator.update_run(
+                    prepared.run_id,
+                    status="failed",
+                    error_category="parse_no_chunks",
+                )
+                self._running = False
+                return {"error": "No processable chunks after splitting"}
+
+            source_hash_prefix = prepared.source_sha256[:16]
+            can_reuse_legacy_state = (
+                resume
+                and self.state.load()
+                and self.state.data.get("source_hash") == source_hash_prefix
+                and self.state.data.get("status") in {"paused", "running", "error"}
+            )
+            if not can_reuse_legacy_state:
+                self.state.reset(filename, source_hash_prefix, len(self._chunks))
+            else:
+                self.state.data["source_file"] = filename
+                self.state.data["total_chunks"] = len(self._chunks)
+                self.state.data["status"] = "running"
+            self.state.data["raw_evidence_capture"] = True
+            self.state.data["processed"] = min(
+                int(prepared.run.get("processed_chunks", 0) or 0),
+                len(self._chunks),
+            )
+            self.state.save()
+            coordinator.update_run(
+                prepared.run_id,
+                status="processing",
+                total_chunks=len(self._chunks),
+                processed_chunks=self.state.data["processed"],
+            )
+            return await self._process_raw_evidence_chunks(
+                coordinator,
+                prepared.run_id,
+                preserve_raw,
+            )
+        except RawEvidenceError as exc:
+            if coordinator is not None and prepared is not None:
+                try:
+                    coordinator.update_run(
+                        prepared.run_id,
+                        status="failed",
+                        error_category=exc.code,
+                    )
+                except Exception:
+                    logger.exception("O5B run failure state update failed")
+            self.state.data["status"] = "error"
+            self.state.data["errors"].append("import_failed")
+            self.state.save()
+            self._running = False
+            raise
+        except Exception:
+            if coordinator is not None and prepared is not None:
+                try:
+                    coordinator.update_run(
+                        prepared.run_id,
+                        status="failed",
+                        error_category="import_failed",
+                    )
+                except Exception:
+                    logger.exception("O5B run failure state update failed")
+            self.state.data["status"] = "error"
+            self.state.data["errors"].append("import_failed")
+            self.state.save()
+            self._running = False
+            logger.exception("O5B import failed")
+            raise
+
+    @staticmethod
+    def _o5b_digest(value: Any) -> str:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _o5b_operation_key(run_id: str, chunk_index: int, item_index: int) -> str:
+        material = f"{run_id}:{chunk_index}:{item_index}".encode("utf-8")
+        return "o5b:" + hashlib.sha256(material).hexdigest()
+
+    @staticmethod
+    def _o5b_create_payload(item: dict) -> dict:
+        return {
+            "content": item["content"],
+            "tags": item.get("tags", []),
+            "importance": item.get("importance", 5),
+            "domain": item.get("domain", ["未分类"]),
+            "valence": item.get("valence", 0.5),
+            "arousal": item.get("arousal", 0.3),
+            "name": item.get("name") or None,
+        }
+
+    async def _o5b_build_operation(self, item: dict, preserve_raw: bool) -> tuple[str, str | None, dict, bool]:
+        """Select and fully plan the memory side effect before applying it."""
+
+        if preserve_raw or item.get("preserve_raw", False):
+            return "create", None, self._o5b_create_payload(item), False
+
+        content = item["content"]
+        domain = item.get("domain", ["未分类"])
+        tags = item.get("tags", [])
+        importance = item.get("importance", 5)
+        valence = item.get("valence", 0.5)
+        arousal = item.get("arousal", 0.3)
+        name = item.get("name", "")
+
+        try:
+            existing = await self.bucket_mgr.search(
+                content,
+                limit=1,
+                domain_filter=domain or None,
+            )
+        except Exception:
+            existing = []
+
+        merge_threshold = self.config.get("merge_threshold", 75)
+        if existing and existing[0].get("score", 0) > merge_threshold:
+            bucket = existing[0]
+            if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+                try:
+                    merged = await self.dehydrator.merge(bucket["content"], content)
+                    self.state.data["api_calls"] += 1
+                    old_v = bucket["metadata"].get("valence", 0.5)
+                    old_a = bucket["metadata"].get("arousal", 0.3)
+                    return (
+                        "update",
+                        bucket["id"],
+                        {
+                            "kwargs": {
+                                "content": merged,
+                                "tags": list(set(bucket["metadata"].get("tags", []) + tags)),
+                                "importance": max(bucket["metadata"].get("importance", 5), importance),
+                                "domain": list(set(bucket["metadata"].get("domain", []) + domain)),
+                                "valence": round((old_v + valence) / 2, 2),
+                                "arousal": round((old_a + arousal) / 2, 2),
+                            }
+                        },
+                        True,
+                    )
+                except Exception:
+                    logger.warning("O5B merge planning failed; using create")
+                    self.state.data["api_calls"] += 1
+
+        return "create", None, self._o5b_create_payload(item), False
+
+    async def _o5b_plan_item(
+        self,
+        coordinator,
+        run_id: str,
+        chunk_index: int,
+        item_index: int,
+        item: dict,
+        preserve_raw: bool,
+    ) -> dict:
+        operation_key = self._o5b_operation_key(run_id, chunk_index, item_index)
+        input_digest = self._o5b_digest(item)
+        operation_kind, target_bucket_id, payload, merged = await self._o5b_build_operation(
+            item,
+            preserve_raw,
+        )
+        operation = self.bucket_mgr.plan_import_operation(
+            operation_key,
+            operation_kind=operation_kind,
+            target_bucket_id=target_bucket_id,
+            payload=payload,
+        )
+        return coordinator.upsert_item(
+            run_id,
+            f"chunk:{chunk_index}:item:{item_index}",
+            item_kind=(
+                "memory_raw"
+                if preserve_raw or item.get("preserve_raw", False)
+                else "memory"
+            ),
+            input_digest=input_digest,
+            status="memory_planned",
+            operation_key=operation_key,
+            operation_kind=operation_kind,
+            target_bucket_id=target_bucket_id,
+            payload_digest=operation["payload_digest"],
+            result_id=operation["result_id"],
+        )
+
+    async def _o5b_apply_item(self, coordinator, run_id: str, record: dict) -> tuple[str, str]:
+        if record["status"] == "succeeded":
+            return record["operation_kind"], record.get("result_id") or ""
+        operation_key = record.get("operation_key")
+        if not operation_key:
+            raise RuntimeError("operation_plan_missing")
+        coordinator.upsert_item(
+            run_id,
+            record["item_key"],
+            item_kind=record["item_kind"],
+            input_digest=record["input_digest"],
+            status="memory_applying",
+            operation_key=record["operation_key"],
+            operation_kind=record["operation_kind"],
+            target_bucket_id=record.get("target_bucket_id"),
+            payload_digest=record.get("payload_digest"),
+            result_id=record.get("result_id"),
+        )
+        try:
+            result = await self.bucket_mgr.apply_import_operation(operation_key)
+        except Exception:
+            coordinator.upsert_item(
+                run_id,
+                record["item_key"],
+                item_kind=record["item_kind"],
+                input_digest=record["input_digest"],
+                status="failed",
+                operation_key=record["operation_key"],
+                operation_kind=record["operation_kind"],
+                target_bucket_id=record.get("target_bucket_id"),
+                payload_digest=record.get("payload_digest"),
+                result_id=record.get("result_id"),
+                error_category="memory_apply_failed",
+            )
+            raise
+        result_id = result.get("result_id") or record.get("result_id") or ""
+        coordinator.upsert_item(
+            run_id,
+            record["item_key"],
+            item_kind=record["item_kind"],
+            input_digest=record["input_digest"],
+            status="succeeded",
+            operation_key=record["operation_key"],
+            operation_kind=record["operation_kind"],
+            target_bucket_id=record.get("target_bucket_id"),
+            payload_digest=record.get("payload_digest"),
+            result_id=result_id,
+        )
+        return record["operation_kind"], result_id
+
+    async def _process_raw_evidence_chunks(self, coordinator, run_id: str, preserve_raw: bool) -> dict:
+        start_idx = int(self.state.data.get("processed", 0) or 0)
+        for i in range(start_idx, len(self._chunks)):
+            if self._paused:
+                self.state.data["status"] = "paused"
+                self.state.save()
+                coordinator.update_run(run_id, status="paused", processed_chunks=i)
+                self._running = False
+                return self.state.to_dict()
+
+            chunk = self._chunks[i]
+            chunk_key = f"chunk:{i}"
+            chunk_digest = hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest()
+            chunk_record = coordinator.get_item(run_id, chunk_key)
+            try:
+                if chunk_record and chunk_record["status"] in {"extraction_ready", "succeeded"}:
+                    item_records = coordinator.list_items(
+                        run_id,
+                        prefix=f"chunk:{i}:item:",
+                    )
+                else:
+                    coordinator.upsert_item(
+                        run_id,
+                        chunk_key,
+                        item_kind="chunk",
+                        input_digest=chunk_digest,
+                        status="extraction_pending",
+                    )
+                    try:
+                        items = await self._extract_memories(chunk["content"])
+                        self.state.data["api_calls"] += 1
+                    except Exception:
+                        coordinator.upsert_item(
+                            run_id,
+                            chunk_key,
+                            item_kind="chunk",
+                            input_digest=chunk_digest,
+                            status="extraction_failed",
+                            error_category="extraction_failed",
+                        )
+                        raise
+
+                    item_records = []
+                    for item_index, item in enumerate(items):
+                        item_records.append(
+                            await self._o5b_plan_item(
+                                coordinator,
+                                run_id,
+                                i,
+                                item_index,
+                                item,
+                                preserve_raw,
+                            )
+                        )
+                    coordinator.upsert_item(
+                        run_id,
+                        chunk_key,
+                        item_kind="chunk",
+                        input_digest=chunk_digest,
+                        status="extraction_ready",
+                        item_count=len(item_records),
+                    )
+
+                for record in item_records:
+                    operation_kind, _result_id = await self._o5b_apply_item(
+                        coordinator,
+                        run_id,
+                        record,
+                    )
+                    if record["status"] != "succeeded":
+                        if record["item_kind"] == "memory_raw":
+                            self.state.data["memories_raw"] += 1
+                            self.state.data["memories_created"] += 1
+                        elif operation_kind == "update":
+                            self.state.data["memories_merged"] += 1
+                        else:
+                            self.state.data["memories_created"] += 1
+
+                coordinator.upsert_item(
+                    run_id,
+                    chunk_key,
+                    item_kind="chunk",
+                    input_digest=chunk_digest,
+                    status="succeeded",
+                    item_count=len(item_records),
+                )
+                self.state.data["processed"] = i + 1
+                self.state.save()
+                coordinator.update_run(
+                    run_id,
+                    status="processing",
+                    processed_chunks=i + 1,
+                )
+            except Exception:
+                if len(self.state.data["errors"]) < 100:
+                    self.state.data["errors"].append("import_failed")
+                self.state.data["status"] = "error"
+                self.state.save()
+                try:
+                    coordinator.update_run(
+                        run_id,
+                        status="failed",
+                        error_category="import_failed",
+                    )
+                except Exception:
+                    logger.exception("O5B run failure state update failed")
+                self._running = False
+                logger.exception("O5B import chunk failed index=%d", i)
+                return self.state.to_dict()
+
+        self.state.data["status"] = "completed"
+        self.state.save()
+        coordinator.update_run(
+            run_id,
+            status="completed",
+            processed_chunks=len(self._chunks),
+        )
+        self._running = False
+        return self.state.to_dict()
 
     async def _process_chunks(self, preserve_raw: bool) -> dict:
         """Process chunks from current position."""

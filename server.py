@@ -7701,6 +7701,17 @@ async def api_import_upload(request):
 
     content_type = request.headers.get("content-type", "")
     filename = ""
+    raw_bytes = b""
+    raw_content = ""
+    media_type = content_type.split(";", 1)[0].strip() or "application/octet-stream"
+    try:
+        from raw_evidence_import import parse_capture_option
+
+        raw_evidence_capture = parse_capture_option(
+            request.query_params.get("raw_evidence_capture")
+        )
+    except Exception:
+        return JSONResponse({"error": "invalid_raw_evidence_capture"}, status_code=400)
 
     try:
         if "multipart/form-data" in content_type:
@@ -7710,25 +7721,45 @@ async def api_import_upload(request):
                 return JSONResponse({"error": "No file field"}, status_code=400)
             raw_bytes = await file_field.read()
             filename = getattr(file_field, "filename", "upload")
-            raw_content = raw_bytes.decode("utf-8", errors="replace")
+            media_type = (
+                getattr(file_field, "content_type", None)
+                or media_type
+                or "application/octet-stream"
+            )
         else:
-            body = await request.body()
-            raw_content = body.decode("utf-8", errors="replace")
+            raw_bytes = await request.body()
             # Try to get filename from query params
             filename = request.query_params.get("filename", "upload")
 
-        if not raw_content.strip():
-            return JSONResponse({"error": "Empty file"}, status_code=400)
+        if raw_evidence_capture:
+            if not raw_bytes.strip():
+                return JSONResponse({"error": "Empty file"}, status_code=400)
+        else:
+            raw_content = raw_bytes.decode("utf-8", errors="replace")
+            if not raw_content.strip():
+                return JSONResponse({"error": "Empty file"}, status_code=400)
 
         preserve_raw = request.query_params.get("preserve_raw", "").lower() in ("1", "true")
         resume = request.query_params.get("resume", "").lower() in ("1", "true")
+
+        if not raw_evidence_capture and not raw_content.strip():
+            return JSONResponse({"error": "Empty file"}, status_code=400)
 
     except Exception: logger.exception("Dashboard import upload read failed"); return JSONResponse({"error": "upload_read_failed"}, status_code=400)
 
     # Start import in background
     async def _run_import():
         try:
-            await import_engine.start(raw_content, filename, preserve_raw, resume)
+            if raw_evidence_capture:
+                await import_engine.start_raw_evidence(
+                    raw_bytes,
+                    filename,
+                    preserve_raw,
+                    resume,
+                    media_type,
+                )
+            else:
+                await import_engine.start(raw_content, filename, preserve_raw, resume)
         except Exception as e:
             logger.error(f"Import failed: {e}")
 
@@ -7737,7 +7768,7 @@ async def api_import_upload(request):
     return JSONResponse({
         "status": "started",
         "filename": filename,
-        "size_bytes": len(raw_content.encode()),
+        "size_bytes": len(raw_bytes) if raw_evidence_capture else len(raw_content.encode()),
     })
 
 
