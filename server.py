@@ -1090,12 +1090,12 @@ async def _merge_or_create(
     返回 (桶ID或名称, 是否合并)。
     """
     try:
-        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None, include_sealed=False)
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
 
-    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+    if existing and not _is_sealed(existing[0]) and existing[0].get("score", 0) > config.get("merge_threshold", 75):
         bucket = existing[0]
         # --- Never merge into pinned/protected buckets ---
         # --- 不合并到钉选/保护桶 ---
@@ -1585,6 +1585,9 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         return f"源桶 {source_id} 是钉选/保护桶，不能被合并删除。"
 
     target_meta = target.get("metadata", {})
+    source_sealed = _is_sealed(source)
+    target_sealed = _is_sealed(target)
+    if source_sealed != target_sealed: return "合并失败：不允许跨隐私边界合并（sealed 状态不匹配）。"
     target_content = target.get("content", "").rstrip()
     source_content = source.get("content", "").strip()
     merged_content = (
@@ -1627,10 +1630,6 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     deleted = await bucket_mgr.delete(source_id)
     if not deleted:
         return f"目标桶已更新，但源桶删除失败: {source_id}"
-    try:
-        embedding_engine.delete_embedding(source_id)
-    except Exception:
-        pass
     return (
         f"已合并 {source_id} → {target_id}: "
         f"importance={merged_importance}, "
@@ -1762,6 +1761,7 @@ def _digest_api_config() -> tuple[str, str, str]:
 def _days_since(value: str) -> int:
     try:
         dt = datetime.fromisoformat(str(value))
+        # Normalize timezone metadata before computing the age.
         return max(0, (datetime.now() - dt.replace(tzinfo=None)).days)
     except (ValueError, TypeError):
         return 9999
@@ -1975,9 +1975,9 @@ async def _auto_link_related(bucket_id: str, threshold: float | None = None, top
         return []
     target_embedding = await embedding_engine.get_embedding(bucket_id)
     if target_embedding is None:
-        await embedding_engine.generate_and_store(bucket_id, bucket.get("content", ""))
-        target_embedding = await embedding_engine.get_embedding(bucket_id)
-    if target_embedding is None:
+        # BucketManager owns lifecycle generation; related-linking never retries it.
+        # A provider failure therefore remains best-effort without replay retries.
+        # Sealed targets already returned above and never reach this path.
         return []
     all_buckets = await bucket_mgr.list_all(include_archive=False)
     scored = []
@@ -2123,7 +2123,7 @@ async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict
         candidates.append(bucket)
 
     try:
-        for bucket in await bucket_mgr.search(content, limit=8):
+        for bucket in await bucket_mgr.search(content, limit=8, include_sealed=False):
             add_bucket(bucket)
     except Exception as exc:
         logger.warning("Conflict search candidates failed: %s", exc)
@@ -2450,7 +2450,7 @@ async def _breath_filtered_impl(
             domain_filter=None,
             query_valence=q_valence,
             query_arousal=q_arousal,
-            include_dormant=True,
+            include_dormant=True, include_sealed=include_sealed,
             candidate_buckets=candidates,
         )
     except Exception as exc:
@@ -2619,8 +2619,7 @@ async def _breath_impl(
             max_results=max_results,
             mode=mode,
             recent_cutoff=recent_cutoff,
-            include_dormant=include_dormant,
-            include_sealed=include_sealed,
+            include_dormant=include_dormant, include_sealed=include_sealed,
             date_from=date_from,
             date_to=date_to,
             resonance_target=resonance_target,
@@ -2732,6 +2731,7 @@ async def _breath_impl(
                 f"没有重要度 >= {importance_min} 的记忆。",
                 emotion_trend,
             )
+        # Touch only the already privacy-filtered candidates.
         for bucket in filtered:
             await bucket_mgr.touch(bucket["id"])
         results = [
@@ -2834,7 +2834,6 @@ async def _breath_impl(
         candidates = candidates[:max_results]
         for bucket in candidates:
             await bucket_mgr.touch(bucket["id"])
-
         summary_mode = mode == "summary"
         pinned_results = []
         dynamic_results = []
@@ -2941,6 +2940,7 @@ async def _breath_impl(
             query_valence=q_valence,
             query_arousal=q_arousal,
             include_dormant=include_dormant,
+            include_sealed=include_sealed,
             trace=search_trace,
         )
     except Exception as e:
@@ -6187,8 +6187,8 @@ async def trace(
     # --- Delete mode / 删除模式 ---
     if delete:
         success = await bucket_mgr.delete(bucket_id)
-        if success:
-            embedding_engine.delete_embedding(bucket_id)
+        # BucketManager owns local ordinary-vector cleanup and failure ordering.
+        # Keep the trace caller's existing success/not-found response contract.
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
@@ -6904,7 +6904,7 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        matches = await bucket_mgr.search(query, limit=10, include_sealed=True)
         result = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -7115,6 +7115,7 @@ async def api_breath_debug(request):
             query_valence=q_valence,
             query_arousal=q_arousal,
             include_dormant=search_include_dormant,
+            include_sealed=include_sealed,
             candidate_buckets=candidate_buckets,
             trace=search_trace,
         )
@@ -7864,9 +7865,9 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                if not await bucket_mgr.delete(bid):
+                    errors += 1
+                    continue
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
