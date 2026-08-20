@@ -116,6 +116,39 @@ async def test_unsealing_writes_final_content_then_generates_once(test_config):
 
 
 @pytest.mark.asyncio
+async def test_unsealing_provider_failure_keeps_final_state_without_retry(test_config):
+    engine = FakeEmbeddingEngine(enabled=False)
+    manager = BucketManager(test_config, embedding_engine=engine)
+    bucket_id = await manager.create("sealed body", sealed=True)
+    engine.delete_embedding.reset_mock()
+    engine.enabled = True
+    engine.generate_and_store.side_effect = RuntimeError("provider down")
+
+    assert await manager.update(bucket_id, content="final unsealed body", sealed=False)
+
+    stored = await manager.get(bucket_id)
+    assert stored["metadata"]["sealed"] == 0
+    assert stored["content"] == "final unsealed body"
+    engine.delete_embedding.assert_not_called()
+    engine.generate_and_store.assert_awaited_once_with(bucket_id, "final unsealed body")
+
+
+@pytest.mark.asyncio
+async def test_unsealed_content_provider_failure_keeps_content_without_retry(test_config):
+    engine = FakeEmbeddingEngine(enabled=False)
+    manager = BucketManager(test_config, embedding_engine=engine)
+    bucket_id = await manager.create("ordinary body")
+    engine.enabled = True
+    engine.generate_and_store.reset_mock()
+    engine.generate_and_store.side_effect = RuntimeError("provider down")
+
+    assert await manager.update(bucket_id, content="ordinary revised body")
+
+    assert (await manager.get(bucket_id))["content"] == "ordinary revised body"
+    engine.generate_and_store.assert_awaited_once_with(bucket_id, "ordinary revised body")
+
+
+@pytest.mark.asyncio
 async def test_delete_scrubs_before_file_removal_and_preserves_file_on_failure(test_config):
     engine = FakeEmbeddingEngine(enabled=False)
     manager = BucketManager(test_config, embedding_engine=engine)
@@ -173,6 +206,84 @@ async def test_o5b_sealed_cleanup_failure_does_not_apply_marker(test_config):
         )
 
     assert manager._get_import_operation(operation["operation_key"])["status"] == "planned"
+
+
+@pytest.mark.asyncio
+async def test_o5b_sealed_create_replay_returns_before_lifecycle(test_config):
+    engine = FakeEmbeddingEngine(enabled=False)
+    manager = BucketManager(test_config, embedding_engine=engine)
+    payload = {
+        "content": "o5b sealed create",
+        "tags": [],
+        "importance": 5,
+        "domain": ["测试"],
+        "valence": 0.5,
+        "arousal": 0.3,
+        "name": "sealed-o5b-create",
+    }
+    operation = manager.plan_import_operation(
+        "o5b:" + "f" * 64,
+        operation_kind="create",
+        payload=payload,
+    )
+
+    result_id = await manager.create(
+        **payload,
+        sealed=True,
+        _o5b_operation_key=operation["operation_key"],
+        _o5b_payload_digest=operation["payload_digest"],
+    )
+    path = manager._find_bucket_file(result_id)
+    first_bytes = Path(path).read_bytes()
+    first_delete_count = engine.delete_embedding.call_count
+    first_generate_count = engine.generate_and_store.await_count
+    first_marker = manager.inspect_import_operation(operation["operation_key"])["marker"]
+
+    replay = await manager.apply_import_operation(operation["operation_key"])
+
+    assert replay["result_id"] == result_id
+    assert Path(path).read_bytes() == first_bytes
+    assert engine.delete_embedding.call_count == first_delete_count
+    assert engine.generate_and_store.await_count == first_generate_count == 0
+    inspected = manager.inspect_import_operation(operation["operation_key"])
+    assert inspected["status"] == "applied"
+    assert inspected["marker"] == first_marker
+
+
+@pytest.mark.asyncio
+async def test_o5b_sealed_update_replay_returns_before_lifecycle(test_config):
+    engine = FakeEmbeddingEngine(enabled=False)
+    manager = BucketManager(test_config, embedding_engine=engine)
+    bucket_id = await manager.create("ordinary body")
+    operation = manager.plan_import_operation(
+        "o5b:" + "g" * 64,
+        operation_kind="update",
+        target_bucket_id=bucket_id,
+        payload={"kwargs": {"content": "sealed update", "sealed": True}},
+    )
+    engine.delete_embedding.reset_mock()
+
+    assert await manager.update(
+        bucket_id,
+        content="sealed update",
+        sealed=True,
+        _o5b_operation_key=operation["operation_key"],
+        _o5b_payload_digest=operation["payload_digest"],
+    )
+    path = manager._find_bucket_file(bucket_id)
+    first_bytes = Path(path).read_bytes()
+    first_delete_count = engine.delete_embedding.call_count
+    first_marker = manager.inspect_import_operation(operation["operation_key"])["marker"]
+
+    replay = await manager.apply_import_operation(operation["operation_key"])
+
+    assert replay["result_id"] == bucket_id
+    assert Path(path).read_bytes() == first_bytes
+    assert engine.delete_embedding.call_count == first_delete_count == 1
+    engine.generate_and_store.assert_not_awaited()
+    inspected = manager.inspect_import_operation(operation["operation_key"])
+    assert inspected["status"] == "applied"
+    assert inspected["marker"] == first_marker
 
 
 @pytest.mark.asyncio
@@ -271,6 +382,23 @@ async def test_merge_rejects_cross_boundary_and_allows_sealed_to_sealed(tmp_path
     assert "已合并" in merged
     assert (await server.bucket_mgr.get(sealed_source_2)) is None
     assert (await server.bucket_mgr.get(sealed_target))["metadata"]["sealed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_keeps_source_when_target_update_succeeds_but_delete_fails(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server.embedding_engine.enabled = False
+    server.bucket_mgr.embedding_engine.enabled = False
+
+    target = await server.bucket_mgr.create("merge target")
+    source = await server.bucket_mgr.create("merge source")
+    server.bucket_mgr.delete = AsyncMock(return_value=False)
+
+    result = await server._merge_bucket_into_target(target, source)
+
+    assert "源桶删除失败" in result
+    assert "merge source" in (await server.bucket_mgr.get(target))["content"]
+    assert (await server.bucket_mgr.get(source)) is not None
 
 
 @pytest.mark.asyncio

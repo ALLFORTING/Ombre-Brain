@@ -277,8 +277,8 @@ trace(bucket_id="abc123", delete=True)
 ```
 
 **系统内部**：
-1. `bucket_mgr.delete("abc123")` → `_find_bucket_file()` 定位文件 → `os.remove(file_path)`
-2. `embedding_engine.delete_embedding("abc123")` → SQLite `DELETE WHERE bucket_id=?`
+1. `bucket_mgr.delete("abc123")` 统一负责定位文件、保留历史、清理本地 ordinary embedding，再移除文件
+2. 本地向量清理失败时保留记忆文件并返回失败，避免留下可被普通检索命中的衍生数据
 3. 返回：`"已遗忘记忆桶: abc123"`
 
 ---
@@ -404,7 +404,7 @@ breath(importance_min=8)
 
 #### 层次 A：BucketManager.search() 内的 Layer 1.5 预筛
 - 调用点：`bucket_mgr.search()` → Layer 1.5
-- 函数：`embedding_engine.search_similar(query, top_k=50)` → 生成查询 embedding → SQLite 全量余弦计算 → 返回 `[(bucket_id, similarity)]` 按相似度降序
+- 函数：先按 `include_sealed` 过滤候选，再调用 `embedding_engine.search_similar(query, top_k=50)` → 生成查询 embedding → SQLite 全量余弦计算 → 返回 `[(bucket_id, similarity)]` 按相似度降序
 - 作用：将精排候选集从所有桶缩小到向量最近邻的 50 个，加速后续多维精排
 
 #### 层次 B：server.py breath 的额外向量通道
@@ -413,9 +413,9 @@ breath(importance_min=8)
 - 标注：补充桶带 `[语义关联]` 前缀
 
 **向量存储路径**：
-- 新建桶后：`embedding_engine.generate_and_store(bucket_id, content)` → `_generate_embedding(text[:2000])` → API 调用 → `_store_embedding()` → SQLite `INSERT OR REPLACE`
-- 合并更新后：同上，用 merged content 重新生成
-- 删除桶时：`embedding_engine.delete_embedding(bucket_id)` → `DELETE FROM embeddings`
+- ordinary 新建桶或内容更新后：由 `BucketManager` best-effort 调用 `embedding_engine.generate_and_store(bucket_id, content)` → `_generate_embedding(text[:2000])` → API 调用 → `_store_embedding()` → SQLite `INSERT OR REPLACE`
+- sealed 新建/内容更新不调用 provider；创建、sealed 内容变更和进入 sealed 边界前先由 `BucketManager` 执行本地 `delete_embedding(bucket_id)`
+- sealed→unsealed 先持久化最终正文和状态，再 best-effort 尝试一次 ordinary embedding 刷新；删除桶由 `BucketManager.delete()` 先清理本地向量后移除文件
 
 **SQLite 结构**：
 ```sql
@@ -427,6 +427,22 @@ CREATE TABLE embeddings (
 ```
 
 **相似度计算**：`_cosine_similarity(a, b)` = dot(a,b) / (|a| × |b|)
+
+### 12.1 Sealed Derived-Data Privacy Boundary（当前实现）
+
+`sealed=1` 的桶正文属于 sealed memory；ordinary embedding 是由正文派生的衍生数据，不能在 sealed 状态下生成或保留。当前边界由 `BucketManager` 的 memory-specific lifecycle 实现，`EmbeddingEngine` 仍是通用的向量存储/检索原语。
+
+- 生命周期：unsealed 新建和 unsealed 内容更新可以 best-effort 生成 ordinary embedding；sealed 新建和 sealed 内容更新不调用 provider。sealed 创建、进入 sealed 边界以及 sealed 内容变更，都在文件写入前执行本地向量清理；unseal 先写入最终状态/正文，再 best-effort 刷新一次 ordinary embedding。sealed 状态不变的 metadata-only 更新不触发清理或生成。
+- 清理语义：`BucketManager.delete()` 拥有记录删除流程，负责历史记录、本地向量清理和文件删除的顺序。local vector cleanup 是 privacy-enforcing；provider 生成/刷新失败是 best-effort，不回滚已持久化的 unsealed 内容，也不重试。
+- 搜索语义：`BucketManager.search()` 默认 `include_sealed=False`，在 semantic ranking 之前排除 sealed 桶；只有显式 `include_sealed=True` 才加入 sealed 结果。Dashboard `/api/search` 显式 opt in，以保持现有可见性。
+- 合并语义：只允许相同 privacy class 合并；跨 sealed 边界拒绝。默认搜索不会选择 sealed 作为自动/import merge 目标，sealed 只有显式搜索 opt in 才可见。
+- 维护语义：backfill 跳过 active/archive 中的 sealed 桶；display-alias maintenance 跳过 sealed 正文重写和 re-embed。
+
+#### 12.2 构造前提与 deferred 风险
+
+当前 production mutation paths 都向 `BucketManager` 注入 `EmbeddingEngine`；standalone `BucketManager` 未注入 engine 时，无法证明或清理 dependency 外部已经存在的 stale vector。该 standalone mutation-capable boundary 仍未完整支持，但这不是当前 production construction 的已知漏洞；未来若支持 standalone mutation-capable `BucketManager`，需另行补 fail-closed/依赖约束设计。
+
+当前 merge 的目标更新与源桶删除不是事务性原子操作：目标更新成功而源删除失败时，源文件会保留，可能短暂存在两份 logical content；该风险不跨越 sealed→unsealed 边界，merge atomicity redesign deferred。
 
 ---
 
@@ -626,7 +642,7 @@ feel 桶自身:
 - `urgency_boost`：`arousal > 0.7 && !resolved → ×1.5`
 - `dream()` 连接提示（best_sim > 0.5）+ 结晶提示（feel 相似度 > 0.7 × ≥2 个）
 - 所有 `/api/*` Dashboard 路由均受 `_require_auth` 保护
-- `trace(delete=True)` 同步调用 `embedding_engine.delete_embedding()`
+- `trace(delete=True)` 通过 `bucket_mgr.delete()` 统一完成本地 ordinary embedding 清理与文件删除
 - `grow()` 单条失败 `try/except` 隔离，标注 `⚠️条目名`，其他条继续
 
 ---
