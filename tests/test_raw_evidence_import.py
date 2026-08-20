@@ -83,7 +83,9 @@ def test_same_run_capture_reuses_logical_evidence_and_invalid_bytes(tmp_path):
     assert first["evidence_id"] == second["evidence_id"]
     assert first["revision_id"] == second["revision_id"]
     assert first["content_hash"] == hashlib.sha256(raw).hexdigest()
-    assert store.get_content(first["revision_id"], allow_sealed=True) == raw
+    assert store.get_content(
+        first["revision_id"], allow_restricted_admin=True
+    ) == raw
     assert first["privacy_class"] == "restricted_admin"
     retried_run = store.create_or_get_import_run(**_run_kwargs(raw))
     assert retried_run["retry_count"] == 1
@@ -288,7 +290,9 @@ async def test_parse_failure_retains_captured_evidence(test_config, tmp_path, mo
     )
     assert run["status"] == "failed"
     assert run["evidence_id"] and run["revision_id"]
-    assert store.get_content(run["revision_id"], allow_sealed=True) == raw
+    assert store.get_content(
+        run["revision_id"], allow_restricted_admin=True
+    ) == raw
 
 
 @pytest.mark.asyncio
@@ -326,7 +330,9 @@ async def test_extraction_failure_retains_evidence_and_checkpoint(test_config, t
         ).fetchone()[0]
     assert run_status == "failed"
     assert item_status == "extraction_failed"
-    assert store.get_content(revision_id, allow_sealed=True) == raw
+    assert store.get_content(
+        revision_id, allow_restricted_admin=True
+    ) == raw
 
 
 @pytest.mark.asyncio
@@ -380,7 +386,9 @@ async def test_memory_failure_retains_evidence_and_retryable_item(
             "SELECT revision_id FROM import_runs WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
     assert item_status == "failed"
-    assert store.get_content(revision_id, allow_sealed=True) == raw
+    assert store.get_content(
+        revision_id, allow_restricted_admin=True
+    ) == raw
 
 
 @pytest.mark.asyncio

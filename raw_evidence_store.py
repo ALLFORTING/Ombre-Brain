@@ -466,7 +466,7 @@ class RawEvidenceStore:
                 if temp_path is not None:
                     self._remove_temp(temp_path)
 
-        return self.get_evidence(evidence_id, allow_sealed=True)
+        return self._get_evidence_internal(evidence_id)
 
     def create(self, content: bytes | bytearray | memoryview | BinaryIO, **kwargs: Any) -> dict[str, Any]:
         """Internal shorthand for :meth:`create_evidence`."""
@@ -1223,8 +1223,14 @@ class RawEvidenceStore:
                 raise RawEvidenceError("storage_unavailable") from exc
 
             if existing_succeeded:
-                self.verify_content(revision_id, allow_sealed=True)
-                return self.get_evidence(evidence_id, allow_sealed=True)
+                self.verify_content(
+                    revision_id,
+                    allow_restricted_admin=True,
+                )
+                return self.get_evidence(
+                    evidence_id,
+                    allow_restricted_admin=True,
+                )
 
             try:
                 temp_path, content_size, content_hash = self._stage_content(content_bytes)
@@ -1294,8 +1300,14 @@ class RawEvidenceStore:
                 if temp_path is not None:
                     self._remove_temp(temp_path)
 
-        result = self.get_evidence(evidence_id, allow_sealed=True)
-        self.verify_content(revision_id, allow_sealed=True)
+        result = self.get_evidence(
+            evidence_id,
+            allow_restricted_admin=True,
+        )
+        self.verify_content(
+            revision_id,
+            allow_restricted_admin=True,
+        )
         return result
 
     def get_evidence(
@@ -1303,8 +1315,19 @@ class RawEvidenceStore:
         evidence_id: str,
         *,
         allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
     ) -> dict[str, Any]:
         self._require_enabled()
+        evidence_id = _validate_id(evidence_id, "evidence_id")
+        row = self._fetch_evidence(evidence_id)
+        self._check_visibility(
+            row["privacy_class"],
+            allow_sealed,
+            allow_restricted_admin,
+        )
+        return dict(row)
+
+    def _fetch_evidence(self, evidence_id: str) -> sqlite3.Row:
         evidence_id = _validate_id(evidence_id, "evidence_id")
         with self._lock:
             with self._connect() as conn:
@@ -1338,37 +1361,77 @@ class RawEvidenceStore:
                 ).fetchone()
         if row is None:
             raise RawEvidenceError("not_found")
-        self._check_visibility(row["privacy_class"], allow_sealed)
-        return dict(row)
+        return row
+
+    def _get_evidence_internal(self, evidence_id: str) -> dict[str, Any]:
+        """Return a newly captured record to trusted internal completion code."""
+
+        self._require_enabled()
+        return dict(self._fetch_evidence(evidence_id))
 
     def get_revision(
         self,
         revision_id: str,
         *,
         allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
     ) -> dict[str, Any]:
         self._require_enabled()
         row = self._fetch_revision(revision_id)
-        self._check_visibility(row["privacy_class"], allow_sealed)
+        self._check_visibility(
+            row["privacy_class"],
+            allow_sealed,
+            allow_restricted_admin,
+        )
         return dict(row)
 
-    def get_content(self, revision_id: str, *, allow_sealed: bool = False) -> bytes:
+    def get_content(
+        self,
+        revision_id: str,
+        *,
+        allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
+    ) -> bytes:
         self._require_enabled()
         row = self._fetch_revision(revision_id)
-        self._check_visibility(row["privacy_class"], allow_sealed)
+        self._check_visibility(
+            row["privacy_class"],
+            allow_sealed,
+            allow_restricted_admin,
+        )
         return self._read_verified(row, return_content=True)
 
-    def verify_content(self, revision_id: str, *, allow_sealed: bool = False) -> bool:
+    def verify_content(
+        self,
+        revision_id: str,
+        *,
+        allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
+    ) -> bool:
         self._require_enabled()
         row = self._fetch_revision(revision_id)
-        self._check_visibility(row["privacy_class"], allow_sealed)
+        self._check_visibility(
+            row["privacy_class"],
+            allow_sealed,
+            allow_restricted_admin,
+        )
         self._read_verified(row, return_content=False)
         return True
 
-    def verify(self, revision_id: str, *, allow_sealed: bool = False) -> bool:
+    def verify(
+        self,
+        revision_id: str,
+        *,
+        allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
+    ) -> bool:
         """Internal shorthand for :meth:`verify_content`."""
 
-        return self.verify_content(revision_id, allow_sealed=allow_sealed)
+        return self.verify_content(
+            revision_id,
+            allow_sealed=allow_sealed,
+            allow_restricted_admin=allow_restricted_admin,
+        )
 
     @guarded_mutation("raw_evidence_metadata_update")
     def update_metadata(
@@ -1464,7 +1527,7 @@ class RawEvidenceStore:
                 raise
             except sqlite3.Error as exc:
                 raise RawEvidenceError("storage_unavailable") from exc
-        return self.get_evidence(evidence_id, allow_sealed=True)
+        return self._get_evidence_internal(evidence_id)
 
     def update_state(self, evidence_id: str, lifecycle_state: str) -> dict[str, Any]:
         """Internal shorthand for the O5A metadata-only state update."""
@@ -2484,9 +2547,22 @@ class RawEvidenceStore:
             return
 
     @staticmethod
-    def _check_visibility(privacy_class: str, allow_sealed: bool) -> None:
-        if privacy_class != "ordinary" and not allow_sealed:
+    def _check_visibility(
+        privacy_class: str,
+        allow_sealed: bool,
+        allow_restricted_admin: bool,
+    ) -> None:
+        if privacy_class == "ordinary":
+            return
+        if privacy_class == "sealed":
+            if allow_sealed:
+                return
             raise RawEvidenceError("sealed_access_denied")
+        if privacy_class == "restricted_admin":
+            if allow_restricted_admin:
+                return
+            raise RawEvidenceError("restricted_admin_access_denied")
+        raise RawEvidenceError("privacy_class_invalid")
 
     def _validate_metadata(self, **values: Any) -> dict[str, Any]:
         for name in (

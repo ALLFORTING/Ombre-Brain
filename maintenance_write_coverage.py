@@ -206,6 +206,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_claim_purge": "guarded_caller_only",
         "_finalize_purge": "guarded_caller_only",
         "_mark_integrity_failure": "guarded_caller_only",
+        "_mark_missing_payload": "guarded_caller_only",
         "_parse_iso": "guarded_caller_only",
         "_bound_backup_authority": "guarded_caller_only",
     },

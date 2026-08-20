@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -283,3 +284,175 @@ def test_publish_pending_without_reference_is_cleaned_by_recovery(tmp_path):
         assert conn.execute(
             "SELECT state FROM cas_objects WHERE content_hash = ?", (content_hash,)
         ).fetchone()[0] == "purged"
+
+
+def _mark_publish_pending(store, content_hash):
+    with sqlite3.connect(store.registry_path) as conn:
+        conn.execute(
+            """
+            UPDATE cas_objects
+            SET state = 'publish_pending', operation_id = ?
+            WHERE content_hash = ?
+            """,
+            ("d" * 32, content_hash),
+        )
+
+
+def test_referenced_publish_pending_valid_blob_recovers_once(tmp_path):
+    store = _store(tmp_path)
+    created = store.create(
+        b"referenced-pending",
+        source_system="fixture",
+        source_kind="item",
+    )
+    _mark_publish_pending(store, created["content_hash"])
+
+    lifecycle = RawEvidenceLifecycle(store)
+    first = lifecycle.run(now=_at(1))
+    second = lifecycle.run(now=_at(2))
+
+    assert first["publish_recovered"] == 1
+    assert second["publish_recovered"] == 0
+    with sqlite3.connect(store.registry_path) as conn:
+        state, operation_id = conn.execute(
+            "SELECT state, operation_id FROM cas_objects WHERE content_hash = ?",
+            (created["content_hash"],),
+        ).fetchone()
+    assert state == "live"
+    assert operation_id is None
+    assert (store.root / created["blob_relpath"]).exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "size", "hash"])
+def test_referenced_publish_pending_invalid_blob_stays_pending(tmp_path, failure):
+    store = _store(tmp_path)
+    created = store.create(
+        b"referenced-invalid",
+        source_system="fixture",
+        source_kind="item",
+    )
+    blob = store.root / created["blob_relpath"]
+    if failure == "missing":
+        blob.unlink()
+    elif failure == "size":
+        blob.write_bytes(b"wrong-size")
+    else:
+        blob.write_bytes(b"x" * len(b"referenced-invalid"))
+    _mark_publish_pending(store, created["content_hash"])
+
+    lifecycle = RawEvidenceLifecycle(store)
+    result = lifecycle.run(now=_at(1))
+    repeated = lifecycle.run(now=_at(2))
+
+    assert result["publish_recovered"] == 0
+    assert repeated["publish_recovered"] == 0
+    with sqlite3.connect(store.registry_path) as conn:
+        state, operation_id = conn.execute(
+            "SELECT state, operation_id FROM cas_objects WHERE content_hash = ?",
+            (created["content_hash"],),
+        ).fetchone()
+    assert state == "publish_pending"
+    assert operation_id == "d" * 32
+    if failure != "missing":
+        assert blob.exists()
+
+
+def test_missing_payload_purge_is_fail_closed_and_idempotent(tmp_path):
+    store = _store(tmp_path)
+    created = store.create(
+        b"missing-during-purge",
+        source_system="fixture",
+        source_kind="item",
+        captured_at=_at(0),
+    )
+    lifecycle = RawEvidenceLifecycle(store)
+    lifecycle.redact(created["evidence_id"], reason="user_redaction")
+    (store.root / created["blob_relpath"]).unlink()
+
+    first = lifecycle.run(now=_at(30))
+    with sqlite3.connect(store.registry_path) as conn:
+        lifecycle_state, payload_deleted = conn.execute(
+            "SELECT lifecycle_state, payload_deleted "
+            "FROM evidence_lifecycle WHERE revision_id = ?",
+            (created["revision_id"],),
+        ).fetchone()
+        cas_state, operation_id = conn.execute(
+            "SELECT state, operation_id FROM cas_objects WHERE content_hash = ?",
+            (created["content_hash"],),
+        ).fetchone()
+        audit = conn.execute(
+            """
+            SELECT to_state, payload_deleted, reconciliation_result
+            FROM lifecycle_audit
+            WHERE revision_id = ? AND to_state = 'missing'
+            ORDER BY lifecycle_operation_id DESC
+            LIMIT 1
+            """,
+            (created["revision_id"],),
+        ).fetchone()
+
+    assert first["purged"] == 0
+    assert lifecycle_state == "missing"
+    assert payload_deleted == 0
+    assert cas_state == "live"
+    assert operation_id is None
+    assert audit == ("missing", 0, "payload_missing")
+
+    second = lifecycle.run(now=_at(31))
+    assert second["purged"] == 0
+    with sqlite3.connect(store.registry_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lifecycle_audit WHERE revision_id = ? "
+            "AND to_state = 'missing'",
+            (created["revision_id"],),
+        ).fetchone()[0] == 1
+
+
+def test_missing_payload_purge_updates_existing_lineage_to_evidence_missing(tmp_path):
+    raw = b"lineage-missing-payload"
+    store = _store(tmp_path)
+    run = store.create_or_get_import_run(
+        run_id="1" * 32,
+        retry_key="lineage-missing",
+        source_sha256=hashlib.sha256(raw).hexdigest(),
+        source_size_bytes=len(raw),
+        filename="source.txt",
+        media_type="text/plain",
+        source_system="dashboard",
+        source_kind="import_upload",
+        source_scope="dashboard_upload",
+        actor_id="test",
+        preserve_raw=False,
+        importer_version="test",
+        parser_version="test",
+        chunker_version="test",
+    )
+    captured = store.create_or_reuse_import_evidence(
+        raw,
+        run_id=run["run_id"],
+    )
+    store.create_lineage_intent(
+        run_id=run["run_id"],
+        run_item_key="source_snapshot",
+        operation_key="op:" + "a" * 64,
+        memory_id="2" * 32,
+        memory_mutation_id="3" * 64,
+        evidence_id=captured["evidence_id"],
+        revision_id=captured["revision_id"],
+        lineage_kind="created",
+    )
+    with sqlite3.connect(store.registry_path) as conn:
+        conn.execute(
+            "UPDATE evidence_lifecycle SET retention_deadline = ? "
+            "WHERE revision_id = ?",
+            (_at(0), captured["revision_id"]),
+        )
+
+    lifecycle = RawEvidenceLifecycle(store)
+    lifecycle.redact(captured["evidence_id"], reason="user_redaction")
+    (store.root / captured["blob_relpath"]).unlink()
+    lifecycle.run(now=_at(30))
+
+    assert store.list_lineage(
+        status="evidence_missing"
+    )[0]["revision_id"] == captured["revision_id"]

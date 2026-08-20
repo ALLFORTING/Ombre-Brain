@@ -300,6 +300,42 @@ def test_sealed_evidence_is_not_visible_without_explicit_internal_access(tmp_pat
     assert not hasattr(store, "search")
 
 
+def test_restricted_admin_capability_is_separate_from_sealed(tmp_path):
+    store = _make_store(tmp_path)
+    result = store.create(
+        b"restricted",
+        source_system="fixture",
+        source_kind="item",
+        privacy_class="restricted_admin",
+    )
+
+    with pytest.raises(RawEvidenceError, match="restricted_admin_access_denied"):
+        store.get_evidence(result["evidence_id"])
+    with pytest.raises(RawEvidenceError, match="restricted_admin_access_denied"):
+        store.get_content(result["revision_id"])
+    with pytest.raises(RawEvidenceError, match="restricted_admin_access_denied"):
+        store.get_revision(result["revision_id"], allow_sealed=True)
+    with pytest.raises(RawEvidenceError, match="restricted_admin_access_denied"):
+        store.verify(result["revision_id"], allow_sealed=True)
+
+    assert store.get_evidence(
+        result["evidence_id"],
+        allow_restricted_admin=True,
+    )["privacy_class"] == "restricted_admin"
+    assert store.get_revision(
+        result["revision_id"],
+        allow_restricted_admin=True,
+    )["privacy_class"] == "restricted_admin"
+    assert store.get_content(
+        result["revision_id"],
+        allow_restricted_admin=True,
+    ) == b"restricted"
+    assert store.verify(
+        result["revision_id"],
+        allow_restricted_admin=True,
+    )
+
+
 def test_schema_version_is_fail_closed(tmp_path):
     root = tmp_path / "raw-evidence"
     store = RawEvidenceStore(root)
