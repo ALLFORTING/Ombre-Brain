@@ -16,7 +16,7 @@ from typing import Any
 
 sys.path.insert(0, ".")
 from utils import load_config
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, _is_sealed_bucket
 from embedding_engine import EmbeddingEngine
 
 
@@ -35,6 +35,7 @@ async def backfill_batch(
         bucket
         for bucket in all_buckets
         if str(bucket.get("content", "")).strip()
+        and not _is_sealed_bucket(bucket)
     ]
 
     missing = []
@@ -83,8 +84,14 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
     print(f"Total buckets: {len(all_buckets)}")
 
     # get_embedding only returns vectors for the currently configured model.
+    eligible = [
+        bucket
+        for bucket in all_buckets
+        if str(bucket.get("content", "")).strip()
+        and not _is_sealed_bucket(bucket)
+    ]
     missing = []
-    for b in all_buckets:
+    for b in eligible:
         emb = await engine.get_embedding(b["id"])
         if emb is None:
             missing.append(b)

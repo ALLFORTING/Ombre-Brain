@@ -33,6 +33,7 @@ import sqlite3
 import hashlib
 import json
 import tempfile
+import inspect
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -79,6 +80,15 @@ def _date_only(value: str | None = None) -> str:
         except (ValueError, TypeError):
             pass
     return datetime.now().date().isoformat()
+
+
+def _is_sealed_bucket(bucket: Any) -> bool:
+    """Return True for either a loaded bucket dict or a frontmatter Post."""
+    metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else bucket
+    try:
+        return int(metadata.get("sealed", 0) or 0) == 1
+    except (TypeError, ValueError):
+        return False
 
 
 class BucketManager:
@@ -139,6 +149,30 @@ class BucketManager:
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
         self._init_history_db()
+
+    async def _delete_ordinary_embedding(self, bucket_id: str) -> None:
+        """Delete the local ordinary vector, regardless of provider enablement."""
+        if self.embedding_engine is None:
+            return
+        delete_embedding = getattr(self.embedding_engine, "delete_embedding", None)
+        if delete_embedding is None:
+            return
+        result = delete_embedding(bucket_id)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _refresh_ordinary_embedding_best_effort(
+        self,
+        bucket_id: str,
+        content: str,
+    ) -> None:
+        """Refresh an unsealed vector without making provider failure fatal."""
+        if not self.embedding_engine or not getattr(self.embedding_engine, "enabled", False):
+            return
+        try:
+            await self.embedding_engine.generate_and_store(bucket_id, content)
+        except Exception as exc:
+            logger.warning(f"Embedding refresh failed for {bucket_id}: {exc}")
 
     def _init_history_db(self) -> None:
         """Create the write-ahead bucket history table if needed."""
@@ -765,6 +799,18 @@ class BucketManager:
             filename = f"{bucket_id}.md"
         file_path = safe_path(target_dir, filename)
 
+        if sealed:
+            try:
+                await self._delete_ordinary_embedding(bucket_id)
+            except Exception as exc:
+                logger.error(
+                    "Refusing sealed bucket create because ordinary-vector cleanup "
+                    "failed for %s: %s",
+                    bucket_id,
+                    exc,
+                )
+                raise RuntimeError("sealed_embedding_cleanup_failed") from exc
+
         try:
             if operation is not None:
                 self._write_post_atomic(file_path, post)
@@ -780,11 +826,8 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
-        if self.embedding_engine and self.embedding_engine.enabled:
-            try:
-                await self.embedding_engine.generate_and_store(bucket_id, content)
-            except Exception as e:
-                logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
+        if not sealed:
+            await self._refresh_ordinary_embedding_best_effort(bucket_id, content)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -889,6 +932,26 @@ class BucketManager:
                 memory_mutation_id=operation.get("memory_mutation_id"),
             )
 
+        previous_sealed = _is_sealed_bucket(post)
+        next_sealed = (
+            int(kwargs["sealed"]) == 1
+            if "sealed" in kwargs
+            else previous_sealed
+        )
+        content_changed = "content" in kwargs
+        cleanup_before_write = next_sealed and (not previous_sealed or content_changed)
+        if cleanup_before_write:
+            try:
+                await self._delete_ordinary_embedding(bucket_id)
+            except Exception as exc:
+                logger.error(
+                    "Refusing sealed bucket update because ordinary-vector cleanup "
+                    "failed for %s: %s",
+                    bucket_id,
+                    exc,
+                )
+                return False
+
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
         # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
         is_pinned = post.get("pinned", False) or post.get("protected", False)
@@ -971,17 +1034,13 @@ class BucketManager:
             self._move_bucket(file_path, self.permanent_dir, domain)
 
         if (
-            "content" in kwargs
-            and self.embedding_engine
-            and self.embedding_engine.enabled
+            not next_sealed
+            and (previous_sealed or content_changed)
         ):
-            try:
-                await self.embedding_engine.generate_and_store(
-                    bucket_id,
-                    kwargs["content"],
-                )
-            except Exception as e:
-                logger.warning(f"Embedding refresh failed for {bucket_id}: {e}")
+            await self._refresh_ordinary_embedding_best_effort(
+                bucket_id,
+                post.content,
+            )
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -1009,17 +1068,41 @@ class BucketManager:
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
+            try:
+                await self._delete_ordinary_embedding(bucket_id)
+            except Exception as exc:
+                logger.error(
+                    "Orphan ordinary-vector cleanup failed for missing bucket %s: %s",
+                    bucket_id,
+                    exc,
+                )
             return False
 
         try:
             post = frontmatter.load(file_path)
             self.record_history(bucket_id, post.content, "delete")
-            os.remove(file_path)
-        except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+        except Exception as exc:
+            logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")
             return False
-        except Exception as e:
-            logger.error(f"Failed to snapshot/delete bucket {bucket_id}: {e}")
+
+        try:
+            await self._delete_ordinary_embedding(bucket_id)
+        except Exception as exc:
+            logger.error(
+                "Refusing to delete bucket %s because ordinary-vector cleanup failed: %s",
+                bucket_id,
+                exc,
+            )
+            return False
+
+        try:
+            os.remove(file_path)
+        except OSError as exc:
+            logger.error(
+                "Bucket file removal failed after vector cleanup / 删除桶文件失败: %s: %s",
+                file_path,
+                exc,
+            )
             return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
@@ -1162,6 +1245,7 @@ class BucketManager:
         query_valence: float = None,
         query_arousal: float = None,
         include_dormant: bool = False,
+        include_sealed: bool = False,
         candidate_buckets: list[dict] = None,
         trace: dict | None = None,
     ) -> list[dict]:
@@ -1261,6 +1345,22 @@ class BucketManager:
                             entry["eligible"] = False
                             entry.setdefault("exclusion_reasons", []).append("dormant")
 
+        if not include_sealed:
+            before_sealed = candidates
+            candidates = [
+                bucket for bucket in candidates
+                if not _is_sealed_bucket(bucket)
+            ]
+            if trace is not None:
+                retained_ids = {str(bucket.get("id", "")) for bucket in candidates}
+                for bucket in before_sealed:
+                    bid = str(bucket.get("id", ""))
+                    if bid not in retained_ids:
+                        entry = trace_entries.get(bid)
+                        if entry is not None:
+                            entry["eligible"] = False
+                            entry.setdefault("exclusion_reasons", []).append("sealed")
+
         # --- Layer 1.5: semantic recall for hybrid keyword/vector ranking ---
         # --- 第1.5层：语义召回，与关键词分数混合排序 ---
         vector_scores = {}
@@ -1271,9 +1371,21 @@ class BucketManager:
             )
             try:
                 if candidate_buckets is None:
+                    candidate_ids = None
+                    if not include_sealed:
+                        candidate_ids = {
+                            str(bucket["id"])
+                            for bucket in all_buckets
+                            if not _is_sealed_bucket(bucket)
+                        }
                     vector_results = await self.embedding_engine.search_similar(
                         query,
                         top_k=50,
+                        **(
+                            {"candidate_ids": candidate_ids}
+                            if candidate_ids is not None
+                            else {}
+                        ),
                     )
                 else:
                     candidate_ids = {str(bucket["id"]) for bucket in candidates}
@@ -1777,6 +1889,9 @@ class BucketManager:
                         logger.warning("Alias cleanup could not read %s: %s", path, exc)
                         continue
 
+                    if _is_sealed_bucket(post):
+                        continue
+
                     original_content = post.content
                     original_name = post.get("name")
                     original_tags = post.get("tags")
@@ -1823,12 +1938,8 @@ class BucketManager:
                         "name": str(post.get("name", bucket_id)),
                         "replacements": file_replacements,
                     })
-                    if (
-                        original_content != post.content
-                        and self.embedding_engine
-                        and self.embedding_engine.enabled
-                    ):
-                        await self.embedding_engine.generate_and_store(
+                    if original_content != post.content:
+                        await self._refresh_ordinary_embedding_best_effort(
                             bucket_id,
                             post.content,
                         )
