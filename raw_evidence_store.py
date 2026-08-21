@@ -1143,6 +1143,11 @@ class RawEvidenceStore:
         self._check_visibility(
             row["privacy_class"], allow_sealed, allow_restricted_admin
         )
+        if (
+            row["revision_schema_version"] != REVISION_SCHEMA_VERSION
+            or row["hash_algorithm"] != HASH_ALGORITHM
+        ):
+            raise RawEvidenceError("revision_metadata_unsupported")
         _validate_raw_byte_range(
             raw_byte_start, raw_byte_end, row["content_size_bytes"]
         )
@@ -1307,7 +1312,7 @@ class RawEvidenceStore:
             with self._connect() as conn:
                 span = conn.execute(
                     """
-                    SELECT s.span_id, s.revision_id, e.privacy_class
+                    SELECT s.span_id, s.revision_id, r.evidence_id, e.privacy_class
                     FROM source_span_descriptors AS s
                     JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
                     JOIN evidence_objects AS e ON e.evidence_id = r.evidence_id
@@ -1325,7 +1330,7 @@ class RawEvidenceStore:
                 with self._connect() as conn:
                     self._begin_write(conn)
                     lineage = conn.execute(
-                        "SELECT revision_id FROM memory_lineage WHERE lineage_id = ?",
+                        "SELECT revision_id, evidence_id FROM memory_lineage WHERE lineage_id = ?",
                         (lineage_id,),
                     ).fetchone()
                     if lineage is None:
@@ -1333,6 +1338,7 @@ class RawEvidenceStore:
                         raise RawEvidenceError("not_found")
                     if (
                         lineage["revision_id"] != span["revision_id"]
+                        or lineage["evidence_id"] != span["evidence_id"]
                         or (revision_id is not None and revision_id != span["revision_id"])
                     ):
                         conn.rollback()
@@ -1406,8 +1412,9 @@ class RawEvidenceStore:
                     FROM memory_lineage_citations AS c
                     JOIN memory_lineage AS l ON l.lineage_id = c.lineage_id
                     JOIN source_span_descriptors AS s ON s.span_id = c.span_id
+                    JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
                     WHERE c.lineage_id = ? AND l.revision_id = ?
-                      AND s.revision_id = ?
+                      AND s.revision_id = ? AND l.evidence_id = r.evidence_id
                     ORDER BY c.created_at, c.span_id
                     """,
                     (lineage_id, revision_id, revision_id),
@@ -1443,6 +1450,7 @@ class RawEvidenceStore:
             or span["locator_kind"] != SPAN_LOCATOR_KIND
             or span["locator_schema_version"] != SPAN_LOCATOR_SCHEMA_VERSION
             or span["span_hash_algorithm"] != SPAN_HASH_ALGORITHM
+            or span["hash_algorithm"] != HASH_ALGORITHM
             or span["revision_schema_version"] != REVISION_SCHEMA_VERSION
         ):
             return {"state": "UNSUPPORTED"}
@@ -1494,7 +1502,14 @@ class RawEvidenceStore:
         with self._lock:
             with self._connect() as conn:
                 lineage = conn.execute(
-                    "SELECT revision_id FROM memory_lineage WHERE lineage_id = ?",
+                    """
+                    SELECT l.revision_id, l.evidence_id,
+                           r.evidence_id AS revision_evidence_id
+                    FROM memory_lineage AS l
+                    LEFT JOIN evidence_revisions AS r
+                      ON r.revision_id = l.revision_id
+                    WHERE l.lineage_id = ?
+                    """,
                     (lineage_id,),
                 ).fetchone()
                 citation = conn.execute(
@@ -1506,7 +1521,10 @@ class RawEvidenceStore:
                 ).fetchone()
         if lineage is None or citation is None:
             return {"state": "NOT_VERIFIED"}
-        if lineage["revision_id"] != revision_id:
+        if (
+            lineage["revision_id"] != revision_id
+            or lineage["evidence_id"] != lineage["revision_evidence_id"]
+        ):
             return {"state": "INVALID"}
         result = self.verify_span(
             span_id,
@@ -1517,6 +1535,199 @@ class RawEvidenceStore:
         if result["state"] == "VERIFIED":
             result["lineage_id"] = lineage_id
         return result
+
+    @guarded_mutation("raw_evidence_source_span_candidate_set_create")
+    def create_candidate_set(
+        self,
+        *,
+        revision_id: str,
+        run_id: str,
+        run_item_key: str,
+        producer_version: str,
+        input_digest: str,
+        candidates: Iterable[dict[str, Any]],
+        allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Atomically establish one complete descriptor/mapping authority set."""
+
+        self._require_enabled()
+        revision_id = _validate_id(revision_id, "revision_id")
+        run_id = _validate_id(run_id, "run_id")
+        _validate_text(run_item_key, "run_item_key", self.limits.max_metadata_chars)
+        _validate_text(producer_version, "producer_version", 128)
+        input_digest = _validate_hash(input_digest, "input_digest")
+        specs = list(candidates)
+        if not specs:
+            raise RawEvidenceError("candidate_scope_invalid")
+        revision = self._fetch_revision(revision_id)
+        self._check_visibility(
+            revision["privacy_class"], allow_sealed, allow_restricted_admin
+        )
+        if (
+            revision["revision_schema_version"] != REVISION_SCHEMA_VERSION
+            or revision["hash_algorithm"] != HASH_ALGORITHM
+        ):
+            raise RawEvidenceError("revision_metadata_unsupported")
+        content = self._read_verified(revision, return_content=True)
+        normalized: list[dict[str, Any]] = []
+        for spec in specs:
+            if not isinstance(spec, dict):
+                raise RawEvidenceError("candidate_scope_invalid")
+            span_id = _validate_id(spec.get("span_id"), "span_id")
+            raw_byte_start = spec.get("raw_byte_start")
+            raw_byte_end = spec.get("raw_byte_end")
+            span_hash = _validate_hash(spec.get("span_hash"), "span_hash")
+            _validate_raw_byte_range(
+                raw_byte_start, raw_byte_end, revision["content_size_bytes"]
+            )
+            if hashlib.sha256(content[raw_byte_start:raw_byte_end]).hexdigest() != span_hash:
+                raise RawEvidenceError("span_hash_invalid")
+            candidate_token = spec.get("candidate_token")
+            if candidate_token is not None:
+                candidate_token = _validate_id(candidate_token, "candidate_token")
+            normalized.append(
+                {
+                    "span_id": span_id,
+                    "raw_byte_start": raw_byte_start,
+                    "raw_byte_end": raw_byte_end,
+                    "span_hash": span_hash,
+                    "candidate_token": candidate_token,
+                }
+            )
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                self._begin_write(conn)
+                item = conn.execute(
+                    """
+                    SELECT evidence_id, revision_id FROM import_run_items
+                    WHERE run_id = ? AND item_key = ?
+                    """,
+                    (run_id, run_item_key),
+                ).fetchone()
+                if (
+                    item is None
+                    or item["revision_id"] != revision_id
+                    or item["evidence_id"] != revision["evidence_id"]
+                ):
+                    raise RawEvidenceError("candidate_scope_invalid")
+                now = _now_iso()
+                results: list[dict[str, Any]] = []
+                for spec in normalized:
+                    existing = conn.execute(
+                        "SELECT * FROM source_span_descriptors WHERE span_id = ?",
+                        (spec["span_id"],),
+                    ).fetchone()
+                    expected_descriptor = (
+                        revision_id,
+                        SPAN_LOCATOR_KIND,
+                        SPAN_LOCATOR_SCHEMA_VERSION,
+                        spec["raw_byte_start"],
+                        spec["raw_byte_end"],
+                        SPAN_HASH_ALGORITHM,
+                        spec["span_hash"],
+                        SPAN_DESCRIPTOR_SCHEMA_VERSION,
+                    )
+                    if existing is not None:
+                        actual_descriptor = (
+                            existing["revision_id"],
+                            existing["locator_kind"],
+                            existing["locator_schema_version"],
+                            existing["raw_byte_start"],
+                            existing["raw_byte_end"],
+                            existing["span_hash_algorithm"],
+                            existing["span_hash"],
+                            existing["descriptor_schema_version"],
+                        )
+                        if actual_descriptor != expected_descriptor:
+                            raise RawEvidenceError("idempotency_conflict")
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO source_span_descriptors (
+                                span_id, revision_id, locator_kind,
+                                locator_schema_version, raw_byte_start,
+                                raw_byte_end, span_hash_algorithm, span_hash,
+                                created_at, descriptor_schema_version
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                spec["span_id"], revision_id, SPAN_LOCATOR_KIND,
+                                SPAN_LOCATOR_SCHEMA_VERSION,
+                                spec["raw_byte_start"], spec["raw_byte_end"],
+                                SPAN_HASH_ALGORITHM, spec["span_hash"], now,
+                                SPAN_DESCRIPTOR_SCHEMA_VERSION,
+                            ),
+                        )
+                    mapping = conn.execute(
+                        """
+                        SELECT * FROM source_span_candidate_tokens
+                        WHERE revision_id = ? AND run_id = ? AND run_item_key = ?
+                          AND producer_version = ? AND input_digest = ?
+                          AND raw_byte_start = ? AND raw_byte_end = ?
+                        """,
+                        (
+                            revision_id, run_id, run_item_key, producer_version,
+                            input_digest, spec["raw_byte_start"],
+                            spec["raw_byte_end"],
+                        ),
+                    ).fetchone()
+                    if mapping is not None:
+                        if mapping["span_id"] != spec["span_id"]:
+                            raise RawEvidenceError("candidate_scope_conflict")
+                        results.append(dict(mapping))
+                        continue
+                    candidate_token = spec["candidate_token"]
+                    if candidate_token is None:
+                        candidate_token = uuid.uuid4().hex
+                    candidate_token = _validate_id(candidate_token, "candidate_token")
+                    token_existing = conn.execute(
+                        "SELECT 1 FROM source_span_candidate_tokens WHERE candidate_token = ?",
+                        (candidate_token,),
+                    ).fetchone()
+                    if token_existing is not None:
+                        raise RawEvidenceError("candidate_scope_conflict")
+                    conn.execute(
+                        """
+                        INSERT INTO source_span_candidate_tokens (
+                            candidate_token, revision_id, run_id, run_item_key,
+                            producer_version, input_digest, raw_byte_start,
+                            raw_byte_end, span_id, created_at,
+                            candidate_schema_version
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate_token, revision_id, run_id, run_item_key,
+                            producer_version, input_digest,
+                            spec["raw_byte_start"], spec["raw_byte_end"],
+                            spec["span_id"], now,
+                            SOURCE_SPAN_CANDIDATE_SCHEMA_VERSION,
+                        ),
+                    )
+                    mapping = conn.execute(
+                        "SELECT * FROM source_span_candidate_tokens WHERE candidate_token = ?",
+                        (candidate_token,),
+                    ).fetchone()
+                    assert mapping is not None
+                    results.append(dict(mapping))
+                conn.commit()
+                return results
+            except RawEvidenceError:
+                with suppress(sqlite3.Error):
+                    conn.rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                with suppress(sqlite3.Error):
+                    conn.rollback()
+                raise RawEvidenceError("candidate_scope_conflict") from exc
+            except sqlite3.Error as exc:
+                with suppress(sqlite3.Error):
+                    conn.rollback()
+                raise RawEvidenceError("storage_unavailable") from exc
+            finally:
+                conn.close()
 
     @guarded_mutation("raw_evidence_source_span_candidate_create")
     def create_candidate_mapping(
@@ -1568,12 +1779,16 @@ class RawEvidenceStore:
                     self._begin_write(conn)
                     item = conn.execute(
                         """
-                        SELECT revision_id FROM import_run_items
+                        SELECT evidence_id, revision_id FROM import_run_items
                         WHERE run_id = ? AND item_key = ?
                         """,
                         (run_id, run_item_key),
                     ).fetchone()
-                    if item is None or item["revision_id"] != revision_id:
+                    if (
+                        item is None
+                        or item["revision_id"] != revision_id
+                        or item["evidence_id"] != descriptor["evidence_id"]
+                    ):
                         conn.rollback()
                         raise RawEvidenceError("candidate_scope_invalid")
                     existing = conn.execute(
@@ -1635,6 +1850,8 @@ class RawEvidenceStore:
         run_item_key: str,
         producer_version: str,
         input_digest: str,
+        allow_sealed: bool = False,
+        allow_restricted_admin: bool = False,
     ) -> dict[str, Any]:
         """Resolve only the current host-rendered opaque token eligibility set."""
 
@@ -1651,6 +1868,15 @@ class RawEvidenceStore:
             ) or len(set(tokens)) != len(tokens):
                 raise RawEvidenceError("attribution_invalid")
         except (RawEvidenceError, TypeError):
+            return {"status": "invalid", "span_ids": []}
+        try:
+            revision = self._fetch_revision(revision_id)
+            self._check_visibility(
+                revision["privacy_class"], allow_sealed, allow_restricted_admin
+            )
+        except RawEvidenceError as exc:
+            if exc.code in {"sealed_access_denied", "restricted_admin_access_denied"}:
+                return {"status": "access_denied", "span_ids": []}
             return {"status": "invalid", "span_ids": []}
         if not tokens:
             return {"status": "empty", "span_ids": []}
@@ -2426,6 +2652,34 @@ class RawEvidenceStore:
                 )
                 conn.execute(
                     """
+                    CREATE TRIGGER IF NOT EXISTS memory_lineage_validate_revision_evidence_insert
+                    BEFORE INSERT ON memory_lineage
+                    BEGIN
+                        SELECT RAISE(ABORT, 'lineage_revision_evidence_mismatch')
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM evidence_revisions AS r
+                            WHERE r.revision_id = NEW.revision_id
+                              AND r.evidence_id = NEW.evidence_id
+                        );
+                    END
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS memory_lineage_validate_revision_evidence_update
+                    BEFORE UPDATE OF evidence_id, revision_id ON memory_lineage
+                    BEGIN
+                        SELECT RAISE(ABORT, 'lineage_revision_evidence_mismatch')
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM evidence_revisions AS r
+                            WHERE r.revision_id = NEW.revision_id
+                              AND r.evidence_id = NEW.evidence_id
+                        );
+                    END
+                    """
+                )
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS source_span_descriptors (
                         span_id TEXT PRIMARY KEY,
                         revision_id TEXT NOT NULL,
@@ -2526,8 +2780,11 @@ class RawEvidenceStore:
                             FROM memory_lineage AS l
                             JOIN source_span_descriptors AS s
                               ON s.span_id = NEW.span_id
+                            JOIN evidence_revisions AS r
+                              ON r.revision_id = s.revision_id
                             WHERE l.lineage_id = NEW.lineage_id
                               AND l.revision_id = s.revision_id
+                              AND l.evidence_id = r.evidence_id
                         );
                     END
                     """

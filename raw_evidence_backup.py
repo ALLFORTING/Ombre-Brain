@@ -36,6 +36,7 @@ from raw_evidence_backup_authority import (
 )
 from raw_evidence_store import (
     HASH_ALGORITHM,
+    REVISION_SCHEMA_VERSION,
     RawEvidenceError,
     LINEAGE_CITATION_SCHEMA_VERSION,
     RawEvidenceStore,
@@ -489,7 +490,8 @@ def _validate_span_citation_semantics(
     descriptors = conn.execute(
         """
         SELECT s.*, r.content_hash, r.content_size_bytes,
-               r.verification_state, l.lifecycle_state
+               r.verification_state, r.hash_algorithm AS revision_hash_algorithm,
+               r.revision_schema_version, l.lifecycle_state
         FROM source_span_descriptors AS s
         JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
         JOIN evidence_lifecycle AS l ON l.revision_id = r.revision_id
@@ -497,6 +499,11 @@ def _validate_span_citation_semantics(
         """
     ).fetchall()
     for descriptor in descriptors:
+        if (
+            descriptor["revision_hash_algorithm"] != HASH_ALGORITHM
+            or descriptor["revision_schema_version"] != REVISION_SCHEMA_VERSION
+        ):
+            raise RawEvidenceBackupError("span_revision_metadata_invalid")
         if (
             descriptor["descriptor_schema_version"] != SPAN_DESCRIPTOR_SCHEMA_VERSION
             or descriptor["locator_kind"] != SPAN_LOCATOR_KIND
@@ -537,14 +544,33 @@ def _validate_span_citation_semantics(
         ):
             raise RawEvidenceBackupError("span_semantic_invalid")
 
+    lineages = conn.execute(
+        """
+        SELECT l.lineage_id, l.evidence_id, l.revision_id,
+               r.evidence_id AS revision_evidence_id
+        FROM memory_lineage AS l
+        LEFT JOIN evidence_revisions AS r ON r.revision_id = l.revision_id
+        ORDER BY l.lineage_id
+        """
+    ).fetchall()
+    for lineage in lineages:
+        if (
+            lineage["revision_evidence_id"] is None
+            or lineage["evidence_id"] != lineage["revision_evidence_id"]
+        ):
+            raise RawEvidenceBackupError("lineage_semantic_invalid")
+
     citations = conn.execute(
         """
         SELECT c.lineage_id, c.span_id, c.citation_schema_version,
                l.revision_id AS lineage_revision_id,
-               s.revision_id AS span_revision_id
+               l.evidence_id AS lineage_evidence_id,
+               s.revision_id AS span_revision_id,
+               r.evidence_id AS span_evidence_id
         FROM memory_lineage_citations AS c
         JOIN memory_lineage AS l ON l.lineage_id = c.lineage_id
         JOIN source_span_descriptors AS s ON s.span_id = c.span_id
+        JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
         ORDER BY c.lineage_id, c.span_id
         """
     ).fetchall()
@@ -552,6 +578,7 @@ def _validate_span_citation_semantics(
         if (
             citation["citation_schema_version"] != LINEAGE_CITATION_SCHEMA_VERSION
             or citation["lineage_revision_id"] != citation["span_revision_id"]
+            or citation["lineage_evidence_id"] != citation["span_evidence_id"]
         ):
             raise RawEvidenceBackupError("citation_semantic_invalid")
 
@@ -563,11 +590,14 @@ def _validate_span_citation_semantics(
                s.revision_id AS span_revision_id,
                s.raw_byte_start AS span_start,
                s.raw_byte_end AS span_end,
-               i.revision_id AS item_revision_id
+               i.revision_id AS item_revision_id,
+               i.evidence_id AS item_evidence_id,
+               r.evidence_id AS revision_evidence_id
         FROM source_span_candidate_tokens AS c
         JOIN source_span_descriptors AS s ON s.span_id = c.span_id
         JOIN import_run_items AS i
           ON i.run_id = c.run_id AND i.item_key = c.run_item_key
+        JOIN evidence_revisions AS r ON r.revision_id = c.revision_id
         ORDER BY c.candidate_token
         """
     ).fetchall()
@@ -576,6 +606,7 @@ def _validate_span_citation_semantics(
             candidate["candidate_schema_version"] != SOURCE_SPAN_CANDIDATE_SCHEMA_VERSION
             or candidate["revision_id"] != candidate["span_revision_id"]
             or candidate["revision_id"] != candidate["item_revision_id"]
+            or candidate["item_evidence_id"] != candidate["revision_evidence_id"]
             or candidate["raw_byte_start"] != candidate["span_start"]
             or candidate["raw_byte_end"] != candidate["span_end"]
         ):

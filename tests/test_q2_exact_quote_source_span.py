@@ -19,7 +19,14 @@ from raw_evidence_restore import _verify_staged_root
 from raw_evidence_import import RawEvidenceImportCoordinator
 from raw_evidence_lifecycle import RawEvidenceLifecycle
 from raw_evidence_store import RawEvidenceError, RawEvidenceStore
-from source_span_producer import SourceAwareSpanProducer, raw_byte_slice
+from source_span_producer import (
+    MODEL_CANDIDATE_CONTEXT_MAX_BYTES,
+    MODEL_CANDIDATE_CONTEXT_MAX_CHARS,
+    MODEL_CANDIDATE_SEGMENT_MAX_BYTES,
+    MODEL_CANDIDATE_SEGMENT_MAX_CHARS,
+    SourceAwareSpanProducer,
+    raw_byte_slice,
+)
 
 
 def _captured(tmp_path, raw: bytes = b"alpha\nbeta\n"):
@@ -53,6 +60,34 @@ def _captured(tmp_path, raw: bytes = b"alpha\nbeta\n"):
         lineage_kind="created",
     )
     return coordinator.store, coordinator, prepared, captured, lineage
+
+
+def _set_privacy(store, evidence_id: str, privacy_class: str) -> None:
+    with sqlite3.connect(store.registry_path) as conn:
+        conn.execute(
+            "UPDATE evidence_objects SET privacy_class = ? WHERE evidence_id = ?",
+            (privacy_class, evidence_id),
+        )
+
+
+def _candidate_span_id(store, candidate_token: str) -> str:
+    with sqlite3.connect(store.registry_path) as conn:
+        row = conn.execute(
+            "SELECT span_id FROM source_span_candidate_tokens WHERE candidate_token = ?",
+            (candidate_token,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _stage_store(store, root, repository_id: str = "9" * 32):
+    store.bind_backup_repository(repository_id)
+    root.mkdir(parents=True, exist_ok=True)
+    staged = root / "staged"
+    staged.mkdir()
+    shutil.copy2(store.registry_path, staged / "registry.sqlite3")
+    shutil.copytree(store.blobs_root, staged / "blobs" / "sha256")
+    return staged, repository_id
 
 
 def test_schema_v5_to_v6_has_structure_only_and_no_backfill(tmp_path):
@@ -133,7 +168,7 @@ def test_strict_utf8_raw_byte_segments_retry_tokens_and_spoof_fail_closed(tmp_pa
         assert "revision_id" not in item and "span_id" not in item and "raw_byte_start" not in item
     selected = producer.create_selected_citations([first.candidates[1].opaque_candidate_token], lineage_id=lineage["lineage_id"], revision_id=captured["revision_id"], run_id=prepared.run_id, run_item_key="source_snapshot", input_digest=digest, allow_restricted_admin=True)
     assert selected == {"status": "valid", "citation_count": 1}
-    assert producer.resolve_model_attribution(["0" * 32], revision_id=captured["revision_id"], run_id=prepared.run_id, run_item_key="source_snapshot", input_digest=digest)["status"] == "invalid"
+    assert producer.resolve_model_attribution(["0" * 32], revision_id=captured["revision_id"], run_id=prepared.run_id, run_item_key="source_snapshot", input_digest=digest, allow_restricted_admin=True)["status"] == "invalid"
     assert producer.produce_candidates(raw, source_format="claude_json", revision_id=captured["revision_id"], run_id=prepared.run_id, run_item_key="source_snapshot", input_digest=digest, allow_restricted_admin=True).status == "UNSUPPORTED"
 
     bad = b"valid\xff"
@@ -186,3 +221,252 @@ def test_restore_staged_root_rechecks_span_payload_semantics(tmp_path):
     payload.write_bytes(b"tamper")
     with pytest.raises(RawEvidenceBackupError, match="^span_semantic_invalid$"):
         _verify_staged_root(staged, repository_id)
+
+
+
+def test_long_single_line_model_views_are_bounded(tmp_path):
+    raw = ("?" * 3000 + "\n").encode("utf-8")
+    store, coordinator, prepared, captured, _ = _captured(tmp_path, raw)
+    result = SourceAwareSpanProducer(store).produce_candidates(
+        raw,
+        source_format="utf8_plain_text",
+        revision_id=captured["revision_id"],
+        run_id=prepared.run_id,
+        run_item_key="source_snapshot",
+        input_digest=hashlib.sha256(raw).hexdigest(),
+        allow_restricted_admin=True,
+    )
+    assert result.status == "READY" and len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert len(candidate.source_segment) <= MODEL_CANDIDATE_SEGMENT_MAX_CHARS
+    assert len(candidate.source_segment.encode("utf-8")) <= MODEL_CANDIDATE_SEGMENT_MAX_BYTES
+    assert len(candidate.source_context) <= MODEL_CANDIDATE_CONTEXT_MAX_CHARS
+    assert len(candidate.source_context.encode("utf-8")) <= MODEL_CANDIDATE_CONTEXT_MAX_BYTES
+    with sqlite3.connect(store.registry_path) as conn:
+        row = conn.execute(
+            "SELECT raw_byte_start, raw_byte_end FROM source_span_descriptors"
+        ).fetchone()
+    assert row == (0, len(raw))
+
+
+def test_candidate_token_replay_is_bound_to_every_explicit_scope(tmp_path):
+    raw = b"alpha\n"
+    store, coordinator, prepared, captured, _ = _captured(tmp_path, raw)
+    producer = SourceAwareSpanProducer(store)
+    digest = hashlib.sha256(raw).hexdigest()
+    result = producer.produce_candidates(
+        raw,
+        source_format="utf8_plain_text",
+        revision_id=captured["revision_id"],
+        run_id=prepared.run_id,
+        run_item_key="source_snapshot",
+        input_digest=digest,
+        allow_restricted_admin=True,
+    )
+    token = result.candidates[0].opaque_candidate_token
+    assert producer.resolve_model_attribution(
+        [token], revision_id=captured["revision_id"], run_id="e" * 32,
+        run_item_key="source_snapshot", input_digest=digest,
+        allow_restricted_admin=True,
+    )["status"] == "invalid"
+    assert producer.resolve_model_attribution(
+        [token], revision_id=captured["revision_id"], run_id=prepared.run_id,
+        run_item_key="wrong-item", input_digest=digest,
+        allow_restricted_admin=True,
+    )["status"] == "invalid"
+    assert producer.resolve_model_attribution(
+        [token], revision_id=captured["revision_id"], run_id=prepared.run_id,
+        run_item_key="source_snapshot",
+        input_digest=hashlib.sha256(b"other").hexdigest(),
+        allow_restricted_admin=True,
+    )["status"] == "invalid"
+    assert SourceAwareSpanProducer(store, producer_version="other-v1").resolve_model_attribution(
+        [token], revision_id=captured["revision_id"], run_id=prepared.run_id,
+        run_item_key="source_snapshot", input_digest=digest,
+        allow_restricted_admin=True,
+    )["status"] == "invalid"
+
+
+def test_sealed_and_restricted_admin_gates_are_orthogonal_for_tokens(tmp_path):
+    restricted_store, _, restricted_run, restricted_capture, _ = _captured(tmp_path / "restricted", b"restricted\n")
+    restricted_producer = SourceAwareSpanProducer(restricted_store)
+    restricted_digest = hashlib.sha256(b"restricted\n").hexdigest()
+    restricted_result = restricted_producer.produce_candidates(
+        b"restricted\n", source_format="utf8_plain_text",
+        revision_id=restricted_capture["revision_id"], run_id=restricted_run.run_id,
+        run_item_key="source_snapshot", input_digest=restricted_digest,
+        allow_restricted_admin=True,
+    )
+    restricted_token = restricted_result.candidates[0].opaque_candidate_token
+    restricted_span = _candidate_span_id(restricted_store, restricted_token)
+    assert restricted_producer.resolve_model_attribution(
+        [restricted_token], revision_id=restricted_capture["revision_id"],
+        run_id=restricted_run.run_id, run_item_key="source_snapshot",
+        input_digest=restricted_digest, allow_sealed=True,
+    )["status"] == "access_denied"
+    assert restricted_producer.resolve_model_attribution(
+        [restricted_token], revision_id=restricted_capture["revision_id"],
+        run_id=restricted_run.run_id, run_item_key="source_snapshot",
+        input_digest=restricted_digest, allow_restricted_admin=True,
+    )["status"] == "valid"
+    with pytest.raises(RawEvidenceError, match="restricted_admin_access_denied"):
+        restricted_store.get_span_descriptor(
+            restricted_span, restricted_capture["revision_id"], allow_sealed=True
+        )
+
+    sealed_store, _, sealed_run, sealed_capture, _ = _captured(tmp_path / "sealed", b"sealed\n")
+    _set_privacy(sealed_store, sealed_capture["evidence_id"], "sealed")
+    sealed_producer = SourceAwareSpanProducer(sealed_store)
+    sealed_digest = hashlib.sha256(b"sealed\n").hexdigest()
+    sealed_result = sealed_producer.produce_candidates(
+        b"sealed\n", source_format="utf8_plain_text",
+        revision_id=sealed_capture["revision_id"], run_id=sealed_run.run_id,
+        run_item_key="source_snapshot", input_digest=sealed_digest,
+        allow_sealed=True,
+    )
+    sealed_token = sealed_result.candidates[0].opaque_candidate_token
+    sealed_span = _candidate_span_id(sealed_store, sealed_token)
+    assert sealed_producer.resolve_model_attribution(
+        [sealed_token], revision_id=sealed_capture["revision_id"],
+        run_id=sealed_run.run_id, run_item_key="source_snapshot",
+        input_digest=sealed_digest, allow_restricted_admin=True,
+    )["status"] == "access_denied"
+    assert sealed_producer.resolve_model_attribution(
+        [sealed_token], revision_id=sealed_capture["revision_id"],
+        run_id=sealed_run.run_id, run_item_key="source_snapshot",
+        input_digest=sealed_digest, allow_sealed=True,
+    )["status"] == "valid"
+    with pytest.raises(RawEvidenceError, match="sealed_access_denied"):
+        sealed_store.get_span_descriptor(
+            sealed_span, sealed_capture["revision_id"], allow_restricted_admin=True
+        )
+
+
+def test_cross_evidence_lineage_spoof_fails_db_and_restore_semantics(tmp_path):
+    store, coordinator, prepared, captured, lineage = _captured(tmp_path)
+    other = store.create(b"other", source_system="test", source_kind="item")
+    span = store.create_span_descriptor(
+        captured["revision_id"], 0, 5, span_id="a" * 32,
+        span_hash=hashlib.sha256(b"alpha").hexdigest(),
+        allow_restricted_admin=True,
+    )
+    with sqlite3.connect(store.registry_path) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="lineage_revision_evidence_mismatch"):
+            conn.execute(
+                "UPDATE memory_lineage SET evidence_id = ? WHERE lineage_id = ?",
+                (other["evidence_id"], lineage["lineage_id"]),
+            )
+    with sqlite3.connect(store.registry_path) as conn:
+        conn.execute("DROP TRIGGER memory_lineage_validate_revision_evidence_update")
+        conn.execute("DROP TRIGGER memory_lineage_citations_validate_insert")
+        conn.execute(
+            "UPDATE memory_lineage SET evidence_id = ? WHERE lineage_id = ?",
+            (other["evidence_id"], lineage["lineage_id"]),
+        )
+        conn.execute(
+            "INSERT INTO memory_lineage_citations (lineage_id, span_id, created_at, citation_schema_version) VALUES (?, ?, ?, 1)",
+            (lineage["lineage_id"], span["span_id"], "2026-08-21T00:00:00+00:00"),
+        )
+    with pytest.raises(RawEvidenceBackupError, match="lineage_semantic_invalid"):
+        _verify_registry_snapshot(store.registry_path, cas_root=store.blobs_root)
+
+
+def test_span_backup_restore_rejects_unsupported_revision_metadata(tmp_path):
+    store, coordinator, prepared, captured, lineage = _captured(tmp_path)
+    span = store.create_span_descriptor(
+        captured["revision_id"], 0, 5, span_id="b" * 32,
+        span_hash=hashlib.sha256(b"alpha").hexdigest(),
+        allow_restricted_admin=True,
+    )
+    store.create_lineage_citation(
+        lineage["lineage_id"], span["span_id"],
+        revision_id=captured["revision_id"], allow_restricted_admin=True,
+    )
+    for field, value in (("revision_schema_version", 99), ("hash_algorithm", "sha1")):
+        staged, repository_id = _stage_store(store, tmp_path / field)
+        with sqlite3.connect(staged / "registry.sqlite3") as conn:
+            conn.execute("DROP TRIGGER evidence_revisions_immutable_content")
+            conn.execute(
+                f"UPDATE evidence_revisions SET {field} = ? WHERE revision_id = ?",
+                (value, captured["revision_id"]),
+            )
+        with pytest.raises(RawEvidenceBackupError, match="span_revision_metadata_invalid"):
+            _verify_registry_snapshot(
+                staged / "registry.sqlite3", cas_root=staged / "blobs" / "sha256"
+            )
+        with pytest.raises(RawEvidenceBackupError, match="span_revision_metadata_invalid"):
+            _verify_staged_root(staged, repository_id)
+
+
+def test_candidate_production_rolls_back_partial_authority_and_retries(tmp_path):
+    raw = b"alpha\nbeta\n"
+    store, coordinator, prepared, captured, _ = _captured(tmp_path, raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(RawEvidenceError, match="candidate_scope_conflict"):
+        store.create_candidate_set(
+            revision_id=captured["revision_id"], run_id=prepared.run_id,
+            run_item_key="source_snapshot", producer_version="atomic-test",
+            input_digest=digest, allow_restricted_admin=True,
+            candidates=[
+                {
+                    "span_id": "c" * 32, "raw_byte_start": 0,
+                    "raw_byte_end": 6,
+                    "span_hash": hashlib.sha256(b"alpha\n").hexdigest(),
+                    "candidate_token": "d" * 32,
+                },
+                {
+                    "span_id": "e" * 32, "raw_byte_start": 6,
+                    "raw_byte_end": 11,
+                    "span_hash": hashlib.sha256(b"beta\n").hexdigest(),
+                    "candidate_token": "d" * 32,
+                },
+            ],
+        )
+    with sqlite3.connect(store.registry_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_span_descriptors").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM source_span_candidate_tokens").fetchone()[0] == 0
+    producer = SourceAwareSpanProducer(store)
+    first = producer.produce_candidates(
+        raw, source_format="utf8_plain_text", revision_id=captured["revision_id"],
+        run_id=prepared.run_id, run_item_key="source_snapshot",
+        input_digest=digest, allow_restricted_admin=True,
+    )
+    retry = producer.produce_candidates(
+        raw, source_format="utf8_plain_text", revision_id=captured["revision_id"],
+        run_id=prepared.run_id, run_item_key="source_snapshot",
+        input_digest=digest, allow_restricted_admin=True,
+    )
+    assert first.status == retry.status == "READY"
+    assert [c.opaque_candidate_token for c in first.candidates] == [c.opaque_candidate_token for c in retry.candidates]
+
+
+def test_explicit_revision_lifecycle_isolation_preserves_old_citation(tmp_path):
+    store, coordinator, prepared, captured, lineage = _captured(tmp_path)
+    old_span = store.create_span_descriptor(
+        captured["revision_id"], 0, 5, span_id="f" * 32,
+        span_hash=hashlib.sha256(b"alpha").hexdigest(),
+        allow_restricted_admin=True,
+    )
+    store.create_lineage_citation(
+        lineage["lineage_id"], old_span["span_id"],
+        revision_id=captured["revision_id"], allow_restricted_admin=True,
+    )
+    newer = store.create(b"newer", source_system="test", source_kind="item")
+    new_span = store.create_span_descriptor(
+        newer["revision_id"], 0, 5, span_id="1" * 32,
+        span_hash=hashlib.sha256(b"newer").hexdigest(),
+    )
+    assert store.verify_span(
+        old_span["span_id"], captured["revision_id"], allow_restricted_admin=True
+    )["state"] == "VERIFIED"
+    RawEvidenceLifecycle(store).redact(newer["evidence_id"], reason="newer-only")
+    assert store.verify_span(
+        old_span["span_id"], captured["revision_id"], allow_restricted_admin=True
+    )["state"] == "VERIFIED"
+    assert store.verify_span(new_span["span_id"], newer["revision_id"])["state"] == "UNAVAILABLE"
+    assert len(
+        store.list_lineage_citations(
+            lineage["lineage_id"], captured["revision_id"],
+            allow_restricted_admin=True,
+        )
+    ) == 1
