@@ -18,6 +18,7 @@ from typing import Any
 from maintenance_write_gate import guarded_mutation
 from raw_evidence_store import (
     CAS_STATES,
+    HASH_ALGORITHM,
     LIFECYCLE_STATES,
     RawEvidenceError,
     RawEvidenceStore,
@@ -285,6 +286,20 @@ class RawEvidenceLifecycle:
                         (row["hash_algorithm"], row["content_hash"]),
                     ).fetchone()[0]
                     if refs:
+                        if row["hash_algorithm"] != HASH_ALGORITHM:
+                            continue
+                        try:
+                            path = self.store._path_from_stored_reference(
+                                row["blob_relpath"], row["content_hash"]
+                            )
+                            if not _verify_owned_file(
+                                path,
+                                row["content_hash"],
+                                row["content_size_bytes"],
+                            ):
+                                continue
+                        except (OSError, RawEvidenceError):
+                            continue
                         conn.execute(
                             """
                             UPDATE cas_objects SET state = 'live', operation_id = NULL,
@@ -421,11 +436,17 @@ class RawEvidenceLifecycle:
             path = self.store._path_from_stored_reference(
                 cas["blob_relpath"], cas["content_hash"]
             )
-            if path.exists():
-                if not _verify_owned_file(path, cas["content_hash"], cas["content_size_bytes"]):
-                    self._mark_integrity_failure(cas, revisions, now)
-                    return {"purged": False, "count": 0, "bytes": 0}
-                path.unlink()
+            if not path.exists():
+                self._mark_missing_payload(cas, revisions, now)
+                return {"purged": False, "count": 0, "bytes": 0}
+            if not _verify_owned_file(
+                path,
+                cas["content_hash"],
+                cas["content_size_bytes"],
+            ):
+                self._mark_integrity_failure(cas, revisions, now)
+                return {"purged": False, "count": 0, "bytes": 0}
+            path.unlink()
             return self._finalize_purge(cas, revisions, now)
         except (OSError, RawEvidenceError):
             return {"purged": False, "count": 0, "bytes": 0}
@@ -607,6 +628,73 @@ class RawEvidenceLifecycle:
                         WHERE evidence_id = ? AND status != 'memory_deleted'
                         """,
                         (now, item["evidence_id"]),
+                    )
+                conn.commit()
+
+    def _mark_missing_payload(self, cas, revisions, now: str) -> None:
+        """Leave a missing payload non-purged and record source loss."""
+
+        with self.store._lock:
+            with self.store._connect() as conn:
+                self.store._begin_write(conn)
+                conn.execute(
+                    """
+                    UPDATE cas_objects SET state = 'live', operation_id = NULL,
+                        updated_at = ?
+                    WHERE hash_algorithm = ? AND content_hash = ?
+                      AND state = 'gc_pending' AND operation_id = ?
+                    """,
+                    (
+                        now,
+                        cas["hash_algorithm"],
+                        cas["content_hash"],
+                        cas["operation_id"],
+                    ),
+                )
+                for item in revisions:
+                    if item["lifecycle_state"] == "purged":
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE evidence_objects SET lifecycle_state = 'tombstoned',
+                            updated_at = ?
+                        WHERE evidence_id = ?
+                        """,
+                        (now, item["evidence_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE evidence_lifecycle SET lifecycle_state = 'missing',
+                            lifecycle_reason = 'payload_missing',
+                            purge_operation_id = NULL, payload_deleted = 0,
+                            updated_at = ?
+                        WHERE revision_id = ? AND purge_operation_id = ?
+                        """,
+                        (now, item["revision_id"], cas["operation_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE memory_lineage SET status = 'evidence_missing',
+                            updated_at = ?
+                        WHERE evidence_id = ? AND status != 'memory_deleted'
+                        """,
+                        (now, item["evidence_id"]),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO lifecycle_audit (
+                            lifecycle_operation_id, evidence_id, revision_id,
+                            from_state, to_state, reason, occurred_at,
+                            actor_class, payload_deleted, reconciliation_result
+                        ) VALUES (?, ?, ?, 'purge_pending', 'missing',
+                            'payload_missing', ?, 'system', 0, 'payload_missing')
+                        """,
+                        (
+                            uuid.uuid4().hex,
+                            item["evidence_id"],
+                            item["revision_id"],
+                            now,
+                        ),
                     )
                 conn.commit()
 

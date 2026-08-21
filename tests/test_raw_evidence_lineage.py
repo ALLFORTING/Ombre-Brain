@@ -356,7 +356,7 @@ async def test_missing_marker_never_fabricates_completed_lineage(tmp_path):
     assert result[0]["status"] == "provenance_broken"
     assert coordinator.list_lineage(run_id=prepared.run_id)[0]["lineage_id"] == lineage["lineage_id"]
     assert coordinator.store.get_content(
-        captured["revision_id"], allow_sealed=True
+        captured["revision_id"], allow_restricted_admin=True
     ) == b"User: source\nAI: answer"
 
 
