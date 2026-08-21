@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sqlite3
 
 import pytest
 
 from raw_evidence_backup import (
+    RawEvidenceBackupError,
     _build_manifest,
     _canonical_json,
     _validate_manifest,
     _verify_registry_snapshot,
 )
+from raw_evidence_restore import _verify_staged_root
 from raw_evidence_import import RawEvidenceImportCoordinator
 from raw_evidence_lifecycle import RawEvidenceLifecycle
 from raw_evidence_store import RawEvidenceError, RawEvidenceStore
@@ -158,3 +161,28 @@ def test_backup_manifest_v2_and_registry_span_semantics(tmp_path):
     tampered["manifest_sha256"] = hashlib.sha256(_canonical_json(digest_input)).hexdigest()
     with pytest.raises(Exception, match="backup_manifest_invalid"):
         _validate_manifest(tampered, _canonical_json(tampered))
+
+
+def test_restore_staged_root_rechecks_span_payload_semantics(tmp_path):
+    store = RawEvidenceStore(tmp_path / "live")
+    raw = b"alpha\n"
+    evidence = store.create(raw, source_system="test", source_kind="item")
+    store.create_span_descriptor(
+        evidence["revision_id"],
+        0,
+        len(raw),
+        span_id="8" * 32,
+        span_hash=hashlib.sha256(raw).hexdigest(),
+    )
+    repository_id = "9" * 32
+    store.bind_backup_repository(repository_id)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    shutil.copy2(store.registry_path, staged / "registry.sqlite3")
+    shutil.copytree(store.blobs_root, staged / "blobs" / "sha256")
+    _verify_staged_root(staged, repository_id)
+
+    payload = staged / "blobs" / "sha256" / evidence["content_hash"][:2] / evidence["content_hash"]
+    payload.write_bytes(b"tamper")
+    with pytest.raises(RawEvidenceBackupError, match="^span_semantic_invalid$"):
+        _verify_staged_root(staged, repository_id)
