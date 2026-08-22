@@ -774,6 +774,10 @@
             "default": "",
             "type": "string"
           },
+          "supersedes_id": {
+            "default": "",
+            "type": "string"
+          },
           "tags": {
             "default": "",
             "type": "string"

@@ -5887,6 +5887,7 @@ async def hold(
     valence: float = -1,
     arousal: float = -1,
     trigger_date: str = "",
+    supersedes_id: str = "",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
@@ -5895,6 +5896,26 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
     content = _apply_display_aliases(content)
+    target_id = supersedes_id.strip()
+    if target_id:
+        target = await bucket_mgr.get(target_id)
+        metadata = target.get("metadata", {}) if isinstance(target, dict) else {}
+        if not isinstance(metadata, dict):
+            return f"supersedes target not found or invalid: {target_id}"
+        try:
+            sealed = int(metadata.get("sealed", 0) or 0) == 1
+        except (TypeError, ValueError):
+            sealed = True
+        if metadata.get("type") != "dynamic" or sealed:
+            return f"supersedes target not found or invalid: {target_id}"
+        try:
+            updated = await bucket_mgr.update(target_id, content=content)
+        except Exception as exc:
+            logger.warning(f"Explicit supersession failed for {target_id}: {exc}")
+            return f"supersedes update failed: {target_id}"
+        if not updated:
+            return f"supersedes update failed: {target_id}"
+        return f"fact evolved in place: {target_id}"
     conflict_warning = await _detect_conflict_warning(content)
     try:
         trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
