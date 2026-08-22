@@ -2,6 +2,7 @@ import frontmatter
 import pytest
 
 from bucket_manager import BucketManager
+from utils import apply_display_aliases
 
 
 @pytest.mark.asyncio
@@ -19,6 +20,31 @@ async def test_bucket_manager_applies_aliases_on_write_and_read(tmp_path):
     assert bucket["content"] == "婷的内容"
     assert bucket["metadata"]["name"] == "婷记录"
     assert bucket["metadata"]["tags"] == ["婷", "朋友"]
+
+
+def test_display_alias_normalization_is_canonical_and_idempotent():
+    canonical = "婷"
+    normalized = apply_display_aliases("婷易")
+
+    assert normalized == canonical
+    assert apply_display_aliases(canonical) == canonical
+    assert apply_display_aliases(normalized) == normalized
+
+
+@pytest.mark.asyncio
+async def test_search_alias_query_matches_canonical_query(tmp_path):
+    manager = BucketManager({"buckets_dir": str(tmp_path / "buckets")})
+    bucket_id = await manager.create(content="婷的内容", name="婷记录")
+    alias_trace = {}
+    canonical_trace = {}
+
+    alias_results = await manager.search("婷易", trace=alias_trace)
+    canonical_results = await manager.search("婷", trace=canonical_trace)
+
+    assert [bucket["id"] for bucket in alias_results] == [bucket_id]
+    assert alias_results == canonical_results
+    assert alias_trace["query"] == "婷易"
+    assert canonical_trace["query"] == "婷"
 
 
 @pytest.mark.asyncio
