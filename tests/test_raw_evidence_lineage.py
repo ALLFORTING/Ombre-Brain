@@ -78,7 +78,7 @@ def test_v2_to_v5_migration_has_lineage_table_without_backfill(tmp_path):
     with sqlite3.connect(migrated.registry_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM store_schema WHERE singleton = 1"
-        ).fetchone()[0] == 5
+        ).fetchone()[0] == 6
         assert conn.execute(
             "SELECT COUNT(*) FROM memory_lineage"
         ).fetchone()[0] == 0

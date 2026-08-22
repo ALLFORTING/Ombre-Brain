@@ -36,14 +36,21 @@ from raw_evidence_backup_authority import (
 )
 from raw_evidence_store import (
     HASH_ALGORITHM,
+    REVISION_SCHEMA_VERSION,
     RawEvidenceError,
+    LINEAGE_CITATION_SCHEMA_VERSION,
     RawEvidenceStore,
     SCHEMA_VERSION,
+    SOURCE_SPAN_CANDIDATE_SCHEMA_VERSION,
+    SPAN_DESCRIPTOR_SCHEMA_VERSION,
+    SPAN_HASH_ALGORITHM,
+    SPAN_LOCATOR_KIND,
+    SPAN_LOCATOR_SCHEMA_VERSION,
     _now_iso,
 )
 
 
-BACKUP_FORMAT_VERSION = 1
+BACKUP_FORMAT_VERSION = 2
 CONTAINER_VERSION = 1
 ENCRYPTION_PROFILE = "X25519-HKDF-SHA256+A256GCM"
 MAGIC = b"OBRAW1\n"
@@ -151,6 +158,9 @@ class RawEvidenceBackupService:
                 registry_path, operation_root / "cas", operation_id, claim_now=now
             )
             self._assert_claim(operation_id, now=now)
+            registry_info = _verify_registry_snapshot(
+                registry_path, cas_root=operation_root / "cas"
+            )
             manifest = _build_manifest(
                 backup_id=backup_id,
                 operation_id=operation_id,
@@ -432,7 +442,9 @@ def _snapshot_registry(store: RawEvidenceStore, destination: Path) -> None:
             source_connection.close()
 
 
-def _verify_registry_snapshot(path: Path) -> dict[str, Any]:
+def _verify_registry_snapshot(
+    path: Path, *, cas_root: Path | None = None
+) -> dict[str, Any]:
     try:
         with sqlite3.connect(str(path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -448,13 +460,16 @@ def _verify_registry_snapshot(path: Path) -> dict[str, Any]:
                 raise RawEvidenceBackupError("schema_unsupported")
             tables = [
                 "store_schema", "evidence_objects", "evidence_revisions",
-                "import_runs", "import_run_items", "memory_lineage", "cas_objects",
+                "import_runs", "import_run_items", "memory_lineage",
+                "source_span_descriptors", "memory_lineage_citations",
+                "source_span_candidate_tokens", "cas_objects",
                 "evidence_lifecycle", "lifecycle_audit", "o5e_coordination",
             ]
             counts = {
                 table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in tables
             }
+            _validate_span_citation_semantics(conn, cas_root=cas_root)
             raw = path.read_bytes()
     except RawEvidenceBackupError:
         raise
@@ -467,6 +482,135 @@ def _verify_registry_snapshot(path: Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "table_counts": counts,
     }
+
+
+def _validate_span_citation_semantics(
+    conn: sqlite3.Connection, *, cas_root: Path | None
+) -> None:
+    descriptors = conn.execute(
+        """
+        SELECT s.*, r.content_hash, r.content_size_bytes,
+               r.verification_state, r.hash_algorithm AS revision_hash_algorithm,
+               r.revision_schema_version, l.lifecycle_state
+        FROM source_span_descriptors AS s
+        JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
+        JOIN evidence_lifecycle AS l ON l.revision_id = r.revision_id
+        ORDER BY s.span_id
+        """
+    ).fetchall()
+    for descriptor in descriptors:
+        if (
+            descriptor["revision_hash_algorithm"] != HASH_ALGORITHM
+            or descriptor["revision_schema_version"] != REVISION_SCHEMA_VERSION
+        ):
+            raise RawEvidenceBackupError("span_revision_metadata_invalid")
+        if (
+            descriptor["descriptor_schema_version"] != SPAN_DESCRIPTOR_SCHEMA_VERSION
+            or descriptor["locator_kind"] != SPAN_LOCATOR_KIND
+            or descriptor["locator_schema_version"] != SPAN_LOCATOR_SCHEMA_VERSION
+            or descriptor["span_hash_algorithm"] != SPAN_HASH_ALGORITHM
+            or not _valid_hash(descriptor["span_hash"])
+            or isinstance(descriptor["raw_byte_start"], bool)
+            or not isinstance(descriptor["raw_byte_start"], int)
+            or isinstance(descriptor["raw_byte_end"], bool)
+            or not isinstance(descriptor["raw_byte_end"], int)
+            or isinstance(descriptor["content_size_bytes"], bool)
+            or not isinstance(descriptor["content_size_bytes"], int)
+            or not 0 <= descriptor["raw_byte_start"] < descriptor["raw_byte_end"]
+            or descriptor["raw_byte_end"] > descriptor["content_size_bytes"]
+        ):
+            raise RawEvidenceBackupError("span_semantic_invalid")
+        if cas_root is None:
+            continue
+        payload = cas_root / descriptor["content_hash"][:2] / descriptor["content_hash"]
+        if not payload.is_file():
+            if (
+                descriptor["lifecycle_state"] == "available"
+                and descriptor["verification_state"] == "verified"
+            ):
+                raise RawEvidenceBackupError("span_payload_missing")
+            continue
+        try:
+            raw = payload.read_bytes()
+        except OSError as exc:
+            raise RawEvidenceBackupError("span_payload_unreadable") from exc
+        if (
+            len(raw) != descriptor["content_size_bytes"]
+            or hashlib.sha256(raw).hexdigest() != descriptor["content_hash"]
+            or hashlib.sha256(
+                raw[descriptor["raw_byte_start"] : descriptor["raw_byte_end"]]
+            ).hexdigest()
+            != descriptor["span_hash"]
+        ):
+            raise RawEvidenceBackupError("span_semantic_invalid")
+
+    lineages = conn.execute(
+        """
+        SELECT l.lineage_id, l.evidence_id, l.revision_id,
+               r.evidence_id AS revision_evidence_id
+        FROM memory_lineage AS l
+        LEFT JOIN evidence_revisions AS r ON r.revision_id = l.revision_id
+        ORDER BY l.lineage_id
+        """
+    ).fetchall()
+    for lineage in lineages:
+        if (
+            lineage["revision_evidence_id"] is None
+            or lineage["evidence_id"] != lineage["revision_evidence_id"]
+        ):
+            raise RawEvidenceBackupError("lineage_semantic_invalid")
+
+    citations = conn.execute(
+        """
+        SELECT c.lineage_id, c.span_id, c.citation_schema_version,
+               l.revision_id AS lineage_revision_id,
+               l.evidence_id AS lineage_evidence_id,
+               s.revision_id AS span_revision_id,
+               r.evidence_id AS span_evidence_id
+        FROM memory_lineage_citations AS c
+        JOIN memory_lineage AS l ON l.lineage_id = c.lineage_id
+        JOIN source_span_descriptors AS s ON s.span_id = c.span_id
+        JOIN evidence_revisions AS r ON r.revision_id = s.revision_id
+        ORDER BY c.lineage_id, c.span_id
+        """
+    ).fetchall()
+    for citation in citations:
+        if (
+            citation["citation_schema_version"] != LINEAGE_CITATION_SCHEMA_VERSION
+            or citation["lineage_revision_id"] != citation["span_revision_id"]
+            or citation["lineage_evidence_id"] != citation["span_evidence_id"]
+        ):
+            raise RawEvidenceBackupError("citation_semantic_invalid")
+
+    candidates = conn.execute(
+        """
+        SELECT c.revision_id, c.run_id, c.run_item_key,
+               c.raw_byte_start, c.raw_byte_end,
+               c.span_id, c.candidate_schema_version,
+               s.revision_id AS span_revision_id,
+               s.raw_byte_start AS span_start,
+               s.raw_byte_end AS span_end,
+               i.revision_id AS item_revision_id,
+               i.evidence_id AS item_evidence_id,
+               r.evidence_id AS revision_evidence_id
+        FROM source_span_candidate_tokens AS c
+        JOIN source_span_descriptors AS s ON s.span_id = c.span_id
+        JOIN import_run_items AS i
+          ON i.run_id = c.run_id AND i.item_key = c.run_item_key
+        JOIN evidence_revisions AS r ON r.revision_id = c.revision_id
+        ORDER BY c.candidate_token
+        """
+    ).fetchall()
+    for candidate in candidates:
+        if (
+            candidate["candidate_schema_version"] != SOURCE_SPAN_CANDIDATE_SCHEMA_VERSION
+            or candidate["revision_id"] != candidate["span_revision_id"]
+            or candidate["revision_id"] != candidate["item_revision_id"]
+            or candidate["item_evidence_id"] != candidate["revision_evidence_id"]
+            or candidate["raw_byte_start"] != candidate["span_start"]
+            or candidate["raw_byte_end"] != candidate["span_end"]
+        ):
+            raise RawEvidenceBackupError("candidate_semantic_invalid")
 
 
 def _build_manifest(
@@ -499,6 +643,16 @@ def _build_manifest(
             "revisions": registry_info["table_counts"]["evidence_revisions"],
             "imports": registry_info["table_counts"]["import_runs"],
             "lineage": registry_info["table_counts"]["memory_lineage"],
+            "span_descriptors": registry_info["table_counts"]["source_span_descriptors"],
+            "citations": registry_info["table_counts"]["memory_lineage_citations"],
+        },
+        "span_descriptors": {
+            "count": registry_info["table_counts"]["source_span_descriptors"],
+            "schema_version": SPAN_DESCRIPTOR_SCHEMA_VERSION,
+        },
+        "citations": {
+            "count": registry_info["table_counts"]["memory_lineage_citations"],
+            "schema_version": LINEAGE_CITATION_SCHEMA_VERSION,
         },
         "encryption_profile": ENCRYPTION_PROFILE,
         "recipient_key_fingerprint": recipient_fingerprint,
@@ -748,7 +902,9 @@ def _extract_and_validate_archive(archive_path: Path, restore_root: Path) -> dic
                     expected_hash = entry["content_hash"]
                 if size != expected_size or digest.hexdigest() != expected_hash:
                     raise RawEvidenceBackupError("backup_integrity_failed")
-            _verify_registry_snapshot(restore_root / "registry.sqlite3")
+            _verify_registry_snapshot(
+                restore_root / "registry.sqlite3", cas_root=restore_root / "cas"
+            )
         return manifest
     except RawEvidenceBackupError:
         raise
@@ -763,8 +919,9 @@ def _validate_manifest(manifest: Any, raw: bytes) -> None:
         "backup_format_version", "source_registry_schema", "repository_id",
         "backup_operation_id", "backup_id", "restore_epoch", "created_at",
         "expires_at", "policy_version", "registry_snapshot", "table_counts",
-        "cas_entries", "logical_counts", "encryption_profile",
-        "recipient_key_fingerprint", "completeness_state", "manifest_sha256",
+        "cas_entries", "logical_counts", "span_descriptors", "citations",
+        "encryption_profile", "recipient_key_fingerprint", "completeness_state",
+        "manifest_sha256",
     }
     if set(manifest) != required or manifest["completeness_state"] != "complete":
         raise RawEvidenceBackupError("backup_manifest_invalid")
@@ -785,6 +942,26 @@ def _validate_manifest(manifest: Any, raw: bytes) -> None:
     if snapshot["path"] != "registry.sqlite3" or snapshot["schema_version"] != SCHEMA_VERSION:
         raise RawEvidenceBackupError("backup_manifest_invalid")
     if not _valid_hash(snapshot["sha256"]) or not _bounded_int(snapshot["size_bytes"], 0, MAX_ARCHIVE_BYTES):
+        raise RawEvidenceBackupError("backup_manifest_invalid")
+    for field, table, schema_version in (
+        ("span_descriptors", "source_span_descriptors", SPAN_DESCRIPTOR_SCHEMA_VERSION),
+        ("citations", "memory_lineage_citations", LINEAGE_CITATION_SCHEMA_VERSION),
+    ):
+        value = manifest[field]
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"count", "schema_version"}
+            or not _bounded_int(value["count"], 0, 1_000_000)
+            or value["schema_version"] != schema_version
+            or manifest["table_counts"].get(table) != value["count"]
+        ):
+            raise RawEvidenceBackupError("backup_manifest_invalid")
+    logical = manifest["logical_counts"]
+    if (
+        not isinstance(logical, dict)
+        or logical.get("span_descriptors") != manifest["span_descriptors"]["count"]
+        or logical.get("citations") != manifest["citations"]["count"]
+    ):
         raise RawEvidenceBackupError("backup_manifest_invalid")
     if not isinstance(manifest["cas_entries"], list) or len(manifest["cas_entries"]) > 1_000_000:
         raise RawEvidenceBackupError("backup_manifest_invalid")

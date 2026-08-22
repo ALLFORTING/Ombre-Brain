@@ -300,7 +300,9 @@ def _prepare_staged_root(
         )
         _expire_staged_rows(conn, now)
         conn.commit()
-    _verify_registry_snapshot(registry_target)
+    _verify_registry_snapshot(
+        registry_target, cas_root=stage_root / "blobs" / "sha256"
+    )
     _verify_staged_cas(stage_root, manifest)
 
 
@@ -343,7 +345,9 @@ def _expire_staged_rows(conn: sqlite3.Connection, now: str) -> None:
 
 def _verify_staged_root(root: Path, repository_id: str) -> None:
     registry = root / "registry.sqlite3"
-    _verify_registry_snapshot(registry)
+    _verify_registry_snapshot(
+        registry, cas_root=root / "blobs" / "sha256"
+    )
     with sqlite3.connect(str(registry)) as conn:
         row = conn.execute(
             "SELECT repository_id, backup_state, active_backup_operation_id "

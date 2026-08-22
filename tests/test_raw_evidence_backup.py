@@ -50,7 +50,7 @@ def test_backup_create_verify_is_encrypted_and_catalogued(tmp_path):
     assert b"backup fixture" not in bundle.read_bytes()
     verified = service.verify(bundle.name, key)
     assert verified["activatable"] is True
-    assert verified["registry_schema"] == 5
+    assert verified["registry_schema"] == 6
     assert authority.catalog_by_name(bundle.name)["status"] == "active"
     assert live.backup_claim_status()["backup_state"] == "released"
 
