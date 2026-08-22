@@ -1281,6 +1281,8 @@ class BucketManager:
                 trace["status"] = "empty_query"
             return []
 
+        query = apply_display_aliases(query)
+
         limit = limit or self.max_results
         all_buckets = (
             list(candidate_buckets)
