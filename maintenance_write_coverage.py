@@ -379,7 +379,7 @@ NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
     ("server.py", "_compose_breath_query_matches", 2530, "bucket_mgr.touch"): "incidental_bucket_activation",
     ("server.py", "_attachment_probe_scan", 3116, "replace"): "string_normalization",
     ("server.py", "_rm_verified_view_image", 4204, "Image.open"): "pillow_image_read",
-    ("server.py", "hold", 5919, "replace"): "string_normalization",
+    ("server.py", "hold", 5940, "replace"): "string_normalization",
     ("server.py", "boot", 6463, "replace"): "string_normalization",
     ("server.py", "dream", 6665, "bucket_mgr.touch"): "incidental_bucket_activation",
     ("server.py", "dream", 6691, "bucket_mgr.touch"): "incidental_bucket_activation",
