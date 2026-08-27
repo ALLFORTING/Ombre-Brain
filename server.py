@@ -221,12 +221,12 @@ def add_mcp_auth_middleware(app):
     """
     Protect only the streamable-http MCP endpoint.
 
-    When OMBRE_AUTH_TOKEN is unset, this intentionally keeps the old behavior so
-    existing deployments do not disconnect after upgrading.
+    HTTP MCP is deny-by-default when OMBRE_AUTH_TOKEN is unset. Anonymous access
+    requires an explicit OMBRE_MCP_ALLOW_ANONYMOUS_HTTP opt-in.
     """
-    if not _mcp_auth_token():
-        logger.warning("OMBRE_AUTH_TOKEN not set, /mcp is unauthenticated")
-        return app
+    expected = _mcp_auth_token()
+    anonymous_opt_in = _env_flag_enabled(os.environ.get("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", ""))
+    if not expected: logger.warning("SECURITY WARNING: anonymous HTTP MCP enabled by OMBRE_MCP_ALLOW_ANONYMOUS_HTTP" if anonymous_opt_in else "OMBRE_AUTH_TOKEN not set; /mcp is disabled")
 
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import PlainTextResponse
@@ -234,27 +234,27 @@ def add_mcp_auth_middleware(app):
     class MCPAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             path = request.url.path or ""
-            if path != "/mcp" and not path.startswith("/mcp/"):
+            if not _is_mcp_http_path(path):
                 return await call_next(request)
 
-            expected = _mcp_auth_token()
+            if not expected and not anonymous_opt_in: return PlainTextResponse("Unauthorized", status_code=401)
+
             authorization = request.headers.get("authorization", "")
             bearer = ""
             if authorization.lower().startswith("bearer "):
                 bearer = authorization[7:].strip()
-            query_token = request.query_params.get("token", "").strip()
 
-            if (
-                _constant_time_token_match(bearer, expected)
-                or _constant_time_token_match(query_token, expected)
-            ):
+            if anonymous_opt_in and not expected: return await call_next(request)
+
+            if _constant_time_token_match(bearer, expected):
                 return await call_next(request)
 
             return PlainTextResponse("Unauthorized", status_code=401)
 
     app.add_middleware(MCPAuthMiddleware)
-    logger.info("OMBRE_AUTH_TOKEN set, /mcp authentication enabled")
+    logger.info("OMBRE_AUTH_TOKEN set, /mcp authentication enabled" if expected else "HTTP MCP authentication not configured")
     return app
+
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -7962,6 +7962,36 @@ from mcp_prompts import register_prompts
 register_prompts(mcp)
 
 
+def _is_mcp_http_path(path: str) -> bool:
+    return (
+        path in {"/mcp", "/sse", "/messages"}
+        or path.startswith("/mcp/")
+        or path.startswith("/messages/")
+    )
+
+
+def _http_allowed_origins() -> list[str]:
+    raw = os.environ.get("OMBRE_HTTP_ALLOWED_ORIGINS", "")
+    return [
+        origin
+        for origin in (item.strip() for item in raw.split(","))
+        if origin and origin != "*"
+    ]
+
+
+def add_http_cors_middleware(app):
+    from starlette.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_http_allowed_origins(),
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+    return app
+
+
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
@@ -7969,7 +7999,6 @@ if __name__ == "__main__":
     if transport in ("sse", "streamable-http"):
         import threading
         import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
 
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
@@ -8005,13 +8034,7 @@ if __name__ == "__main__":
         else:
             _app = mcp.sse_app()
         add_mcp_auth_middleware(_app)
-        _app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            expose_headers=["*"],
-        )
+        add_http_cors_middleware(_app)
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
     else:
