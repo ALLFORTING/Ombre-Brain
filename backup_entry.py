@@ -123,7 +123,6 @@ def run() -> None:
         return
 
     import uvicorn
-    from starlette.middleware.cors import CORSMiddleware
 
     async def keepalive_loop():
         await asyncio.sleep(10)
@@ -150,13 +149,7 @@ def run() -> None:
     else:
         app = server.mcp.sse_app()
     server.add_mcp_auth_middleware(app)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-    )
+    server.add_http_cors_middleware(app)
     uvicorn.run(app, host="0.0.0.0", port=server.OMBRE_PORT)
 
 
