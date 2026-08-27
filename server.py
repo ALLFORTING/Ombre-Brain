@@ -234,7 +234,7 @@ def add_mcp_auth_middleware(app):
     class MCPAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             path = request.url.path or ""
-            if path != "/mcp" and not path.startswith("/mcp/"):
+            if not _is_mcp_http_path(path):
                 return await call_next(request)
 
             if not expected and not anonymous_opt_in: return PlainTextResponse("Unauthorized", status_code=401)
@@ -7960,6 +7960,14 @@ def _safe_asset_ingest_error(exc: Exception, fallback: str = "asset_unavailable"
 from mcp_prompts import register_prompts
 
 register_prompts(mcp)
+
+
+def _is_mcp_http_path(path: str) -> bool:
+    return (
+        path in {"/mcp", "/sse", "/messages"}
+        or path.startswith("/mcp/")
+        or path.startswith("/messages/")
+    )
 
 
 def _http_allowed_origins() -> list[str]:

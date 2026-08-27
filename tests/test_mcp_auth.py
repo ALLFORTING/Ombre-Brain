@@ -31,6 +31,12 @@ def _app_with_auth(server):
     return app
 
 
+def _sse_app_with_auth(server):
+    app = server.mcp.sse_app()
+    server.add_mcp_auth_middleware(app)
+    return app
+
+
 def test_mcp_fails_closed_when_token_unset_by_default(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
@@ -84,6 +90,43 @@ def test_non_mcp_paths_remain_exempt_with_token(tmp_path, monkeypatch):
     assert client.get("/health").status_code == 200
     assert client.get("/dashboard").status_code == 200
     assert client.post("/auth/login").status_code == 200
+
+
+def test_sse_mcp_routes_fail_closed_without_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_sse_app_with_auth(server))
+
+    assert client.get("/sse").status_code == 401
+    assert client.post("/messages").status_code == 401
+    assert client.get("/health").status_code == 200
+
+
+def test_sse_mcp_message_route_accepts_bearer(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.setenv("OMBRE_AUTH_TOKEN", "test-token")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_sse_app_with_auth(server))
+
+    assert client.post(
+        "/messages",
+        headers={"Authorization": "Bearer test-token"},
+    ).status_code != 401
+
+
+def test_sse_mcp_message_route_allows_explicit_anonymous_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", "true")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_sse_app_with_auth(server))
+
+    assert client.post("/messages").status_code != 401
 
 
 def test_http_cors_origins_are_explicit(tmp_path, monkeypatch):
