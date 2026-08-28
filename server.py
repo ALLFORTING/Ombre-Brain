@@ -1068,8 +1068,8 @@ async def dream_hook(request):
 
 
 # =============================================================
-# Internal helper: merge-or-create
-# 内部辅助：检查是否可合并，可以则合并，否则新建
+# Internal helper: deduplicate-or-create
+# 内部辅助：仅复用确定性重复，否则新建
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
@@ -1084,10 +1084,10 @@ async def _merge_or_create(
     trigger_date: str = "",
 ) -> tuple[str, bool]:
     """
-    Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
-    检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    Reuse a deterministic duplicate if found; otherwise create a new bucket.
+    Returns (bucket_id_or_name, is_merged), where True means an existing record
+    was reused.
+    仅复用确定性重复，否则新建；返回 (桶ID或名称, 是否复用已有记录)。
     """
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None, include_sealed=False)
@@ -1095,30 +1095,20 @@ async def _merge_or_create(
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
 
-    if existing and not _is_sealed(existing[0]) and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+    if existing:
         bucket = existing[0]
-        # --- Never merge into pinned/protected buckets ---
-        # --- 不合并到钉选/保护桶 ---
-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-            try:
-                merged = await dehydrator.merge(bucket["content"], content)
-                old_v = bucket["metadata"].get("valence", 0.5)
-                old_a = bucket["metadata"].get("arousal", 0.3)
-                merged_valence = round((old_v + valence) / 2, 2)
-                merged_arousal = round((old_a + arousal) / 2, 2)
-                await bucket_mgr.update(
-                    bucket["id"],
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                    **({"trigger_date": trigger_date, "trigger_last_seen": ""} if trigger_date else {}),
-                )
-                return bucket["metadata"].get("name", bucket["id"]), True
-            except Exception as e:
-                logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
+        metadata = bucket.get("metadata", {})
+        normalized_existing = BucketManager._normalize_search_text(bucket.get("content", ""))
+        normalized_content = BucketManager._normalize_search_text(content)
+        if (
+            not _is_sealed(bucket)
+            and metadata.get("type") != "feel"
+            and normalized_existing == normalized_content
+            and not (metadata.get("pinned") or metadata.get("protected"))
+        ):
+            # Deterministic duplicate only: reuse the existing record without
+            # invoking the lossy LLM merge path.
+            return metadata.get("name", bucket["id"]), True
 
     bucket_id = await bucket_mgr.create(
         content=content,

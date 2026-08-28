@@ -54,7 +54,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 - **永不衰减**：permanent / pinned / protected / feel
 
 **记忆间交互**
-- **智能合并**：新记忆与相似桶（score>75）自动 LLM 合并，valence/arousal 取均值，tags/domain 并集
+- **保守去重**：普通自动写入只有正文经现有归一化后确定性相等才复用已有桶；相似但不同的内容新建并可通过 related 保留关联
 - **时间涟漪**：touch 一个桶时，±48h 内创建的桶 activation_count +0.3（上限 5 桶/次）
 - **向量相似网络**：embedding 余弦相似度 >0.5 建边
 - **Feel 结晶化**：≥3 条相似 feel（相似度>0.7）→ 提示升级为钉选准则
@@ -98,7 +98,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 - 若指定 valence，对匹配桶的 valence 微调 ±0.1（情感记忆重构）
 
 **`hold`** — 两种模式：
-- **普通模式**（`feel=False`，默认）：自动 LLM 分析 domain/valence/arousal/tags/name → 向量相似度查重 → 相似度>0.85 则合并到已有桶 → 否则新建 dynamic 桶 → 生成 embedding
+- **普通模式**（`feel=False`，默认）：自动 LLM 分析 domain/valence/arousal/tags/name → 搜索候选 → 仅确定性文本重复时复用已有桶，否则新建 dynamic 桶 → 生成 embedding
 - **Feel 模式**（`feel=True`）：跳过 LLM 分析，直接存为 `feel` 类型桶（存入 `feel/` 目录），不参与普通浮现/衰减/合并。若提供 `source_bucket`，标记源记忆为 `digested=True` 并写入 `model_valence`。返回格式：`🫧feel→{bucket_id}`
 
 **`dream`** — 做梦/自省触发器：
@@ -329,7 +329,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 | `transport` | `"stdio"` | 传输模式 |
 | `log_level` | `"INFO"` | 日志级别 |
 | `buckets_dir` | `"./buckets"` | 记忆桶目录 |
-| `merge_threshold` | `75` | 合并相似度阈值 (0-100) |
+| `merge_threshold` | `75` | O5B 更新规划专用相似度阈值；普通 hold/grow 和 generic import 不使用此阈值，仅复用确定性文本重复项 |
 | `dehydration.model` | `"deepseek-chat"` | 脱水用 LLM 模型 |
 | `dehydration.base_url` | `"https://api.deepseek.com/v1"` | API 地址 |
 | `dehydration.api_key` | `""` | API 密钥 |

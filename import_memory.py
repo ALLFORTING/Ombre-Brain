@@ -344,7 +344,7 @@ IMPORT_EXTRACT_PROMPT = """你是一个对话记忆提取专家。从以下对�
 
 提取规则：
 1. 提取用户的事实、偏好、习惯、重要事件、情感时刻
-2. 同一话题的零散信息整合为一条记忆
+2. 仅当零散片段明确描述同一底层事实或事件时才整合；仅同一话题不够。不同日期、事件、人物/实体、状态、计划与结果、修正/否定或改变的观点必须分别保留为独立记忆
 3. 过滤掉纯技术调试输出、代码块、重复问答、无意义寒暄
 4. 如果对话中有特殊暗号、仪式性行为、关键承诺等，标记 preserve_raw=true；这表示保留本次提取结果中的 content，并在导入时跳过后续合并/脱水摘要，不表示保留上传文件的原始逐字稿或来源证据
 5. 如果内容是用户和AI之间的习惯性互动模式（例如打招呼方式、告别习惯），标记 is_pattern=true
@@ -666,7 +666,11 @@ class ImportEngine:
         merge_threshold = self.config.get("merge_threshold", 75)
         if existing and existing[0].get("score", 0) > merge_threshold:
             bucket = existing[0]
-            if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+            # O5B keeps its durable planned-update and lineage semantics.
+            if (
+                bucket["metadata"].get("type") != "feel"
+                and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
+            ):
                 try:
                     merged = await self.dehydrator.merge(bucket["content"], content)
                     self.state.data["api_calls"] += 1
@@ -1136,7 +1140,7 @@ class ImportEngine:
         return validated
 
     async def _merge_or_create_item(self, item: dict) -> bool:
-        """Try to merge with existing bucket, or create new. Returns is_merged."""
+        """Reuse only deterministic duplicates; otherwise create a new bucket."""
         content = item["content"]
         domain = item.get("domain", ["未分类"])
         tags = item.get("tags", [])
@@ -1150,29 +1154,18 @@ class ImportEngine:
         except Exception:
             existing = []
 
-        merge_threshold = self.config.get("merge_threshold", 75)
-
-        if existing and existing[0].get("score", 0) > merge_threshold:
+        if existing:
             bucket = existing[0]
-            if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                try:
-                    merged = await self.dehydrator.merge(bucket["content"], content)
-                    self.state.data["api_calls"] += 1
-                    old_v = bucket["metadata"].get("valence", 0.5)
-                    old_a = bucket["metadata"].get("arousal", 0.3)
-                    await self.bucket_mgr.update(
-                        bucket["id"],
-                        content=merged,
-                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                        importance=max(bucket["metadata"].get("importance", 5), importance),
-                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                        valence=round((old_v + valence) / 2, 2),
-                        arousal=round((old_a + arousal) / 2, 2),
-                    )
-                    return True
-                except Exception as e:
-                    logger.warning(f"Merge failed during import: {e}")
-                    self.state.data["api_calls"] += 1
+            metadata = bucket.get("metadata", {})
+            if (
+                not metadata.get("sealed")
+                and metadata.get("type") != "feel"
+                and self.bucket_mgr._normalize_search_text(bucket.get("content", ""))
+                == self.bucket_mgr._normalize_search_text(content)
+                and not (metadata.get("pinned") or metadata.get("protected"))
+            ):
+                # Generic imports may reuse only deterministic textual duplicates.
+                return True
 
         # Create new
         bucket_id = await self.bucket_mgr.create(
