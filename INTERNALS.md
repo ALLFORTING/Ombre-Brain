@@ -329,7 +329,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 | `transport` | `"stdio"` | 传输模式 |
 | `log_level` | `"INFO"` | 日志级别 |
 | `buckets_dir` | `"./buckets"` | 记忆桶目录 |
-| `merge_threshold` | `75` | legacy 导入/O5B 更新规划的相似度阈值；普通 hold/grow 不以相似度触发合并 |
+| `merge_threshold` | `75` | O5B 更新规划专用相似度阈值；普通 hold/grow 和 generic import 不使用此阈值，仅复用确定性文本重复项 |
 | `dehydration.model` | `"deepseek-chat"` | 脱水用 LLM 模型 |
 | `dehydration.base_url` | `"https://api.deepseek.com/v1"` | API 地址 |
 | `dehydration.api_key` | `""` | API 密钥 |

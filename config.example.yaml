@@ -22,9 +22,11 @@ log_level: "INFO"
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
 
 # --- Merge threshold / 桶合并阈值 ---
-# Used by legacy generic imports and durable O5B update planning; ordinary
-# hold/grow writes reuse only deterministic textual duplicates.
-# 用于 legacy 普通导入和 O5B 持久更新规划；hold/grow 仅复用确定性文本重复项。
+# Used only by durable O5B update planning; generic imports and ordinary
+# hold/grow writes do not use this threshold and reuse only deterministic
+# textual duplicates.
+# 仅用于 O5B 持久更新规划；普通导入和 hold/grow 不使用此阈值，
+# 仅复用确定性文本重复项。
 merge_threshold: 75
 
 # --- Dehydration API / 脱水压缩 API 配置 ---
