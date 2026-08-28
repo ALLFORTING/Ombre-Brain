@@ -6,6 +6,9 @@
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
+| `OMBRE_AUTH_TOKEN` | 否 | 无 | HTTP MCP（`/mcp`、`/mcp/*`、SSE 的 `/sse` 与 `/messages`）只接受 `Authorization: Bearer <token>`；未设置或不匹配时拒绝访问，不支持 query-token |
+| `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` | 否 | 关闭 | 显式允许匿名 HTTP MCP；默认关闭，启用会输出强安全警告，仅适合刻意的本地/受控场景，绝不要用于公网部署 |
+| `OMBRE_HTTP_ALLOWED_ORIGINS` | 否 | 空 | 逗号分隔的明确浏览器 origin；为空时不允许跨 origin 浏览器访问，不要使用 `*`。CORS 是浏览器策略，不是 MCP 认证 |
 | `OMBRE_BUCKETS_DIR` | 否 | `./buckets` | 记忆桶文件存放目录（绑定 Docker Volume 时务必设置） |
 | `OMBRE_RAW_EVIDENCE_ROOT` | 否 | 无 | O5B 明确启用后使用的 Raw Evidence 绝对路径；不得与 `OMBRE_BUCKETS_DIR` 或 Remember-Me 根目录重叠。默认关闭时不要求配置，也不会创建该目录。 |
 | `OMBRE_RAW_EVIDENCE_RETENTION_DAYS` | 否 | `30` | O5D 显式 lifecycle invocation 使用的有限证据 retention 天数；仅允许 `1..365`，不改变已保存 revision deadline。 |
