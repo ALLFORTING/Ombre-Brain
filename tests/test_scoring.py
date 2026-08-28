@@ -252,11 +252,12 @@ class TestSearchScoring:
     @pytest.mark.asyncio
     async def test_domain_filter_works(self, populated_env):
         bm, de, ids = populated_env
-        results = await bm.search("学习", limit=50, domain_filter=["编程"])
+        results = await bm.search("编程", limit=50, domain_filter=["编程"])
+        assert results
         for r in results:
             domains = r.get("metadata", {}).get("domain", [])
             # Should have at least some affinity to 编程
-            assert any("编程" in d for d in domains) or True  # fuzzy match allows some slack
+            assert any("编程" in d for d in domains)
 
     @pytest.mark.asyncio
     async def test_emotion_resonance_scoring(self, populated_env):
