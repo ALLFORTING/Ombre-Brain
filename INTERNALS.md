@@ -8,7 +8,7 @@
 
 ---
 
-Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-Setup-Token` header. The token exists only for a truly missing auth file, is consumed after create-if-absent publication, and is never stored in the auth file or configuration. `setup_completed_login_required` means the auth file is already valid and the user must use normal login; `409` means another setup request published first.
+Initial dashboard setup requires the operator-provided `OMBRE_DASHBOARD_SETUP_TOKEN` in the `X-Ombre-Setup-Token` header when the auth file is truly missing. The application does not generate or print a startup token. The configured token is kept in process memory and consumed only after create-if-absent publication. If it is not configured, setup fails closed; `setup_completed_login_required` means the password was published but normal login is required, and `409` means another setup request won the race.
 
 ## 0. 功能总览——这个系统到底做了什么
 
@@ -77,16 +77,14 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 
 ### 技术能力
 
-**6 个 MCP 工具**
+**当前 MCP surface / Current MCP surface**
 
-| 工具 | 关键参数 | 功能 |
-|---|---|---|
-| `breath` | query, max_tokens, domain, valence, arousal, max_results, **importance_min**, tags_filter, topic_filter | 检索/浮现记忆；结构化过滤先于 query 排名 |
-| `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
-| `grow` | content | 日记拆分归档 |
-| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
-| `pulse` | include_archive | 系统状态 |
-| `dream` | （无） | 做梦自省 |
+运行时默认注册 21 个工具；设置 `OMBRE_DIAG_TOOLS` 为 `1`、`true`、`yes` 或 `on` 时注册全部 36 个工具。默认 surface 包含 1 个 resource（`ui://remember-me/asset-viewer.html`）和 1 个无参数、可选 prompt（`start_ombre_brain`）；没有 resource templates。精确名称、暴露条件和 schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+
+- 核心记忆/session（9）：`boot`、`breath`、`hold`、`grow`、`trace`、`archive_session`、`todos`、`pulse`、`dream`
+- 默认 Remember-Me 资产（8）：`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_update_metadata`、`rm_asset_search`、`rm_asset_download_link`、`rm_asset_view`、`rm_asset_inspect`
+- 默认维护/受控（4）：`digest`、`related_backfill`、`rm_asset_reindex_embeddings`、`seal_letter`
+- 诊断/验收（15，仅 `OMBRE_DIAG_TOOLS` 开启时）：`asset_attachment_context_probe`、`asset_ingest_probe`、`asset_ingest_begin`、`asset_ingest_chunk`、`asset_ingest_finish`、`asset_ingest_abort`、`asset_browser_upload_link`、`asset_browser_upload_status`、`asset_render_probe`、`asset_export_probe`、`asset_vision_challenge`、`asset_vision_verify`、`asset_vision_export`、`asset_vision_download_link`、`asset_vision_upload_challenge`
 
 **工具详细行为**
 
@@ -204,7 +202,7 @@ Initial dashboard setup uses a one-time in-memory startup token in the `X-Ombre-
 
 ```
                     ┌──────────────┐
-                    │  server.py   │  MCP 主入口，6 个工具 + Dashboard + Hook
+                    │  server.py   │  MCP 主入口，21/36 个工具 + Dashboard + Hook
                     └──────┬───────┘
            ┌───────────────┼───────────────┬────────────────┐
            ▼               ▼               ▼                ▼
