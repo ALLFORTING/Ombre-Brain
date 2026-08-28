@@ -123,6 +123,8 @@ curl http://localhost:18001/health
 
 > 本地 HTTP 的 MCP 默认也是 fail-closed：设置 `OMBRE_AUTH_TOKEN`，并让客户端发送 `Authorization: Bearer <your-token>`；URL 保持为 `http://localhost:18001/mcp`。
 > Local HTTP MCP is also fail-closed by default: set `OMBRE_AUTH_TOKEN` and have the client send `Authorization: Bearer <your-token>`; keep the URL at `http://localhost:18001/mcp`.
+> 对于只能填写 URL 的客户端，可在明确需要时同时设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 和独立的 `OMBRE_MCP_QUERY_TOKEN`，并使用 `http://localhost:18001/mcp?token=<dedicated-query-token>`；这是兼容模式，不是首选认证方式。
+> For a URL-only client, when deliberately required, set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` together with a separate `OMBRE_MCP_QUERY_TOKEN`, then use `http://localhost:18001/mcp?token=<dedicated-query-token>`; this is a compatibility mode, not the preferred authentication method.
 > 如果只是刻意进行本机匿名 HTTP 测试，可显式设置 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP=true`；这会输出强安全警告，绝不要在公网部署中启用。
 > For a deliberately anonymous local-only HTTP test, set `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP=true`; it emits a strong security warning and must never be enabled on a public deployment.
 
@@ -764,6 +766,8 @@ Sensitive config via env vars:
 - `OMBRE_EMBEDDING_API_KEY` — 独立 embedding API key；不设则可复用主 key / Separate embedding API key; can fall back to the main key
 - `OMBRE_TRANSPORT` — 覆盖传输方式：`stdio` / `sse` / `streamable-http` / Override MCP transport
 - `OMBRE_AUTH_TOKEN` — 保护 HTTP MCP（`/mcp`、SSE 的 `/sse` 与 `/messages`）；仅接受 `Authorization: Bearer <token>`，未设置或不匹配时拒绝访问 / Protects HTTP MCP (`/mcp`, SSE `/sse`, and `/messages`); accepts only `Authorization: Bearer <token>` and rejects access when unset or incorrect
+- `OMBRE_MCP_ALLOW_QUERY_TOKEN` — URL-only MCP 客户端的显式 query-token 兼容开关，默认关闭；启用时 URL 凭据可能被客户端、代理或访问日志保留 / Explicit query-token compatibility switch for URL-only MCP clients, disabled by default; URL credentials may be retained by clients, proxies, or access logs when enabled
+- `OMBRE_MCP_QUERY_TOKEN` — 与 `OMBRE_AUTH_TOKEN` 独立的专用 query token，仅在兼容开关开启时用于 `?token=<dedicated-query-token>`，不会回退或复用 Bearer token / Separate dedicated query token, used only when compatibility is enabled; never falls back to or reuses the Bearer token
 - `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` — 显式允许匿名 HTTP MCP；默认关闭，仅用于刻意的本地/受控场景，启用会输出强安全警告，绝不要用于公网部署 / Explicit anonymous HTTP MCP opt-in; disabled by default, for deliberate local/controlled use only, emits a strong security warning, and must never be used on a public deployment
 - `OMBRE_HTTP_ALLOWED_ORIGINS` — 逗号分隔的明确浏览器 origin；未设置/为空时不允许跨 origin 浏览器访问。不要设置为 `*`；这是浏览器 CORS 策略，不是 MCP 认证 / Comma-separated explicit browser origins; unset/empty allows no cross-origin browser access. Do not use `*`; this is browser CORS policy, not MCP authentication
 - `OMBRE_RESPONSE_SEAL` — 返回验真暗语；`boot` 和 `breath` 末尾会附带 `seal: <value>` / Response verification seal appended to `boot` and `breath`
@@ -782,7 +786,9 @@ Sensitive config via env vars:
 | `OMBRE_EMBEDDING_MODEL` | 否 / No | `gemini-embedding-001` 或配置值 | embedding 模型名；不同供应商模型目录不同 / Embedding model name; provider catalogs differ |
 | `OMBRE_TRANSPORT` | 否 / No | `stdio` | MCP 传输方式：本地 Claude Desktop 用 `stdio`；远程/Render 用 `streamable-http` / MCP transport |
 | `OMBRE_PORT` | 否 / No | `8000` | HTTP/SSE/streamable-http 监听端口 / HTTP port |
-| `OMBRE_AUTH_TOKEN` | 否 / No | 空 / empty | HTTP MCP（`/mcp`、SSE 的 `/sse` 与 `/messages`）的 Bearer token；只接受 `Authorization: Bearer <token>`，未设置或不匹配时拒绝访问 / HTTP MCP Bearer token; only `Authorization: Bearer <token>` is accepted, and unset or incorrect tokens are rejected |
+| `OMBRE_AUTH_TOKEN` | 否 / No | 空 / empty | HTTP MCP（`/mcp`、SSE 的 `/sse` 与 `/messages`）的首选 Bearer token；只接受 `Authorization: Bearer <token>`，未设置或不匹配时拒绝访问 / Preferred HTTP MCP Bearer token; only `Authorization: Bearer <token>` is accepted, and unset or incorrect tokens are rejected |
+| `OMBRE_MCP_ALLOW_QUERY_TOKEN` | 否 / No | 关闭 / disabled | URL-only MCP 客户端的显式 query-token 兼容开关；默认关闭。启用后 URL 凭据可能被客户端、代理、历史记录或访问日志保留 / Explicit query-token compatibility switch for URL-only MCP clients; disabled by default. URL credentials may be retained by clients, proxies, browsing history, or access logs |
+| `OMBRE_MCP_QUERY_TOKEN` | 否 / No | 空 / empty | 与 `OMBRE_AUTH_TOKEN` 独立的专用 query token；仅在 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 时用于 `?token=<dedicated-query-token>`，不会回退或复用 `OMBRE_AUTH_TOKEN` / Separate dedicated query token; used only when `OMBRE_MCP_ALLOW_QUERY_TOKEN=true`, with no fallback to or reuse of `OMBRE_AUTH_TOKEN` |
 | `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` | 否 / No | 关闭 / disabled | 显式允许匿名 HTTP MCP；默认关闭，启用会输出强安全警告，只适合刻意的本地/受控场景，绝不要用于公网部署 / Explicit anonymous HTTP MCP opt-in; disabled by default, emits a strong security warning, for deliberate local/controlled use only, never for public deployment |
 | `OMBRE_HTTP_ALLOWED_ORIGINS` | 否 / No | 空 / empty | 逗号分隔的明确浏览器 origin；为空时不允许跨 origin 浏览器访问，不要使用 `*`。CORS 只是浏览器策略，不替代认证 / Comma-separated explicit browser origins; empty means no cross-origin browser access. Do not use `*`. CORS is a browser policy, not authentication |
 | `OMBRE_HOOK_TOKEN` | 否 / No | 空 / empty | `/breath-hook` 与 `/dream-hook` 的独立 Bearer token；未配置时返回 `503 hook_not_configured`，不支持 query token 或匿名回退 / Dedicated Bearer token for the two hook endpoints; unset returns `503 hook_not_configured`, with no query-token or anonymous fallback |
@@ -819,8 +825,13 @@ In CI/system prompts, treat missing/mismatched seals or tool output containing b
 
 ## 保护 HTTP MCP 端点 / Protect HTTP MCP Endpoints
 
-远程/网络 HTTP MCP 默认 fail-closed。`OMBRE_AUTH_TOKEN` 未设置或 Bearer token 不匹配时，`/mcp`、`/mcp/*` 以及 SSE 的 `/sse`、`/messages` 端点拒绝访问。HTTP MCP 只接受请求头 `Authorization: Bearer <your-token>`；不要把 token 放进 URL，也不支持 query-token 认证。
-Remote/network HTTP MCP is fail-closed by default. When `OMBRE_AUTH_TOKEN` is unset or the Bearer token is incorrect, `/mcp`, `/mcp/*`, and the SSE `/sse` and `/messages` endpoints reject access. HTTP MCP accepts only `Authorization: Bearer <your-token>`; do not put tokens in URLs, and query-token authentication is not supported.
+远程/网络 HTTP MCP 默认 fail-closed。`OMBRE_AUTH_TOKEN` 未设置或 Bearer token 不匹配时，`/mcp`、`/mcp/*` 以及 SSE 的 `/sse`、`/messages` 端点拒绝访问。首选方式是请求头 `Authorization: Bearer <your-token>`。
+Remote/network HTTP MCP is fail-closed by default. When `OMBRE_AUTH_TOKEN` is unset or the Bearer token is incorrect, `/mcp`, `/mcp/*`, and the SSE `/sse` and `/messages` endpoints reject access. The preferred method is `Authorization: Bearer <your-token>`.
+
+对于只能填写 MCP URL、不能发送 Bearer 请求头的 URL-only 客户端，可明确设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 和独立的 `OMBRE_MCP_QUERY_TOKEN`，然后使用 `https://<host>/mcp?token=<dedicated-query-token>`。flag 未开启、专用 token 未设置或 token 错误时，query-token 仍被拒绝；`OMBRE_MCP_QUERY_TOKEN` 不会回退或复用 `OMBRE_AUTH_TOKEN`。
+For a URL-only client that cannot send a Bearer header, explicitly set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` and a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<host>/mcp?token=<dedicated-query-token>`. If the flag is disabled, the dedicated token is unset, or the token is wrong, query-token access remains rejected; `OMBRE_MCP_QUERY_TOKEN` never falls back to or reuses `OMBRE_AUTH_TOKEN`.
+
+Query credentials can be retained in client URLs, proxies, browsing history, or access logs. Use a dedicated, independently rotatable token and enable this compatibility mode only when a URL-only client—such as a specific Claude custom connector setup—requires it. This is not required for all Claude products or MCP clients; Bearer remains preferred wherever supported.
 
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` 默认关闭。只有在明确需要匿名 HTTP MCP 的本地或受控场景中，才显式设置为 `true`；启用会输出强安全警告，绝不要在公网部署中启用。未设置 `OMBRE_AUTH_TOKEN` 且未启用该 opt-in 时，HTTP MCP 仍拒绝访问。
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` is disabled by default. Set it to `true` only when anonymous HTTP MCP is deliberately required in a local or controlled environment; enabling it emits a strong security warning and must never be used on a public deployment. Without `OMBRE_AUTH_TOKEN` and without this opt-in, HTTP MCP remains inaccessible.
@@ -1059,7 +1070,8 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
 2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
 3. （推荐）设置 `OMBRE_RESPONSE_SEAL`：`boot`/`breath` 返回验真暗语
-4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 必须使用它；客户端发送 `Authorization: Bearer <your-token>`
+4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 的首选认证方式；客户端发送 `Authorization: Bearer <your-token>`
+   如果客户端只能填写 URL，可另外显式设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 与独立的 `OMBRE_MCP_QUERY_TOKEN`，使用 `https://<你的服务名>.onrender.com/mcp?token=<dedicated-query-token>`；query token 可能被保留在 URL、日志或历史记录中。
 5. （推荐）设置 `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`：启用语义检索与自动 related
 6. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API
 7. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
@@ -1070,7 +1082,8 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 1. `OMBRE_API_KEY`: any OpenAI-compatible key (**required** for hold/grow; without it those tools raise an error)
 2. (Optional) `OMBRE_BASE_URL`: any OpenAI-compatible endpoint, e.g. `https://api.deepseek.com/v1`, `http://123.1.1.1:7689/v1`, `http://your-ollama:11434/v1`
 3. (Recommended) `OMBRE_RESPONSE_SEAL`: response verification phrase appended to `boot`/`breath`
-4. `OMBRE_AUTH_TOKEN`: required for public HTTP MCP; clients must send `Authorization: Bearer <your-token>`
+4. `OMBRE_AUTH_TOKEN`: preferred for public HTTP MCP; clients must send `Authorization: Bearer <your-token>`
+   For a URL-only client, explicitly set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` and a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<your-service>.onrender.com/mcp?token=<dedicated-query-token>`; query credentials may be retained in URLs, logs, or history.
 5. (Recommended) `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`: semantic retrieval and auto-related
 6. (Optional) `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`: enable `digest` and API conflict detection
 7. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
@@ -1095,8 +1108,10 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 2. **设置环境变量 / Set environment variables**（服务页面 → **Variables** 标签页）
    - `OMBRE_API_KEY`（**必需**）— LLM API 密钥；未设置时 hold/grow/dream 会报错
    - `OMBRE_BASE_URL`（可选）— API 地址，如 `https://api.deepseek.com/v1`
-   - `OMBRE_AUTH_TOKEN`（公网 HTTP MCP 必需）— 保护 `/mcp`、SSE 的 `/sse` 与 `/messages`；客户端发送 `Authorization: Bearer <your-token>`，不要把 token 放进 URL
-   - `OMBRE_AUTH_TOKEN` (required for public HTTP MCP) — protects `/mcp`, SSE `/sse`, and `/messages`; clients send `Authorization: Bearer <your-token>` and must not put tokens in URLs
+   - `OMBRE_AUTH_TOKEN`（公网 HTTP MCP 首选）— 保护 `/mcp`、SSE 的 `/sse` 与 `/messages`；客户端发送 `Authorization: Bearer <your-token>`，不要把 `OMBRE_AUTH_TOKEN` 放进 URL
+   - `OMBRE_AUTH_TOKEN` (preferred for public HTTP MCP) — protects `/mcp`, SSE `/sse`, and `/messages`; clients send `Authorization: Bearer <your-token>` and must not put `OMBRE_AUTH_TOKEN` in URLs
+   - URL-only 客户端兼容：同时设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 与独立的 `OMBRE_MCP_QUERY_TOKEN`，使用 `https://<你的域名>.zeabur.app/mcp?token=<dedicated-query-token>`；仅在确实需要时启用，并注意 URL 凭据可能泄露到日志或历史记录
+   - URL-only client compatibility: set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` with a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<your-domain>.zeabur.app/mcp?token=<dedicated-query-token>`; enable only when required and remember that URL credentials may reach logs or history
 
    > ⚠️ **不需要**手动设置 `OMBRE_TRANSPORT` 和 `OMBRE_BUCKETS_DIR`，Dockerfile 里已经设好了默认值。Zeabur 对单阶段 Dockerfile 会自动注入控制台设置的环境变量。
    > You do **NOT** need to set `OMBRE_TRANSPORT` or `OMBRE_BUCKETS_DIR` — defaults are baked into the Dockerfile. Zeabur auto-injects dashboard env vars for single-stage Dockerfiles.
@@ -1149,10 +1164,10 @@ When connecting via tunnel, ensure:
    ```
 
 2. **在 Claude.ai 网页版添加 MCP 服务器** / Adding to Claude.ai web
-   - MCP URL: `https://<tunnel-subdomain>.trycloudflare.com/mcp`；客户端必须发送 `Authorization: Bearer <your-token>`
-   - MCP URL: `https://<xxxx>.ngrok-free.app/mcp`; clients must send `Authorization: Bearer <your-token>`
-   - 如果客户端只能填写 URL、不能发送该请求头，则无法连接启用认证的 HTTP MCP；不要把 token 放进 URL
-   - If a client only accepts a URL and cannot send this header, it cannot connect to authenticated HTTP MCP; do not put tokens in URLs
+   - MCP URL: `https://<tunnel-subdomain>.trycloudflare.com/mcp`；支持 Bearer 时客户端发送 `Authorization: Bearer <your-token>`
+   - MCP URL: `https://<xxxx>.ngrok-free.app/mcp`; clients should send `Authorization: Bearer <your-token>` when supported
+   - 如果客户端只能填写 URL，可明确启用 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true`，设置独立的 `OMBRE_MCP_QUERY_TOKEN`，并使用 `https://<tunnel-subdomain>.trycloudflare.com/mcp?token=<dedicated-query-token>`；这是兼容模式，query 凭据可能被保留在 URL、代理或访问日志中
+   - If a client only accepts a URL, explicitly enable `OMBRE_MCP_ALLOW_QUERY_TOKEN=true`, set a separate `OMBRE_MCP_QUERY_TOKEN`, and use `https://<xxxx>.ngrok-free.app/mcp?token=<dedicated-query-token>`; this is compatibility mode, and query credentials may be retained in URLs, proxies, or access logs
    - 先访问 `/health` 验证连接 / Verify first: `https://<your-tunnel>/health` should return `{"status":"ok",...}`
 
 3. **已知限制 / Known limitations**

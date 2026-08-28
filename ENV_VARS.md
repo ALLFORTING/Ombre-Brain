@@ -6,7 +6,9 @@
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
-| `OMBRE_AUTH_TOKEN` | 否 | 无 | HTTP MCP（`/mcp`、`/mcp/*`、SSE 的 `/sse` 与 `/messages`）只接受 `Authorization: Bearer <token>`；未设置或不匹配时拒绝访问，不支持 query-token |
+| `OMBRE_AUTH_TOKEN` | 否 | 无 | HTTP MCP（`/mcp`、`/mcp/*`、SSE 的 `/sse` 与 `/messages`）的首选认证；只接受 `Authorization: Bearer <token>`，Bearer 未设置或不匹配时拒绝访问 |
+| `OMBRE_MCP_ALLOW_QUERY_TOKEN` | 否 | 关闭 | URL-only MCP 客户端的显式 query-token 兼容开关；默认关闭。启用后 URL 凭据可能被客户端、代理、历史记录或访问日志保留 |
+| `OMBRE_MCP_QUERY_TOKEN` | 否 | 无 | 与 `OMBRE_AUTH_TOKEN` 独立的专用 query token；仅在 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 时用于 `?token=<dedicated-query-token>`，不会回退或复用 `OMBRE_AUTH_TOKEN` |
 | `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` | 否 | 关闭 | 显式允许匿名 HTTP MCP；默认关闭，启用会输出强安全警告，仅适合刻意的本地/受控场景，绝不要用于公网部署 |
 | `OMBRE_HTTP_ALLOWED_ORIGINS` | 否 | 空 | 逗号分隔的明确浏览器 origin；为空时不允许跨 origin 浏览器访问，不要使用 `*`。CORS 是浏览器策略，不是 MCP 认证 |
 | `OMBRE_BUCKETS_DIR` | 否 | `./buckets` | 记忆桶文件存放目录（绑定 Docker Volume 时务必设置） |
@@ -31,6 +33,14 @@
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
 | `OMBRE_EMBEDDING_API_KEY` | 否 | — | 独立的向量 API key；设置后不会复用主 LLM key |
+
+## HTTP MCP authentication
+
+`OMBRE_AUTH_TOKEN` 是 HTTP MCP 的首选认证方式：客户端发送 `Authorization: Bearer <token>`。远程/网络 HTTP MCP 默认 fail-closed；未配置认证时拒绝访问。`OMBRE_TRANSPORT=stdio` 的本地 stdio 行为保持不变，Dashboard 认证也与 MCP 认证分开。
+
+对于只能填写 URL、不能发送 Bearer 请求头的 MCP 客户端，可明确启用兼容模式：同时设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 和独立的 `OMBRE_MCP_QUERY_TOKEN`，然后使用 `https://<host>/mcp?token=<dedicated-query-token>`。该 token 不会回退或复用 `OMBRE_AUTH_TOKEN`；flag 未开启、专用 token 未设置或 token 错误时仍拒绝访问。
+
+Query credentials 可能被客户端、代理、浏览器历史或访问日志保留。只在确实需要 URL-only 客户端时启用，使用可独立轮换的专用 token；客户端支持 Bearer 时仍应优先使用 Bearer。该兼容模式可用于特定 URL-only custom connector，不代表所有 Claude 产品或 MCP 客户端都需要它。匿名 HTTP 仍由独立的 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` 控制，默认关闭并不因 query-token 设置而自动开启。
 
 ## Dashboard auth store and first deployment
 
