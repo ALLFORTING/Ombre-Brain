@@ -108,6 +108,26 @@ def test_dashboard_http_errors_are_bounded(
 
 
 @pytest.mark.security
+def test_dashboard_status_reports_current_release_version(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_require_auth", lambda request: None)
+    server.bucket_mgr.get_stats = AsyncMock(
+        return_value={
+            "permanent_count": 0,
+            "dynamic_count": 0,
+            "archive_count": 0,
+        }
+    )
+
+    response = asyncio.run(
+        server.api_system_status(_request("GET", "/api/status"))
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["version"] == "1.4.0"
+
+
+@pytest.mark.security
 def test_config_persistence_error_is_bounded(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setattr(server, "_require_dashboard_write", lambda request, route: None)
