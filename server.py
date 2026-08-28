@@ -219,35 +219,35 @@ def _constant_time_token_match(candidate: str, expected: str) -> bool:
 
 def add_mcp_auth_middleware(app):
     """
-    Protect only the streamable-http MCP endpoint.
-
+    Protect only the supported MCP HTTP transport endpoints.
     HTTP MCP is deny-by-default when OMBRE_AUTH_TOKEN is unset. Anonymous access
-    requires an explicit OMBRE_MCP_ALLOW_ANONYMOUS_HTTP opt-in.
+    requires an explicit OMBRE_MCP_ALLOW_ANONYMOUS_HTTP opt-in. Query-token
+    compatibility is separately opt-in and uses only OMBRE_MCP_QUERY_TOKEN.
     """
     expected = _mcp_auth_token()
+    query_token = os.environ.get("OMBRE_MCP_QUERY_TOKEN", "").strip()
+    query_token_opt_in = _env_flag_enabled(os.environ.get("OMBRE_MCP_ALLOW_QUERY_TOKEN", ""))
     anonymous_opt_in = _env_flag_enabled(os.environ.get("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", ""))
     if not expected: logger.warning("SECURITY WARNING: anonymous HTTP MCP enabled by OMBRE_MCP_ALLOW_ANONYMOUS_HTTP" if anonymous_opt_in else "OMBRE_AUTH_TOKEN not set; /mcp is disabled")
-
+    if query_token_opt_in: logger.warning("SECURITY WARNING: MCP query-token compatibility enabled; URL/query credentials may be retained by clients, proxies, or access logs")
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import PlainTextResponse
-
     class MCPAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             path = request.url.path or ""
             if not _is_mcp_http_path(path):
                 return await call_next(request)
 
-            if not expected and not anonymous_opt_in: return PlainTextResponse("Unauthorized", status_code=401)
-
+            query_auth_configured = query_token_opt_in and bool(query_token)
+            if not expected and not query_auth_configured and not anonymous_opt_in: return PlainTextResponse("Unauthorized", status_code=401)
             authorization = request.headers.get("authorization", "")
-            bearer = ""
-            if authorization.lower().startswith("bearer "):
-                bearer = authorization[7:].strip()
+            bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
 
-            if anonymous_opt_in and not expected: return await call_next(request)
+            if anonymous_opt_in and not expected and not query_auth_configured: return await call_next(request)
 
-            if _constant_time_token_match(bearer, expected):
-                return await call_next(request)
+            if _constant_time_token_match(bearer, expected): return await call_next(request)
+
+            if query_token_opt_in and _constant_time_token_match(request.query_params.get("token", ""), query_token): return await call_next(request)
 
             return PlainTextResponse("Unauthorized", status_code=401)
 
