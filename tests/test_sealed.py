@@ -94,6 +94,40 @@ async def test_decay_never_sets_or_clears_sealed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decay_skips_sealed_content_mutation(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    plain_id = await server.bucket_mgr.create(
+        content="plain content eligible for decay compression",
+        importance=1,
+    )
+    sealed_id = await server.bucket_mgr.create(
+        content="sealed content must remain unchanged",
+        importance=1,
+    )
+    await server.trace(sealed_id, sealed=1)
+    old = datetime.now() - timedelta(days=31)
+    for bucket_id in (plain_id, sealed_id):
+        path = server.bucket_mgr._find_bucket_file(bucket_id)
+        post = frontmatter.load(path)
+        post["last_active"] = old.isoformat()
+        post["updated_at"] = old.date().isoformat()
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(frontmatter.dumps(post))
+
+    engine = DecayEngine(
+        {"decay": {"threshold": -1, "check_interval_hours": 24}},
+        server.bucket_mgr,
+    )
+    result = await engine.run_decay_cycle()
+
+    assert result["compressed"] == 1
+    assert (await server.bucket_mgr.get(plain_id))["content"].endswith("...")
+    assert (await server.bucket_mgr.get(sealed_id))["content"] == (
+        "sealed content must remain unchanged"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pulse_hides_sealed_by_default_and_marks_when_included(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     sealed_id = await server.bucket_mgr.create(content="sealed pulse control")

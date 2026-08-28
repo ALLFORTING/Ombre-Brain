@@ -402,6 +402,25 @@ async def test_merge_keeps_source_when_target_update_succeeds_but_delete_fails(t
 
 
 @pytest.mark.asyncio
+async def test_merge_rejects_protected_targets_and_feel_buckets(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server.embedding_engine.enabled = False
+    server.bucket_mgr.embedding_engine.enabled = False
+
+    protected_target = await server.bucket_mgr.create("protected target", pinned=True)
+    source = await server.bucket_mgr.create("ordinary source")
+    rejected = await server._merge_bucket_into_target(protected_target, source)
+    assert "目标桶" in rejected
+    assert (await server.bucket_mgr.get(source)) is not None
+
+    feel_target = await server.bucket_mgr.create("feel target", bucket_type="feel")
+    ordinary_source = await server.bucket_mgr.create("ordinary source 2")
+    rejected_feel = await server._merge_bucket_into_target(feel_target, ordinary_source)
+    assert "feel" in rejected_feel
+    assert (await server.bucket_mgr.get(ordinary_source)) is not None
+
+
+@pytest.mark.asyncio
 async def test_automatic_merge_defensively_rejects_a_sealed_search_result(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server.embedding_engine.enabled = False

@@ -963,7 +963,11 @@ class BucketManager:
             try:
                 self.record_history(bucket_id, post.content, history_change_type)
             except Exception as e:
-                logger.warning(f"Failed to record bucket history for {bucket_id}: {e}")
+                logger.error(
+                    f"Refusing content update because history capture failed "
+                    f"for {bucket_id}: {e}"
+                )
+                return False
             kwargs["content"] = apply_display_aliases(kwargs["content"])
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
@@ -1011,9 +1015,10 @@ class BucketManager:
         post["updated_at"] = _date_only()
 
         try:
-            if operation is not None:
+            if operation is not None or content_changed:
                 self._write_post_atomic(file_path, post)
-                self._mark_import_operation_applied(o5b_operation_key)
+                if operation is not None:
+                    self._mark_import_operation_applied(o5b_operation_key)
             else:
                 with open(file_path, "w", encoding="utf-8") as f:
                     f.write(frontmatter.dumps(post))
@@ -1061,7 +1066,7 @@ class BucketManager:
     # 删除桶
     # ---------------------------------------------------------
     @guarded_async_mutation("bucket_delete")
-    async def delete(self, bucket_id: str) -> bool:
+    async def delete(self, bucket_id: str, *, _allow_sealed: bool = False) -> bool:
         """
         Delete a memory bucket file.
         删除指定的记忆桶文件。
@@ -1080,6 +1085,16 @@ class BucketManager:
 
         try:
             post = frontmatter.load(file_path)
+            if (
+                (not _allow_sealed and _is_sealed_bucket(post))
+                or post.get("pinned")
+                or post.get("protected")
+            ):
+                logger.warning(
+                    "Refusing destructive delete of protected bucket %s",
+                    bucket_id,
+                )
+                return False
             self.record_history(bucket_id, post.content, "delete")
         except Exception as exc:
             logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")

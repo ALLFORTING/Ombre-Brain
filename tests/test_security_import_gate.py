@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -94,6 +94,31 @@ def test_import_review_and_pause_work_when_maintenance_is_open(tmp_path, monkeyp
     assert paused.body == b'{"status":"pause_requested"}'
     update.assert_awaited_once_with("bucket-1", importance=9)
     pause.assert_called_once_with()
+
+
+@pytest.mark.security
+def test_import_review_reports_partial_delete_failures(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        server, "_require_dashboard_write", lambda _request, _route: None
+    )
+    delete = AsyncMock(side_effect=[True, False])
+    server.bucket_mgr = SimpleNamespace(delete=delete)
+
+    async def exercise():
+        return await server.api_import_review(_Request({
+            "decisions": [
+                {"bucket_id": "bucket-1", "action": "delete"},
+                {"bucket_id": "bucket-2", "action": "delete"},
+            ]
+        }))
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 409
+    assert response.body == b'{"applied":1,"errors":1}'
+    assert delete.await_args_list == [call("bucket-1"), call("bucket-2")]
 
 
 @pytest.mark.security
