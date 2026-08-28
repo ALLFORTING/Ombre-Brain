@@ -832,7 +832,6 @@ Remote/network HTTP MCP is fail-closed by default. When `OMBRE_AUTH_TOKEN` is un
 For a URL-only client that cannot send a Bearer header, explicitly set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` and a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<host>/mcp?token=<dedicated-query-token>`. If the flag is disabled, the dedicated token is unset, or the token is wrong, query-token access remains rejected; `OMBRE_MCP_QUERY_TOKEN` never falls back to or reuses `OMBRE_AUTH_TOKEN`.
 
 Query credentials can be retained in client URLs, proxies, browsing history, or access logs. Use a dedicated, independently rotatable token and enable this compatibility mode only when a URL-only client—such as a specific Claude custom connector setup—requires it. This is not required for all Claude products or MCP clients; Bearer remains preferred wherever supported.
-Query credentials can be retained in client URLs, proxies, browsing history, or access logs. Use a dedicated, independently rotatable token and enable this compatibility mode only when a URL-only client—such as a specific Claude custom connector setup—requires it. It is not required for all Claude products or MCP clients; Bearer remains preferred wherever supported.
 
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` 默认关闭。只有在明确需要匿名 HTTP MCP 的本地或受控场景中，才显式设置为 `true`；启用会输出强安全警告，绝不要在公网部署中启用。未设置 `OMBRE_AUTH_TOKEN` 且未启用该 opt-in 时，HTTP MCP 仍拒绝访问。
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` is disabled by default. Set it to `true` only when anonymous HTTP MCP is deliberately required in a local or controlled environment; enabling it emits a strong security warning and must never be used on a public deployment. Without `OMBRE_AUTH_TOKEN` and without this opt-in, HTTP MCP remains inaccessible.
@@ -1071,7 +1070,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
 2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
 3. （推荐）设置 `OMBRE_RESPONSE_SEAL`：`boot`/`breath` 返回验真暗语
-4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 必须使用它；客户端发送 `Authorization: Bearer <your-token>`
+4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 的首选认证方式；客户端发送 `Authorization: Bearer <your-token>`
    如果客户端只能填写 URL，可另外显式设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 与独立的 `OMBRE_MCP_QUERY_TOKEN`，使用 `https://<你的服务名>.onrender.com/mcp?token=<dedicated-query-token>`；query token 可能被保留在 URL、日志或历史记录中。
 5. （推荐）设置 `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`：启用语义检索与自动 related
 6. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API
