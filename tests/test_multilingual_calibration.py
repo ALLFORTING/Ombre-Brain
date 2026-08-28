@@ -1,8 +1,29 @@
-"""Bounded offline calibration for ordinary-memory multilingual retrieval."""
+"""Bounded offline and external calibration for ordinary-memory retrieval."""
+
+import os
 
 import pytest
 
 from bucket_manager import BucketManager
+
+
+OFFLINE_RECALL_GOLD_SET = (
+    {
+        "query": "incident response",
+        "relevant_ids": {"en-relevant"},
+        "top_k": 1,
+    },
+    {
+        "query": "旅行计划",
+        "relevant_ids": {"zh-relevant"},
+        "top_k": 1,
+    },
+    {
+        "query": "Python 性能优化",
+        "relevant_ids": {"mixed-relevant"},
+        "top_k": 1,
+    },
+)
 
 
 class DeterministicSemanticSearch:
@@ -147,6 +168,32 @@ def multilingual_fixture():
 
 
 @pytest.mark.asyncio
+async def test_offline_recall_and_miss_rate_baseline_uses_real_search_pipeline(
+    test_config, multilingual_fixture
+):
+    buckets, _ = multilingual_fixture
+    manager = BucketManager(test_config)
+    observed_hits = []
+
+    for case in OFFLINE_RECALL_GOLD_SET:
+        results = await manager.search(
+            case["query"],
+            limit=case["top_k"],
+            candidate_buckets=buckets,
+        )
+        top_ids = {result["id"] for result in results[: case["top_k"]]}
+        observed_hits.append(bool(top_ids & case["relevant_ids"]))
+
+    recall_at_k = sum(observed_hits) / len(observed_hits)
+    miss_rate = 1.0 - recall_at_k
+    assert recall_at_k == 1.0, (
+        f"offline lexical recall@1={recall_at_k:.3f}; "
+        f"miss_rate={miss_rate:.3f}"
+    )
+    assert miss_rate == 0.0
+
+
+@pytest.mark.asyncio
 async def test_multilingual_retrieval_calibration_passes_existing_gate(
     test_config, multilingual_fixture
 ):
@@ -187,6 +234,53 @@ async def test_multilingual_retrieval_calibration_passes_existing_gate(
 
     assert len(semantic.calls) == len(cases)
     assert all(call[1] == 50 for call in semantic.calls)
+
+
+@pytest.mark.external
+@pytest.mark.skipif(
+    not os.environ.get("OMBRE_API_KEY"),
+    reason="OMBRE_API_KEY not set — skipping actual embedding quality baseline",
+)
+@pytest.mark.asyncio
+async def test_external_multilingual_provider_recall_and_miss_rate(
+    test_config, multilingual_fixture
+):
+    from bucket_manager import BucketManager
+    from embedding_engine import EmbeddingEngine
+
+    buckets, cases = multilingual_fixture
+    config = {
+        **test_config,
+        "embedding": {
+            **test_config["embedding"],
+            "api_key": os.environ["OMBRE_API_KEY"],
+            "enabled": True,
+        },
+    }
+    embedding = EmbeddingEngine(config)
+    manager = BucketManager(config, embedding_engine=embedding)
+
+    for bucket in buckets:
+        assert await embedding.generate_and_store(
+            bucket["id"], bucket["content"]
+        )
+
+    observed_hits = []
+    for case in cases:
+        results = await manager.search(
+            case["query"],
+            limit=3,
+            candidate_buckets=buckets,
+        )
+        top_ids = {result["id"] for result in results[:3]}
+        observed_hits.append(case["relevant"] in top_ids)
+
+    recall_at_3 = sum(observed_hits) / len(observed_hits)
+    miss_rate = 1.0 - recall_at_3
+    assert recall_at_3 == 1.0, (
+        f"provider recall@3={recall_at_3:.3f}; miss_rate={miss_rate:.3f}"
+    )
+    assert miss_rate == 0.0
 
 
 def test_lexical_normalization_preserves_cjk_english_and_mixed_cues(test_config):

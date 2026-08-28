@@ -1,5 +1,5 @@
 # ============================================================
-# Test 2: LLM Quality Baseline — needs GEMINI_API_KEY
+# Test 2: LLM Quality Baseline — needs OMBRE_API_KEY
 # 测试 2：LLM 质量基准 —— 需要 GEMINI_API_KEY
 #
 # Verifies LLM auto-tagging returns reasonable results:
@@ -80,6 +80,9 @@ class TestLLMQuality:
         assert isinstance(result["domain"], list)
         assert len(result["domain"]) >= 1
         assert all(isinstance(d, str) for d in result["domain"])
+        assert set(result["domain"]) & expected_domains, (
+            f"Expected one of {expected_domains}, got {result['domain']}"
+        )
 
         # Valence and arousal in range
         assert 0.0 <= result["valence"] <= 1.0, f"valence {result['valence']} out of range"
@@ -92,6 +95,7 @@ class TestLLMQuality:
 
         # Tags is a list
         assert isinstance(result["tags"], list)
+        assert isinstance(result["suggested_name"], str)
 
     @pytest.mark.asyncio
     async def test_analyze_domain_semantic_match(self, dehydrator):
@@ -104,11 +108,12 @@ class TestLLMQuality:
 
     @pytest.mark.asyncio
     async def test_analyze_empty_content(self, dehydrator):
-        """Empty content should raise or return defaults gracefully."""
-        try:
-            result = await dehydrator.analyze("。")
-            # If it doesn't raise, should still return valid structure
-            assert isinstance(result, dict)
-            assert 0.0 <= result["valence"] <= 1.0
-        except Exception:
-            pass  # Raising is also acceptable
+        """Empty content returns the documented neutral defaults."""
+        result = await dehydrator.analyze("")
+        assert result == {
+            "domain": ["未分类"],
+            "valence": 0.5,
+            "arousal": 0.3,
+            "tags": [],
+            "suggested_name": "",
+        }

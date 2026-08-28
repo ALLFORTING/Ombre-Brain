@@ -250,3 +250,38 @@ async def test_feel_write_does_not_merge_into_a_factual_bucket(tmp_path, monkeyp
     assert len(buckets) == 2
     assert (await server.bucket_mgr.get(factual_id))["content"] == "same factual content"
     server._merge_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repeated_ingestion_baseline_suppresses_noise_without_collapsing_facts(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    server.embedding_engine.enabled = False
+    server.bucket_mgr.embedding_engine.enabled = False
+
+    facts = (
+        "Ting planned a Kyoto trip on June 1",
+        "Ting planned a Kyoto trip on September 1",
+        "Ting canceled the Kyoto trip after a visa issue",
+    )
+    sequence = [facts[0], facts[0], facts[1], facts[1], facts[2]]
+    outcomes = []
+
+    for content in sequence:
+        _, reused = await server._merge_or_create(
+            content,
+            [],
+            5,
+            ["test"],
+            0.5,
+            0.3,
+        )
+        outcomes.append(reused)
+
+    buckets = await server.bucket_mgr.list_all(include_archive=False)
+    contents = {bucket["content"] for bucket in buckets}
+
+    assert outcomes == [False, True, False, True, False]
+    assert len(buckets) == len(facts)
+    assert contents == set(facts)

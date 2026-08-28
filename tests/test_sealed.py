@@ -171,3 +171,31 @@ async def test_dream_and_todos_hide_sealed_by_default(tmp_path, monkeypatch):
     assert "sealed dream todo control" not in dream_detail
     assert sealed_id not in todos
     assert "hidden sealed todo" not in todos
+
+
+@pytest.mark.asyncio
+async def test_observed_sealed_leakage_across_covered_routes_is_zero(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    marker = "covered route sealed leakage marker"
+    sealed_id = await server.bucket_mgr.create(content=marker, name="Covered sealed")
+    await server.trace(sealed_id, sealed=1)
+
+    covered_routes = {
+        "breath": await server.breath(query=marker),
+        "pulse": await server.pulse(show_all=True),
+        "dream": await server.dream(),
+        "todos": await server.todos(),
+    }
+    leaking_routes = [
+        route
+        for route, output in covered_routes.items()
+        if sealed_id in output or marker in output
+    ]
+    observed_leakage_rate = len(leaking_routes) / len(covered_routes)
+
+    assert observed_leakage_rate == 0.0, (
+        "observed sealed leakage across covered evaluation routes: "
+        f"{leaking_routes}"
+    )
