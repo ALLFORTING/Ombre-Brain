@@ -22,9 +22,9 @@ log_level: "INFO"
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
 
 # --- Merge threshold / 桶合并阈值 ---
-# When storing a new memory, if similarity with an existing bucket exceeds
-# this value (0-100), merge instead of creating a new one
-# 存新记忆时，如果与已有桶的相似度超过此值（0-100），则合并而非新建
+# Used by legacy generic imports and durable O5B update planning; ordinary
+# hold/grow writes reuse only deterministic textual duplicates.
+# 用于 legacy 普通导入和 O5B 持久更新规划；hold/grow 仅复用确定性文本重复项。
 merge_threshold: 75
 
 # --- Dehydration API / 脱水压缩 API 配置 ---

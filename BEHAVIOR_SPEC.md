@@ -112,17 +112,12 @@ hold(content="用户拿到实习 offer，情绪激动", importance=7)
    - 返回示例：`{"domain": ["成长", "求职"], "valence": 0.8, "arousal": 0.7, "tags": ["实习", "offer", "激动", ...], "suggested_name": "实习offer获得"}`
    - 失败时降级：`{"domain": ["未分类"], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_name": ""}`
 6. 合并 `auto_tags + extra_tags` 去重
-7. **合并检测**：`_merge_or_create(content, tags, importance=7, domain, valence, arousal, name)`
-   - `bucket_mgr.search(content, limit=1, domain_filter=domain)` — 搜索最相似的桶
-   - 若最高分 > `config["merge_threshold"]`（默认 75）且该桶非 pinned/protected：
-     - `dehydrator.merge(old_content, new_content)` → `_api_merge()` → LLM 融合
-     - `bucket_mgr.update(bucket_id, content=merged, tags=union, importance=max, domain=union, valence=avg, arousal=avg)`
-     - `embedding_engine.generate_and_store(bucket_id, merged_content)` 更新向量
-     - 返回 `(bucket_name, True)`
-   - 否则：
-     - `bucket_mgr.create(content, tags, importance=7, domain, valence, arousal, name)` → 写 `.md` 文件到 `dynamic/<主题域>/` 目录
-     - `embedding_engine.generate_and_store(bucket_id, content)` 生成并存储向量
-     - 返回 `(bucket_id, False)`
+7. **保守去重**：`_merge_or_create(content, tags, importance=7, domain, valence, arousal, name)`
+   - `bucket_mgr.search(content, limit=1, domain_filter=domain)` — 搜索候选桶
+   - 只有候选正文经过现有空白/大小写归一化后与新正文确定性相等，且该桶非 sealed、feel、pinned/protected 时，才复用已有桶并跳过 LLM 合并
+   - 相似度分数本身不能改写已有记忆；其他输入一律新建 dynamic 桶
+   - `bucket_mgr.create(content, tags, importance=7, domain, valence, arousal, name)` → 写 `.md` 文件到 `dynamic/<主题域>/` 目录
+   - 新建后生成 embedding，并保留既有 related-link 行为
 
 **返回结果**：
 - 新建：`"新建→实习offer获得 成长,求职"`
@@ -499,20 +494,20 @@ Claude 决策: hold / grow / 自动
                           │
                     bucket_mgr.search(content, limit=1, domain_filter)
                           │
-                    ┌─────┴─────────────────────────┐
-                    │ score > merge_threshold (75)?  │
-                    │                                │
-                   YES                               NO
-                    │                                │
-                    ▼                                ▼
-           dehydrator.merge(              bucket_mgr.create(
-             old_content, new)              content, tags,
-             MERGE_PROMPT → LLM             importance, domain,
-                    │                       valence, arousal,
-                    ▼                       bucket_type="dynamic"
-           bucket_mgr.update(...)         )
-                    │                        │
-                    └──────────┬─────────────┘
+                    ┌─────┴──────────────────────────────┐
+                    │ normalized old content == new?      │
+                    │ and target is not protected/feel?   │
+                    │                                     │
+                   YES                                    NO
+                    │                                     │
+                    ▼                                     ▼
+           reuse existing bucket             bucket_mgr.create(
+           (no LLM merge)                     content, tags,
+                    │                         importance, domain,
+                    │                         valence, arousal,
+                    │                         bucket_type="dynamic"
+                    │                         )
+                    └──────────┬──────────────────────────┘
                                │
                                ▼
                     embedding_engine.generate_and_store(

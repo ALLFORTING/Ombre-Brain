@@ -757,7 +757,7 @@ All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
 | `embedding.model` | Embedding 模型 / Embedding model | `gemini-embedding-001` |
 | `decay.lambda` | 衰减速率，越大越快忘 / Decay rate | `0.05` |
 | `decay.threshold` | 归档阈值 / Archive threshold | `0.3` |
-| `merge_threshold` | 合并相似度阈值 (0-100) / Merge similarity | `75` |
+| `merge_threshold` | legacy 导入/O5B 更新规划的相似度阈值；普通 hold/grow 仅复用确定性文本重复项 / Similarity threshold for legacy imports/O5B update planning; ordinary hold/grow reuse only deterministic textual duplicates | `75` |
 
 敏感配置用环境变量：
 Sensitive config via env vars:

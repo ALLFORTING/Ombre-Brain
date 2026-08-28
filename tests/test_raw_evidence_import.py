@@ -221,6 +221,40 @@ async def test_capture_and_preserve_raw_are_independent(
 
 
 @pytest.mark.asyncio
+async def test_generic_import_similarity_does_not_destructively_merge(test_config):
+    manager = BucketManager(test_config)
+    existing_id = await manager.create(
+        content="Ting planned a Kyoto trip on June 1",
+        domain=["测试"],
+    )
+    existing = await manager.get(existing_id)
+    existing["score"] = 100
+    manager.search = AsyncMock(return_value=[existing])
+    dehydrator = type("D", (), {"api_available": True})()
+    dehydrator.merge = AsyncMock(
+        side_effect=AssertionError("generic import must not LLM-merge by score")
+    )
+    engine = ImportEngine(test_config, manager, dehydrator)
+
+    is_merged = await engine._merge_or_create_item(
+        {
+            "name": "trip",
+            "content": "Ting planned a Kyoto trip on September 1",
+            "domain": ["测试"],
+            "tags": [],
+            "importance": 5,
+            "valence": 0.5,
+            "arousal": 0.3,
+        }
+    )
+
+    assert is_merged is False
+    assert dehydrator.merge.await_count == 0
+    assert (await manager.get(existing_id))["content"] == "Ting planned a Kyoto trip on June 1"
+    assert len(await manager.list_all(include_archive=False)) == 2
+
+
+@pytest.mark.asyncio
 async def test_capture_limit_fails_before_decode_or_extraction(test_config, tmp_path):
     config = dict(test_config, raw_evidence_root=str(tmp_path / "raw-evidence"))
     engine = ImportEngine(
