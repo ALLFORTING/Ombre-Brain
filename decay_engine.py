@@ -198,7 +198,16 @@ class DecayEngine:
 
             # Skip permanent / pinned / protected / feel buckets
             # 跳过固化桶、钉选/保护桶和 feel 桶
-            if meta.get("type") in ("permanent", "feel") or meta.get("pinned") or meta.get("protected"):
+            try:
+                sealed = int(meta.get("sealed", 0) or 0) == 1
+            except (TypeError, ValueError):
+                sealed = True
+            if (
+                sealed
+                or meta.get("type") in ("permanent", "feel")
+                or meta.get("pinned")
+                or meta.get("protected")
+            ):
                 continue
 
             checked += 1

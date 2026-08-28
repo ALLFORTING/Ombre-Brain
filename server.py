@@ -1575,6 +1575,10 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         return f"源桶 {source_id} 是钉选/保护桶，不能被合并删除。"
 
     target_meta = target.get("metadata", {})
+    if target_meta.get("pinned") or target_meta.get("protected"):
+        return f"目标桶 {target_id} 是钉选/保护桶，不能作为合并目标。"
+    if source_meta.get("type") == "feel" or target_meta.get("type") == "feel":
+        return "合并失败：feel 桶不能参与普通记忆合并。"
     source_sealed = _is_sealed(source)
     target_sealed = _is_sealed(target)
     if source_sealed != target_sealed: return "合并失败：不允许跨隐私边界合并（sealed 状态不匹配）。"
@@ -1617,7 +1621,7 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     if not updated:
         return f"合并失败，无法更新目标桶: {target_id}"
 
-    deleted = await bucket_mgr.delete(source_id)
+    deleted = await bucket_mgr.delete(source_id, _allow_sealed=source_sealed)
     if not deleted:
         return f"目标桶已更新，但源桶删除失败: {source_id}"
     return (
@@ -5898,6 +5902,8 @@ async def hold(
             sealed = True
         if metadata.get("type") != "dynamic" or sealed:
             return f"supersedes target not found or invalid: {target_id}"
+        if metadata.get("pinned") or metadata.get("protected"):
+            return f"supersedes target not found or invalid: {target_id}"
         try:
             updated = await bucket_mgr.update(target_id, content=content)
         except Exception as exc:
@@ -6197,6 +6203,16 @@ async def trace(
 
     # --- Delete mode / 删除模式 ---
     if delete:
+        bucket = await bucket_mgr.get(bucket_id)
+        if not bucket:
+            return f"未找到记忆桶: {bucket_id}"
+        metadata = bucket.get("metadata", {})
+        if (
+            _is_sealed(bucket)
+            or metadata.get("pinned")
+            or metadata.get("protected")
+        ):
+            return f"删除失败：记忆桶 {bucket_id} 受到保护。"
         success = await bucket_mgr.delete(bucket_id)
         # BucketManager owns local ordinary-vector cleanup and failure ordering.
         # Keep the trace caller's existing success/not-found response contract.
@@ -6205,6 +6221,13 @@ async def trace(
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
+    metadata = bucket.get("metadata", {})
+    if content and (
+        _is_sealed(bucket)
+        or metadata.get("pinned")
+        or metadata.get("protected")
+    ):
+        return f"内容修改失败：记忆桶 {bucket_id} 受到保护。"
 
     # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
     updates = {}
@@ -7864,27 +7887,43 @@ async def api_import_review(request):
     applied = 0
     errors = 0
     for d in decisions:
+        if not isinstance(d, dict):
+            errors += 1
+            continue
         bid = d.get("bucket_id", "")
         action = d.get("action", "")
         if not bid or not action:
+            errors += 1
             continue
         try:
             if action == "important":
-                await bucket_mgr.update(bid, importance=9)
+                if not await bucket_mgr.update(bid, importance=9):
+                    errors += 1
+                    continue
             elif action == "pin":
-                await bucket_mgr.update(bid, pinned=True)
+                if not await bucket_mgr.update(bid, pinned=True):
+                    errors += 1
+                    continue
             elif action == "noise":
-                await bucket_mgr.update(bid, resolved=True, importance=1)
+                if not await bucket_mgr.update(bid, resolved=True, importance=1):
+                    errors += 1
+                    continue
             elif action == "delete":
                 if not await bucket_mgr.delete(bid):
                     errors += 1
                     continue
+            else:
+                errors += 1
+                continue
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
             errors += 1
 
-    return JSONResponse({"applied": applied, "errors": errors})
+    return JSONResponse(
+        {"applied": applied, "errors": errors},
+        status_code=409 if errors else 200,
+    )
 
 
 # =============================================================
