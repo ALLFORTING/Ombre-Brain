@@ -22,6 +22,8 @@ def _app_with_auth(server):
         routes=[
             Route("/mcp", ok, methods=["GET", "POST"]),
             Route("/mcp/sub", ok, methods=["GET", "POST"]),
+            Route("/sse", ok, methods=["GET"]),
+            Route("/messages", ok, methods=["POST"]),
             Route("/health", ok),
             Route("/dashboard", ok),
             Route("/auth/login", ok, methods=["POST"]),
@@ -80,6 +82,74 @@ def test_mcp_requires_token_when_configured(tmp_path, monkeypatch):
     assert client.post("/mcp/sub?token=test-token").status_code == 401
 
 
+def test_query_token_is_rejected_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "query-secret")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/mcp?token=query-secret").status_code == 401
+
+
+def test_query_token_requires_dedicated_token_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.delenv("OMBRE_MCP_QUERY_TOKEN", raising=False)
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/mcp?token=query-secret").status_code == 401
+
+
+def test_query_token_rejects_wrong_dedicated_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "query-secret")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/mcp?token=wrong").status_code == 401
+
+
+def test_query_token_accepts_dedicated_token_when_explicitly_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "query-secret")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/mcp?token=query-secret").status_code == 200
+
+
+def test_bearer_token_is_not_reused_as_query_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.setenv("OMBRE_AUTH_TOKEN", "bearer-secret")
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.delenv("OMBRE_MCP_QUERY_TOKEN", raising=False)
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/mcp?token=bearer-secret").status_code == 401
+
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "bearer-secret")
+    server = _load_server(monkeypatch)
+    assert TestClient(_app_with_auth(server)).get("/mcp?token=bearer-secret").status_code == 200
+
+
 def test_non_mcp_paths_remain_exempt_with_token(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.setenv("OMBRE_AUTH_TOKEN", "test-token")
@@ -118,6 +188,20 @@ def test_sse_mcp_message_route_accepts_bearer(tmp_path, monkeypatch):
     ).status_code != 401
 
 
+def test_sse_and_message_mcp_paths_accept_dedicated_query_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "query-secret")
+    server = _load_server(monkeypatch)
+
+    client = TestClient(_app_with_auth(server))
+
+    assert client.get("/sse?token=query-secret").status_code == 200
+    assert client.post("/messages?token=query-secret").status_code == 200
+
+
 def test_sse_mcp_message_route_allows_explicit_anonymous_opt_in(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
@@ -127,6 +211,21 @@ def test_sse_mcp_message_route_allows_explicit_anonymous_opt_in(tmp_path, monkey
     client = TestClient(_sse_app_with_auth(server))
 
     assert client.post("/messages").status_code != 401
+
+
+def test_query_token_warning_does_not_include_secret(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "query-secret")
+
+    with caplog.at_level("WARNING"):
+        server = _load_server(monkeypatch)
+        _app_with_auth(server)
+
+    assert "query-token compatibility enabled" in caplog.text
+    assert "query-secret" not in caplog.text
 
 
 def test_http_cors_origins_are_explicit(tmp_path, monkeypatch):
