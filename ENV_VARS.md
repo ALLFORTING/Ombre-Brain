@@ -57,7 +57,7 @@ During env-password recovery, the env password remains higher priority than the 
 
 For an existing `.dashboard_auth.json`, deployment operators must verify and tighten its permissions to `0600`. This is a manual check; the application does not claim to migrate permissions on every pre-existing file.
 
-Clean first deployment uses the one-time in-memory startup token printed once in the service startup log and sent in `X-Ombre-Setup-Token`, plus same-origin setup and a password without leading or trailing whitespace. The token is consumed only after the auth file is published. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
+Clean first deployment requires the operator-configured `OMBRE_DASHBOARD_SETUP_TOKEN` in `X-Ombre-Setup-Token`, plus same-origin setup and a password without leading or trailing whitespace. The application does not generate or print a startup token. The configured token is consumed only after the auth file is published. `setup_completed_login_required` means the file was published but the setup request could not create a session; use normal login. `409` means another setup request won the create-if-absent race; do not overwrite the winner.
 
 ## 说明
 
