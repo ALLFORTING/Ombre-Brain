@@ -39,16 +39,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.12.14
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.14'
           cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio
+          pip install -r requirements.txt -c constraints-py312-linux.txt
+          pip install pytest pytest-asyncio -c constraints-py312-linux.txt
 
       - name: Prepare isolated buckets directory
         run: mkdir -p "${{ runner.temp }}/ombre-buckets"
@@ -66,16 +66,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.12.14
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.14'
           cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio
+          pip install -r requirements.txt -c constraints-py312-linux.txt
+          pip install pytest pytest-asyncio -c constraints-py312-linux.txt
 
       - name: Prepare isolated buckets directory
         run: mkdir -p "${{ runner.temp }}/ombre-buckets"
