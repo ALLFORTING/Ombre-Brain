@@ -4,7 +4,7 @@ services:
     env: python
     region: oregon
     plan: starter
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt -c constraints-py312-linux.txt
     startCommand: python backup_entry.py
     envVars:
       - key: OMBRE_TRANSPORT
