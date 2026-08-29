@@ -1,0 +1,66 @@
+name: Generate S7B Linux constraints
+
+on:
+  push:
+    branches:
+      - feat/s7b
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+
+      - name: Print runtime versions
+        run: |
+          python --version
+          pip --version
+
+      - name: Install pip-tools in the ephemeral runner
+        run: python -m pip install --disable-pip-version-check pip-tools
+
+      - name: Generate Linux constraints
+        run: pip-compile --output-file=constraints-py312-linux.txt requirements.txt
+
+      - name: Verify Remember-Me URL and SHA-256 integrity
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          requirements = Path('requirements.txt').read_text(encoding='utf-8')
+          constraints = Path('constraints-py312-linux.txt').read_text(encoding='utf-8')
+          immutable = []
+          for line in requirements.splitlines():
+              if not re.search(r'remember[-_.]?me', line, re.IGNORECASE):
+                  continue
+              url = re.search(r'@\s*(\S+)', line)
+              digest = re.search(r'sha256=([0-9a-f]{64})', line, re.IGNORECASE)
+              if url and digest:
+                  immutable.append((url.group(1), digest.group(1).lower()))
+
+          if not immutable:
+              raise SystemExit('Remember-Me immutable direct URL/SHA-256 requirement not found')
+
+          for url, digest in immutable:
+              if url not in constraints or f'sha256={digest}' not in constraints.lower():
+                  raise SystemExit('Remember-Me immutable direct URL/SHA-256 requirement changed')
+          PY
+
+      - name: Validate the generated constraints
+        run: |
+          pip install --no-cache-dir -r requirements.txt -c constraints-py312-linux.txt
+          pip check
+
+      - name: Upload Linux constraints artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: constraints-py312-linux
+          path: constraints-py312-linux.txt
+          if-no-files-found: error
