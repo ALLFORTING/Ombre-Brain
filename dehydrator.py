@@ -87,7 +87,8 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
     "valence": 0.7,
     "arousal": 0.4,
     "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
-    "importance": 5
+    "importance": 5,
+    "todos": ["明确的未完成事项"]
   }
 ]
 
@@ -103,6 +104,7 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
   事务: ["财务", "计划", "待办"]
   内心: ["情绪", "回忆", "梦境", "自省"]
 importance: 1-10，根据内容重要程度判断
+todos: 只提取原文明确表达且当前仍未完成的事项；没有就返回空数组，不要推测或创造任务
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
 
@@ -142,7 +144,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、用户可能用不同措辞搜索的词
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
-6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+6. todos（未完成待办）：只提取原文明确表达且当前仍未完成的事项；没有就返回空数组，不要推测或创造任务
+7. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -150,7 +153,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
+  "suggested_name": "简短标题",
+  "todos": ["明确的未完成事项"]
 }"""
 
 
@@ -489,6 +493,16 @@ class Dehydrator:
             arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
         except (ValueError, TypeError):
             valence, arousal = 0.5, 0.3
+        raw_todos = result.get("todos", [])
+        todos = (
+            list(dict.fromkeys(
+                str(item).strip()
+                for item in raw_todos
+                if item is not None and str(item).strip()
+            ))[:20]
+            if isinstance(raw_todos, list)
+            else []
+        )
 
         return {
             "domain": result.get("domain", ["未分类"])[:3],
@@ -496,6 +510,7 @@ class Dehydrator:
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+            "todos": todos,
         }
 
     # ---------------------------------------------------------
@@ -513,6 +528,7 @@ class Dehydrator:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "todos": [],
         }
 
     # ---------------------------------------------------------
@@ -603,6 +619,16 @@ class Dehydrator:
                 arousal = max(0.0, min(1.0, float(item.get("arousal", 0.3))))
             except (ValueError, TypeError):
                 valence, arousal = 0.5, 0.3
+            raw_todos = item.get("todos", [])
+            todos = (
+                list(dict.fromkeys(
+                    str(todo).strip()
+                    for todo in raw_todos
+                    if todo is not None and str(todo).strip()
+                ))[:20]
+                if isinstance(raw_todos, list)
+                else []
+            )
 
             validated.append({
                 "name": str(item.get("name", ""))[:20],
@@ -612,5 +638,6 @@ class Dehydrator:
                 "arousal": arousal,
                 "tags": item.get("tags", [])[:15],
                 "importance": importance,
+                "todos": todos,
             })
         return validated

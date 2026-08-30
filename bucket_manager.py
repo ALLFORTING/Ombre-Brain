@@ -64,6 +64,39 @@ _IMPORT_MARKER_FIELD = "_ob_import_operations"
 _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
 
 
+def canonicalize_todos(raw: Any) -> list[str]:
+    """Return todos in the canonical, ordered ``list[str]`` form."""
+    if isinstance(raw, list):
+        values = [str(item).strip() for item in raw if item is not None and str(item).strip()]
+    elif isinstance(raw, dict):
+        values = [
+            f"{key}: {value}".strip()
+            for key, value in raw.items()
+            if str(value).strip()
+        ]
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed != raw:
+            return canonicalize_todos(parsed)
+        values = [
+            line.strip().lstrip("-* ").strip()
+            for line in text.replace(",", "\n").splitlines()
+            if line.strip().lstrip("-* ").strip()
+        ]
+    elif raw is None:
+        values = []
+    else:
+        text = str(raw).strip()
+        values = [text] if text else []
+    return list(dict.fromkeys(values))
+
+
 class BucketIdempotencyError(RuntimeError):
     """Content-free failure for the O5B memory idempotency seam."""
 
@@ -659,6 +692,7 @@ class BucketManager:
         protected: bool = False,
         sealed: bool = False,
         topics: list[str] = None,
+        todos: list[str] = None,
         _o5b_operation_key: str | None = None,
         _o5b_payload_digest: str | None = None,
         _o5c_memory_mutation_id: str | None = None,
@@ -673,18 +707,21 @@ class BucketManager:
         """
         operation = None
         if _o5b_operation_key is not None:
+            operation_payload = {
+                "content": content,
+                "tags": tags or [],
+                "importance": importance,
+                "domain": domain,
+                "valence": valence,
+                "arousal": arousal,
+                "name": name,
+            }
+            if todos is not None:
+                operation_payload["todos"] = canonicalize_todos(todos)
             operation = self._ensure_import_operation(
                 _o5b_operation_key,
                 operation_kind="create",
-                payload={
-                    "content": content,
-                    "tags": tags or [],
-                    "importance": importance,
-                    "domain": domain,
-                    "valence": valence,
-                    "arousal": arousal,
-                    "name": name,
-                },
+                payload=operation_payload,
                 payload_digest=_o5b_payload_digest,
                 memory_mutation_id=_o5c_memory_mutation_id,
             )
@@ -697,6 +734,7 @@ class BucketManager:
         name = apply_display_aliases(name) if name else name
         tags = apply_display_aliases_to_value(tags or [])
         domain = apply_display_aliases_to_value(domain) if domain else domain
+        todos = apply_display_aliases_to_value(canonicalize_todos(todos))
         bucket_name = sanitize_name(name) if name else bucket_id
         # feel buckets are allowed to have empty domain; others default to ["未分类"]
         if bucket_type == "feel":
@@ -733,6 +771,7 @@ class BucketManager:
             "dormant": False,
             "sealed": 1 if sealed else 0,
             "activation_count": 0,
+            "todos": todos,
         }
         if pinned:
             metadata["pinned"] = True
@@ -973,6 +1012,10 @@ class BucketManager:
         if "tags" in kwargs:
             kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
             post["tags"] = kwargs["tags"]
+        if "todos" in kwargs:
+            post["todos"] = apply_display_aliases_to_value(
+                canonicalize_todos(kwargs["todos"])
+            )
         if "importance" in kwargs:
             post["importance"] = max(1, min(10, int(kwargs["importance"])))
         if "domain" in kwargs:

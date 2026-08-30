@@ -76,7 +76,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, canonicalize_todos
 from asset_store import (
     MAX_IMAGE_PIXELS as RM_ASSET_MAX_IMAGE_PIXELS,
     AssetStore,
@@ -1082,6 +1082,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     trigger_date: str = "",
+    todos: list | None = None,
 ) -> tuple[str, bool]:
     """
     Reuse a deterministic duplicate if found; otherwise create a new bucket.
@@ -1089,6 +1090,7 @@ async def _merge_or_create(
     was reused.
     仅复用确定性重复，否则新建；返回 (桶ID或名称, 是否复用已有记录)。
     """
+    incoming_todos = _canonical_todos(todos)
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None, include_sealed=False)
     except Exception as e:
@@ -1108,6 +1110,21 @@ async def _merge_or_create(
         ):
             # Deterministic duplicate only: reuse the existing record without
             # invoking the lossy LLM merge path.
+            if incoming_todos:
+                existing_todos = _canonical_todos(metadata.get("todos"))
+                merged_todos = list(dict.fromkeys(existing_todos + incoming_todos))
+                if (
+                    merged_todos != existing_todos
+                    or not isinstance(metadata.get("todos"), list)
+                ):
+                    updated = await bucket_mgr.update(
+                        bucket["id"],
+                        todos=merged_todos,
+                    )
+                    if not updated:
+                        raise RuntimeError(
+                            f"failed to preserve todos for duplicate bucket {bucket['id']}"
+                        )
             return metadata.get("name", bucket["id"]), True
 
     bucket_id = await bucket_mgr.create(
@@ -1118,6 +1135,7 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        todos=incoming_todos,
     )
     await _auto_link_related(bucket_id)
     if trigger_date:
@@ -1447,6 +1465,11 @@ def _normalize_todos(raw) -> list[str]:
     return [str(raw).strip()] if raw is not None and str(raw).strip() else []
 
 
+def _canonical_todos(raw) -> list[str]:
+    """Normalize legacy todo shapes and return an ordered, deduplicated list."""
+    return canonicalize_todos(_normalize_todos(raw))
+
+
 def _parse_emotion_history(raw) -> list[dict]:
     if isinstance(raw, list):
         history = raw
@@ -1596,6 +1619,9 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     if isinstance(source_tags, str):
         source_tags = _parse_csv_ids(source_tags)
     merged_tags = list(dict.fromkeys([*target_tags, *source_tags]))
+    target_todos = _canonical_todos(target_meta.get("todos"))
+    source_todos = _canonical_todos(source_meta.get("todos"))
+    merged_todos = list(dict.fromkeys(target_todos + source_todos))
     merged_importance = max(
         int(target_meta.get("importance", 5)),
         int(source_meta.get("importance", 5)),
@@ -1617,6 +1643,7 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         valence=merged_valence,
         arousal=merged_arousal,
         dormant=False,
+        todos=merged_todos,
     )
     if not updated:
         return f"合并失败，无法更新目标桶: {target_id}"
@@ -5943,6 +5970,7 @@ async def hold(
             arousal=feel_arousal,
             name=feel_name,
             bucket_type="feel",
+            todos=_canonical_todos(feel_analysis.get("todos")),
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
@@ -5971,7 +5999,7 @@ async def hold(
         logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
         analysis = {
             "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
-            "tags": [], "suggested_name": "",
+            "tags": [], "suggested_name": "", "todos": [],
         }
 
     domain = analysis["domain"]
@@ -5979,6 +6007,7 @@ async def hold(
     auto_arousal = analysis["arousal"]
     auto_tags = analysis["tags"]
     suggested_name = analysis.get("suggested_name", "")
+    analysis_todos = _canonical_todos(analysis.get("todos"))
 
     # --- User-supplied valence/arousal takes priority over analyze() result ---
     # --- 用户显式传入的 valence/arousal 优先，analyze() 结果作为 fallback ---
@@ -6000,6 +6029,7 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            todos=analysis_todos,
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
@@ -6021,6 +6051,7 @@ async def hold(
         arousal=final_arousal,
         name=suggested_name,
         trigger_date=trigger_date,
+        todos=analysis_todos,
     )
     if should_record_emotion:
         _record_emotion_snapshot(valence, arousal, "hold")
@@ -6069,6 +6100,7 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            todos=_canonical_todos(analysis.get("todos")),
         )
         action = "合并" if is_merged else "新建"
         response = f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -6104,6 +6136,7 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                todos=_canonical_todos(item.get("todos")),
             )
 
             if is_merged:
@@ -6142,6 +6175,7 @@ async def trace(
     arousal: float = -1,
     importance: int = -1,
     tags: str = "",
+    todos: str | None = None,
     resolved: int = -1,
     pinned: int = -1,
     digested: int = -1,
@@ -6176,6 +6210,7 @@ async def trace(
                 arousal=arousal,
                 importance=importance,
                 tags=tags,
+                todos=todos,
                 resolved=resolved,
                 pinned=pinned,
                 digested=digested,
@@ -6243,6 +6278,8 @@ async def trace(
         updates["importance"] = importance
     if tags:
         updates["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    if todos is not None:
+        updates["todos"] = _canonical_todos(todos)
     if resolved in (0, 1):
         updates["resolved"] = bool(resolved)
     if pinned in (0, 1):

@@ -116,4 +116,5 @@ class TestLLMQuality:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "todos": [],
         }

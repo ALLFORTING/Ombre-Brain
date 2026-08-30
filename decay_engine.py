@@ -21,10 +21,71 @@
 
 import math
 import asyncio
+import json
 import logging
 from datetime import datetime
 
 logger = logging.getLogger("ombre_brain.decay")
+
+
+_PROTECTED_TYPES = frozenset({"permanent", "feel", "i", "plan", "letter"})
+
+
+def _parse_decay_age(metadata: dict, *keys: str) -> float | None:
+    """Return age in days, or None when no usable decay timestamp exists."""
+    for key in keys:
+        if key not in metadata:
+            continue
+        raw = metadata.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            current = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+            age = (current - parsed).total_seconds() / 86400
+        except (ValueError, TypeError):
+            return None
+        return max(0.0, age)
+    return None
+
+
+def _is_truthy_metadata(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _has_unresolved_todos(metadata: dict) -> bool:
+    """Recognize canonical todos and old scalar/string frontmatter forms."""
+    raw = metadata.get("todos")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return False
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed != raw:
+            return _has_unresolved_todos({"todos": parsed})
+        return any(
+            line.strip().lstrip("-* ").strip()
+            for line in text.replace(",", "\n").splitlines()
+        )
+    if isinstance(raw, list):
+        return any(item is not None and str(item).strip() for item in raw)
+    if isinstance(raw, dict):
+        return any(str(value).strip() for value in raw.values())
+    return raw is not None and bool(str(raw).strip())
+
+
+def _is_decay_protected(metadata: dict) -> bool:
+    return (
+        metadata.get("type") in _PROTECTED_TYPES
+        or metadata.get("pinned")
+        or metadata.get("protected")
+        or _is_truthy_metadata(metadata.get("anchor"))
+    )
 
 
 class DecayEngine:
@@ -103,23 +164,27 @@ class DecayEngine:
         if metadata.get("pinned") or metadata.get("protected"):
             return 999.0
 
-        # --- Permanent buckets never decay ---
-        if metadata.get("type") == "permanent":
-            return 999.0
-
         # --- Feel buckets: never decay, fixed moderate score ---
         if metadata.get("type") == "feel":
             return 15.0
+
+        # --- Permanent / pinned / protected buckets never decay ---
+        if _is_decay_protected(metadata):
+            return 999.0
 
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
         # --- Days since last activation ---
-        last_active_str = metadata.get("last_active", metadata.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
+        days_since = _parse_decay_age(
+            metadata,
+            "last_active",
+            "created",
+            "created_at",
+        )
+        if days_since is None:
+            # Scoring is also used by read-only surfacing routes. Keep their
+            # existing neutral fallback, while run_decay_cycle fails closed.
             days_since = 30
 
         # --- Emotion weight ---
@@ -202,12 +267,28 @@ class DecayEngine:
                 sealed = int(meta.get("sealed", 0) or 0) == 1
             except (TypeError, ValueError):
                 sealed = True
-            if (
-                sealed
-                or meta.get("type") in ("permanent", "feel")
-                or meta.get("pinned")
-                or meta.get("protected")
-            ):
+            if sealed or _is_decay_protected(meta):
+                continue
+
+            activity_age = _parse_decay_age(
+                meta,
+                "last_active",
+                "created",
+                "created_at",
+            )
+            update_age = _parse_decay_age(
+                meta,
+                "updated_at",
+                "last_active",
+                "created",
+                "created_at",
+            )
+            if activity_age is None or update_age is None:
+                logger.warning(
+                    "Skipping destructive decay for %s because time metadata is "
+                    "missing or invalid",
+                    bucket.get("id", "?"),
+                )
                 continue
 
             checked += 1
@@ -227,17 +308,14 @@ class DecayEngine:
             if not meta.get("resolved", False):
                 tags = list(meta.get("tags", []) or [])
                 imp = int(meta.get("importance", 5))
-                updated_str = meta.get("updated_at", meta.get("last_active", meta.get("created", "")))
-                try:
-                    updated = datetime.fromisoformat(str(updated_str))
-                    days_since_update = (datetime.now() - updated).total_seconds() / 86400
-                except (ValueError, TypeError):
-                    days_since_update = 999
+                days_since_update = update_age
+                has_todos = _has_unresolved_todos(meta)
                 if (
                     imp < 6
                     and score < 5.0
                     and days_since_update > 30
                     and "compressed" not in tags
+                    and not has_todos
                 ):
                     summary = str(meta.get("summary", "") or "").strip()
                     compressed_content = summary if summary else f"{bucket.get('content', '')[:100]}..."
@@ -246,6 +324,7 @@ class DecayEngine:
                             bucket["id"],
                             content=compressed_content,
                             tags=list(dict.fromkeys(tags + ["compressed"])),
+                            _history_change_type="decay_compression",
                         )
                         compressed += 1
                         logger.info(
@@ -258,14 +337,9 @@ class DecayEngine:
 
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
-            if not meta.get("resolved", False):
+            if not meta.get("resolved", False) and not _has_unresolved_todos(meta):
                 imp = int(meta.get("importance", 5))
-                last_active_str = meta.get("last_active", meta.get("created", ""))
-                try:
-                    last_active = datetime.fromisoformat(str(last_active_str))
-                    days_since = (datetime.now() - last_active).total_seconds() / 86400
-                except (ValueError, TypeError):
-                    days_since = 999
+                days_since = activity_age
                 if imp <= 4 and days_since > 30:
                     try:
                         await self.bucket_mgr.update(bucket["id"], resolved=True)

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from utils import count_tokens_approx, now_iso
+from bucket_manager import canonicalize_todos
 from maintenance_write_gate import guarded_mutation
 
 logger = logging.getLogger("ombre_brain.import")
@@ -362,6 +363,7 @@ IMPORT_EXTRACT_PROMPT = """你是一个对话记忆提取专家。从以下对�
     "arousal": 0.4,
     "tags": ["核心词1", "核心词2", "扩展词1"],
     "importance": 5,
+    "todos": ["明确的未完成事项"],
     "preserve_raw": false,
     "is_pattern": false
   }
@@ -378,6 +380,7 @@ IMPORT_EXTRACT_PROMPT = """你是一个对话记忆提取专家。从以下对�
   内心: ["情绪", "回忆", "梦境", "自省"]
 
 importance: 1-10
+todos: 只提取原文明确表达且当前仍未完成的事项；没有就返回空数组，不要推测或创造任务
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）
 preserve_raw: true = 保留本次提取结果中的 content，并在导入时跳过后续合并/脱水摘要；不表示保留上传文件原文、精确引文或不可变来源证据
@@ -638,6 +641,7 @@ class ImportEngine:
             "valence": item.get("valence", 0.5),
             "arousal": item.get("arousal", 0.3),
             "name": item.get("name") or None,
+            "todos": canonicalize_todos(item.get("todos")),
         }
 
     async def _o5b_build_operation(self, item: dict, preserve_raw: bool) -> tuple[str, str | None, dict, bool]:
@@ -653,6 +657,7 @@ class ImportEngine:
         valence = item.get("valence", 0.5)
         arousal = item.get("arousal", 0.3)
         name = item.get("name", "")
+        incoming_todos = canonicalize_todos(item.get("todos"))
 
         try:
             existing = await self.bucket_mgr.search(
@@ -676,6 +681,9 @@ class ImportEngine:
                     self.state.data["api_calls"] += 1
                     old_v = bucket["metadata"].get("valence", 0.5)
                     old_a = bucket["metadata"].get("arousal", 0.3)
+                    existing_todos = canonicalize_todos(
+                        bucket["metadata"].get("todos")
+                    )
                     return (
                         "update",
                         bucket["id"],
@@ -687,6 +695,9 @@ class ImportEngine:
                                 "domain": list(set(bucket["metadata"].get("domain", []) + domain)),
                                 "valence": round((old_v + valence) / 2, 2),
                                 "arousal": round((old_a + arousal) / 2, 2),
+                                "todos": list(dict.fromkeys(
+                                    existing_todos + incoming_todos
+                                )),
                             }
                         },
                         True,
@@ -1053,6 +1064,7 @@ class ImportEngine:
                         valence=item.get("valence", 0.5),
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
+                        todos=canonicalize_todos(item.get("todos")),
                     )
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
@@ -1124,6 +1136,16 @@ class ImportEngine:
                 arousal = max(0.0, min(1.0, float(item.get("arousal", 0.3))))
             except (ValueError, TypeError):
                 valence, arousal = 0.5, 0.3
+            raw_todos = item.get("todos", [])
+            todos = (
+                list(dict.fromkeys(
+                    str(todo).strip()
+                    for todo in raw_todos
+                    if todo is not None and str(todo).strip()
+                ))[:20]
+                if isinstance(raw_todos, list)
+                else []
+            )
 
             validated.append({
                 "name": str(item.get("name", ""))[:20],
@@ -1133,6 +1155,7 @@ class ImportEngine:
                 "arousal": arousal,
                 "tags": [str(t) for t in item.get("tags", [])][:10],
                 "importance": importance,
+                "todos": todos,
                 "preserve_raw": bool(item.get("preserve_raw", False)),
                 "is_pattern": bool(item.get("is_pattern", False)),
             })
@@ -1165,6 +1188,22 @@ class ImportEngine:
                 and not (metadata.get("pinned") or metadata.get("protected"))
             ):
                 # Generic imports may reuse only deterministic textual duplicates.
+                incoming_todos = canonicalize_todos(item.get("todos"))
+                if incoming_todos:
+                    existing_todos = canonicalize_todos(metadata.get("todos"))
+                    merged_todos = list(dict.fromkeys(existing_todos + incoming_todos))
+                    if (
+                        merged_todos != existing_todos
+                        or not isinstance(metadata.get("todos"), list)
+                    ):
+                        updated = await self.bucket_mgr.update(
+                            bucket["id"],
+                            todos=merged_todos,
+                        )
+                        if not updated:
+                            raise RuntimeError(
+                                f"failed to preserve todos for duplicate bucket {bucket['id']}"
+                            )
                 return True
 
         # Create new
@@ -1176,6 +1215,7 @@ class ImportEngine:
             valence=valence,
             arousal=arousal,
             name=name or None,
+            todos=canonicalize_todos(item.get("todos")),
         )
         return False
 

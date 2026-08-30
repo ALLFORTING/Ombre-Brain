@@ -1277,6 +1277,17 @@
             "default": "",
             "type": "string"
           },
+          "todos": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "trigger_date": {
             "default": "",
             "type": "string"

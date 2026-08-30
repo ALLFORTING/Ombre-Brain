@@ -439,6 +439,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `append: bool = False` — `content` 默认替换正文；`append=True` 时以空行分隔追加 / `content` replaces by default; `append=True` appends with a blank-line separator.
 - 写前快照 / Write-ahead snapshots: replace、append、delete 前会写入 `bucket_history.sqlite3` 的 `bucket_history(bucket_id, old_content, changed_at, change_type)`，便于手工恢复 / Before replace, append, or delete, old content is stored in `bucket_history.sqlite3` for manual recovery.
 - `merge: str = ""` — 将源桶并入当前目标桶：正文追加、tags 去重合并、importance 取最大、VA 取平均、删除源桶；不能与 `delete` 同用，源桶不能是 pinned/protected / Merge source into target: append content, union tags, max importance, average VA, delete source; cannot combine with `delete`; source cannot be pinned/protected.
+- `todos: str | None = None` — 省略表示不修改；传空字符串清空；传逗号或换行分隔的待办项替换为规范化列表 / Omit to preserve; pass an empty string to clear; pass comma- or newline-separated items to replace with a canonical list.
 - `sealed: int = -1` — `1` 手动封存、`0` 取消、`-1` 不改；sealed 优先级高于 pinned，默认不在 `breath`/`pulse`/`dream`/`todos` 泄漏 / `1` seal, `0` unseal, `-1` unchanged; sealed overrides pinned and is hidden by default.
 - `dormant: int = -1` — `1` 手动沉底、`0` 恢复、`-1` 不改；`trace` 修改会自动解除 dormant，除非显式传 `dormant=1` / `1` dormant, `0` restore, `-1` unchanged; trace updates wake dormant buckets unless explicitly kept dormant.
 - `related: str = ""` — 逗号分隔 related bucket IDs，写入双向关联 / Comma-separated related bucket IDs; links are bidirectional.
