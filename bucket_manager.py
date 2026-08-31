@@ -1109,7 +1109,13 @@ class BucketManager:
     # 删除桶
     # ---------------------------------------------------------
     @guarded_async_mutation("bucket_delete")
-    async def delete(self, bucket_id: str, *, _allow_sealed: bool = False) -> bool:
+    async def delete(
+        self,
+        bucket_id: str,
+        *,
+        _allow_sealed: bool = False,
+        _dashboard_override: bool = False,
+    ) -> bool:
         """
         Delete a memory bucket file.
         删除指定的记忆桶文件。
@@ -1128,7 +1134,7 @@ class BucketManager:
 
         try:
             post = frontmatter.load(file_path)
-            if (
+            if not _dashboard_override and (
                 (not _allow_sealed and _is_sealed_bucket(post))
                 or post.get("pinned")
                 or post.get("protected")

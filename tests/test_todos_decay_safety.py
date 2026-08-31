@@ -172,6 +172,68 @@ async def test_todos_tri_state_resolved_filter_and_merge_preserve(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_trace_todos_accepts_string_and_list_with_tri_state_semantics(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(
+        content="todo input symmetry",
+        todos=["initial"],
+    )
+
+    await server.trace(bucket_id, todos="string task, another string task")
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["todos"] == [
+        "string task",
+        "another string task",
+    ]
+
+    await server.trace(bucket_id, todos=[" list task ", "", "list task", "second"])
+    bucket = await server.bucket_mgr.get(bucket_id)
+    assert bucket["metadata"]["todos"] == ["list task", "second"]
+    assert isinstance(bucket["metadata"]["todos"], list)
+    assert all(isinstance(item, str) for item in bucket["metadata"]["todos"])
+
+    await server.trace(bucket_id, todos="")
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["todos"] == []
+
+    await server.trace(bucket_id, todos=["keep before None"])
+    before_none = await server.bucket_mgr.get(bucket_id)
+    await server.trace(bucket_id, todos=None)
+    after_none = await server.bucket_mgr.get(bucket_id)
+    assert after_none["metadata"]["todos"] == before_none["metadata"]["todos"]
+    assert isinstance(after_none["metadata"]["todos"], list)
+
+
+@pytest.mark.asyncio
+async def test_trace_mcp_schema_and_runtime_accept_string_or_array_todos(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="MCP todo input")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(server.mcp) as client:
+        tools = (await client.list_tools()).tools
+        schema = next(tool.inputSchema for tool in tools if tool.name == "trace")
+        todos_schema = schema["properties"]["todos"]
+        branches = todos_schema["anyOf"]
+        array_schema = next(branch for branch in branches if branch.get("type") == "array")
+        assert {branch.get("type") for branch in branches} == {"array", "string", "null"}
+        assert array_schema == {"items": {"type": "string"}, "type": "array"}
+        assert todos_schema["default"] is None
+
+        result = await client.call_tool(
+            "trace",
+            {"bucket_id": bucket_id, "todos": ["runtime task", "", "runtime task"]},
+        )
+
+    assert result.isError is False
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["todos"] == [
+        "runtime task"
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_field", ["last_active", "updated_at"])
 async def test_decay_invalid_time_metadata_fails_closed(
     bucket_mgr, invalid_field, tmp_path

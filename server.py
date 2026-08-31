@@ -1681,6 +1681,20 @@ def _is_sealed(bucket: dict) -> bool:
     return int(bucket.get("metadata", {}).get("sealed", 0) or 0) == 1
 
 
+def _pinned_unpin_confirm_token(bucket: dict) -> str:
+    """Return a deterministic confirmation token for unpinning this bucket."""
+    metadata = bucket.get("metadata", {})
+    payload = "|".join(
+        (
+            str(bucket.get("id", "")),
+            str(int(bool(metadata.get("pinned")))),
+            str(metadata.get("updated_at", "")),
+            str(metadata.get("last_active", "")),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def _extract_session_summary(content: str, max_chars: int = 700) -> str:
     """Extract the Summary section from an archived session bucket."""
     text = strip_wikilinks(content or "").strip()
@@ -6175,7 +6189,7 @@ async def trace(
     arousal: float = -1,
     importance: int = -1,
     tags: str = "",
-    todos: str | None = None,
+    todos: str | list[str] | None = None,
     resolved: int = -1,
     pinned: int = -1,
     digested: int = -1,
@@ -6187,6 +6201,7 @@ async def trace(
     append: bool = False,
     trigger_date: str = "",
     delete: bool = False,
+    confirm_token: str = "",
 ) -> str:
     # MCP schema note: related must stay in the tool signature for bidirectional links.
     """Mixed memory operation: metadata/content, relations, merge, seal, and destructive delete; no MCP undo command."""
@@ -6222,6 +6237,7 @@ async def trace(
                 append=append,
                 trigger_date=trigger_date,
                 delete=delete,
+                confirm_token=confirm_token,
             )
             results.append(f"[{current_id}] {result}")
         return "\n".join(results)
@@ -6257,11 +6273,14 @@ async def trace(
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
     metadata = bucket.get("metadata", {})
-    if content and (
-        _is_sealed(bucket)
-        or metadata.get("pinned")
-        or metadata.get("protected")
-    ):
+    if pinned == 0 and metadata.get("pinned"):
+        unpin_token = _pinned_unpin_confirm_token(bucket)
+        if not hmac.compare_digest((confirm_token or "").strip(), unpin_token):
+            return (
+                "confirmation required: rerun trace with pinned=0 and "
+                f"confirm_token: {unpin_token}."
+            )
+    if content and (_is_sealed(bucket) or metadata.get("protected")):
         return f"内容修改失败：记忆桶 {bucket_id} 受到保护。"
 
     # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
@@ -6946,21 +6965,78 @@ async def api_archives(request):
         logger.exception("Dashboard archive listing failed")
         return JSONResponse({"error": "archive_list_failed"}, status_code=500)
 
-@mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET", "PATCH", "DELETE"])
+@guarded_http_mutation(
+    "dashboard_bucket_mutation",
+    methods=("PATCH", "DELETE"),
+)
 async def api_bucket_detail(request):
-    """Get full bucket content by ID."""
+    """Get, update, or delete bucket content by ID."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
-    if err: return err
+
+    method = request.method.upper()
+    route = "/api/bucket/{bucket_id}"
+    err = (
+        _require_dashboard_write(request, route)
+        if method in {"PATCH", "DELETE"}
+        else _require_auth(request)
+    )
+    if err:
+        return err
     bucket_id = request.path_params["bucket_id"]
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
     meta = bucket.get("metadata", {})
+
+    if method == "PATCH":
+        try:
+            body = await request.json()
+        except Exception:
+            return _dashboard_write_error(route, 400, "invalid_json")
+        if not isinstance(body, dict) or set(body) != {"content"}:
+            return _dashboard_write_error(route, 400, "content_only")
+        if not isinstance(body["content"], str):
+            return _dashboard_write_error(route, 400, "invalid_content")
+        try:
+            updated = await bucket_mgr.update(
+                bucket_id,
+                content=body["content"],
+                _history_change_type="dashboard_replace",
+            )
+        except Exception:
+            logger.error(
+                "Dashboard bucket content update failed route=%s "
+                "code=content_update_failed",
+                route,
+            )
+            return _dashboard_write_error(route, 500, "content_update_failed")
+        if not updated:
+            return _dashboard_write_error(route, 500, "content_update_failed")
+        bucket = await bucket_mgr.get(bucket_id) or bucket
+        meta = bucket.get("metadata", {})
+
+    if method == "DELETE":
+        try:
+            deleted = await bucket_mgr.delete(
+                bucket_id,
+                _dashboard_override=True,
+            )
+        except Exception:
+            logger.error(
+                "Dashboard bucket delete failed route=%s code=bucket_delete_failed",
+                route,
+            )
+            return _dashboard_write_error(route, 500, "bucket_delete_failed")
+        if not deleted:
+            return _dashboard_write_error(route, 500, "bucket_delete_failed")
+        return JSONResponse({"id": bucket_id, "deleted": True})
+
     return JSONResponse({
         "id": bucket["id"],
         "metadata": meta,
         "content": strip_wikilinks(bucket.get("content", "")),
+        "raw_content": bucket.get("content", ""),
         "score": decay_engine.calculate_score(meta),
     })
 

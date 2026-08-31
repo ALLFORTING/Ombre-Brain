@@ -299,6 +299,59 @@
     overflow-y: auto;
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
+  .detail-actions {
+    display: flex;
+    gap: 10px;
+    margin: -8px 0 20px;
+  }
+  .detail-actions button {
+    padding: 8px 18px;
+    font-family: inherit;
+    font-size: 12px;
+    border-radius: 20px;
+    cursor: pointer;
+  }
+  .detail-delete-btn {
+    color: var(--negative);
+    background: transparent;
+    border: 1px solid var(--negative);
+  }
+  .detail-editor { margin-top: 24px; }
+  .detail-editor label {
+    display: block;
+    color: var(--text-light);
+    margin-bottom: 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .detail-editor textarea {
+    display: block;
+    width: 100%;
+    min-height: 260px;
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 16px;
+    border-radius: 12px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.8;
+    box-shadow: inset 2px 2px 4px var(--shadow-dark-subtle), inset -2px -2px 4px var(--shadow-light);
+  }
+  .detail-editor textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow), inset 2px 2px 4px var(--shadow-dark-subtle);
+  }
+  .detail-editor-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .detail-editor-status { font-size: 12px; color: var(--text-dim); }
 
   .config-section {
     margin-bottom: 28px;
@@ -1344,9 +1397,12 @@ document.getElementById('archive-next').addEventListener('click', function() {
   archiveState.offset += archiveState.limit;
   loadArchives();
 });
+var currentDetailId = '';
+var currentDetail = null;
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
+  currentDetailId = id;
   content.innerHTML = '<div class="loading">加载中…</div>';
   panel.classList.add('open');
 
@@ -1354,6 +1410,13 @@ async function showDetail(id) {
     var res = await fetch(BASE + '/api/bucket/' + id);
     var b = await res.json();
     var meta = b.metadata || {};
+    var rawContent = b.raw_content != null ? b.raw_content : b.content;
+    currentDetail = {
+      id: id,
+      rawContent: rawContent || '',
+      displayContent: b.content || '',
+      metadata: meta
+    };
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
       '<div class="detail-meta">' +
@@ -1373,14 +1436,103 @@ async function showDetail(id) {
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-actions">' +
+        '<button class="btn-secondary" type="button" onclick="beginDetailEdit()">编辑</button>' +
+        '<button class="detail-delete-btn" type="button" onclick="deleteDetailBucket()">删除</button>' +
+      '</div>' +
+      '<div id="detail-body"><div class="detail-content">' + esc(b.content) + '</div></div>';
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
 }
 
+function beginDetailEdit() {
+  var body = document.getElementById('detail-body');
+  if (!body || !currentDetail) return;
+  body.innerHTML =
+    '<div class="detail-editor">' +
+      '<label for="detail-editor-text">正文</label>' +
+      '<textarea id="detail-editor-text" spellcheck="false">' + esc(currentDetail.rawContent) + '</textarea>' +
+      '<div class="detail-editor-actions">' +
+        '<button id="detail-save-btn" class="btn-primary" type="button" onclick="saveDetailContent()">保存</button>' +
+        '<button class="btn-secondary" type="button" onclick="cancelDetailEdit()">取消</button>' +
+        '<span id="detail-editor-status" class="detail-editor-status"></span>' +
+      '</div>' +
+    '</div>';
+  document.getElementById('detail-editor-text').focus();
+}
+
+function cancelDetailEdit() {
+  var body = document.getElementById('detail-body');
+  if (!body || !currentDetail) return;
+  body.innerHTML = '<div class="detail-content">' + esc(currentDetail.displayContent) + '</div>';
+}
+
+async function saveDetailContent() {
+  var id = currentDetailId;
+  var textarea = document.getElementById('detail-editor-text');
+  var button = document.getElementById('detail-save-btn');
+  var status = document.getElementById('detail-editor-status');
+  if (!id || !textarea || !button || !status) return;
+  button.disabled = true;
+  status.style.color = 'var(--text-dim)';
+  status.textContent = '保存中…';
+  try {
+    var res = await authFetch('/api/bucket/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({content: textarea.value})
+    });
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok) {
+      status.style.color = 'var(--negative)';
+      status.textContent = data.error || '保存失败';
+      return;
+    }
+    await loadBuckets();
+    await showDetail(id);
+  } catch (e) {
+    status.style.color = 'var(--negative)';
+    status.textContent = '保存失败';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteDetailBucket() {
+  var id = currentDetailId;
+  if (!id) return;
+  var metadata = currentDetail ? currentDetail.metadata || {} : {};
+  var protectedStates = [];
+  if (metadata.pinned) protectedStates.push('pinned');
+  if (metadata.protected) protectedStates.push('protected');
+  if (Number(metadata.sealed || 0) === 1) protectedStates.push('sealed');
+  var prompt = protectedStates.length
+    ? '此 bucket 当前为 ' + protectedStates.join(' / ') + ' 状态，属于高风险删除。此操作不可撤销，请再次确认删除。'
+    : '此操作不可撤销，确认删除这个 bucket 吗？';
+  if (!confirm(prompt)) return;
+  try {
+    var res = await authFetch('/api/bucket/' + encodeURIComponent(id), {method: 'DELETE'});
+    if (!res) return;
+    var data = await res.json();
+    if (!res.ok) {
+      alert(data.error || '删除失败');
+      return;
+    }
+    currentDetail = null;
+    currentDetailId = '';
+    closeDetail();
+    await loadBuckets();
+  } catch (e) {
+    alert('删除失败');
+  }
+}
+
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
+  currentDetail = null;
+  currentDetailId = '';
 }
 
 var networkData = null;

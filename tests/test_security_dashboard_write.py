@@ -1,5 +1,7 @@
+import asyncio
 import importlib
 import sys
+from unittest.mock import Mock
 
 import pytest
 from starlette.applications import Starlette
@@ -24,6 +26,11 @@ def _client(server):
         Route("/api/import/upload", server.api_import_upload, methods=["POST"]),
         Route("/api/import/pause", server.api_import_pause, methods=["POST"]),
         Route("/api/import/review", server.api_import_review, methods=["POST"]),
+        Route(
+            "/api/bucket/{bucket_id}",
+            server.api_bucket_detail,
+            methods=["GET", "PATCH", "DELETE"],
+        ),
     ])
     return TestClient(app, base_url="http://testserver")
 
@@ -40,6 +47,17 @@ def _login(server, client):
         "Origin": "http://testserver",
         "X-Ombre-CSRF": server._sessions[session]["csrf_token"],
     }
+
+
+def _authenticated_client(server):
+    client = _client(server)
+    token = server._create_session()
+    client.cookies.set("ombre_session", token)
+    client.headers.update({
+        "Origin": "http://testserver",
+        "X-Ombre-CSRF": server._sessions[token]["csrf_token"],
+    })
+    return client
 
 
 @pytest.mark.security
@@ -169,3 +187,151 @@ def test_dashboard_write_calls_use_auth_fetch_without_multipart_override():
     assert review.index("if (!resp.ok)") < review.index("card.style.display")
     assert "detectPatterns();" in batch
     assert batch.index("if (!resp.ok)") < batch.index("detectPatterns();")
+    assert "authFetch('/api/bucket/'" in dashboard
+    assert "async function saveDetailContent()" in dashboard
+    assert "function beginDetailEdit()" in dashboard
+    assert "async function deleteDetailBucket()" in dashboard
+    assert "取消" in dashboard
+    assert "高风险删除" in dashboard
+    assert "method: 'PATCH'" in dashboard
+    assert "method: 'DELETE'" in dashboard
+
+    save = dashboard.split("async function saveDetailContent()", 1)[1].split(
+        "async function deleteDetailBucket()", 1
+    )[0]
+    delete = dashboard.split("async function deleteDetailBucket()", 1)[1].split(
+        "function closeDetail()", 1
+    )[0]
+    assert "await loadBuckets();" in save
+    assert "await showDetail(id);" in save
+    assert "closeDetail();" in delete
+    assert "await loadBuckets();" in delete
+
+
+def test_dashboard_bucket_patch_updates_all_bucket_states_and_preserves_wikilinks(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    cases = ({}, {"pinned": True}, {"protected": True}, {"sealed": True})
+    for index, options in enumerate(cases):
+        bucket_id = asyncio.run(
+            server.bucket_mgr.create(
+                content=f"old [[Original Link {index}]]",
+                name="Dashboard content",
+                **options,
+            )
+        )
+
+        detail = client.get(f"/api/bucket/{bucket_id}")
+        assert detail.status_code == 200
+        assert detail.json()["content"] != detail.json()["raw_content"]
+        assert detail.json()["raw_content"] == f"old [[Original Link {index}]]"
+
+        response = client.patch(
+            f"/api/bucket/{bucket_id}",
+            json={"content": f"new [[Saved Link {index}]]"},
+        )
+        assert response.status_code == 200
+        assert response.json()["raw_content"] == f"new [[Saved Link {index}]]"
+        assert (asyncio.run(server.bucket_mgr.get(bucket_id)))["content"] == (
+            f"new [[Saved Link {index}]]"
+        )
+        history = server.bucket_mgr.get_history(bucket_id)
+        assert history[0]["change_type"] == "dashboard_replace"
+        assert history[0]["old_content"] == f"old [[Original Link {index}]]"
+
+
+def test_dashboard_bucket_delete_overrides_all_bucket_protections_and_records_history(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    cases = ({}, {"pinned": True}, {"protected": True}, {"sealed": True})
+    for index, options in enumerate(cases):
+        bucket_id = asyncio.run(
+            server.bucket_mgr.create(content=f"delete body {index}", **options)
+        )
+        response = client.delete(
+            f"/api/bucket/{bucket_id}",
+        )
+        assert response.status_code == 200
+        assert response.json() == {"id": bucket_id, "deleted": True}
+        assert asyncio.run(server.bucket_mgr.get(bucket_id)) is None
+        assert server.bucket_mgr.get_history(bucket_id)[0]["change_type"] == "delete"
+
+
+def test_dashboard_bucket_patch_history_failure_is_fail_closed(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = asyncio.run(server.bucket_mgr.create(content="history authority"))
+    server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
+    client = _authenticated_client(server)
+
+    response = client.patch(
+        f"/api/bucket/{bucket_id}",
+        json={"content": "must not write"},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "content_update_failed"}
+    assert (asyncio.run(server.bucket_mgr.get(bucket_id)))["content"] == (
+        "history authority"
+    )
+
+
+def test_dashboard_bucket_delete_history_failure_is_fail_closed(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = asyncio.run(server.bucket_mgr.create(content="delete history authority"))
+    server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
+    client = _authenticated_client(server)
+
+    response = client.delete(f"/api/bucket/{bucket_id}")
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "bucket_delete_failed"}
+    assert (asyncio.run(server.bucket_mgr.get(bucket_id)))["content"] == (
+        "delete history authority"
+    )
+
+
+def test_dashboard_bucket_patch_keeps_auth_csrf_and_origin_protection(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = asyncio.run(server.bucket_mgr.create(content="auth boundary"))
+    anonymous = _client(server)
+    for method, kwargs in (
+        ("patch", {"json": {"content": "no auth"}}),
+        ("delete", {}),
+    ):
+        assert getattr(anonymous, method)(
+            f"/api/bucket/{bucket_id}",
+            headers={"Origin": "http://testserver"},
+            **kwargs,
+        ).status_code == 401
+
+    for method, kwargs in (
+        ("patch", {"json": {"content": "no csrf"}}),
+        ("delete", {}),
+    ):
+        missing_csrf = _authenticated_client(server)
+        missing_csrf.headers.pop("X-Ombre-CSRF")
+        response = getattr(missing_csrf, method)(
+            f"/api/bucket/{bucket_id}",
+            **kwargs,
+        )
+        assert response.status_code == 403
+        assert response.json() == {"error": "csrf_required"}
+
+    for method, kwargs in (
+        ("patch", {"json": {"content": "no origin"}}),
+        ("delete", {}),
+    ):
+        wrong_origin = _authenticated_client(server)
+        wrong_origin.headers["Origin"] = "https://evil.example"
+        response = getattr(wrong_origin, method)(
+            f"/api/bucket/{bucket_id}",
+            **kwargs,
+        )
+        assert response.status_code == 403
+        assert response.json() == {"error": "same_origin_required"}
