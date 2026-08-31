@@ -50,11 +50,10 @@ async def test_trace_replace_and_delete_record_history(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_protected_trace_destructive_targets_are_rejected(tmp_path, monkeypatch):
+async def test_protected_trace_content_targets_are_rejected(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     cases = (
         {"sealed": True},
-        {"pinned": True},
         {"protected": True},
     )
 
@@ -73,6 +72,66 @@ async def test_protected_trace_destructive_targets_are_rejected(tmp_path, monkey
         assert "受到保护" in delete
         bucket = await server.bucket_mgr.get(bucket_id)
         assert bucket["content"] == f"protected content {index}"
+
+
+@pytest.mark.asyncio
+async def test_pinned_trace_replace_append_record_history_and_delete_stays_blocked(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(
+        content="pinned original",
+        pinned=True,
+    )
+
+    replaced = await server.trace(bucket_id, content="pinned replacement")
+    appended = await server.trace(bucket_id, content="pinned append", append=True)
+    deleted = await server.trace(bucket_id, delete=True)
+    bucket = await server.bucket_mgr.get(bucket_id)
+    history = server.bucket_mgr.get_history(bucket_id)
+
+    assert "content=已替换" in replaced
+    assert "content=已追加" in appended
+    assert "受到保护" in deleted
+    assert bucket["content"] == "pinned replacement\n\npinned append"
+    assert [row["change_type"] for row in history[:2]] == ["append", "replace"]
+    assert history[0]["old_content"] == "pinned replacement"
+    assert history[1]["old_content"] == "pinned original"
+
+
+@pytest.mark.asyncio
+async def test_pinned_trace_unpin_requires_current_confirmation_token(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="pinned body", pinned=True)
+
+    blocked = await server.trace(bucket_id, pinned=0)
+    token = blocked.split("confirm_token:", 1)[1].split(".", 1)[0].strip()
+    before = await server.bucket_mgr.get(bucket_id)
+
+    assert "confirmation required" in blocked
+    assert token == server._pinned_unpin_confirm_token(before)
+    assert before["metadata"]["pinned"] is True
+
+    wrong = await server.trace(bucket_id, pinned=0, confirm_token="wrong-token")
+    assert "confirmation required" in wrong
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["pinned"] is True
+
+    unpinned = await server.trace(bucket_id, pinned=0, confirm_token=token)
+    assert "pinned=False" in unpinned
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["pinned"] is False
+
+
+@pytest.mark.asyncio
+async def test_unpin_non_pinned_bucket_does_not_require_confirmation(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="ordinary body")
+
+    result = await server.trace(bucket_id, pinned=0)
+
+    assert "confirmation required" not in result
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["pinned"] is False
 
 
 @pytest.mark.asyncio
