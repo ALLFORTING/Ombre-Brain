@@ -36,7 +36,9 @@
 ## 检索与写入原则
 
 - 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索。
-- 已知 `letter_id` 时，优先 `get_letter(letter_id)`；`include_sealed=True` 是沿用 mailbox 的明确 sealed opt-in，不是默认权限。
+- 已知 `letter_id` 时，优先 `get_letter(letter_id)`；默认 `include_sealed=False`，只有显式 `include_sealed=True` 时才能读取 sealed letter。
+- sealed letter 与真实不存在的 `letter_id` 都返回 not found；这是刻意的存在性隐藏，不应据此断言“这封信不存在”。
+- 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
 - 闲聊、短期信息和已经准确记住的内容不必重复写入。
 - 确有值得保留的单条信息用 `hold`；较长日记/总结用 `grow`。
 - `feel=True` 记录的是模型带走的感受、问题或观察，不是事件本身的情绪。只有真的有沉淀时才写；不要为了完成流程强行产出。
