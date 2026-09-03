@@ -797,6 +797,34 @@
       }
     },
     {
+      "name": "get_letter",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "letter_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "letter_id"
+        ]
+      }
+    },
+    {
       "name": "pulse",
       "primitive": "tool",
       "category": "memory_session",
@@ -818,6 +846,17 @@
           "include_sealed": {
             "default": false,
             "type": "boolean"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
           },
           "show_all": {
             "default": false,

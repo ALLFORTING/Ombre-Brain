@@ -79,9 +79,9 @@ Initial dashboard setup requires the operator-provided `OMBRE_DASHBOARD_SETUP_TO
 
 **当前 MCP surface / Current MCP surface**
 
-运行时默认注册 21 个工具；设置 `OMBRE_DIAG_TOOLS` 为 `1`、`true`、`yes` 或 `on` 时注册全部 36 个工具。默认 surface 包含 1 个 resource（`ui://remember-me/asset-viewer.html`）和 1 个无参数、可选 prompt（`start_ombre_brain`）；没有 resource templates。精确名称、暴露条件和 schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+运行时默认注册 22 个工具；设置 `OMBRE_DIAG_TOOLS` 为 `1`、`true`、`yes` 或 `on` 时注册全部 37 个工具。默认 surface 包含 1 个 resource（`ui://remember-me/asset-viewer.html`）和 1 个无参数、可选 prompt（`start_ombre_brain`）；没有 resource templates。精确名称、暴露条件和 schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
 
-- 核心记忆/session（9）：`boot`、`breath`、`hold`、`grow`、`trace`、`archive_session`、`todos`、`pulse`、`dream`
+- 核心记忆/session（10）：`boot`、`breath`、`get_letter`、`hold`、`grow`、`trace`、`archive_session`、`todos`、`pulse`、`dream`
 - 默认 Remember-Me 资产（8）：`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_update_metadata`、`rm_asset_search`、`rm_asset_download_link`、`rm_asset_view`、`rm_asset_inspect`
 - 默认维护/受控（4）：`digest`、`related_backfill`、`rm_asset_reindex_embeddings`、`seal_letter`
 - 诊断/验收（15，仅 `OMBRE_DIAG_TOOLS` 开启时）：`asset_attachment_context_probe`、`asset_ingest_probe`、`asset_ingest_begin`、`asset_ingest_chunk`、`asset_ingest_finish`、`asset_ingest_abort`、`asset_browser_upload_link`、`asset_browser_upload_status`、`asset_render_probe`、`asset_export_probe`、`asset_vision_challenge`、`asset_vision_verify`、`asset_vision_export`、`asset_vision_download_link`、`asset_vision_upload_challenge`
@@ -202,7 +202,7 @@ Initial dashboard setup requires the operator-provided `OMBRE_DASHBOARD_SETUP_TO
 
 ```
                     ┌──────────────┐
-                    │  server.py   │  MCP 主入口，21/36 个工具 + Dashboard + Hook
+                    │  server.py   │  MCP 主入口，22/37 个工具 + Dashboard + Hook
                     └──────┬───────┘
            ┌───────────────┼───────────────┬────────────────┐
            ▼               ▼               ▼                ▼

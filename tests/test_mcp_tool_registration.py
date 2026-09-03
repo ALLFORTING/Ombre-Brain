@@ -244,7 +244,7 @@ def _validate_manifest():
 
 def test_manifest_is_valid_and_current_counts_are_derived():
     _validate_manifest()
-    assert len(DEFAULT_TOOLS) == 21
+    assert len(DEFAULT_TOOLS) == 22
     assert len(DIAGNOSTIC_TOOLS) == 15
     assert len(TOOL_ENTRIES) == len(DEFAULT_TOOLS) + len(DIAGNOSTIC_TOOLS)
     assert DEFAULT_TOOLS.isdisjoint(DIAGNOSTIC_TOOLS)
