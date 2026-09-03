@@ -147,6 +147,57 @@ async def test_pulse_hides_sealed_by_default_and_marks_when_included(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_pulse_show_all_is_bounded_and_offset_is_reported(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_ids = [
+        await server.bucket_mgr.create(content=f"pulse page marker {index}")
+        for index in range(7)
+    ]
+
+    first_page = await server.pulse(show_all=True, limit=3, offset=0)
+    second_page = await server.pulse(show_all=True, limit=3, offset=3)
+    last_page = await server.pulse(show_all=True, limit=3, offset=6)
+    past_end = await server.pulse(show_all=True, limit=3, offset=20)
+
+    def listed_ids(result):
+        return {
+            line.split("bucket_id:", 1)[1].split()[0]
+            for line in result.splitlines()
+            if "bucket_id:" in line
+        }
+
+    first_ids = listed_ids(first_page)
+    second_ids = listed_ids(second_page)
+    last_ids = listed_ids(last_page)
+
+    assert len(first_ids) == 3
+    assert len(second_ids) == 3
+    assert len(last_ids) == 1
+    assert first_ids.isdisjoint(second_ids)
+    assert first_ids | second_ids | last_ids == set(bucket_ids)
+    assert "总数:7个可见桶" in first_page
+    assert "当前显示:3个" in first_page
+    assert "还有更多:是" in first_page
+    assert "offset=3" in second_page
+    assert "还有更多:否" in last_page
+    assert "当前显示:0个" in past_end
+    assert "还有更多:否" in past_end
+
+
+@pytest.mark.asyncio
+async def test_pulse_default_top15_ignores_bounded_page_arguments(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    for index in range(18):
+        await server.bucket_mgr.create(content=f"pulse top15 marker {index}")
+
+    result = await server.pulse(show_all=False, limit=1, offset=12)
+    listed_lines = [line for line in result.splitlines() if "bucket_id:" in line]
+
+    assert len(listed_lines) == 15
+    assert "动态Top15" in result
+
+
+@pytest.mark.asyncio
 async def test_dream_and_todos_hide_sealed_by_default(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     sealed_id = await server.bucket_mgr.create(

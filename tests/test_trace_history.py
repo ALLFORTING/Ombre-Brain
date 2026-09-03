@@ -150,3 +150,82 @@ async def test_destructive_content_updates_fail_closed_when_history_capture_fail
     assert "supersedes update failed" in superseded
     assert (await server.bucket_mgr.get(bucket_id))["content"] == "original trace content"
     assert (await server.bucket_mgr.get(superseded_id))["content"] == "original superseded content"
+
+
+@pytest.mark.asyncio
+async def test_delete_history_capture_failure_does_not_delete_or_report_not_found(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="delete history failure")
+    server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
+
+    result = await server.trace(bucket_id, delete=True)
+
+    assert "删除失败" in result
+    assert "未找到" not in result
+    assert await server.bucket_mgr.get(bucket_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_execution_failure_is_not_reported_as_not_found(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="delete execution failure")
+    server.bucket_mgr.delete = AsyncMock(return_value=False)
+
+    result = await server.trace(bucket_id, delete=True)
+
+    assert "删除失败" in result
+    assert "未找到" not in result
+
+
+@pytest.mark.asyncio
+async def test_batch_trace_returns_identifiable_result_for_each_bucket(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first_id = await server.bucket_mgr.create(content="batch first")
+    second_id = await server.bucket_mgr.create(content="batch second")
+
+    result = await server.trace(f"{first_id},{second_id}", resolved=1)
+
+    assert f"[{first_id}]" in result
+    assert f"[{second_id}]" in result
+    assert (await server.bucket_mgr.get(first_id))["metadata"]["resolved"] is True
+    assert (await server.bucket_mgr.get(second_id))["metadata"]["resolved"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protection", ["pinned", "protected"])
+async def test_trace_importance_change_reports_pinned_or_protected_lock(
+    tmp_path, monkeypatch, protection
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(
+        content=f"{protection} importance lock",
+        **{protection: True},
+    )
+
+    result = await server.trace(bucket_id, importance=3)
+
+    assert "importance 未修改" in result
+    assert "pinned/protected" in result
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["importance"] == 10
+
+
+@pytest.mark.asyncio
+async def test_archived_session_trace_allows_unsealed_body_but_not_sealed_body(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    open_result = await server.archive_session("open archive session")
+    open_id = open_result.split("bucket_id:", 1)[1].strip()
+    sealed_result = await server.archive_session("sealed archive session", sealed=True)
+    sealed_id = sealed_result.split("bucket_id:", 1)[1].strip()
+    sealed_before = await server.bucket_mgr.get(sealed_id)
+
+    updated = await server.trace(open_id, content="updated archived body")
+    blocked = await server.trace(sealed_id, content="must not replace")
+
+    assert "content=已替换" in updated
+    assert (await server.bucket_mgr.get(open_id))["content"] == "updated archived body"
+    assert "受到保护" in blocked
+    assert (await server.bucket_mgr.get(sealed_id))["content"] == sealed_before["content"]

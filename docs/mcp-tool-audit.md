@@ -14,18 +14,18 @@ guidance lives in [`CLAUDE_PROMPT.md`](../CLAUDE_PROMPT.md).
 
 ## Inventory Summary
 
-The server registers **21 formal MCP tools by default**. The 15 diagnostic
+The server registers **22 formal MCP tools by default**. The 15 diagnostic
 tools remain implemented, but are registered only when `OMBRE_DIAG_TOOLS` is
 explicitly enabled:
 
 | Category | Count | Intended audience |
 |---|---:|---|
-| Core memory and session | 9 | Ordinary users and model workflows |
+| Core memory and session | 10 | Ordinary users and model workflows |
 | Formal Remember-Me assets | 8 | Ordinary users and model workflows |
 | Administration and maintenance | 4 | Operators or controlled maintenance |
 | Diagnostic probes | 15 | Developers and acceptance testing only; disabled by default |
-| **Default total** | **21** | |
-| **Diagnostic-enabled total** | **36** | |
+| **Default total** | **22** | |
+| **Diagnostic-enabled total** | **37** | |
 
 The ordinary tool surface no longer includes the diagnostic probes. Their
 functions, routes, and tests remain available for development and acceptance
@@ -41,6 +41,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 | Tool | Module | Purpose | Audience | Formal | Overlap or misuse risk | Recommendation |
 |---|---|---|---|---|---|---|
 | `breath` | Memory retrieval | Surface or search memories, including semantic and exact tag/topic filtered retrieval | User/model | Yes | Large parameter surface blurs search, surfacing, mailbox, and emotion modes | Keep; later put specialist modes behind workflows |
+| `get_letter` | Memory read | Read one handoff letter by exact `letter_id`, with sealed visibility opt-in | User/model | Yes | Narrow lookup should not be used as mailbox enumeration | Keep; use when the letter ID is already known |
 | `hold` | Memory write | Store one memory with tagging, merge, emotion, and trigger metadata | User/model | Yes | Can be confused with `grow` for long input | Keep; sharpen routing guidance |
 | `grow` | Memory write | Split and archive journal-style content into multiple memories | User/model | Yes | Overlaps `hold` at the content-length boundary | Keep; add a write workflow that chooses `hold` or `grow` |
 | `trace` | Memory mutation | Update, append, replace, relate, merge, seal, or delete buckets | User/model power operation | Yes | Highly overloaded and includes destructive actions | Keep; later introduce narrower action groups and confirmations |

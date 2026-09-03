@@ -12,8 +12,8 @@
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
 #   - Expose the current MCP tool and resource surface:
 #     注册当前 MCP 工具与资源表面：
-#       21 default tools; 15 optional diagnostic tools
-#                21 个默认工具；15 个可选诊断工具
+#       22 default tools; 15 optional diagnostic tools
+#                22 个默认工具；15 个可选诊断工具
 #       memory/session, Remember-Me, and maintenance operations
 #                记忆/会话、Remember-Me 与维护操作
 #       one viewer resource; diagnostics via OMBRE_DIAG_TOOLS
@@ -6174,6 +6174,28 @@ async def grow(content: str) -> str:
     return response
 
 
+@mcp.tool()
+async def get_letter(letter_id: int, include_sealed: bool = False) -> str:
+    """Read one handoff letter by exact id; sealed letters require explicit opt-in."""
+    try:
+        letter_id = int(letter_id)
+    except (TypeError, ValueError):
+        return "Please provide a valid letter_id."
+    if letter_id < 1:
+        return "Please provide a valid letter_id."
+    letter = bucket_mgr.get_letter(letter_id, include_sealed=include_sealed)
+    if not letter:
+        return _with_response_seal(f"letter_id not found: {letter_id}")
+    body = (
+        "=== 信箱 ===\n"
+        f"[letter_id:{letter.get('id')}] "
+        f"created_at:{letter.get('created_at')} "
+        f"session_id:{letter.get('session_id')}\n"
+        f"{letter.get('content', '')}"
+    )
+    return _with_response_seal(body)
+
+
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
@@ -6266,13 +6288,22 @@ async def trace(
             return f"删除失败：记忆桶 {bucket_id} 受到保护。"
         success = await bucket_mgr.delete(bucket_id)
         # BucketManager owns local ordinary-vector cleanup and failure ordering.
-        # Keep the trace caller's existing success/not-found response contract.
-        return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
+        # The earlier get() already distinguished not-found and protection.
+        return (
+            f"已遗忘记忆桶: {bucket_id}"
+            if success
+            else f"删除失败：记忆桶 {bucket_id} 存在，但删除未完成。"
+        )
 
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
     metadata = bucket.get("metadata", {})
+    importance_requested = 1 <= importance <= 10
+    importance_protected = importance_requested and (
+        metadata.get("pinned") or metadata.get("protected")
+    )
+    protection_label = "pinned/protected"
     if pinned == 0 and metadata.get("pinned"):
         unpin_token = _pinned_unpin_confirm_token(bucket)
         if not hmac.compare_digest((confirm_token or "").strip(), unpin_token):
@@ -6293,7 +6324,7 @@ async def trace(
         updates["valence"] = valence
     if 0 <= arousal <= 1:
         updates["arousal"] = arousal
-    if 1 <= importance <= 10:
+    if importance_requested and not importance_protected:
         updates["importance"] = importance
     if tags:
         updates["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
@@ -6334,6 +6365,14 @@ async def trace(
         next_valence = updates.get("valence", meta.get("valence", 0.5))
         next_arousal = updates.get("arousal", meta.get("arousal", 0.3))
         updates["emotion_history"] = _append_emotion_history(meta, next_valence, next_arousal)
+
+    if importance_protected:
+        updates.pop("importance", None)
+        if not updates:
+            return (
+                f"importance 未修改：记忆桶 {bucket_id} 受到 {protection_label} protection，"
+                "importance 锁定为 10。"
+            )
 
     if not updates:
         return "没有任何字段需要修改。"
@@ -6378,6 +6417,11 @@ async def trace(
             changed += " → 已隐藏，保留但不再浮现"
         else:
             changed += " → 已取消隐藏，重新参与浮现"
+    if importance_protected:
+        changed += (
+            "; importance 未修改：受到 pinned/protected protection，"
+            "importance 锁定为 10"
+        )
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 @mcp.tool()
@@ -6593,9 +6637,31 @@ async def boot(pinned_chars: int = 2000, max_tokens: int = 8000) -> str:
 
 
 @mcp.tool()
-async def pulse(include_archive: bool = False, show_all: bool = False, include_sealed: bool = False) -> str:
+async def pulse(
+    include_archive: bool = False,
+    show_all: bool = False,
+    include_sealed: bool = False,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=50, description="Maximum number of bucket summaries to display."),
+    ] = 50,
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Number of ordered bucket summaries to skip."),
+    ] = 0,
+) -> str:
     """Status/listing readout; listing may update bounded dormant metadata as part of maintenance."""
     await decay_engine.ensure_started()
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except (TypeError, ValueError):
+        return "limit 和 offset 必须是整数。"
+    if limit < 1:
+        return "limit 必须大于等于 1。"
+    if offset < 0:
+        return "offset 必须大于等于 0。"
+    limit = min(limit, 50)
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -6617,14 +6683,14 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
         logger.error("Pulse bucket listing failed: %s", e); return status + "\n列出记忆桶失败。"
 
     if not buckets:
-        return status + "\n记忆库为空。"
+        return status + "\n记忆库为空。\n总数:0个可见桶，当前显示:0个，还有更多:否"
 
     await _mark_dormant_buckets(buckets)
-    total_buckets = len(buckets)
     listable_buckets = [
         b for b in buckets
         if include_sealed or not _is_sealed(b)
     ]
+    total_buckets = len(listable_buckets)
     pinned_buckets = [
         b for b in listable_buckets
         if b["metadata"].get("pinned", False)
@@ -6639,7 +6705,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
             return 0.0
 
     if show_all:
-        visible_buckets = sorted(
+        ordered_buckets = sorted(
             listable_buckets,
             key=lambda b: (
                 bool(b["metadata"].get("pinned") or b["metadata"].get("protected")),
@@ -6648,6 +6714,7 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
             reverse=True,
         )
         dynamic_count = len(listable_buckets) - len(pinned_buckets)
+        visible_buckets = ordered_buckets[offset:offset + limit]
     else:
         dynamic_buckets = [
             b for b in listable_buckets
@@ -6701,16 +6768,22 @@ async def pulse(include_archive: bool = False, show_all: bool = False, include_s
             f"标签:{','.join(meta.get('tags', []))}"
         )
 
+    has_more = (
+        offset + len(visible_buckets) < total_buckets
+        if show_all
+        else len(visible_buckets) < total_buckets
+    )
     if show_all:
-        breakdown = f"钉选{len(pinned_buckets)}个 + 全部非钉选{dynamic_count}个"
+        breakdown = f"有界全部列表，limit={limit}, offset={offset}"
         display_stats = (
-            f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
-            f"（{breakdown}）\n"
+            f"\n总数:{total_buckets}个可见桶，当前显示:{len(visible_buckets)}个"
+            f"（{breakdown}），还有更多:{'是' if has_more else '否'}\n"
         )
     else:
         display_stats = (
-            f"\n共{total_buckets}个桶，当前显示{len(visible_buckets)}个"
-            f"（钉选{len(pinned_buckets)}个 + 动态Top15）\n"
+            f"\n总数:{total_buckets}个可见桶，当前显示:{len(visible_buckets)}个"
+            f"（钉选{len(pinned_buckets)}个 + 动态Top15），"
+            f"还有更多:{'是' if has_more else '否'}\n"
         )
     return status + "\n=== 记忆列表 ===\n" + "\n".join(lines) + display_stats
 

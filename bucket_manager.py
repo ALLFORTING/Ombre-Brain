@@ -661,6 +661,26 @@ class BucketManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_letter(self, letter_id: int, include_sealed: bool = False) -> Optional[dict]:
+        """Return one handoff letter by exact id, respecting sealed visibility."""
+        try:
+            letter_id = int(letter_id)
+        except (TypeError, ValueError):
+            return None
+        if letter_id < 1:
+            return None
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, content, created_at, session_id, sealed
+                FROM letters
+                WHERE id = ? AND (? OR sealed = 0)
+                """,
+                (letter_id, bool(include_sealed)),
+            ).fetchone()
+        return dict(row) if row else None
+
     @guarded_mutation("bucket_letter_seal")
     def seal_letter(self, letter_id: int, sealed: bool = True) -> bool:
         """Hide or unhide one handoff letter by id."""

@@ -139,3 +139,26 @@ async def test_seal_letter_hides_default_mailbox_until_included(tmp_path, monkey
     assert "letter_id:1 sealed" in result
     assert letter not in hidden
     assert letter in included
+
+
+@pytest.mark.asyncio
+async def test_get_letter_reads_exact_id_and_hides_sealed_by_default(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.archive_session("first carrier", letter="first exact letter")
+    await server.archive_session(
+        "sealed carrier",
+        letter="sealed exact letter",
+        sealed=True,
+    )
+
+    first = await server.get_letter(1)
+    hidden = await server.get_letter(2)
+    included = await server.get_letter(2, include_sealed=True)
+
+    assert "letter_id:1" in first
+    assert "first exact letter" in first
+    assert "sealed exact letter" not in first
+    assert "letter_id not found: 2" in hidden
+    assert "sealed exact letter" not in hidden
+    assert "letter_id:2" in included
+    assert "sealed exact letter" in included

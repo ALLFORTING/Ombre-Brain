@@ -376,9 +376,9 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 21 个默认工具、36 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 22 个默认工具、37 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 21 default tools, 36 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 22 default tools, 37 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
 ### 默认 MCP 工具 / Default MCP tools
 
@@ -388,10 +388,11 @@ The current MCP surface has 21 default tools, 36 tools when diagnostics are enab
 |-----------|-------------------------------|
 | `boot` | 推荐的一次性启动上下文：钉选摘要、到期 trigger、信箱、feel 回声、最近 session、todos，并按 token 预算截断 / Recommended one-shot startup context; observing due triggers may update bounded seen metadata |
 | `breath` | 检索或浮现记忆；`query` 用于定向检索。它是 retrieval-oriented，命中/排序可能更新 activation metadata / Retrieval or surfacing; targeted `query` is preferred when the topic is known, and bounded activation metadata may be updated |
+| `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认隐藏 sealed letter，需明确 `include_sealed=True` 才读取 / Read one handoff letter by exact ID; sealed letters stay hidden unless explicitly included |
 | `hold` | 写入单条记忆或模型自己的 `feel` 反思 / Store one memory or a model `feel` reflection |
 | `grow` | 将日记/长内容拆分并写入多个记忆桶 / Digest journal-style content into multiple memory buckets |
-| `trace` | 混合修改工具：元数据、正文替换/追加、related、merge、seal 以及 `delete=True`。delete 是正常工具流程中的 destructive 操作；仓库可能保留写前快照供人工恢复，但没有 MCP undo/restore 命令 / Mixed mutation tool; delete is destructive in the normal workflow, while write-ahead history may support manual recovery without providing an MCP undo command |
-| `pulse` | 系统状态和记忆桶列表；listing 可能更新 bounded dormant metadata / Status and bucket listing; listing may update bounded dormant metadata |
+| `trace` | 混合修改工具：元数据、正文替换/追加、related、merge、seal 以及 `delete=True`。delete 明确成功才代表写前快照成功；没有 MCP undo/restore 命令 / Mixed mutation tool; delete is destructive, and only explicit success confirms the write-ahead snapshot; there is no MCP undo/restore command |
+| `pulse` | 系统状态和记忆桶列表；`show_all=True` 默认最多显示 50 个，可用 `limit`/`offset` 分页；listing 可能更新 bounded dormant metadata / Status and bucket listing; `show_all=True` is bounded to 50 per page by default |
 | `dream` | 可选的最近记忆反思/详情读取，不要求每次启动调用 / Optional recent-memory reflection/detail readout; not required on every startup |
 | `seal_letter` | sealed-memory handoff-letter maintenance：改变一封 letter 的可见性，不是普通检索 / Changes handoff-letter visibility; not ordinary retrieval |
 | `archive_session` | 归档一次会话摘要，可附 highlights/mood/VA 和 mailbox letter / Archive a session summary with optional handoff letter |
@@ -433,6 +434,10 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `tags_filter: list[str] | None = None` — 可选的桶标签精确过滤；列表内任一标签匹配即可，多个标签过滤与 `topic_filter` 之间按 AND 组合 / Optional exact bucket-tag filter; any listed tag may match, and it combines conjunctively with `topic_filter`.
 - `topic_filter: list[str] | None = None` — 可选的归档会话主题精确过滤；列表内任一主题匹配即可。过滤会先于 query 排名，单独使用时按最新记录优先 / Optional exact archived-session topic filter; any listed topic may match. Structured filtering happens before query ranking, and filter-only calls return newest first.
 
+#### `get_letter`
+
+- `get_letter(letter_id, include_sealed=False)` — 按 ID 精确读取单封信；sealed letter 默认隐藏，沿用明确的 `include_sealed=True` opt-in / Read one letter by exact ID; sealed letters are hidden by default.
+
 #### `trace`
 
 - `bucket_id` 支持逗号分隔批量 ID；批量模式忽略 `content` 和 `name`，不支持 `merge` / `bucket_id` accepts comma-separated IDs; batch mode ignores `content` and `name`, and cannot merge.
@@ -444,6 +449,10 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `dormant: int = -1` — `1` 手动沉底、`0` 恢复、`-1` 不改；`trace` 修改会自动解除 dormant，除非显式传 `dormant=1` / `1` dormant, `0` restore, `-1` unchanged; trace updates wake dormant buckets unless explicitly kept dormant.
 - `related: str = ""` — 逗号分隔 related bucket IDs，写入双向关联 / Comma-separated related bucket IDs; links are bidirectional.
 - `trigger_date: str = ""` — 前瞻记忆日期，格式 `YYYY-MM-DD`，到期后由 `boot` 的“今日浮现”显示 / Prospective memory date; due items appear in `boot`.
+
+#### `pulse`
+
+`pulse(show_all=False)` 保持非 pinned 动态桶 Top15 的默认行为；`pulse(show_all=True, limit=50, offset=0)` 返回 bounded page。`limit` 最大 50，`offset` 从 0 开始。返回末尾给出可见总数、当前显示数量和 `还有更多:是/否`，据此继续下一页；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。
 
 #### `archive_session`
 
@@ -960,10 +969,10 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 
 > 下列阈值、转换条件和路由列表是当前实现参考，不是 Contract v1 的精确公共保证；v1 只承诺其已明确限定的默认可见性和显式包含边界。
 
-- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True)` 可管理它们。被 `breath` 命中或 `trace` 修改后会自动解除 dormant。
+- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。被 `breath` 命中或 `trace` 修改后会自动解除 dormant。
 - `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；需要显式 `include_sealed=True` 才显示。
 
-- `dormant` is automatic sinking from natural decay: `pulse()` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or `pulse(show_all=True)` for management. A `breath` hit or `trace` update wakes the bucket.
+- `dormant` is automatic sinking from natural decay: `pulse()` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. A `breath` hit or `trace` update wakes the bucket.
 - `sealed` is manual hiding, only changed by `trace(sealed=1/0)`. Natural decay never creates sealed buckets. Sealed overrides pinned and hides the bucket name, ID, and summary from `breath`, `pulse`, `dream`, and `todos` unless `include_sealed=True`.
 
 ### 参数说明 / Parameters

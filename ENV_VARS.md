@@ -65,7 +65,7 @@ Clean first deployment requires the operator-configured `OMBRE_DASHBOARD_SETUP_T
 - `OMBRE_DASHBOARD_PASSWORD` 设置后，valid auth store 的 Dashboard "修改密码"功能仍禁用（显示提示，建议直接修改环境变量）；仅 corrupt/unreadable auth store 允许用 env 密码登录后通过现有 `/auth/change-password` 显式恢复。未设置则密码存储在 `{buckets_dir}/.dashboard_auth.json`（SHA-256 + salt）。
 - `OMBRE_HOOK_TOKEN` 只用于两个 HTTP hook 的 `Authorization: Bearer` 认证，与 `OMBRE_AUTH_TOKEN` 独立，不支持 query token 或匿名回退；未配置时 hook 返回 `503 hook_not_configured`。
 
-- 默认 MCP 工具面只注册 21 个正式工具。15 个诊断工具仍保留在代码和测试中，只有显式设置 `OMBRE_DIAG_TOOLS` 为开启值时才注册；普通用户不应开启。
+- 默认 MCP 工具面只注册 22 个正式工具。15 个诊断工具仍保留在代码和测试中，只有显式设置 `OMBRE_DIAG_TOOLS` 为开启值时才注册；普通用户不应开启。
 
 - `OMBRE_RM_RUNTIME_ENABLED` 默认关闭。关闭时 `OMBRE_RM_DATA_ROOT` 即使是非法值也不会被读取或验证。开启时 `OMBRE_RM_DATA_ROOT` 必须是绝对路径，例如 `C:\example\remember-me-data` 或 `/tmp/remember-me-data`；启动失败会 fail closed，不会回退到旧 AssetStore。
 
