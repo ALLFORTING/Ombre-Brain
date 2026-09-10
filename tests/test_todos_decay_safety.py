@@ -205,6 +205,35 @@ async def test_trace_todos_accepts_string_and_list_with_tri_state_semantics(
 
 
 @pytest.mark.asyncio
+async def test_breath_uses_current_metadata_todos_after_cached_summary(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(
+        content="stable body used by a cached breath summary",
+        todos=["old one", "old two"],
+    )
+    await server.trace(
+        bucket_id,
+        todos=["new one", "new two", "new three", "new four"],
+    )
+    current = await server.bucket_mgr.get(bucket_id)
+    server.bucket_mgr.search = AsyncMock(return_value=[current])
+    server.bucket_mgr.touch = AsyncMock(return_value=None)
+    server.dehydrator.dehydrate = AsyncMock(
+        return_value="cached summary without authoritative todos"
+    )
+
+    result = await server.breath(query="find the stable body")
+
+    assert "=== 当前 todos（以 metadata 为准）===" in result
+    for item in ("new one", "new two", "new three", "new four"):
+        assert f"- {item}" in result
+    assert "- old one" not in result
+    assert "- old two" not in result
+
+
+@pytest.mark.asyncio
 async def test_trace_mcp_schema_and_runtime_accept_string_or_array_todos(
     tmp_path, monkeypatch
 ):

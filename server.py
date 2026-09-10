@@ -1577,6 +1577,14 @@ async def _with_related_line(text: str, bucket: dict) -> str:
 
 async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = False) -> str:
     lines = [text]
+    current_todos = _canonical_todos(
+        bucket.get("metadata", {}).get("todos")
+    )
+    if current_todos:
+        lines.append(
+            "=== 当前 todos（以 metadata 为准）===\n"
+            + "\n".join(f"- {item}" for item in current_todos)
+        )
     related_line = await _format_related_line(bucket)
     if related_line:
         lines.append(related_line)
