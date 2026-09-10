@@ -178,15 +178,28 @@ class RememberMeMcpCompatibilityPresenter:
                 indexed=result.indexed,
                 skipped=result.skipped,
                 failed=result.failed,
+                last_error=getattr(result, "last_error", ""),
+                last_error_details=getattr(
+                    result,
+                    "last_error_details",
+                    None,
+                ),
             )
+            payload = {
+                "ok": True,
+                "scanned": counters.scanned,
+                "indexed": counters.indexed,
+                "skipped": counters.skipped,
+                "failed": counters.failed,
+            }
+            if counters.failed:
+                payload["last_error_details"] = (
+                    counters.last_error_details or {}
+                )
+                if counters.last_error:
+                    payload["last_error"] = counters.last_error
             return json.dumps(
-                {
-                    "ok": True,
-                    "scanned": counters.scanned,
-                    "indexed": counters.indexed,
-                    "skipped": counters.skipped,
-                    "failed": counters.failed,
-                },
+                payload,
                 ensure_ascii=False,
                 sort_keys=True,
             )

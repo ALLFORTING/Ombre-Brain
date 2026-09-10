@@ -52,6 +52,19 @@ class RememberMeVectorProviderAdapter:
     async def embed(self, text: str) -> list[float]:
         return await self._embedding_engine.embed_text(text)
 
+    @property
+    def last_error(self) -> str:
+        return str(getattr(self._embedding_engine, "last_error", "") or "")
+
+    @property
+    def last_error_details(self) -> dict[str, Any]:
+        details = getattr(self._embedding_engine, "last_error_details", {})
+        return dict(details) if isinstance(details, dict) else {}
+
+    def clear_error_diagnostics(self) -> None:
+        self._embedding_engine.last_error = ""
+        self._embedding_engine.last_error_details = {}
+
 
 def _normalized_backend(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("_", "-")

@@ -1127,7 +1127,12 @@ async def test_core_adapter_reindex_maps_only_four_counters_and_errors():
     adapter = RememberMeCoreAdapter(_runtime(service))
 
     result = await adapter.reindex_embeddings(asset_id=" a ", limit=7)
-    assert result == RememberMeReindexResult(3, 1, 1, 1)
+    assert result == RememberMeReindexResult(
+        3,
+        1,
+        1,
+        1,
+    )
     request = service.reindex_embeddings.await_args.args[0]
     assert request.asset_id == "a"
     assert request.limit == 7
@@ -1142,6 +1147,51 @@ async def test_core_adapter_reindex_maps_only_four_counters_and_errors():
             await adapter.reindex_embeddings()
         assert caught.value.code == code
         assert "private path" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_core_adapter_reindex_returns_bounded_provider_failure_details():
+    provider = SimpleNamespace(last_error="", last_error_details={})
+
+    def clear_error_diagnostics():
+        provider.last_error = ""
+        provider.last_error_details = {}
+
+    async def fail_with_payment_required(_request):
+        provider.last_error = "embedding_http_error"
+        provider.last_error_details = {
+            "request_url": "https://api.siliconflow.com",
+            "status_code": 402,
+            "response_body": "[redacted]",
+            "error_type": "PermissionDeniedError",
+            "api_key": "must-not-escape",
+        }
+        return ReindexEmbeddingsResult(
+            enabled=True,
+            model_id="private-model",
+            scanned=1,
+            indexed=0,
+            skipped=0,
+            failed=1,
+        )
+
+    provider.clear_error_diagnostics = clear_error_diagnostics
+    service = SimpleNamespace(
+        vector_provider=provider,
+        reindex_embeddings=AsyncMock(side_effect=fail_with_payment_required),
+    )
+    adapter = RememberMeCoreAdapter(_runtime(service))
+
+    result = await adapter.reindex_embeddings(asset_id=ASSET_ID)
+
+    assert result.last_error == "embedding_http_error"
+    assert result.last_error_details == {
+        "request_url": "https://api.siliconflow.com",
+        "status_code": 402,
+        "response_body": "[redacted]",
+        "error_type": "PermissionDeniedError",
+    }
+    assert "api_key" not in result.last_error_details
 
 
 @pytest.mark.asyncio
@@ -1170,8 +1220,8 @@ async def test_presenter_reindex_exact_legacy_json_and_error_envelopes():
 
     raw = await presenter.rm_asset_reindex_embeddings(asset_id="a", limit=9)
     assert raw == (
-        '{"failed": 1, "indexed": 1, "ok": true, '
-        '"scanned": 4, "skipped": 2}'
+        '{"failed": 1, "indexed": 1, "last_error_details": {}, '
+        '"ok": true, "scanned": 4, "skipped": 2}'
     )
     assert "enabled" not in raw
     assert "model_id" not in raw
@@ -1414,6 +1464,13 @@ async def test_real_rm_search_and_reindex_provider_failure_are_redacted(tmp_path
         "indexed": 0,
         "skipped": 0,
         "failed": 1,
+        "last_error": "embedding_http_error",
+        "last_error_details": {
+            "request_url": "https://api.example.invalid",
+            "status_code": 502,
+            "response_body": "[redacted]",
+            "error_type": "SyntheticHttpError",
+        },
     }
     assert reindex["scanned"] == (
         reindex["indexed"] + reindex["skipped"] + reindex["failed"]
@@ -1421,12 +1478,6 @@ async def test_real_rm_search_and_reindex_provider_failure_are_redacted(tmp_path
 
     public_output = search_raw + reindex_raw
     for private_key in (
-        "last_error",
-        "last_error_details",
-        "error_type",
-        "request_url",
-        "status_code",
-        "response_body",
         "model_id",
         "endpoint",
         "api_key",
