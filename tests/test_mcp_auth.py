@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 from pathlib import Path
 
@@ -228,6 +229,39 @@ def test_query_token_warning_does_not_include_secret(tmp_path, monkeypatch, capl
     assert "query-secret" not in caplog.text
 
 
+def test_uvicorn_access_log_filter_redacts_only_query_token(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    server = _load_server(monkeypatch)
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        (
+            "127.0.0.1:1234",
+            "GET",
+            "/mcp?mode=stream&token=plain-secret&after=kept",
+            "1.1",
+            200,
+        ),
+        None,
+    )
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.filters.clear()
+    server.install_uvicorn_access_log_redaction()
+    server.install_uvicorn_access_log_redaction()
+    assert len(access_logger.filters) == 1
+    assert access_logger.filters[0].filter(record) is True
+
+    rendered = record.getMessage()
+    assert "plain-secret" not in rendered
+    assert "/mcp?mode=stream&token=[redacted]&after=kept" in rendered
+
+
 def test_http_cors_origins_are_explicit(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_AUTH_TOKEN", raising=False)
@@ -262,5 +296,7 @@ def test_both_http_entrypoints_use_shared_cors_policy():
 
     assert "add_http_cors_middleware(_app)" in server_source
     assert "server.add_http_cors_middleware(app)" in backup_source
+    assert "install_uvicorn_access_log_redaction()" in server_source
+    assert "server.install_uvicorn_access_log_redaction()" in backup_source
     assert 'allow_origins=["*"]' not in server_source
     assert 'allow_origins=["*"]' not in backup_source

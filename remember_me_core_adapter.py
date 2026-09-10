@@ -76,6 +76,8 @@ class RememberMeReindexResult:
     indexed: int
     skipped: int
     failed: int
+    last_error: str = ""
+    last_error_details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         counters = (
@@ -91,6 +93,39 @@ class RememberMeReindexResult:
             for value in counters
         ) or self.scanned != self.indexed + self.skipped + self.failed:
             raise ValueError("invalid_reindex_counters")
+        if not isinstance(self.last_error, str):
+            raise ValueError("invalid_reindex_error")
+        if self.last_error_details is not None and not isinstance(
+            self.last_error_details, dict
+        ):
+            raise ValueError("invalid_reindex_error_details")
+
+
+def _bounded_reindex_failure(provider: Any) -> tuple[str, dict[str, Any]]:
+    raw_code = str(getattr(provider, "last_error", "") or "")
+    code = raw_code if re.fullmatch(r"[a-z0-9_]{1,80}", raw_code) else ""
+    raw_details = getattr(provider, "last_error_details", {})
+    if not isinstance(raw_details, dict):
+        return code, {}
+
+    details: dict[str, Any] = {}
+    request_url = raw_details.get("request_url")
+    if (
+        isinstance(request_url, str)
+        and len(request_url) <= 500
+        and re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]:]+", request_url)
+    ):
+        details["request_url"] = request_url
+    status_code = raw_details.get("status_code")
+    if isinstance(status_code, int) and not isinstance(status_code, bool) and 100 <= status_code <= 599:
+        details["status_code"] = status_code
+    response_body = raw_details.get("response_body")
+    if response_body in ("", "[redacted]"):
+        details["response_body"] = response_body
+    error_type = raw_details.get("error_type")
+    if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", error_type):
+        details["error_type"] = error_type
+    return code, details
 
 
 class RememberMeCoreAdapter:
@@ -336,6 +371,10 @@ class RememberMeCoreAdapter:
     ) -> RememberMeReindexResult:
         if type(limit) is not int or not 1 <= limit <= 500:
             raise RememberMeCoreAdapterError("invalid_limit")
+        provider = getattr(self._runtime.service, "vector_provider", None)
+        clear_diagnostics = getattr(provider, "clear_error_diagnostics", None)
+        if callable(clear_diagnostics):
+            clear_diagnostics()
         try:
             result = await self._runtime.service.reindex_embeddings(
                 ReindexEmbeddingsRequest(
@@ -343,11 +382,20 @@ class RememberMeCoreAdapter:
                     limit=limit,
                 )
             )
+            last_error, last_error_details = (
+                _bounded_reindex_failure(provider)
+                if result.failed
+                else ("", None)
+            )
+            if last_error_details == {}:
+                last_error_details = None
             return RememberMeReindexResult(
                 scanned=result.scanned,
                 indexed=result.indexed,
                 skipped=result.skipped,
                 failed=result.failed,
+                last_error=last_error,
+                last_error_details=last_error_details,
             )
         except InvalidMetadata as exc:
             raise RememberMeCoreAdapterError("asset_unavailable") from exc

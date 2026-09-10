@@ -150,6 +150,41 @@ def _mcp_auth_token() -> str:
     return os.environ.get("OMBRE_AUTH_TOKEN", "").strip()
 
 
+_ACCESS_LOG_QUERY_TOKEN_PATTERN = re.compile(
+    r"([?&]token=)[^&\s]*",
+    flags=re.IGNORECASE,
+)
+
+
+class _UvicornAccessTokenRedactionFilter(logging.Filter):
+    """Redact query-token values without changing the request scope."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            redacted_args = list(args)
+            redacted_args[2] = _ACCESS_LOG_QUERY_TOKEN_PATTERN.sub(
+                r"\1[redacted]",
+                args[2],
+            )
+            record.args = tuple(redacted_args)
+        return True
+
+
+def install_uvicorn_access_log_redaction() -> None:
+    """Install the idempotent server-side query-token log filter.
+
+    This relies on uvicorn keeping the raw path/query string in record.args[2];
+    revisit the filter whenever uvicorn or the access-log formatter changes.
+    """
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(
+        isinstance(item, _UvicornAccessTokenRedactionFilter)
+        for item in access_logger.filters
+    ):
+        access_logger.addFilter(_UvicornAccessTokenRedactionFilter())
+
+
 _HOOK_OBVIOUS_TOKENS = frozenset({
     "changeme",
     "password",
@@ -1577,6 +1612,14 @@ async def _with_related_line(text: str, bucket: dict) -> str:
 
 async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = False) -> str:
     lines = [text]
+    current_todos = _canonical_todos(
+        bucket.get("metadata", {}).get("todos")
+    )
+    if current_todos:
+        lines.append(
+            "=== 当前 todos（以 metadata 为准）===\n"
+            + "\n".join(f"- {item}" for item in current_todos)
+        )
     related_line = await _format_related_line(bucket)
     if related_line:
         lines.append(related_line)
@@ -6559,10 +6602,10 @@ async def todos() -> str:
 
 
 @mcp.tool()
-async def boot(pinned_chars: int = 2000, max_tokens: int = 8000) -> str:
+async def boot(pinned_chars: int = 5000, max_tokens: int = 8000) -> str:
     """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
     await decay_engine.ensure_started()
-    pinned_chars = max(80, min(int(pinned_chars or 2000), 2000))
+    pinned_chars = max(80, min(int(pinned_chars or 5000), 5000))
     max_tokens = max(1000, min(int(max_tokens or 8000), 12000))
 
     try:
@@ -8250,6 +8293,7 @@ if __name__ == "__main__":
             _app = mcp.sse_app()
         add_mcp_auth_middleware(_app)
         add_http_cors_middleware(_app)
+        install_uvicorn_access_log_redaction()
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
     else:

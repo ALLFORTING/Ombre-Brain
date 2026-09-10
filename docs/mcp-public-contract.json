@@ -536,7 +536,7 @@
             "type": "integer"
           },
           "pinned_chars": {
-            "default": 2000,
+            "default": 5000,
             "type": "integer"
           }
         }
