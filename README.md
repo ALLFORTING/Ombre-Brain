@@ -418,6 +418,12 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 ### 工具参数速查 / Tool Parameter Quick Reference
 
+#### `boot`
+
+`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算；超出预算时返回会被截断。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+
+`boot` accepts optional `pinned_chars` and `max_tokens` parameters: the former controls the character budget for pinned content, while the latter controls the token budget for the overall response; output is truncated when a budget is exceeded. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
+
 #### `breath`
 
 - `query: str = ""` — 关键词/语义检索；为空时进入浮现模式 / Keyword or semantic query; empty means surfacing mode.
@@ -433,10 +439,12 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `include_sealed: bool = False` — 是否显示手动封存桶；默认不返回桶名、ID、摘要，也不计入隐藏数量 / Include manually sealed buckets; hidden by default including name, ID, summary, and counts.
 - `tags_filter: list[str] | None = None` — 可选的桶标签精确过滤；列表内任一标签匹配即可，多个标签过滤与 `topic_filter` 之间按 AND 组合 / Optional exact bucket-tag filter; any listed tag may match, and it combines conjunctively with `topic_filter`.
 - `topic_filter: list[str] | None = None` — 可选的归档会话主题精确过滤；列表内任一主题匹配即可。过滤会先于 query 排名，单独使用时按最新记录优先 / Optional exact archived-session topic filter; any listed topic may match. Structured filtering happens before query ranking, and filter-only calls return newest first.
+- 命中桶后，输出中的 todos 会从当前 bucket metadata 重新读取并追加；即使脱水摘要来自旧缓存，todos 也以当前 metadata 为准 / After a bucket is matched, todos are reread from current bucket metadata and appended to the output; current metadata remains authoritative even when the dehydrated summary comes from an older cache entry.
 
 #### `get_letter`
 
 - `get_letter(letter_id, include_sealed=False)` — 按 ID 精确读取单封信；sealed letter 默认隐藏，沿用明确的 `include_sealed=True` opt-in / Read one letter by exact ID; sealed letters are hidden by default.
+- sealed letter 与真正不存在的 `letter_id` 返回完全相同的 not found 结果，调用方不能据此断定该信不存在；这是刻意的存在性隐藏，`include_sealed=True` 是读取 sealed 内容的显式开关 / A sealed letter and a genuinely missing `letter_id` return the same not-found result, so callers cannot conclude that the letter does not exist; this is deliberate existence hiding, and `include_sealed=True` is the explicit opt-in for reading sealed content.
 
 #### `trace`
 
@@ -543,6 +551,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - RM-enabled bootstrap rejects a Remember-Me data root that resolves to the legacy OB asset root, so the two `assets.sqlite3` files cannot be accidentally collapsed into one store.
 - Only title, description, tags, original filename, kind, and MIME type are included in RM embedding text. Original file bytes, base64, hashes, and disk paths are never sent to the Embedding API.
 - `rm_asset_reindex_embeddings(...)` rebuilds missing or stale RM vectors. Current rows are skipped; metadata or model identity changes rebuild them; empty index metadata removes the RM vector.
+- 重建失败时，响应可能包含 `last_error` 和 `last_error_details`；后者可包含受限的 `request_url`、HTTP `status_code`、标记为 `[redacted]` 的响应体占位和 `error_type`。API key 与完整响应体不会返回 / When a rebuild fails, the response may include `last_error` and `last_error_details`; the latter may contain a bounded `request_url`, HTTP `status_code`, a `[redacted]` response-body placeholder, and `error_type`. API keys and complete response bodies are never returned.
 - When the provider is disabled or query embedding is unavailable, RM Search preserves keyword-only results. The default standalone Remember-Me runtime still uses `NullVectorProvider`; the real provider is supplied only by the OB Host.
 - Existing legacy vectors are retained but are not visible to RM-enabled Search. After switching to RM-enabled operation, users must explicitly call `rm_asset_reindex_embeddings(asset_id="", limit=100)` before semantic recall exists for RM assets. No startup backfill or production migration is performed.
 
@@ -842,6 +851,10 @@ Remote/network HTTP MCP is fail-closed by default. When `OMBRE_AUTH_TOKEN` is un
 For a URL-only client that cannot send a Bearer header, explicitly set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` and a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<host>/mcp?token=<dedicated-query-token>`. If the flag is disabled, the dedicated token is unset, or the token is wrong, query-token access remains rejected; `OMBRE_MCP_QUERY_TOKEN` never falls back to or reuses `OMBRE_AUTH_TOKEN`.
 
 Query credentials can be retained in client URLs, proxies, browsing history, or access logs. Use a dedicated, independently rotatable token and enable this compatibility mode only when a URL-only client—such as a specific Claude custom connector setup—requires it. This is not required for all Claude products or MCP clients; Bearer remains preferred wherever supported.
+
+两个内置 HTTP 启动入口都会将 Uvicorn access log 中 URL query 的 `token` 值脱敏为 `[redacted]`。这个保护只适用于这些内置 Uvicorn access log；客户端 URL、浏览器历史、外部反向代理及其他日志仍可能保留凭据。
+
+Both built-in HTTP entry points redact the URL-query `token` value as `[redacted]` in Uvicorn access logs. This protection is limited to those built-in Uvicorn access logs; client URLs, browser history, external reverse proxies, and other logs may still retain credentials.
 
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` 默认关闭。只有在明确需要匿名 HTTP MCP 的本地或受控场景中，才显式设置为 `true`；启用会输出强安全警告，绝不要在公网部署中启用。未设置 `OMBRE_AUTH_TOKEN` 且未启用该 opt-in 时，HTTP MCP 仍拒绝访问。
 `OMBRE_MCP_ALLOW_ANONYMOUS_HTTP` is disabled by default. Set it to `true` only when anonymous HTTP MCP is deliberately required in a local or controlled environment; enabling it emits a strong security warning and must never be used on a public deployment. Without `OMBRE_AUTH_TOKEN` and without this opt-in, HTTP MCP remains inaccessible.
