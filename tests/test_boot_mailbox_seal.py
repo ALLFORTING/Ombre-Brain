@@ -51,7 +51,7 @@ async def test_archive_letter_boot_and_mailbox(tmp_path, monkeypatch):
     assert "session summary two without letter" in boot_result
     assert "finish boot validation" in boot_result
     assert "seal: test-seal-a" in boot_result
-    assert server.count_tokens_approx(boot_result) <= 8000
+    assert server.count_tokens_approx(boot_result) <= 12000
 
     assert letter in mailbox_result
     assert "seal: test-seal-a" in mailbox_result

@@ -532,7 +532,7 @@
         "type": "object",
         "properties": {
           "max_tokens": {
-            "default": 8000,
+            "default": 12000,
             "type": "integer"
           },
           "pinned_chars": {
