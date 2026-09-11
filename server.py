@@ -6602,11 +6602,11 @@ async def todos() -> str:
 
 
 @mcp.tool()
-async def boot(pinned_chars: int = 5000, max_tokens: int = 8000) -> str:
+async def boot(pinned_chars: int = 5000, max_tokens: int = 12000) -> str:
     """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
     await decay_engine.ensure_started()
     pinned_chars = max(80, min(int(pinned_chars or 5000), 5000))
-    max_tokens = max(1000, min(int(max_tokens or 8000), 12000))
+    max_tokens = max(1000, min(int(max_tokens or 12000), 12000))
 
     try:
         active_buckets = await bucket_mgr.list_all(include_archive=False)
