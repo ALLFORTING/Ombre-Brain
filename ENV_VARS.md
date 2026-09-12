@@ -33,6 +33,7 @@
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
 | `OMBRE_EMBEDDING_API_KEY` | 否 | — | 独立的向量 API key；设置后不会复用主 LLM key |
+| `OMBRE_CONFLICT_DETECTION_ENABLED` | 否 | `true` | 独立控制 `hold`/`grow` 矛盾检测；关闭时跳过候选选择和模型调用。开启时仍需可用的 digest API 配置才能实际调用模型 |
 
 ## HTTP MCP authentication
 

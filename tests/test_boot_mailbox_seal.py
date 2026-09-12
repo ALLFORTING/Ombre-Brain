@@ -52,6 +52,17 @@ async def test_archive_letter_boot_and_mailbox(tmp_path, monkeypatch):
     assert "finish boot validation" in boot_result
     assert "seal: test-seal-a" in boot_result
     assert server.count_tokens_approx(boot_result) <= 12000
+    section_headers = [
+        "=== boot: 今日浮现 ===",
+        "=== boot: 最新信箱 ===",
+        "=== boot: 未完结 todos ===",
+        "=== boot: 最近 3 次归档 ===",
+        "=== boot: 开机索引 ===",
+        "=== boot: 回声 ===",
+    ]
+    assert [boot_result.index(header) for header in section_headers] == sorted(
+        boot_result.index(header) for header in section_headers
+    )
 
     assert letter in mailbox_result
     assert "seal: test-seal-a" in mailbox_result
@@ -79,6 +90,83 @@ async def test_boot_pinned_index_defaults_to_5000_chars(tmp_path, monkeypatch):
     assert "VISIBLE_AFTER_2000" in boot_result
     assert "HIDDEN_AFTER_5000" not in boot_result
     assert "seal: test-seal-a" in boot_result
+
+
+def test_fit_sections_outputs_blocks_that_exactly_fit(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    sections = [
+        ("first", "第一块", "first section"),
+        ("second", "第二块", "second section"),
+    ]
+    exact_budget = sum(
+        server.count_tokens_approx(text) for _, _, text in sections
+    )
+
+    result = server._fit_sections_to_budget(sections, exact_budget)
+
+    assert result == "first section\n\nsecond section"
+    assert "已按 boot 预算截断" not in result
+
+
+def test_fit_sections_reports_partial_and_later_omitted_blocks(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    result = server._fit_sections_to_budget(
+        [
+            ("first", "第一块", "short first block"),
+            ("second", "第二块", "中" * 2000),
+            ("third", "第三块", "third block must be omitted"),
+        ],
+        max_tokens=180,
+    )
+
+    assert "short first block" in result
+    assert "- 部分截断：第二块" in result
+    assert "- 未输出：第三块" in result
+
+
+def test_fit_sections_reports_multiple_blocks_after_budget_exhaustion(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    result = server._fit_sections_to_budget(
+        [
+            ("first", "第一块", "中" * 2000),
+            ("second", "第二块", "second block"),
+            ("third", "第三块", "third block"),
+        ],
+        max_tokens=180,
+    )
+
+    assert "- 部分截断：第一块" in result
+    assert "- 未输出：第二块、第三块" in result
+    assert server.count_tokens_approx(result) <= 180
+
+
+def test_fit_sections_preserves_pinned_minimum_before_echo(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    pinned_text = "=== boot: 开机索引 ===\n" + ("钉" * 4000)
+    result = server._fit_sections_to_budget(
+        [
+            ("triggers", "今日触发", "short trigger"),
+            ("pinned", "钉选索引", pinned_text),
+            ("echo", "feel 回声", "echo" * 1000),
+        ],
+        max_tokens=4500,
+        minimum_chars={"pinned": server.BOOT_PINNED_MIN_CHARS},
+    )
+
+    pinned_output = result.split("\n\n已按 boot 预算截断：", 1)[0]
+    pinned_start = pinned_output.index("=== boot: 开机索引 ===")
+    assert len(pinned_output[pinned_start:]) >= server.BOOT_PINNED_MIN_CHARS
+    assert "- 部分截断：钉选索引" in result
+    assert "- 未输出：feel 回声" in result
 
 
 @pytest.mark.asyncio
