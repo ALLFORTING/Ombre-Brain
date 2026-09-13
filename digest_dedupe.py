@@ -1,12 +1,16 @@
 """Pure local embedding duplicate scan used by the digest MCP tool."""
 
+import hashlib
 import json
 import os
 import sqlite3
 from pathlib import Path
 
 import numpy as np
+import frontmatter
 import yaml
+
+from utils import strip_wikilinks
 
 
 def _read_frontmatter_fields(
@@ -57,24 +61,42 @@ def _display_label(value: object, fallback: str, limit: int = 160) -> str:
     return text[:limit] if text else fallback
 
 
-def _read_unsealed_body_summary(file_path: str) -> str | None:
-    """Read only the JSON ``summary`` from a bucket body already found unsealed."""
+def _read_unsealed_body(file_path: str) -> str | None:
+    """Read the body exactly as Breath does after its initial sealed check passed."""
     try:
-        with open(file_path, "r", encoding="utf-8") as handle:
-            if handle.readline().strip() != "---":
-                return None
-            for raw_line in handle:
-                if raw_line.strip() in ("---", "..."):
-                    break
-            else:
-                return None
-            body = json.loads(handle.read())
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return str(frontmatter.load(file_path).content or "")
+    except (OSError, ValueError, TypeError, yaml.YAMLError):
         return None
-    if not isinstance(body, dict):
-        return None
-    summary = body.get("summary")
-    return summary if isinstance(summary, str) and summary.strip() else None
+
+
+def _read_cached_summaries(
+    cache_db_path: str,
+    content_hashes: set[str],
+) -> dict[str, str]:
+    """Read cached dehydration summaries without creating or changing the DB."""
+    database_path = Path(cache_db_path)
+    if not content_hashes or not database_path.is_file():
+        return {}
+    database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(database_uri, uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            summaries: dict[str, str] = {}
+            hashes = sorted(content_hashes)
+            for start in range(0, len(hashes), 900):
+                chunk = hashes[start:start + 900]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT content_hash, summary FROM dehydration_cache "
+                    f"WHERE content_hash IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for content_hash, summary in rows:
+                    if isinstance(summary, str) and summary.strip():
+                        summaries[str(content_hash)] = summary
+            return summaries
+    except (OSError, sqlite3.Error):
+        return {}
 
 
 def _is_sealed_for_output(file_path: str) -> bool:
@@ -123,16 +145,54 @@ def _bucket_metadata_index(
                     {"name", "dormant"},
                 ) or {}
                 name = _display_label(display.get("name"), bucket_id)
-                body_summary = _read_unsealed_body_summary(file_path)
+                body = _read_unsealed_body(file_path)
+                cleaned_body = strip_wikilinks(body or "")
+                has_body = bool(cleaned_body.strip())
                 records[bucket_id] = {
                     "sealed": False,
                     "file_path": file_path,
                     "name": name,
-                    "summary": _display_label(body_summary, name, limit=120),
-                    "summary_source": "body" if body_summary else "name",
+                    "body": cleaned_body if has_body else "",
+                    "content_hash": (
+                        hashlib.sha256(cleaned_body.encode("utf-8")).hexdigest()
+                        if has_body
+                        else ""
+                    ),
                     "dormant": _is_dormant(display.get("dormant", False)),
                 }
     return records, counts
+
+
+def _attach_summary_sources(
+    bucket_records: dict[str, dict],
+    cache_db_path: str,
+) -> dict[str, int]:
+    """Apply cache, body, then name fallback without calling any model or API."""
+    cached_summaries = _read_cached_summaries(
+        cache_db_path,
+        {
+            record["content_hash"]
+            for record in bucket_records.values()
+            if not record.get("sealed", True) and record.get("content_hash")
+        },
+    )
+    counts = {"summary": 0, "body": 0, "name": 0}
+    for record in bucket_records.values():
+        if record.get("sealed", True):
+            continue
+        content_hash = record.get("content_hash", "")
+        cached_summary = cached_summaries.get(content_hash)
+        if cached_summary:
+            record["summary"] = _display_label(cached_summary, record["name"], limit=120)
+            record["summary_source"] = "summary"
+        elif record.get("body"):
+            record["summary"] = _display_label(record["body"], record["name"], limit=120)
+            record["summary_source"] = "body"
+        else:
+            record["summary"] = record["name"]
+            record["summary_source"] = "name"
+        counts[record["summary_source"]] += 1
+    return counts
 
 
 def _read_embedding_rows(db_path: str, model: str) -> tuple[list[tuple[str, str]], list[tuple[str, int]]]:
@@ -179,6 +239,10 @@ def run_dedupe_scan(
         include_display=False,
     )
     embedding_rows, model_counts = _read_embedding_rows(db_path, model)
+    summary_counts = _attach_summary_sources(
+        bucket_records,
+        str(Path(db_path).with_name("dehydration_cache.db")),
+    )
 
     orphan_rows = 0
     sealed_vector_rows = 0
@@ -252,9 +316,20 @@ def run_dedupe_scan(
         f"差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}",
         f"孤儿向量行: {orphan_rows}",
         f"未命名桶（name=bucket_id）: {len(unnamed_bucket_ids)}",
-        "embeddings 表 model 分布:",
+        "未命名桶 ID 清单:",
     ]
     lines.extend(f"- {bucket_id}" for bucket_id in unnamed_bucket_ids)
+    if not unnamed_bucket_ids:
+        lines.append("- 无")
+    lines.extend([
+        (
+            "摘要来源: "
+            f"缓存命中={summary_counts['summary']}，"
+            f"正文回退={summary_counts['body']}，"
+            f"名称回退={summary_counts['name']}"
+        ),
+        "embeddings 表 model 分布:",
+    ])
     lines.extend(f"- {stored_model or '(empty)'}: {count}" for stored_model, count in model_counts)
     lines.append("相似度分布（同维、有效、非 sealed 向量对）:")
     lines.extend(f"- {label}: {count}" for label, count in distribution)
@@ -279,12 +354,12 @@ def run_dedupe_scan(
         ):
             continue
         rendered += 1
-        left_fallback = " (name)" if left_record["summary_source"] == "name" else ""
-        right_fallback = " (name)" if right_record["summary_source"] == "name" else ""
+        left_source = f" ({left_record['summary_source']})"
+        right_source = f" ({right_record['summary_source']})"
         lines.append(
             f"{rendered}. {scores[pair_index]:.6f} | "
-            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r}{left_fallback} dormant={left_record['dormant']} "
-            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r}{right_fallback} dormant={right_record['dormant']}"
+            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r}{left_source} dormant={left_record['dormant']} "
+            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r}{right_source} dormant={right_record['dormant']}"
         )
     if not rendered:
         lines.append("- 无可输出的向量对。")
