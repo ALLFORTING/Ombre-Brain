@@ -2501,6 +2501,7 @@ async def _breath_filtered_impl(
     mode: str,
     recent_cutoff: str | None,
     include_dormant: bool,
+    wake_dormant: bool,
     include_sealed: bool,
     date_from: str,
     date_to: str,
@@ -2690,6 +2691,7 @@ async def _breath_filtered_impl(
                 await bucket_mgr.touch(
                     bucket["id"],
                     ripple_ids=returned_ids,
+                    wake_dormant=wake_dormant,
                 )
                 if bucket.get("vector_match"):
                     summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
@@ -2848,6 +2850,7 @@ async def _compose_breath_query_matches(
     total_matches: int | None = None,
     trace_by_id: dict[str, dict] | None = None,
     touch: bool = True,
+    wake_dormant: bool = False,
     cache: bool = True,
     next_cursor: str = "",
 ) -> tuple[str, dict]:
@@ -2899,7 +2902,10 @@ async def _compose_breath_query_matches(
                             omitted_decision["final_decision"] = "omitted_token_budget"
                 break
             if touch:
-                await bucket_mgr.touch(bucket["id"])
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    wake_dormant=wake_dormant,
+                )
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
@@ -2969,6 +2975,7 @@ async def _breath_impl(
     resonance: str = "",
     tags_filter: list[str] | None = None,
     topic_filter: list[str] | None = None,
+    wake_dormant: bool = False,
     cursor: str = "",
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
@@ -3013,6 +3020,7 @@ async def _breath_impl(
             mode=mode,
             recent_cutoff=recent_cutoff,
             include_dormant=include_dormant, include_sealed=include_sealed,
+            wake_dormant=wake_dormant,
             date_from=date_from,
             date_to=date_to,
             resonance_target=resonance_target,
@@ -3126,7 +3134,10 @@ async def _breath_impl(
             )
         # Touch only the already privacy-filtered candidates.
         for bucket in filtered:
-            await bucket_mgr.touch(bucket["id"])
+            await bucket_mgr.touch(
+                bucket["id"],
+                wake_dormant=wake_dormant,
+            )
         results = [
             await _append_bucket_extras(
                 _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))),
@@ -3160,7 +3171,10 @@ async def _breath_impl(
         total = len(candidates)
         candidates = candidates[:max_results]
         for bucket in candidates:
-            await bucket_mgr.touch(bucket["id"])
+            await bucket_mgr.touch(
+                bucket["id"],
+                wake_dormant=wake_dormant,
+            )
         results = [
             await _append_bucket_extras(
                 _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
@@ -3226,7 +3240,10 @@ async def _breath_impl(
             candidates = cold_start + non_cold
         candidates = candidates[:max_results]
         for bucket in candidates:
-            await bucket_mgr.touch(bucket["id"])
+            await bucket_mgr.touch(
+                bucket["id"],
+                wake_dormant=wake_dormant,
+            )
         summary_mode = mode == "summary"
         pinned_results = []
         dynamic_results = []
@@ -3410,6 +3427,7 @@ async def _breath_impl(
             for entry in search_trace.get("candidates", [])
         },
         touch=True,
+        wake_dormant=wake_dormant,
         next_cursor=next_cursor,
     )
     if not final_text:
@@ -6282,6 +6300,15 @@ async def breath(
             )
         ),
     ] = None,
+    wake_dormant: Annotated[
+        bool,
+        Field(
+            description=(
+                "Defaults to False. Only when explicitly True, clear the target "
+                "bucket's dormant flag; activation touch accounting is unchanged."
+            )
+        ),
+    ] = False,
     cursor: Annotated[
         str,
         Field(
@@ -6311,6 +6338,7 @@ async def breath(
         recent_days=recent_days,
         emotion_trend=emotion_trend,
         include_dormant=include_dormant,
+        wake_dormant=wake_dormant,
         include_sealed=include_sealed,
         date_from=date_from,
         date_to=date_to,
@@ -7218,7 +7246,7 @@ async def pulse(
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream(detail_ids: str = "") -> str:
+async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
     """Optional reflection readout: recent memory summaries, or full details for selected buckets."""
     await decay_engine.ensure_started()
 
@@ -7245,7 +7273,10 @@ async def dream(detail_ids: str = "") -> str:
                 f"ID: {bucket_id}\n"
                 f"{strip_wikilinks(bucket.get('content', ''))}"
             )
-            await bucket_mgr.touch(bucket_id)
+            await bucket_mgr.touch(
+                bucket_id,
+                wake_dormant=wake_dormant,
+            )
         return "=== Dream Details ===\n" + "\n---\n".join(details)
 
     try:
@@ -7271,7 +7302,10 @@ async def dream(detail_ids: str = "") -> str:
     )
     recent = candidates[:5]
     for bucket in recent:
-        await bucket_mgr.touch(bucket["id"])
+        await bucket_mgr.touch(
+            bucket["id"],
+            wake_dormant=wake_dormant,
+        )
 
     if not recent:
         return "没有需要消化的新记忆。"

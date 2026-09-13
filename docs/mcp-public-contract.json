@@ -662,6 +662,10 @@
           "valence": {
             "default": -1,
             "type": "number"
+          },
+          "wake_dormant": {
+            "default": false,
+            "type": "boolean"
           }
         }
       }
@@ -704,7 +708,7 @@
       "exposure": "default",
       "diagnostic_only": false,
       "feature_flag": null,
-      "mutability": "read_only",
+      "mutability": "read_with_side_effects",
       "auth_relevance": "endpoint_auth",
       "compatibility_status": "compatibility_sensitive",
       "output_kind": "text",
@@ -714,6 +718,10 @@
           "detail_ids": {
             "default": "",
             "type": "string"
+          },
+          "wake_dormant": {
+            "default": false,
+            "type": "boolean"
           }
         }
       }

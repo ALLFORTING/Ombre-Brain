@@ -1203,11 +1203,12 @@ class BucketManager:
         self,
         bucket_id: str,
         ripple_ids: set[str] | None = None,
+        wake_dormant: bool = False,
     ) -> None:
         """
-        Update a bucket's last activation time and count.
+        Update a bucket's last activation time and count. Wake it only when requested.
         Also triggers time ripple: nearby memories get a slight activation boost.
-        更新桶的最后激活时间和激活次数。
+        更新桶的最后激活时间和激活次数；仅在显式请求时解除休眠。
         同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
         """
         file_path = self._find_bucket_file(bucket_id)
@@ -1218,7 +1219,8 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
-            post["dormant"] = False
+            if wake_dormant:
+                post["dormant"] = False
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
