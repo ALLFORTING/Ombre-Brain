@@ -397,6 +397,10 @@ async def test_mcp_schema_has_nullable_string_arrays_and_descriptions(
 
     assert schema.get("required", []) == []
     for name, description in (
+        (
+            "cursor",
+            "Opaque cursor returned by a previous query Breath page. Reuse it with the same query and filters.",
+        ),
         ("tags_filter", "Optional exact bucket-tag filters. Any listed tag may match."),
         (
             "topic_filter",
@@ -404,11 +408,15 @@ async def test_mcp_schema_has_nullable_string_arrays_and_descriptions(
         ),
     ):
         property_schema = schema["properties"][name]
-        array_schema = next(
-            option for option in property_schema["anyOf"] if option.get("type") == "array"
-        )
-        assert array_schema == {"items": {"type": "string"}, "type": "array"}
-        assert property_schema["default"] is None
+        if name != "cursor":
+            array_schema = next(
+                option for option in property_schema["anyOf"] if option.get("type") == "array"
+            )
+            assert array_schema == {"items": {"type": "string"}, "type": "array"}
+            assert property_schema["default"] is None
+        else:
+            assert property_schema["default"] == ""
+            assert property_schema["type"] == "string"
         assert property_schema["description"] == description
 
 
