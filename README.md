@@ -436,6 +436,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `emotion_trend: bool = False` — 附带持久化情绪时间线 / Attach persisted emotion timeline.
 - `feels: bool = False` — 专门检索 feel 桶，相当于 `domain="feel"` / Search feel buckets only, equivalent to `domain="feel"`.
 - `include_dormant: bool = False` — 是否搜索自动沉底桶 / Include auto-dormant buckets.
+- `wake_dormant: bool = False` — 是否将本次实际返回的 dormant 桶显式唤醒；仅与 `include_dormant=True` 一起使用时有实际效果 / Explicitly wake dormant buckets actually returned by this call; meaningful only with `include_dormant=True`.
 - `include_sealed: bool = False` — 是否显示手动封存桶；默认不返回桶名、ID、摘要，也不计入隐藏数量 / Include manually sealed buckets; hidden by default including name, ID, summary, and counts.
 - `tags_filter: list[str] | None = None` — 可选的桶标签精确过滤；列表内任一标签匹配即可，多个标签过滤与 `topic_filter` 之间按 AND 组合 / Optional exact bucket-tag filter; any listed tag may match, and it combines conjunctively with `topic_filter`.
 - `topic_filter: list[str] | None = None` — 可选的归档会话主题精确过滤；列表内任一主题匹配即可。过滤会先于 query 排名，单独使用时按最新记录优先 / Optional exact archived-session topic filter; any listed topic may match. Structured filtering happens before query ranking, and filter-only calls return newest first.
@@ -982,10 +983,10 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 
 > 下列阈值、转换条件和路由列表是当前实现参考，不是 Contract v1 的精确公共保证；v1 只承诺其已明确限定的默认可见性和显式包含边界。
 
-- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。被 `breath` 命中或 `trace` 修改后会自动解除 dormant。
+- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。普通读取只更新访问记账，不解除 dormant；需要显式使用 `breath(include_dormant=True, wake_dormant=True)` 或 `dream(detail_ids="...", wake_dormant=True)` 才会唤醒实际读取的桶。
 - `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；需要显式 `include_sealed=True` 才显示。
 
-- `dormant` is automatic sinking from natural decay: `pulse()` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. A `breath` hit or `trace` update wakes the bucket.
+- `dormant` is automatic sinking from natural decay: `pulse()` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. Ordinary reads update activation bookkeeping without waking dormant buckets; explicitly pass `wake_dormant=True` to a dormant-inclusive `breath` call or a detail `dream` call to wake buckets actually read.
 - `sealed` is manual hiding, only changed by `trace(sealed=1/0)`. Natural decay never creates sealed buckets. Sealed overrides pinned and hides the bucket name, ID, and summary from `breath`, `pulse`, `dream`, and `todos` unless `include_sealed=True`.
 
 ### 参数说明 / Parameters
@@ -1001,9 +1002,9 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 > 本节描述当前实现和可选模型指导；feel 的精确存储、衰减和参与路由不是 Contract v1 的稳定公共保证。
 
 ### Dreaming — 做梦
-`dream()` 是可选的反思/消化工具：当最近记忆确实值得展开时使用，用第一人称思考哪些事还有重量、哪些可以放下。运行时不会强制每次启动调用它。
+`dream()` 是可选的反思/消化工具：当最近记忆确实值得展开时使用，用第一人称思考哪些事还有重量、哪些可以放下。运行时不会强制每次启动调用它；`dream(detail_ids="...", wake_dormant=True)` 可显式唤醒指定的 dormant 桶，默认读取不唤醒。
 
-`dream()` is an optional reflection/digestion tool. Use it when recent memories genuinely benefit from reflection; the runtime does not require it on every startup.
+`dream()` is an optional reflection/digestion tool. Use it when recent memories genuinely benefit from reflection; the runtime does not require it on every startup. `dream(detail_ids="...", wake_dormant=True)` explicitly wakes selected dormant buckets; ordinary reads do not.
 
 - 值得放下的 → `trace(resolved=1)` 让它沉底
 - 有沉淀的 → 写 `feel`，记录模型自己的感受

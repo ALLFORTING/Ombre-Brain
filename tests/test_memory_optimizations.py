@@ -43,7 +43,7 @@ async def test_dormant_is_excluded_unless_requested(bucket_mgr):
 
 
 @pytest.mark.asyncio
-async def test_touch_clears_dormant(bucket_mgr):
+async def test_touch_records_access_without_clearing_dormant_by_default(bucket_mgr):
     bucket_id = await bucket_mgr.create(
         content="待恢复记忆",
         tags=["恢复"],
@@ -51,8 +51,35 @@ async def test_touch_clears_dormant(bucket_mgr):
         domain=["测试"],
     )
     await bucket_mgr.set_dormant(bucket_id, True)
+    path = bucket_mgr._find_bucket_file(bucket_id)
+    post = frontmatter.load(path)
+    old_time = (datetime.now() - timedelta(days=31)).isoformat()
+    post["last_active"] = old_time
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(frontmatter.dumps(post))
 
+    before = await bucket_mgr.get(bucket_id)
     await bucket_mgr.touch(bucket_id)
+    bucket = await bucket_mgr.get(bucket_id)
+
+    assert bucket["metadata"]["dormant"] is True
+    assert bucket["metadata"]["activation_count"] == (
+        before["metadata"]["activation_count"] + 1
+    )
+    assert bucket["metadata"]["last_active"] != old_time
+
+
+@pytest.mark.asyncio
+async def test_touch_clears_dormant_only_when_explicitly_requested(bucket_mgr):
+    bucket_id = await bucket_mgr.create(
+        content="显式唤醒测试",
+        tags=["唤醒"],
+        importance=2,
+        domain=["测试"],
+    )
+    await bucket_mgr.set_dormant(bucket_id, True)
+
+    await bucket_mgr.touch(bucket_id, wake_dormant=True)
     bucket = await bucket_mgr.get(bucket_id)
 
     assert bucket["metadata"]["dormant"] is False
