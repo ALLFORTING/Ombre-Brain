@@ -8,6 +8,7 @@ import pytest
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
+    monkeypatch.delenv("OMBRE_CONFLICT_DETECTION_ENABLED", raising=False)
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
@@ -157,6 +158,115 @@ async def test_conflict_detection_uses_lexical_fallback_candidates(tmp_path, mon
 
     assert warning == "bucket has conflicting date"
     assert old_id in captured["old_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_content,new_content",
+    [
+        (
+            "Opus hallucination safeguards were recorded in 2026.",
+            "The studio was founded in 2026.",
+        ),
+        (
+            "Opus 5 幻觉与硬规则记录于 2026.09.12",
+            "工作室建于 2026.09.12",
+        ),
+    ],
+    ids=["shared-year-only", "real-shared-full-date-only"],
+)
+async def test_conflict_candidates_reject_time_only_overlap(
+    tmp_path,
+    monkeypatch,
+    old_content,
+    new_content,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "e24f331b163e",
+        "content": old_content,
+        "metadata": {"name": "unrelated old event", "tags": []},
+    }
+    server.bucket_mgr.search = AsyncMock(return_value=[old_bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(return_value="")
+
+    candidates = await server._conflict_candidate_buckets(new_content)
+    warning = await server._detect_conflict_warning(new_content)
+
+    assert candidates == []
+    assert warning == ""
+    server._call_conflict_api.assert_awaited_once_with(new_content, [])
+
+
+@pytest.mark.asyncio
+async def test_conflict_prompt_rejects_different_subjects_and_uncertainty(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_digest_api_config",
+        lambda: ("test-key", "https://example.invalid/v1", "test-model"),
+    )
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "无"}}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["prompt"] = json["messages"][1]["content"]
+            return FakeResponse()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda timeout: FakeClient())
+    old_bucket = {
+        "id": "different-subject-old",
+        "content": "Alice invoice status is open on 2026.09.12.",
+        "metadata": {"name": "Alice invoice", "tags": []},
+    }
+    server.bucket_mgr.search = AsyncMock(return_value=[old_bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[old_bucket])
+
+    warning = await server._detect_conflict_warning(
+        "Bob invoice status is closed on 2026.09.12."
+    )
+
+    assert warning == ""
+    assert "同一天发生的不同事件不构成矛盾" in captured["prompt"]
+    assert "同一主体、同一事实槽位" in captured["prompt"]
+    assert "任何不确定，一律只回答“无”" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_conflict_detection_has_default_on_independent_switch(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+
+    assert server._conflict_detection_enabled() is True
+
+    monkeypatch.setenv("OMBRE_CONFLICT_DETECTION_ENABLED", "false")
+    server._conflict_candidate_buckets = AsyncMock(return_value=[])
+    server._call_conflict_api = AsyncMock(return_value="conflict")
+
+    warning = await server._detect_conflict_warning("new content")
+
+    assert warning == ""
+    server._conflict_candidate_buckets.assert_not_awaited()
+    server._call_conflict_api.assert_not_awaited()
 
 
 @pytest.mark.asyncio

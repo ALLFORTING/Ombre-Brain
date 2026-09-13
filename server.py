@@ -350,6 +350,13 @@ def _env_flag_enabled(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _conflict_detection_enabled() -> bool:
+    """Keep conflict detection independently switchable and default-on."""
+    return _env_flag_enabled(
+        os.environ.get("OMBRE_CONFLICT_DETECTION_ENABLED", "true")
+    )
+
+
 DIAGNOSTIC_TOOLS_ENABLED = _env_flag_enabled(
     os.environ.get("OMBRE_DIAG_TOOLS", "")
 )
@@ -1810,22 +1817,110 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
     )
 
 
-def _fit_sections_to_budget(sections: list[tuple[str, str]], max_tokens: int) -> str:
-    """Append sections in priority order, truncating lower-priority content first."""
+BOOT_TRUNCATION_NOTICE_TOKENS = 160
+BOOT_SECTION_MINIMUM_CHARS = {
+    "mailbox": 1000,
+    "todos": 1500,
+    "sessions": 1200,
+    "pinned": 4000,
+}
+
+
+def _prefix_within_token_budget(text: str, token_budget: int) -> str:
+    """Return the longest text prefix that fits the approximate token budget."""
+    if token_budget <= 0:
+        return ""
+    if count_tokens_approx(text) <= token_budget:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens_approx(text[:middle]) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip()
+
+
+def _fit_sections_to_budget(
+    sections: list[tuple[str, str, str]],
+    max_tokens: int,
+    *,
+    minimum_chars: dict[str, int] | None = None,
+) -> str:
+    """Fit named sections in priority order and report every omitted block."""
+    if not sections:
+        return ""
+    minimum_chars = minimum_chars or {}
+    total_tokens = sum(count_tokens_approx(text) for _, _, text in sections)
+    if total_tokens <= max_tokens:
+        return "\n\n".join(text for _, _, text in sections)
+
+    content_budget = max(0, max_tokens - BOOT_TRUNCATION_NOTICE_TOKENS)
+    requested_tokens = {}
+    for key, _, text in sections:
+        minimum = max(0, minimum_chars.get(key, 0))
+        if key == "triggers":
+            requested_tokens[key] = count_tokens_approx(text)
+        elif minimum > 0:
+            requested_tokens[key] = count_tokens_approx(text[:minimum])
+
+    reserved_tokens = {}
+    remaining_reserve = content_budget
+    # If every guarantee fits, later sections keep their full reservation.
+    # Otherwise the same pass assigns the available budget in output order.
+    for key, _, _ in sections:
+        requested = requested_tokens.get(key, 0)
+        reserved = min(requested, remaining_reserve)
+        if key in requested_tokens:
+            reserved_tokens[key] = reserved
+        remaining_reserve -= reserved
     output = []
+    complete = []
+    partial = []
+    omitted = []
     used = 0
-    for _, text in sections:
+    priority_exhausted = False
+
+    for index, (key, display_name, text) in enumerate(sections):
+        later_reserve = sum(
+            reserved_tokens.get(later_key, 0)
+            for later_key, _, _ in sections[index + 1 :]
+        )
+        is_reserved = key in reserved_tokens
+        if priority_exhausted and not is_reserved:
+            omitted.append(display_name)
+            continue
+
+        available = max(0, content_budget - used - later_reserve)
         section_tokens = count_tokens_approx(text)
-        if used + section_tokens <= max_tokens:
+        if section_tokens <= available:
             output.append(text)
+            complete.append(display_name)
             used += section_tokens
             continue
-        remaining = max_tokens - used
-        if remaining <= 40:
-            break
-        chars = max(200, remaining * 3)
-        output.append(text[:chars].rstrip() + "\n...（已按 boot 预算截断）")
-        break
+
+        prefix = _prefix_within_token_budget(text, available)
+        if prefix:
+            output.append(prefix)
+            partial.append(display_name)
+            used += count_tokens_approx(prefix)
+        else:
+            omitted.append(display_name)
+        priority_exhausted = True
+
+    notice_lines = ["已按 boot 预算截断："]
+    if partial:
+        notice_lines.append("- 部分截断：" + "、".join(partial))
+    if omitted:
+        notice_lines.append("- 未输出：" + "、".join(omitted))
+    notice = "\n".join(notice_lines)
+    if count_tokens_approx(notice) > BOOT_TRUNCATION_NOTICE_TOKENS:
+        notice = _prefix_within_token_budget(
+            notice,
+            BOOT_TRUNCATION_NOTICE_TOKENS,
+        )
+    output.append(notice)
     return "\n\n".join(output)
 
 
@@ -2157,6 +2252,9 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
     prompt = (
         "判断新内容和旧记忆之间是否存在日期、数字或事实上的直接矛盾。"
         "有则用一句中文指出矛盾，并包含相关 bucket_id；无则只回答“无”。"
+        "必须遵守以下硬规则：同一天发生的不同事件不构成矛盾；"
+        "必须先确认描述的是同一主体、同一事实槽位，再判断两个值是否互斥；"
+        "只要主体、事实槽位或互斥关系有任何不确定，一律只回答“无”。"
         "\n\n# 新内容\n"
         f"{strip_wikilinks(new_content)[:1500]}"
         "\n\n# 旧记忆\n"
@@ -2182,20 +2280,57 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
 
 def _conflict_tokens(text: str) -> set[str]:
     normalized = strip_wikilinks(_apply_display_aliases(text or "")).lower()
-    return {
+    calendar_dates = {
+        f"{match.group(1)}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+        for match in re.finditer(
+            r"((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})",
+            normalized,
+        )
+    }
+    lexical_tokens = {
         token
         for token in re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", normalized)
         if len(token.strip()) >= 2
+        and token not in bucket_mgr.wikilink_stopwords
     }
+    return lexical_tokens | calendar_dates
+
+
+def _is_conflict_temporal_token(token: str) -> bool:
+    """Return whether a lexical token only identifies a year or calendar date."""
+    normalized = str(token or "").strip().lower()
+    return bool(
+        re.fullmatch(r"(?:19|20)\d{2}", normalized)
+        or re.fullmatch(r"(?:19|20)\d{6}", normalized)
+    )
 
 
 async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict]:
     candidates = []
     seen = set()
+    query_tokens = _conflict_tokens(content)
+
+    def candidate_haystack(bucket: dict) -> str:
+        meta = bucket.get("metadata", {})
+        return " ".join([
+            str(meta.get("name", "")),
+            str(meta.get("summary", "")),
+            " ".join(map(str, meta.get("tags", []) or [])),
+            strip_wikilinks(bucket.get("content", "")),
+        ])
+
+    def candidate_overlap(bucket: dict) -> set[str]:
+        return query_tokens & _conflict_tokens(candidate_haystack(bucket))
 
     def add_bucket(bucket: dict) -> None:
         bucket_id = bucket.get("id")
         if not bucket_id or bucket_id in seen or _is_sealed(bucket):
+            return
+        overlap = candidate_overlap(bucket)
+        if not any(
+            not _is_conflict_temporal_token(token)
+            for token in overlap
+        ):
             return
         seen.add(bucket_id)
         candidates.append(bucket)
@@ -2209,7 +2344,6 @@ async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict
     if len(candidates) >= limit:
         return candidates[:limit]
 
-    query_tokens = _conflict_tokens(content)
     if not query_tokens:
         return candidates[:limit]
 
@@ -2223,20 +2357,28 @@ async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict
     for bucket in all_buckets:
         if bucket.get("id") in seen or _is_sealed(bucket):
             continue
-        meta = bucket.get("metadata", {})
-        haystack = " ".join([
-            str(meta.get("name", "")),
-            str(meta.get("summary", "")),
-            " ".join(map(str, meta.get("tags", []) or [])),
-            strip_wikilinks(bucket.get("content", "")),
-        ])
-        overlap = query_tokens & _conflict_tokens(haystack)
-        strong_overlap = [
-            token for token in overlap
+        overlap = candidate_overlap(bucket)
+        temporal_overlap = {
+            token for token in overlap if _is_conflict_temporal_token(token)
+        }
+        non_temporal_overlap = overlap - temporal_overlap
+        strong_non_temporal_overlap = [
+            token for token in non_temporal_overlap
             if len(token) >= 4 or any(ch.isdigit() for ch in token)
         ]
-        if strong_overlap or len(overlap) >= 2:
-            lexical.append((len(strong_overlap) * 3 + len(overlap), bucket))
+        has_non_temporal_context = bool(non_temporal_overlap)
+        qualifies = bool(
+            strong_non_temporal_overlap
+            or len(non_temporal_overlap) >= 2
+            or (temporal_overlap and has_non_temporal_context)
+        )
+        if qualifies:
+            lexical.append((
+                len(strong_non_temporal_overlap) * 3
+                + len(non_temporal_overlap)
+                + len(temporal_overlap),
+                bucket,
+            ))
 
     lexical.sort(key=lambda item: item[0], reverse=True)
     for _, bucket in lexical:
@@ -2248,6 +2390,8 @@ async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict
 
 
 async def _detect_conflict_warning(content: str) -> str:
+    if not _conflict_detection_enabled():
+        return ""
     try:
         old_buckets = await _conflict_candidate_buckets(content, limit=3)
         response = await _call_conflict_api(content, old_buckets)
@@ -2566,6 +2710,7 @@ async def _compose_breath_query_matches(
     q_valence: float | None,
     emotion_trend: bool,
     hidden_count: int,
+    total_matches: int | None = None,
     trace_by_id: dict[str, dict] | None = None,
     touch: bool = True,
     cache: bool = True,
@@ -2573,12 +2718,19 @@ async def _compose_breath_query_matches(
     """Compose query results using the same path as normal Breath."""
     results = []
     token_used = 0
-    for bucket in matches:
+    token_budget_omitted = 0
+    for index, bucket in enumerate(matches):
         bid = str(bucket.get("id", ""))
         decision = trace_by_id.get(bid) if trace_by_id is not None else None
         if token_used >= max_tokens:
-            if decision is not None:
-                decision["final_decision"] = "omitted_token_budget"
+            token_budget_omitted += len(matches) - index
+            if trace_by_id is not None:
+                for omitted_bucket in matches[index:]:
+                    omitted_decision = trace_by_id.get(
+                        str(omitted_bucket.get("id", ""))
+                    )
+                    if omitted_decision is not None:
+                        omitted_decision["final_decision"] = "omitted_token_budget"
             break
         try:
             clean_meta = {
@@ -2601,13 +2753,19 @@ async def _compose_breath_query_matches(
                 )
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
-                if decision is not None:
-                    decision["final_decision"] = "omitted_token_budget"
+                token_budget_omitted += len(matches) - index
+                if trace_by_id is not None:
+                    for omitted_bucket in matches[index:]:
+                        omitted_decision = trace_by_id.get(
+                            str(omitted_bucket.get("id", ""))
+                        )
+                        if omitted_decision is not None:
+                            omitted_decision["final_decision"] = "omitted_token_budget"
                 break
             if touch:
                 await bucket_mgr.touch(bucket["id"])
             if bucket.get("vector_match"):
-                summary = f"[璇箟鍏宠仈] [bucket_id:{bucket['id']}] {summary}"
+                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
@@ -2620,23 +2778,39 @@ async def _compose_breath_query_matches(
                 decision["final_decision"] = "omitted_composition_error"
             continue
 
-    if not results:
-        return "", {
-            "surfaced_count": 0,
-            "token_used": token_used,
-            "token_budget": max_tokens,
-            "hidden_count": hidden_count,
-        }
-
-    final_text = "\n---\n".join(results)
-    if hidden_count:
-        final_text += f"\n\n杩樻湁{hidden_count}涓浉鍏宠蹇嗘湭鏄剧ず"
-    return _with_emotion_timeline(final_text, emotion_trend), {
-        "surfaced_count": len(results),
+    matched_count = (
+        max(0, int(total_matches))
+        if total_matches is not None
+        else len(matches) + hidden_count
+    )
+    displayed_count = len(results)
+    omitted_count = hidden_count + token_budget_omitted
+    composition = {
+        "surfaced_count": displayed_count,
         "token_used": token_used,
         "token_budget": max_tokens,
-        "hidden_count": hidden_count,
+        "matched_count": matched_count,
+        "result_limit_omitted": hidden_count,
+        "token_budget_omitted": token_budget_omitted,
+        "hidden_count": omitted_count,
     }
+    if matched_count == 0:
+        return "", composition
+
+    summary_lines = []
+    if omitted_count:
+        summary_lines.append(f"还有{omitted_count}个相关记忆未显示")
+    summary_lines.append(
+        f"共匹配 {matched_count} / 本次显示 {displayed_count} / "
+        f"因结果上限省略 {hidden_count} / "
+        f"因 token 预算省略 {token_budget_omitted}"
+    )
+    final_text = "\n---\n".join(results)
+    if final_text:
+        final_text += "\n\n" + "\n".join(summary_lines)
+    else:
+        final_text = "\n".join(summary_lines)
+    return _with_emotion_timeline(final_text, emotion_trend), composition
 
 
 async def _breath_impl(
@@ -3035,6 +3209,7 @@ async def _breath_impl(
     if resonance_target:
         matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
     hidden_count = max(0, len(matches) - max_results)
+    total_matches = len(matches)
     matches = matches[:max_results]
 
     final_text, composition = await _compose_breath_query_matches(
@@ -3043,6 +3218,7 @@ async def _breath_impl(
         q_valence=q_valence,
         emotion_trend=emotion_trend,
         hidden_count=hidden_count,
+        total_matches=total_matches,
         trace_by_id={
             str(entry.get("id", "")): entry
             for entry in search_trace.get("candidates", [])
@@ -6602,11 +6778,14 @@ async def todos() -> str:
 
 
 @mcp.tool()
-async def boot(pinned_chars: int = 5000, max_tokens: int = 12000) -> str:
+async def boot(
+    pinned_chars: int = 5000,
+    max_tokens: Annotated[int, Field(ge=1000, le=16000)] = 16000,
+) -> str:
     """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
     await decay_engine.ensure_started()
     pinned_chars = max(80, min(int(pinned_chars or 5000), 5000))
-    max_tokens = max(1000, min(int(max_tokens or 12000), 12000))
+    max_tokens = max(1000, min(int(max_tokens or 16000), 16000))
 
     try:
         active_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -6664,14 +6843,15 @@ async def boot(pinned_chars: int = 5000, max_tokens: int = 12000) -> str:
 
     body = _fit_sections_to_budget(
         [
-            ("triggers", trigger_text),
-            ("pinned", pinned_text),
-            ("mailbox", mailbox_text),
-            ("echo", echo_text),
-            ("sessions", sessions_text),
-            ("todos", todos_text),
+            ("triggers", "今日触发", trigger_text),
+            ("mailbox", "最新 letter", mailbox_text),
+            ("todos", "todos", todos_text),
+            ("sessions", "最近归档", sessions_text),
+            ("pinned", "钉选索引", pinned_text),
+            ("echo", "feel 回声", echo_text),
         ],
         max_tokens=max_tokens - 20,
+        minimum_chars=BOOT_SECTION_MINIMUM_CHARS,
     )
     today = datetime.now().date().isoformat()
     for bucket_id in trigger_ids:
@@ -7429,6 +7609,7 @@ async def api_breath_debug(request):
             q_valence=q_valence,
             emotion_trend=False,
             hidden_count=hidden_count,
+            total_matches=len(matches),
             trace_by_id=trace_by_id,
             touch=False,
             cache=False,
