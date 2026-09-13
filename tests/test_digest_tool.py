@@ -204,13 +204,13 @@ async def test_digest_rebalance_repeated_confirmation_does_not_lower_again(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_digest_dedupe_is_readonly_skips_sealed_and_reports_orphans(tmp_path, monkeypatch):
+async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     first_id = await server.bucket_mgr.create(
         content="first duplicate body",
         importance=5,
         domain=["dedupe-test"],
-        name="first duplicate",
+        name="session_named_memory",
     )
     second_id = await server.bucket_mgr.create(
         content="second duplicate body",
@@ -230,14 +230,27 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_reports_orphans(tmp_pa
         domain=["dedupe-test"],
         name="SEALED_NAME_MUST_NOT_APPEAR",
     )
+    archive_id = await server.bucket_mgr.create(
+        content="ARCHIVED_BODY_MUST_NOT_APPEAR_BY_DEFAULT",
+        importance=5,
+        domain=["dedupe-test"],
+        name="ordinary archived memory",
+    )
+    first_path = Path(server.bucket_mgr._find_bucket_file(first_id))
+    first_post = frontmatter.load(first_path)
+    first_summary = "summary-" + ("x" * 130)
+    first_post["summary"] = first_summary
+    first_path.write_text(frontmatter.dumps(first_post), encoding="utf-8")
     assert await server.bucket_mgr.set_dormant(dormant_id, True)
     await server.trace(sealed_id, sealed=1)
+    assert await server.bucket_mgr.archive(archive_id)
 
     server.embedding_engine._store_embedding(first_id, [1.0, 0.0])
     server.embedding_engine._store_embedding(second_id, [1.0, 0.0])
     server.embedding_engine._store_embedding(dormant_id, [0.9, 0.435889894])
     # Simulate a stale derived vector left behind after a bucket was sealed.
     server.embedding_engine._store_embedding(sealed_id, [1.0, 0.0])
+    server.embedding_engine._store_embedding(archive_id, [1.0, 0.0])
     server.embedding_engine._store_embedding("orphan-vector-row", [1.0, 0.0])
     with sqlite3.connect(server.embedding_engine.db_path) as conn:
         conn.execute(
@@ -245,7 +258,7 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_reports_orphans(tmp_pa
             ("other-model-row", json.dumps([1.0, 0.0]), "other-model", "2026-09-13T00:00:00"),
         )
 
-    tracked_ids = (first_id, second_id, dormant_id, sealed_id)
+    tracked_ids = (first_id, second_id, dormant_id, sealed_id, archive_id)
     bucket_paths = {
         bucket_id: server.bucket_mgr._find_bucket_file(bucket_id)
         for bucket_id in tracked_ids
@@ -269,23 +282,31 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_reports_orphans(tmp_pa
     )
 
     result = await server.digest(mode="dedupe")
+    with_archive = await server.digest(mode="dedupe", include_archive=True)
 
     assert server.decay_engine.ensure_started.await_count == 0
     assert server.bucket_mgr.list_all.await_count == 0
     assert server.embedding_engine._generate_embedding.await_count == 0
-    assert "向量: N=3（当前模型行=5，sealed 跳过=1，无效跳过=0）" in result
+    assert "向量: N=3（当前模型行=6，sealed 跳过=1，无效跳过=0）" in result
     assert "桶: M=4（sealed=1，元数据不可读=0）" in result
+    assert "归档桶排除: 1" in result
     assert "差额: K=M-N=1" in result
     assert "孤儿向量行: 1" in result
-    assert f"- {server.embedding_engine.model}: 5" in result
+    assert f"- {server.embedding_engine.model}: 6" in result
     assert "- other-model: 1" in result
     assert "- 0.95+: 1" in result
     assert "- 0.90-0.95: 2" in result
-    assert f"{first_id} name='first duplicate' dormant=False" in result
-    assert f"{dormant_id} name='dormant nearby' dormant=True" in result
+    assert f"{first_id} name='session_named_memory' summary={first_summary[:120]!r} dormant=False" in result
+    assert f"{dormant_id} name='dormant nearby' summary='dormant nearby' dormant=True" in result
     assert sealed_id not in result
     assert "SEALED_NAME_MUST_NOT_APPEAR" not in result
     assert "SEALED_BODY_MUST_NOT_APPEAR" not in result
+    assert archive_id not in result
+    assert "ordinary archived memory" not in result
+    assert "ARCHIVED_BODY_MUST_NOT_APPEAR_BY_DEFAULT" not in result
+    assert "归档桶排除: 0" in with_archive
+    assert archive_id in with_archive
+    assert "ordinary archived memory" in with_archive
     assert "orphan-vector-row" not in result
     assert embedding_before == Path(server.embedding_engine.db_path).read_bytes()
     assert before_bytes == {

@@ -2046,15 +2046,16 @@ async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-async def _run_dedupe_scan(limit: int = 30) -> str:
+async def _run_dedupe_scan(limit: int = 30, include_archive: bool = False) -> str:
     """Delegate the MCP path to the same pure scanner used for production verification."""
+    bucket_roots = (
+        bucket_mgr.permanent_dir,
+        bucket_mgr.dynamic_dir,
+        bucket_mgr.feel_dir,
+    )
     return run_dedupe_scan(
-        bucket_roots=(
-            bucket_mgr.permanent_dir,
-            bucket_mgr.dynamic_dir,
-            bucket_mgr.feel_dir,
-            bucket_mgr.archive_dir,
-        ),
+        bucket_roots=bucket_roots + ((bucket_mgr.archive_dir,) if include_archive else ()),
+        excluded_archive_roots=() if include_archive else (bucket_mgr.archive_dir,),
         db_path=embedding_engine.db_path,
         model=embedding_engine.model,
         limit=limit,
@@ -6266,13 +6267,14 @@ async def digest(
     max_groups: int = 10,
     confirm_token: str = "",
     mode: str = "maintenance",
+    include_archive: bool = False,
     limit: int = 30,
 ) -> str:
     """Memory maintenance, or a local read-only embedding dedupe scan when mode='dedupe'."""
     normalized_mode = (mode or "maintenance").strip().lower()
     if normalized_mode == "dedupe":
         try:
-            return await _run_dedupe_scan(limit=limit)
+            return await _run_dedupe_scan(limit=limit, include_archive=include_archive)
         except Exception as exc:
             logger.error("Dedupe scan failed: %s", exc)
             return "embedding 查重失败。"
