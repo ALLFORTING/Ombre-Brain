@@ -57,12 +57,38 @@ def _display_label(value: object, fallback: str, limit: int = 160) -> str:
     return text[:limit] if text else fallback
 
 
+def _read_unsealed_body_summary(file_path: str) -> str | None:
+    """Read only the JSON ``summary`` from a bucket body already found unsealed."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            if handle.readline().strip() != "---":
+                return None
+            for raw_line in handle:
+                if raw_line.strip() in ("---", "..."):
+                    break
+            else:
+                return None
+            body = json.loads(handle.read())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    summary = body.get("summary")
+    return summary if isinstance(summary, str) and summary.strip() else None
+
+
+def _is_sealed_for_output(file_path: str) -> bool:
+    """Recheck sealed state immediately before rendering; unreadable fails closed."""
+    access = _read_frontmatter_fields(file_path, {"sealed"})
+    return access is None or _is_sealed(access.get("sealed", 0))
+
+
 def _bucket_metadata_index(
     bucket_roots: tuple[str, ...],
     *,
     include_display: bool = True,
 ) -> tuple[dict[str, dict], dict[str, int]]:
-    """Index access frontmatter and, when allowed, unsealed display frontmatter."""
+    """Index access frontmatter and, when allowed, unsealed display data."""
     records: dict[str, dict] = {}
     counts = {"buckets": 0, "sealed": 0, "metadata_unreadable": 0}
     for base_dir in bucket_roots:
@@ -94,16 +120,16 @@ def _bucket_metadata_index(
 
                 display = _read_frontmatter_fields(
                     file_path,
-                    {"name", "summary", "dormant"},
+                    {"name", "dormant"},
                 ) or {}
+                name = _display_label(display.get("name"), bucket_id)
+                body_summary = _read_unsealed_body_summary(file_path)
                 records[bucket_id] = {
                     "sealed": False,
-                    "name": _display_label(display.get("name"), bucket_id),
-                    "summary": _display_label(
-                        display.get("summary") or display.get("name"),
-                        bucket_id,
-                        limit=120,
-                    ),
+                    "file_path": file_path,
+                    "name": name,
+                    "summary": _display_label(body_summary, name, limit=120),
+                    "summary_source": "body" if body_summary else "name",
                     "dormant": _is_dormant(display.get("dormant", False)),
                 }
     return records, counts
@@ -211,6 +237,11 @@ def run_dedupe_scan(
         ("0.80-0.85", int(np.count_nonzero((scores >= 0.80) & (scores < 0.85)))),
         ("0.75-0.80", int(np.count_nonzero((scores >= 0.75) & (scores < 0.80)))),
     )
+    unnamed_bucket_ids = sorted(
+        bucket_id
+        for bucket_id, record in bucket_records.items()
+        if not record.get("sealed", True) and record.get("name") == bucket_id
+    )
 
     lines = [
         "=== digest embedding 查重（只读）===",
@@ -220,8 +251,10 @@ def run_dedupe_scan(
         f"归档桶排除: {excluded_archive_counts['buckets']}",
         f"差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}",
         f"孤儿向量行: {orphan_rows}",
+        f"未命名桶（name=bucket_id）: {len(unnamed_bucket_ids)}",
         "embeddings 表 model 分布:",
     ]
+    lines.extend(f"- {bucket_id}" for bucket_id in unnamed_bucket_ids)
     lines.extend(f"- {stored_model or '(empty)'}: {count}" for stored_model, count in model_counts)
     lines.append("相似度分布（同维、有效、非 sealed 向量对）:")
     lines.extend(f"- {label}: {count}" for label, count in distribution)
@@ -231,15 +264,28 @@ def run_dedupe_scan(
         lines.append("- 无可输出的向量对。")
         return "\n".join(lines)
 
-    ordered = np.argsort(scores)[::-1][:limit]
-    for rank, pair_index in enumerate(ordered, start=1):
+    ordered = np.argsort(scores)[::-1]
+    rendered = 0
+    for pair_index in ordered:
+        if rendered >= limit:
+            break
         left_id = usable_entries[int(left_indexes[pair_index])][0]
         right_id = usable_entries[int(right_indexes[pair_index])][0]
         left_record = bucket_records[left_id]
         right_record = bucket_records[right_id]
+        if (
+            _is_sealed_for_output(left_record["file_path"])
+            or _is_sealed_for_output(right_record["file_path"])
+        ):
+            continue
+        rendered += 1
+        left_fallback = " (name)" if left_record["summary_source"] == "name" else ""
+        right_fallback = " (name)" if right_record["summary_source"] == "name" else ""
         lines.append(
-            f"{rank}. {scores[pair_index]:.6f} | "
-            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r} dormant={left_record['dormant']} "
-            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r} dormant={right_record['dormant']}"
+            f"{rendered}. {scores[pair_index]:.6f} | "
+            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r}{left_fallback} dormant={left_record['dormant']} "
+            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r}{right_fallback} dormant={right_record['dormant']}"
         )
+    if not rendered:
+        lines.append("- 无可输出的向量对。")
     return "\n".join(lines)
