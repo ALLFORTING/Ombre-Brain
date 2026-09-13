@@ -2251,10 +2251,15 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
         )
     prompt = (
         "判断新内容和旧记忆之间是否存在日期、数字或事实上的直接矛盾。"
-        "有则用一句中文指出矛盾，并包含相关 bucket_id；无则只回答“无”。"
+        "只返回一个 JSON 对象，不要使用 Markdown 代码块或附加文字。"
+        "对象必须包含且仅表达以下字段："
+        '{"same_fact":布尔值,"conflict":布尔值,"bucket_id":"旧记忆ID",'
+        '"evidence_new":"新内容中的原句","evidence_old":"旧记忆中的原句"}。'
+        "无冲突时两个布尔值至少一个为 false，其余字符串可为空。"
+        "判定冲突时 bucket_id 必须来自给出的旧记忆，且两段 evidence 必须直接支持判断。"
         "必须遵守以下硬规则：同一天发生的不同事件不构成矛盾；"
         "必须先确认描述的是同一主体、同一事实槽位，再判断两个值是否互斥；"
-        "只要主体、事实槽位或互斥关系有任何不确定，一律只回答“无”。"
+        "只要主体、事实槽位或互斥关系有任何不确定，same_fact 或 conflict 必须为 false。"
         "\n\n# 新内容\n"
         f"{strip_wikilinks(new_content)[:1500]}"
         "\n\n# 旧记忆\n"
@@ -2271,11 +2276,57 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
+                "response_format": {"type": "json_object"},
             },
         )
     response.raise_for_status()
     data = response.json()
     return data["choices"][0]["message"]["content"].strip()
+
+
+def _parse_conflict_response(
+    response: str,
+    allowed_bucket_ids: set[str],
+) -> dict | None:
+    """Parse the strict conflict verdict; every invalid shape fails closed."""
+    try:
+        payload = _json_lib.loads(response)
+    except (TypeError, ValueError, _json_lib.JSONDecodeError):
+        return None
+    required = {
+        "same_fact",
+        "conflict",
+        "bucket_id",
+        "evidence_new",
+        "evidence_old",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        return None
+    if not isinstance(payload["same_fact"], bool) or not isinstance(payload["conflict"], bool):
+        return None
+    for key in ("bucket_id", "evidence_new", "evidence_old"):
+        if not isinstance(payload[key], str):
+            return None
+        payload[key] = payload[key].strip()
+    if payload["same_fact"] and payload["conflict"]:
+        if (
+            payload["bucket_id"] not in allowed_bucket_ids
+            or not payload["evidence_new"]
+            or not payload["evidence_old"]
+        ):
+            return None
+    return payload
+
+
+def _format_conflict_warning(verdict: dict) -> str:
+    def evidence(value: str) -> str:
+        return " ".join(value.split())[:200]
+
+    return (
+        f"bucket {verdict['bucket_id']} 同一事实冲突："
+        f"新内容「{evidence(verdict['evidence_new'])}」；"
+        f"旧记忆「{evidence(verdict['evidence_old'])}」"
+    )
 
 
 def _conflict_tokens(text: str) -> set[str]:
@@ -2398,12 +2449,13 @@ async def _detect_conflict_warning(content: str) -> str:
     except Exception as exc:
         logger.warning("Conflict detection failed: %s", exc)
         return ""
-    normalized = response.strip()
-    if not normalized or normalized in ("无", "沒有", "没有", "無"):
+    verdict = _parse_conflict_response(
+        response,
+        {str(bucket.get("id", "")) for bucket in old_buckets},
+    )
+    if not verdict or not (verdict["same_fact"] and verdict["conflict"]):
         return ""
-    if normalized.startswith("无") and len(normalized) <= 4:
-        return ""
-    return normalized[:500]
+    return _format_conflict_warning(verdict)
 
 
 async def _digest_scheduler_loop() -> None:
