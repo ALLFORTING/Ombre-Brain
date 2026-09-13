@@ -693,9 +693,17 @@
             "default": true,
             "type": "boolean"
           },
+          "limit": {
+            "default": 30,
+            "type": "integer"
+          },
           "max_groups": {
             "default": 10,
             "type": "integer"
+          },
+          "mode": {
+            "default": "maintenance",
+            "type": "string"
           }
         }
       }
