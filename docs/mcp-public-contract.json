@@ -563,6 +563,10 @@
             "default": -1,
             "type": "number"
           },
+          "cursor": {
+            "default": "",
+            "type": "string"
+          },
           "date_from": {
             "default": "",
             "type": "string"
