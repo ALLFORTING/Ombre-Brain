@@ -2,6 +2,7 @@ import importlib
 import sys
 from unittest.mock import AsyncMock
 
+import frontmatter
 import pytest
 
 
@@ -74,6 +75,12 @@ async def test_breath_excluding_dormant_does_not_wake(server_module):
 async def test_breath_including_dormant_default_does_not_wake(server_module):
     anchor = "synthetic-visible-breath-anchor"
     bucket_id = await _create_dormant(server_module, content=anchor)
+    bucket_path = server_module.bucket_mgr._find_bucket_file(bucket_id)
+    post = frontmatter.load(bucket_path)
+    old_last_active = "2000-01-01T00:00:00"
+    post["last_active"] = old_last_active
+    with open(bucket_path, "w", encoding="utf-8") as handle:
+        handle.write(frontmatter.dumps(post))
 
     result = await server_module.breath(query=anchor, include_dormant=True)
     metadata = await _metadata(server_module, bucket_id)
@@ -81,6 +88,7 @@ async def test_breath_including_dormant_default_does_not_wake(server_module):
     assert bucket_id in result
     assert metadata["dormant"] is True
     assert metadata["activation_count"] == 1
+    assert metadata["last_active"] != old_last_active
 
 
 @pytest.mark.asyncio
