@@ -52,13 +52,17 @@ def _is_dormant(value: object) -> bool:
     return bool(value)
 
 
-def _display_label(value: object, fallback: str) -> str:
+def _display_label(value: object, fallback: str, limit: int = 160) -> str:
     text = " ".join(str(value or "").split())
-    return text[:160] if text else fallback
+    return text[:limit] if text else fallback
 
 
-def _bucket_metadata_index(bucket_roots: tuple[str, ...]) -> tuple[dict[str, dict], dict[str, int]]:
-    """Index only access/display frontmatter; sealed buckets never reach display reads."""
+def _bucket_metadata_index(
+    bucket_roots: tuple[str, ...],
+    *,
+    include_display: bool = True,
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """Index access frontmatter and, when allowed, unsealed display frontmatter."""
     records: dict[str, dict] = {}
     counts = {"buckets": 0, "sealed": 0, "metadata_unreadable": 0}
     for base_dir in bucket_roots:
@@ -84,15 +88,21 @@ def _bucket_metadata_index(bucket_roots: tuple[str, ...]) -> tuple[dict[str, dic
                     records[bucket_id] = {"sealed": True}
                     continue
 
+                if not include_display:
+                    records[bucket_id] = {"sealed": False}
+                    continue
+
                 display = _read_frontmatter_fields(
                     file_path,
                     {"name", "summary", "dormant"},
                 ) or {}
                 records[bucket_id] = {
                     "sealed": False,
-                    "name": _display_label(
-                        display.get("name") or display.get("summary"),
+                    "name": _display_label(display.get("name"), bucket_id),
+                    "summary": _display_label(
+                        display.get("summary") or display.get("name"),
                         bucket_id,
+                        limit=120,
                     ),
                     "dormant": _is_dormant(display.get("dormant", False)),
                 }
@@ -126,6 +136,7 @@ def _read_embedding_rows(db_path: str, model: str) -> tuple[list[tuple[str, str]
 def run_dedupe_scan(
     *,
     bucket_roots: tuple[str, ...],
+    excluded_archive_roots: tuple[str, ...] = (),
     db_path: str,
     model: str,
     limit: int = 30,
@@ -137,6 +148,10 @@ def run_dedupe_scan(
         return "limit 必须是整数。"
 
     bucket_records, bucket_counts = _bucket_metadata_index(bucket_roots)
+    excluded_archive_records, excluded_archive_counts = _bucket_metadata_index(
+        excluded_archive_roots,
+        include_display=False,
+    )
     embedding_rows, model_counts = _read_embedding_rows(db_path, model)
 
     orphan_rows = 0
@@ -146,6 +161,8 @@ def run_dedupe_scan(
     for bucket_id, embedding_json in embedding_rows:
         record = bucket_records.get(bucket_id)
         if record is None:
+            if bucket_id in excluded_archive_records:
+                continue
             orphan_rows += 1
             continue
         if record.get("sealed", True):
@@ -200,6 +217,7 @@ def run_dedupe_scan(
         f"当前模型: {model}",
         f"向量: N={len(usable_entries)}（当前模型行={len(embedding_rows)}，sealed 跳过={sealed_vector_rows}，无效跳过={invalid_vector_rows}）",
         f"桶: M={bucket_counts['buckets']}（sealed={bucket_counts['sealed']}，元数据不可读={bucket_counts['metadata_unreadable']}）",
+        f"归档桶排除: {excluded_archive_counts['buckets']}",
         f"差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}",
         f"孤儿向量行: {orphan_rows}",
         "embeddings 表 model 分布:",
@@ -221,7 +239,7 @@ def run_dedupe_scan(
         right_record = bucket_records[right_id]
         lines.append(
             f"{rank}. {scores[pair_index]:.6f} | "
-            f"{left_id} name={left_record['name']!r} dormant={left_record['dormant']} "
-            f"<-> {right_id} name={right_record['name']!r} dormant={right_record['dormant']}"
+            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r} dormant={left_record['dormant']} "
+            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r} dormant={right_record['dormant']}"
         )
     return "\n".join(lines)

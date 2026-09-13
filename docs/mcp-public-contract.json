@@ -693,6 +693,10 @@
             "default": true,
             "type": "boolean"
           },
+          "include_archive": {
+            "default": false,
+            "type": "boolean"
+          },
           "limit": {
             "default": 30,
             "type": "integer"
