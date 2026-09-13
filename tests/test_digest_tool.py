@@ -1,6 +1,9 @@
 import importlib
+import json
+import sqlite3
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import frontmatter
@@ -198,3 +201,101 @@ async def test_digest_rebalance_repeated_confirmation_does_not_lower_again(tmp_p
     assert after_first["metadata"]["importance"] == 8
     assert "confirmation required" in second
     assert after_second["metadata"]["importance"] == 8
+
+
+@pytest.mark.asyncio
+async def test_digest_dedupe_is_readonly_skips_sealed_and_reports_orphans(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first_id = await server.bucket_mgr.create(
+        content="first duplicate body",
+        importance=5,
+        domain=["dedupe-test"],
+        name="first duplicate",
+    )
+    second_id = await server.bucket_mgr.create(
+        content="second duplicate body",
+        importance=5,
+        domain=["dedupe-test"],
+        name="second duplicate",
+    )
+    dormant_id = await server.bucket_mgr.create(
+        content="dormant nearby body",
+        importance=5,
+        domain=["dedupe-test"],
+        name="dormant nearby",
+    )
+    sealed_id = await server.bucket_mgr.create(
+        content="SEALED_BODY_MUST_NOT_APPEAR",
+        importance=5,
+        domain=["dedupe-test"],
+        name="SEALED_NAME_MUST_NOT_APPEAR",
+    )
+    assert await server.bucket_mgr.set_dormant(dormant_id, True)
+    await server.trace(sealed_id, sealed=1)
+
+    server.embedding_engine._store_embedding(first_id, [1.0, 0.0])
+    server.embedding_engine._store_embedding(second_id, [1.0, 0.0])
+    server.embedding_engine._store_embedding(dormant_id, [0.9, 0.435889894])
+    # Simulate a stale derived vector left behind after a bucket was sealed.
+    server.embedding_engine._store_embedding(sealed_id, [1.0, 0.0])
+    server.embedding_engine._store_embedding("orphan-vector-row", [1.0, 0.0])
+    with sqlite3.connect(server.embedding_engine.db_path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings (bucket_id, embedding, model, updated_at) VALUES (?, ?, ?, ?)",
+            ("other-model-row", json.dumps([1.0, 0.0]), "other-model", "2026-09-13T00:00:00"),
+        )
+
+    tracked_ids = (first_id, second_id, dormant_id, sealed_id)
+    bucket_paths = {
+        bucket_id: server.bucket_mgr._find_bucket_file(bucket_id)
+        for bucket_id in tracked_ids
+    }
+    before_bytes = {
+        bucket_id: Path(path).read_bytes()
+        for bucket_id, path in bucket_paths.items()
+    }
+    before_metadata = {
+        bucket_id: {
+            key: frontmatter.load(path).get(key)
+            for key in ("dormant", "last_active", "activation_count", "digested")
+        }
+        for bucket_id, path in bucket_paths.items()
+    }
+    embedding_before = Path(server.embedding_engine.db_path).read_bytes()
+    server.decay_engine.ensure_started.reset_mock()
+    server.bucket_mgr.list_all = AsyncMock(side_effect=AssertionError("dedupe must not load buckets"))
+    server.embedding_engine._generate_embedding = AsyncMock(
+        side_effect=AssertionError("dedupe must not call embedding API")
+    )
+
+    result = await server.digest(mode="dedupe")
+
+    assert server.decay_engine.ensure_started.await_count == 0
+    assert server.bucket_mgr.list_all.await_count == 0
+    assert server.embedding_engine._generate_embedding.await_count == 0
+    assert "向量: N=3（当前模型行=5，sealed 跳过=1，无效跳过=0）" in result
+    assert "桶: M=4（sealed=1，元数据不可读=0）" in result
+    assert "差额: K=M-N=1" in result
+    assert "孤儿向量行: 1" in result
+    assert f"- {server.embedding_engine.model}: 5" in result
+    assert "- other-model: 1" in result
+    assert "- 0.95+: 1" in result
+    assert "- 0.90-0.95: 2" in result
+    assert f"{first_id} name='first duplicate' dormant=False" in result
+    assert f"{dormant_id} name='dormant nearby' dormant=True" in result
+    assert sealed_id not in result
+    assert "SEALED_NAME_MUST_NOT_APPEAR" not in result
+    assert "SEALED_BODY_MUST_NOT_APPEAR" not in result
+    assert "orphan-vector-row" not in result
+    assert embedding_before == Path(server.embedding_engine.db_path).read_bytes()
+    assert before_bytes == {
+        bucket_id: Path(path).read_bytes()
+        for bucket_id, path in bucket_paths.items()
+    }
+    assert before_metadata == {
+        bucket_id: {
+            key: frontmatter.load(path).get(key)
+            for key in ("dormant", "last_active", "activation_count", "digested")
+        }
+        for bucket_id, path in bucket_paths.items()
+    }
