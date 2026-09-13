@@ -67,6 +67,9 @@ from PIL import Image, UnidentifiedImageError
 # authentication, capability lookup, or durable state.
 _RM_PROCESS_BOOT_ID = secrets.token_hex(16)
 _RM_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+_BREATH_CURSOR_TTL_SECONDS = 15 * 60
+_BREATH_CURSOR_MAX_STATES = 256
+_BREATH_CURSOR_STATES: dict[str, dict] = {}
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -2251,10 +2254,15 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
         )
     prompt = (
         "判断新内容和旧记忆之间是否存在日期、数字或事实上的直接矛盾。"
-        "有则用一句中文指出矛盾，并包含相关 bucket_id；无则只回答“无”。"
+        "只返回一个 JSON 对象，不要使用 Markdown 代码块或附加文字。"
+        "对象必须包含且仅表达以下字段："
+        '{"same_fact":布尔值,"conflict":布尔值,"bucket_id":"旧记忆ID",'
+        '"evidence_new":"新内容中的原句","evidence_old":"旧记忆中的原句"}。'
+        "无冲突时两个布尔值至少一个为 false，其余字符串可为空。"
+        "判定冲突时 bucket_id 必须来自给出的旧记忆，且两段 evidence 必须直接支持判断。"
         "必须遵守以下硬规则：同一天发生的不同事件不构成矛盾；"
         "必须先确认描述的是同一主体、同一事实槽位，再判断两个值是否互斥；"
-        "只要主体、事实槽位或互斥关系有任何不确定，一律只回答“无”。"
+        "只要主体、事实槽位或互斥关系有任何不确定，same_fact 或 conflict 必须为 false。"
         "\n\n# 新内容\n"
         f"{strip_wikilinks(new_content)[:1500]}"
         "\n\n# 旧记忆\n"
@@ -2271,11 +2279,57 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
+                "response_format": {"type": "json_object"},
             },
         )
     response.raise_for_status()
     data = response.json()
     return data["choices"][0]["message"]["content"].strip()
+
+
+def _parse_conflict_response(
+    response: str,
+    allowed_bucket_ids: set[str],
+) -> dict | None:
+    """Parse the strict conflict verdict; every invalid shape fails closed."""
+    try:
+        payload = _json_lib.loads(response)
+    except (TypeError, ValueError, _json_lib.JSONDecodeError):
+        return None
+    required = {
+        "same_fact",
+        "conflict",
+        "bucket_id",
+        "evidence_new",
+        "evidence_old",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        return None
+    if not isinstance(payload["same_fact"], bool) or not isinstance(payload["conflict"], bool):
+        return None
+    for key in ("bucket_id", "evidence_new", "evidence_old"):
+        if not isinstance(payload[key], str):
+            return None
+        payload[key] = payload[key].strip()
+    if payload["same_fact"] and payload["conflict"]:
+        if (
+            payload["bucket_id"] not in allowed_bucket_ids
+            or not payload["evidence_new"]
+            or not payload["evidence_old"]
+        ):
+            return None
+    return payload
+
+
+def _format_conflict_warning(verdict: dict) -> str:
+    def evidence(value: str) -> str:
+        return " ".join(value.split())[:200]
+
+    return (
+        f"bucket {verdict['bucket_id']} 同一事实冲突："
+        f"新内容「{evidence(verdict['evidence_new'])}」；"
+        f"旧记忆「{evidence(verdict['evidence_old'])}」"
+    )
 
 
 def _conflict_tokens(text: str) -> set[str]:
@@ -2398,12 +2452,13 @@ async def _detect_conflict_warning(content: str) -> str:
     except Exception as exc:
         logger.warning("Conflict detection failed: %s", exc)
         return ""
-    normalized = response.strip()
-    if not normalized or normalized in ("无", "沒有", "没有", "無"):
+    verdict = _parse_conflict_response(
+        response,
+        {str(bucket.get("id", "")) for bucket in old_buckets},
+    )
+    if not verdict or not (verdict["same_fact"] and verdict["conflict"]):
         return ""
-    if normalized.startswith("无") and len(normalized) <= 4:
-        return ""
-    return normalized[:500]
+    return _format_conflict_warning(verdict)
 
 
 async def _digest_scheduler_loop() -> None:
@@ -2703,6 +2758,86 @@ def _filter_breath_query_matches(
     ]
 
 
+def _breath_cursor_scope(
+    *,
+    query: str,
+    domain: str,
+    valence: float,
+    arousal: float,
+    recent_cutoff: str | None,
+    include_dormant: bool,
+    include_sealed: bool,
+    date_from: str,
+    date_to: str,
+    resonance: str,
+) -> str:
+    payload = {
+        "query": query,
+        "domain": domain,
+        "valence": valence,
+        "arousal": arousal,
+        "recent_cutoff": recent_cutoff,
+        "include_dormant": include_dormant,
+        "include_sealed": include_sealed,
+        "date_from": date_from,
+        "date_to": date_to,
+        "resonance": resonance,
+    }
+    encoded = _json_lib.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _encode_breath_cursor(bucket_ids: list[str], position: int, scope: str) -> str:
+    now = time.monotonic()
+    for token, state in list(_BREATH_CURSOR_STATES.items()):
+        if float(state.get("expires_at", 0)) <= now:
+            _BREATH_CURSOR_STATES.pop(token, None)
+    while len(_BREATH_CURSOR_STATES) >= _BREATH_CURSOR_MAX_STATES:
+        oldest = min(
+            _BREATH_CURSOR_STATES,
+            key=lambda token: float(_BREATH_CURSOR_STATES[token].get("created_at", 0)),
+        )
+        _BREATH_CURSOR_STATES.pop(oldest, None)
+    token = secrets.token_urlsafe(24)
+    _BREATH_CURSOR_STATES[token] = {
+        "ids": list(bucket_ids),
+        "position": position,
+        "scope": scope,
+        "created_at": now,
+        "expires_at": now + _BREATH_CURSOR_TTL_SECONDS,
+    }
+    return token
+
+
+def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[str], int]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 256:
+        raise ValueError("invalid cursor")
+    state = _BREATH_CURSOR_STATES.get(cursor)
+    if state is None or float(state.get("expires_at", 0)) <= time.monotonic():
+        _BREATH_CURSOR_STATES.pop(cursor, None)
+        raise ValueError("invalid cursor")
+    bucket_ids = state.get("ids")
+    position = state.get("position")
+    if (
+        state.get("scope") != expected_scope
+        or not isinstance(bucket_ids, list)
+        or len(bucket_ids) > 1000
+        or any(not isinstance(bucket_id, str) or not bucket_id for bucket_id in bucket_ids)
+        or len(set(bucket_ids)) != len(bucket_ids)
+        or not isinstance(position, int)
+        or isinstance(position, bool)
+        or position < 0
+        or position > len(bucket_ids)
+    ):
+        raise ValueError("invalid cursor")
+    return list(bucket_ids), position
+
+
 async def _compose_breath_query_matches(
     matches: list[dict],
     *,
@@ -2714,6 +2849,7 @@ async def _compose_breath_query_matches(
     trace_by_id: dict[str, dict] | None = None,
     touch: bool = True,
     cache: bool = True,
+    next_cursor: str = "",
 ) -> tuple[str, dict]:
     """Compose query results using the same path as normal Breath."""
     results = []
@@ -2805,6 +2941,8 @@ async def _compose_breath_query_matches(
         f"因结果上限省略 {hidden_count} / "
         f"因 token 预算省略 {token_budget_omitted}"
     )
+    if next_cursor:
+        summary_lines.append(f"下一页 cursor: {next_cursor}")
     final_text = "\n---\n".join(results)
     if final_text:
         final_text += "\n\n" + "\n".join(summary_lines)
@@ -2831,6 +2969,7 @@ async def _breath_impl(
     resonance: str = "",
     tags_filter: list[str] | None = None,
     topic_filter: list[str] | None = None,
+    cursor: str = "",
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
@@ -2860,6 +2999,8 @@ async def _breath_impl(
         return str(exc)
     if date_from and date_to and date_from > date_to:
         return "date_from cannot be later than date_to."
+    if cursor and (not query.strip() or tags_filter or topic_filter):
+        return "cursor 仅适用于不带 tags_filter/topic_filter 的 query 检索。"
 
     if tags_filter or topic_filter:
         return await _breath_filtered_impl(
@@ -3183,34 +3324,79 @@ async def _breath_impl(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
-    try:
-        search_trace = {}
-        matches = await bucket_mgr.search(
-            query,
-            limit=1000,
-            domain_filter=domain_filter,
-            query_valence=q_valence,
-            query_arousal=q_arousal,
-            include_dormant=include_dormant,
-            include_sealed=include_sealed,
-            trace=search_trace,
-        )
-    except Exception as e:
-        logger.error(f"Search failed / 检索失败: {e}")
-        return "检索过程出错，请稍后重试。"
-
-    matches = _filter_breath_query_matches(
-        matches,
+    cursor_scope = _breath_cursor_scope(
+        query=query,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
         recent_cutoff=recent_cutoff,
+        include_dormant=include_dormant,
+        include_sealed=include_sealed,
         date_from=date_from,
         date_to=date_to,
-        include_sealed=include_sealed,
+        resonance=resonance,
     )
-    if resonance_target:
-        matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
-    hidden_count = max(0, len(matches) - max_results)
-    total_matches = len(matches)
-    matches = matches[:max_results]
+    search_trace = {}
+    if cursor:
+        try:
+            ordered_ids, position = _decode_breath_cursor(cursor, cursor_scope)
+        except ValueError:
+            return "cursor 无效、已过期或与当前检索条件不匹配。"
+        page_ids = ordered_ids[position:position + max_results]
+        loaded = []
+        for bucket_id in page_ids:
+            bucket = await bucket_mgr.get(bucket_id)
+            if bucket is not None:
+                loaded.append(bucket)
+        matches = _filter_breath_query_matches(
+            loaded,
+            recent_cutoff=recent_cutoff,
+            date_from=date_from,
+            date_to=date_to,
+            include_sealed=include_sealed,
+        )
+        if not include_dormant:
+            matches = [
+                bucket
+                for bucket in matches
+                if not bucket.get("metadata", {}).get("dormant", False)
+            ]
+        next_position = min(position + max_results, len(ordered_ids))
+    else:
+        try:
+            matches = await bucket_mgr.search(
+                query,
+                limit=1000,
+                domain_filter=domain_filter,
+                query_valence=q_valence,
+                query_arousal=q_arousal,
+                include_dormant=include_dormant,
+                include_sealed=include_sealed,
+                trace=search_trace,
+            )
+        except Exception as e:
+            logger.error(f"Search failed / 检索失败: {e}")
+            return "检索过程出错，请稍后重试。"
+
+        matches = _filter_breath_query_matches(
+            matches,
+            recent_cutoff=recent_cutoff,
+            date_from=date_from,
+            date_to=date_to,
+            include_sealed=include_sealed,
+        )
+        if resonance_target:
+            matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
+        ordered_ids = [str(bucket.get("id", "")) for bucket in matches]
+        matches = matches[:max_results]
+        next_position = len(matches)
+    total_matches = len(ordered_ids)
+    hidden_count = max(0, total_matches - len(matches))
+    next_cursor = (
+        _encode_breath_cursor(ordered_ids, next_position, cursor_scope)
+        if next_position < total_matches
+        else ""
+    )
 
     final_text, composition = await _compose_breath_query_matches(
         matches,
@@ -3224,6 +3410,7 @@ async def _breath_impl(
             for entry in search_trace.get("candidates", [])
         },
         touch=True,
+        next_cursor=next_cursor,
     )
     if not final_text:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
@@ -6095,6 +6282,15 @@ async def breath(
             )
         ),
     ] = None,
+    cursor: Annotated[
+        str,
+        Field(
+            description=(
+                "Opaque cursor returned by a previous query Breath page. "
+                "Reuse it with the same query and filters."
+            )
+        ),
+    ] = "",
 ) -> str:
     """Retrieval-oriented memory search; surfacing may update bounded activation metadata."""
     if mailbox:
@@ -6121,6 +6317,7 @@ async def breath(
         resonance=resonance,
         tags_filter=tags_filter,
         topic_filter=topic_filter,
+        cursor=cursor,
     )
     return _with_response_seal(result)
 
