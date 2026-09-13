@@ -420,9 +420,9 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `boot`
 
-`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算。各块按“今日触发 → 最新 letter → todos → 最近归档 → 钉选索引 → feel 回声”的顺序出队；发生截断时，返回末尾会区分列出部分截断和完全未输出的块名。预算允许时，钉选索引至少保留 2500 字符。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算（默认及硬上限均为 16000）。各块按“今日触发 → 最新 letter → todos → 最近归档 → 钉选索引 → feel 回声”的顺序出队；发生截断时，返回末尾会区分列出部分截断和完全未输出的块名。预算允许时，最新 letter、todos、最近归档和钉选索引分别预留 1000、1500、1200、4000 字符；实际内容短于保底时，未使用的额度会归还给后续块。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
 
-`boot` accepts optional `pinned_chars` and `max_tokens` parameters. Sections are emitted in this order: daily triggers, latest letter, todos, recent archives, pinned index, and feel echo. When truncation occurs, the response names partially truncated and wholly omitted sections. When the total budget permits, the pinned index keeps at least 2500 characters. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
+`boot` accepts optional `pinned_chars` and `max_tokens` parameters; the default and hard maximum for `max_tokens` are both 16000. Sections are emitted in this order: daily triggers, latest letter, todos, recent archives, pinned index, and feel echo. When truncation occurs, the response names partially truncated and wholly omitted sections. When the budget permits, latest letter, todos, recent archives, and pinned index reserve 1000, 1500, 1200, and 4000 characters respectively; unused allowance from a shorter section returns to later sections. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
 
 #### `breath`
 

@@ -1818,7 +1818,12 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
 
 
 BOOT_TRUNCATION_NOTICE_TOKENS = 160
-BOOT_PINNED_MIN_CHARS = 2500
+BOOT_SECTION_MINIMUM_CHARS = {
+    "mailbox": 1000,
+    "todos": 1500,
+    "sessions": 1200,
+    "pinned": 4000,
+}
 
 
 def _prefix_within_token_budget(text: str, token_budget: int) -> str:
@@ -1852,14 +1857,24 @@ def _fit_sections_to_budget(
         return "\n\n".join(text for _, _, text in sections)
 
     content_budget = max(0, max_tokens - BOOT_TRUNCATION_NOTICE_TOKENS)
-    reserved_tokens = {
-        key: min(
-            count_tokens_approx(text),
-            count_tokens_approx(text[: max(0, minimum_chars.get(key, 0))]),
-        )
-        for key, _, text in sections
-        if minimum_chars.get(key, 0) > 0
-    }
+    requested_tokens = {}
+    for key, _, text in sections:
+        minimum = max(0, minimum_chars.get(key, 0))
+        if key == "triggers":
+            requested_tokens[key] = count_tokens_approx(text)
+        elif minimum > 0:
+            requested_tokens[key] = count_tokens_approx(text[:minimum])
+
+    reserved_tokens = {}
+    remaining_reserve = content_budget
+    # If every guarantee fits, later sections keep their full reservation.
+    # Otherwise the same pass assigns the available budget in output order.
+    for key, _, _ in sections:
+        requested = requested_tokens.get(key, 0)
+        reserved = min(requested, remaining_reserve)
+        if key in requested_tokens:
+            reserved_tokens[key] = reserved
+        remaining_reserve -= reserved
     output = []
     complete = []
     partial = []
@@ -6763,11 +6778,14 @@ async def todos() -> str:
 
 
 @mcp.tool()
-async def boot(pinned_chars: int = 5000, max_tokens: int = 12000) -> str:
+async def boot(
+    pinned_chars: int = 5000,
+    max_tokens: Annotated[int, Field(ge=1000, le=16000)] = 16000,
+) -> str:
     """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
     await decay_engine.ensure_started()
     pinned_chars = max(80, min(int(pinned_chars or 5000), 5000))
-    max_tokens = max(1000, min(int(max_tokens or 12000), 12000))
+    max_tokens = max(1000, min(int(max_tokens or 16000), 16000))
 
     try:
         active_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -6833,7 +6851,7 @@ async def boot(pinned_chars: int = 5000, max_tokens: int = 12000) -> str:
             ("echo", "feel 回声", echo_text),
         ],
         max_tokens=max_tokens - 20,
-        minimum_chars={"pinned": BOOT_PINNED_MIN_CHARS},
+        minimum_chars=BOOT_SECTION_MINIMUM_CHARS,
     )
     today = datetime.now().date().isoformat()
     for bucket_id in trigger_ids:
