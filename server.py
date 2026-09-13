@@ -99,6 +99,7 @@ from asset_viewer import (
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
+from digest_dedupe import run_dedupe_scan
 from import_memory import ImportEngine
 from maintenance_write_gate import (
     guarded_async_mutation,
@@ -2043,6 +2044,21 @@ async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
     response.raise_for_status()
     data = response.json()
     return data["choices"][0]["message"]["content"].strip()
+
+
+async def _run_dedupe_scan(limit: int = 30) -> str:
+    """Delegate the MCP path to the same pure scanner used for production verification."""
+    return run_dedupe_scan(
+        bucket_roots=(
+            bucket_mgr.permanent_dir,
+            bucket_mgr.dynamic_dir,
+            bucket_mgr.feel_dir,
+            bucket_mgr.archive_dir,
+        ),
+        db_path=embedding_engine.db_path,
+        model=embedding_engine.model,
+        limit=limit,
+    )
 
 
 async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
@@ -6245,8 +6261,23 @@ async def asset_vision_upload_challenge() -> str:
 
 
 @mcp.tool()
-async def digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
-    """Controlled memory maintenance: plan by default; confirmed execution may mutate digestion state."""
+async def digest(
+    dry_run: bool = True,
+    max_groups: int = 10,
+    confirm_token: str = "",
+    mode: str = "maintenance",
+    limit: int = 30,
+) -> str:
+    """Memory maintenance, or a local read-only embedding dedupe scan when mode='dedupe'."""
+    normalized_mode = (mode or "maintenance").strip().lower()
+    if normalized_mode == "dedupe":
+        try:
+            return await _run_dedupe_scan(limit=limit)
+        except Exception as exc:
+            logger.error("Dedupe scan failed: %s", exc)
+            return "embedding 查重失败。"
+    if normalized_mode != "maintenance":
+        return "mode 必须是 maintenance 或 dedupe。"
     await decay_engine.ensure_started()
     try:
         return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token)
