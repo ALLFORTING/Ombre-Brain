@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,7 @@ import pytest
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
+    monkeypatch.delenv("OMBRE_CONFLICT_DETECTION_ENABLED", raising=False)
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
@@ -147,7 +149,15 @@ async def test_conflict_detection_uses_lexical_fallback_candidates(tmp_path, mon
 
     async def fake_call(new_content, old_buckets):
         captured["old_ids"] = [bucket["id"] for bucket in old_buckets]
-        return "bucket has conflicting date"
+        return json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": old_id,
+                "evidence_new": "Alpha invoice due date is 2026-07-01.",
+                "evidence_old": "Alpha invoice due date is 2026-07-06.",
+            }
+        )
 
     server._call_conflict_api = fake_call
 
@@ -155,8 +165,232 @@ async def test_conflict_detection_uses_lexical_fallback_candidates(tmp_path, mon
         "codex_conflict_marker Alpha invoice due date is 2026-07-01."
     )
 
-    assert warning == "bucket has conflicting date"
+    assert old_id in warning
+    assert "Alpha invoice due date is 2026-07-01." in warning
+    assert "Alpha invoice due date is 2026-07-06." in warning
     assert old_id in captured["old_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_content,new_content",
+    [
+        (
+            "Opus hallucination safeguards were recorded in 2026.",
+            "The studio was founded in 2026.",
+        ),
+        (
+            "Opus 5 幻觉与硬规则记录于 2026.09.12",
+            "工作室建于 2026.09.12",
+        ),
+    ],
+    ids=["shared-year-only", "real-shared-full-date-only"],
+)
+async def test_conflict_candidates_reject_time_only_overlap(
+    tmp_path,
+    monkeypatch,
+    old_content,
+    new_content,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "e24f331b163e",
+        "content": old_content,
+        "metadata": {"name": "unrelated old event", "tags": []},
+    }
+    server.bucket_mgr.search = AsyncMock(return_value=[old_bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(return_value="")
+
+    candidates = await server._conflict_candidate_buckets(new_content)
+    warning = await server._detect_conflict_warning(new_content)
+
+    assert candidates == []
+    assert warning == ""
+    server._call_conflict_api.assert_awaited_once_with(new_content, [])
+
+
+@pytest.mark.asyncio
+async def test_conflict_prompt_rejects_different_subjects_and_uncertainty(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_digest_api_config",
+        lambda: ("test-key", "https://example.invalid/v1", "test-model"),
+    )
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "same_fact": False,
+                                    "conflict": False,
+                                    "bucket_id": "",
+                                    "evidence_new": "",
+                                    "evidence_old": "",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["prompt"] = json["messages"][1]["content"]
+            captured["response_format"] = json["response_format"]
+            return FakeResponse()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda timeout: FakeClient())
+    old_bucket = {
+        "id": "different-subject-old",
+        "content": "Alice invoice status is open on 2026.09.12.",
+        "metadata": {"name": "Alice invoice", "tags": []},
+    }
+    server.bucket_mgr.search = AsyncMock(return_value=[old_bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[old_bucket])
+
+    warning = await server._detect_conflict_warning(
+        "Bob invoice status is closed on 2026.09.12."
+    )
+
+    assert warning == ""
+    assert "同一天发生的不同事件不构成矛盾" in captured["prompt"]
+    assert "同一主体、同一事实槽位" in captured["prompt"]
+    assert "任何不确定，same_fact 或 conflict 必须为 false" in captured["prompt"]
+    assert captured["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_conflict_warning_requires_same_fact_and_conflict(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "old-invoice",
+        "content": "Alpha invoice status is open.",
+        "metadata": {"name": "Alpha invoice", "tags": ["invoice"]},
+    }
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(
+        return_value=json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": "old-invoice",
+                "evidence_new": "Alpha invoice status is closed.",
+                "evidence_old": "Alpha invoice status is open.",
+            }
+        )
+    )
+
+    warning = await server._detect_conflict_warning(
+        "Alpha invoice status is closed."
+    )
+
+    assert "old-invoice" in warning
+    assert "Alpha invoice status is closed." in warning
+    assert "Alpha invoice status is open." in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        "bucket old-invoice conflicts",
+        "{malformed",
+        json.dumps({"same_fact": True, "conflict": True}),
+        json.dumps(
+            {
+                "same_fact": "yes",
+                "conflict": True,
+                "bucket_id": "old-invoice",
+                "evidence_new": "new",
+                "evidence_old": "old",
+            }
+        ),
+        json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": "unknown-bucket",
+                "evidence_new": "new",
+                "evidence_old": "old",
+            }
+        ),
+        json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": "old-invoice",
+                "evidence_new": "",
+                "evidence_old": "old",
+            }
+        ),
+    ],
+    ids=[
+        "free-text",
+        "malformed-json",
+        "missing-fields",
+        "invalid-boolean",
+        "unknown-bucket",
+        "missing-evidence",
+    ],
+)
+async def test_invalid_conflict_response_fails_closed(
+    tmp_path,
+    monkeypatch,
+    response,
+):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "old-invoice",
+        "content": "Alpha invoice status is open.",
+        "metadata": {"name": "Alpha invoice", "tags": ["invoice"]},
+    }
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(return_value=response)
+
+    warning = await server._detect_conflict_warning(
+        "Alpha invoice status is closed."
+    )
+
+    assert warning == ""
+
+
+@pytest.mark.asyncio
+async def test_conflict_detection_has_default_on_independent_switch(
+    tmp_path,
+    monkeypatch,
+):
+    server = _load_server(tmp_path, monkeypatch)
+
+    assert server._conflict_detection_enabled() is True
+
+    monkeypatch.setenv("OMBRE_CONFLICT_DETECTION_ENABLED", "false")
+    server._conflict_candidate_buckets = AsyncMock(return_value=[])
+    server._call_conflict_api = AsyncMock(return_value="conflict")
+
+    warning = await server._detect_conflict_warning("new content")
+
+    assert warning == ""
+    server._conflict_candidate_buckets.assert_not_awaited()
+    server._call_conflict_api.assert_not_awaited()
 
 
 @pytest.mark.asyncio

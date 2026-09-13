@@ -420,9 +420,9 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `boot`
 
-`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算；超出预算时返回会被截断。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算（默认及硬上限均为 16000）。各块按“今日触发 → 最新 letter → todos → 最近归档 → 钉选索引 → feel 回声”的顺序出队；发生截断时，返回末尾会区分列出部分截断和完全未输出的块名。预算允许时，最新 letter、todos、最近归档和钉选索引分别预留 1000、1500、1200、4000 字符；实际内容短于保底时，未使用的额度会归还给后续块。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
 
-`boot` accepts optional `pinned_chars` and `max_tokens` parameters: the former controls the character budget for pinned content, while the latter controls the token budget for the overall response; output is truncated when a budget is exceeded. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
+`boot` accepts optional `pinned_chars` and `max_tokens` parameters; the default and hard maximum for `max_tokens` are both 16000. Sections are emitted in this order: daily triggers, latest letter, todos, recent archives, pinned index, and feel echo. When truncation occurs, the response names partially truncated and wholly omitted sections. When the budget permits, latest letter, todos, recent archives, and pinned index reserve 1000, 1500, 1200, and 4000 characters respectively; unused allowance from a shorter section returns to later sections. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
 
 #### `breath`
 
@@ -793,6 +793,7 @@ Sensitive config via env vars:
 - `OMBRE_RESPONSE_SEAL` — 返回验真暗语；`boot` 和 `breath` 末尾会附带 `seal: <value>` / Response verification seal appended to `boot` and `breath`
 - `OMBRE_DIGEST_API_KEY` — 自动消化与矛盾检测使用的 DeepSeek/OpenAI-compatible key / DeepSeek/OpenAI-compatible key for digestion and conflict detection
 - `OMBRE_DIGEST_BASE_URL` — 自动消化与矛盾检测 API 地址，默认 `https://api.deepseek.com/v1` / API base URL for digestion and conflict detection
+- `OMBRE_CONFLICT_DETECTION_ENABLED` — 独立控制 `hold`/`grow` 矛盾检测，默认开启；关闭时不选择候选也不调用模型 / Independently controls `hold`/`grow` conflict detection; enabled by default, and disabling it skips candidate selection and model calls
 - `OMBRE_DASHBOARD_PASSWORD` — Dashboard 访问密码（可选，见下）/ Dashboard password
 
 ### 环境变量完整列表 / Environment Variables
@@ -816,6 +817,7 @@ Sensitive config via env vars:
 | `OMBRE_DIGEST_API_KEY` | 否 / No | — | `digest` 自动消化和 `hold`/`grow` 矛盾检测使用的 LLM key / Key used by `digest` and conflict detection |
 | `OMBRE_DIGEST_BASE_URL` | 否 / No | `https://api.deepseek.com/v1` | 消化/矛盾检测 API base URL / API base URL for digestion/conflict detection |
 | `OMBRE_DIGEST_MODEL` | 否 / No | `deepseek-chat` | 消化/矛盾检测模型名 / Model for digestion/conflict detection |
+| `OMBRE_CONFLICT_DETECTION_ENABLED` | 否 / No | `true` | 独立启用 `hold`/`grow` 矛盾检测；关闭后不选择候选、不调用模型。启用时仍需 `OMBRE_DIGEST_API_KEY` 才能调用模型 / Independently enables `hold`/`grow` conflict detection; disabling skips candidate selection and model calls. An API key is still required for model calls when enabled |
 | `OMBRE_DIGEST_SCHEDULER` | 否 / No | `false` | 是否启用服务内自动消化定时循环；默认关闭 / Enable in-service digestion scheduler; disabled by default |
 | `OMBRE_DIGEST_DRY_RUN` | 否 / No | `true` | 定时消化是否只 dry-run；上线初期建议保持 true / Whether scheduled digestion only dry-runs; keep true during rollout |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 / No | — | Dashboard 和 `/api/*` 密码 / Dashboard and `/api/*` password |
@@ -1097,7 +1099,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 的首选认证方式；客户端发送 `Authorization: Bearer <your-token>`
    如果客户端只能填写 URL，可另外显式设置 `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` 与独立的 `OMBRE_MCP_QUERY_TOKEN`，使用 `https://<你的服务名>.onrender.com/mcp?token=<dedicated-query-token>`；query token 可能被保留在 URL、日志或历史记录中。
 5. （推荐）设置 `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`：启用语义检索与自动 related
-6. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API
+6. （可选）设置 `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`：启用 `digest` 和矛盾检测 API；矛盾检测另由默认开启的 `OMBRE_CONFLICT_DETECTION_ENABLED` 独立控制
 7. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
 8. Dashboard：`https://<你的服务名>.onrender.com/dashboard`
 9. 部署后 MCP URL：`https://<你的服务名>.onrender.com/mcp`；客户端必须另行发送 `Authorization: Bearer <your-token>`
@@ -1109,7 +1111,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 4. `OMBRE_AUTH_TOKEN`: preferred for public HTTP MCP; clients must send `Authorization: Bearer <your-token>`
    For a URL-only client, explicitly set `OMBRE_MCP_ALLOW_QUERY_TOKEN=true` and a separate `OMBRE_MCP_QUERY_TOKEN`, then use `https://<your-service>.onrender.com/mcp?token=<dedicated-query-token>`; query credentials may be retained in URLs, logs, or history.
 5. (Recommended) `OMBRE_EMBEDDING_API_KEY` / `OMBRE_EMBEDDING_MODEL`: semantic retrieval and auto-related
-6. (Optional) `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`: enable `digest` and API conflict detection
+6. (Optional) `OMBRE_DIGEST_API_KEY` / `OMBRE_DIGEST_BASE_URL`: enable `digest` and API conflict detection; conflict detection is independently controlled by default-on `OMBRE_CONFLICT_DETECTION_ENABLED`
 7. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
 8. Dashboard: `https://<your-service>.onrender.com/dashboard`
 9. MCP URL after deploy: `https://<your-service>.onrender.com/mcp`; clients must separately send `Authorization: Bearer <your-token>`
