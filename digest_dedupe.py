@@ -1,12 +1,16 @@
 """Pure local embedding duplicate scan used by the digest MCP tool."""
 
+import hashlib
 import json
 import os
 import sqlite3
 from pathlib import Path
 
 import numpy as np
+import frontmatter
 import yaml
+
+from utils import strip_wikilinks
 
 
 def _read_frontmatter_fields(
@@ -57,12 +61,56 @@ def _display_label(value: object, fallback: str, limit: int = 160) -> str:
     return text[:limit] if text else fallback
 
 
+def _read_unsealed_body(file_path: str) -> str | None:
+    """Read the body exactly as Breath does after its initial sealed check passed."""
+    try:
+        return str(frontmatter.load(file_path).content or "")
+    except (OSError, ValueError, TypeError, yaml.YAMLError):
+        return None
+
+
+def _read_cached_summaries(
+    cache_db_path: str,
+    content_hashes: set[str],
+) -> dict[str, str]:
+    """Read cached dehydration summaries without creating or changing the DB."""
+    database_path = Path(cache_db_path)
+    if not content_hashes or not database_path.is_file():
+        return {}
+    database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(database_uri, uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            summaries: dict[str, str] = {}
+            hashes = sorted(content_hashes)
+            for start in range(0, len(hashes), 900):
+                chunk = hashes[start:start + 900]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT content_hash, summary FROM dehydration_cache "
+                    f"WHERE content_hash IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for content_hash, summary in rows:
+                    if isinstance(summary, str) and summary.strip():
+                        summaries[str(content_hash)] = summary
+            return summaries
+    except (OSError, sqlite3.Error):
+        return {}
+
+
+def _is_sealed_for_output(file_path: str) -> bool:
+    """Recheck sealed state immediately before rendering; unreadable fails closed."""
+    access = _read_frontmatter_fields(file_path, {"sealed"})
+    return access is None or _is_sealed(access.get("sealed", 0))
+
+
 def _bucket_metadata_index(
     bucket_roots: tuple[str, ...],
     *,
     include_display: bool = True,
 ) -> tuple[dict[str, dict], dict[str, int]]:
-    """Index access frontmatter and, when allowed, unsealed display frontmatter."""
+    """Index access frontmatter and, when allowed, unsealed display data."""
     records: dict[str, dict] = {}
     counts = {"buckets": 0, "sealed": 0, "metadata_unreadable": 0}
     for base_dir in bucket_roots:
@@ -94,19 +142,57 @@ def _bucket_metadata_index(
 
                 display = _read_frontmatter_fields(
                     file_path,
-                    {"name", "summary", "dormant"},
+                    {"name", "dormant"},
                 ) or {}
+                name = _display_label(display.get("name"), bucket_id)
+                body = _read_unsealed_body(file_path)
+                cleaned_body = strip_wikilinks(body or "")
+                has_body = bool(cleaned_body.strip())
                 records[bucket_id] = {
                     "sealed": False,
-                    "name": _display_label(display.get("name"), bucket_id),
-                    "summary": _display_label(
-                        display.get("summary") or display.get("name"),
-                        bucket_id,
-                        limit=120,
+                    "file_path": file_path,
+                    "name": name,
+                    "body": cleaned_body if has_body else "",
+                    "content_hash": (
+                        hashlib.sha256(cleaned_body.encode("utf-8")).hexdigest()
+                        if has_body
+                        else ""
                     ),
                     "dormant": _is_dormant(display.get("dormant", False)),
                 }
     return records, counts
+
+
+def _attach_summary_sources(
+    bucket_records: dict[str, dict],
+    cache_db_path: str,
+) -> dict[str, int]:
+    """Apply cache, body, then name fallback without calling any model or API."""
+    cached_summaries = _read_cached_summaries(
+        cache_db_path,
+        {
+            record["content_hash"]
+            for record in bucket_records.values()
+            if not record.get("sealed", True) and record.get("content_hash")
+        },
+    )
+    counts = {"summary": 0, "body": 0, "name": 0}
+    for record in bucket_records.values():
+        if record.get("sealed", True):
+            continue
+        content_hash = record.get("content_hash", "")
+        cached_summary = cached_summaries.get(content_hash)
+        if cached_summary:
+            record["summary"] = _display_label(cached_summary, record["name"], limit=120)
+            record["summary_source"] = "summary"
+        elif record.get("body"):
+            record["summary"] = _display_label(record["body"], record["name"], limit=120)
+            record["summary_source"] = "body"
+        else:
+            record["summary"] = record["name"]
+            record["summary_source"] = "name"
+        counts[record["summary_source"]] += 1
+    return counts
 
 
 def _read_embedding_rows(db_path: str, model: str) -> tuple[list[tuple[str, str]], list[tuple[str, int]]]:
@@ -153,6 +239,10 @@ def run_dedupe_scan(
         include_display=False,
     )
     embedding_rows, model_counts = _read_embedding_rows(db_path, model)
+    summary_counts = _attach_summary_sources(
+        bucket_records,
+        str(Path(db_path).with_name("dehydration_cache.db")),
+    )
 
     orphan_rows = 0
     sealed_vector_rows = 0
@@ -211,6 +301,11 @@ def run_dedupe_scan(
         ("0.80-0.85", int(np.count_nonzero((scores >= 0.80) & (scores < 0.85)))),
         ("0.75-0.80", int(np.count_nonzero((scores >= 0.75) & (scores < 0.80)))),
     )
+    unnamed_bucket_ids = sorted(
+        bucket_id
+        for bucket_id, record in bucket_records.items()
+        if not record.get("sealed", True) and record.get("name") == bucket_id
+    )
 
     lines = [
         "=== digest embedding 查重（只读）===",
@@ -220,8 +315,21 @@ def run_dedupe_scan(
         f"归档桶排除: {excluded_archive_counts['buckets']}",
         f"差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}",
         f"孤儿向量行: {orphan_rows}",
-        "embeddings 表 model 分布:",
+        f"未命名桶（name=bucket_id）: {len(unnamed_bucket_ids)}",
+        "未命名桶 ID 清单:",
     ]
+    lines.extend(f"- {bucket_id}" for bucket_id in unnamed_bucket_ids)
+    if not unnamed_bucket_ids:
+        lines.append("- 无")
+    lines.extend([
+        (
+            "摘要来源: "
+            f"缓存命中={summary_counts['summary']}，"
+            f"正文回退={summary_counts['body']}，"
+            f"名称回退={summary_counts['name']}"
+        ),
+        "embeddings 表 model 分布:",
+    ])
     lines.extend(f"- {stored_model or '(empty)'}: {count}" for stored_model, count in model_counts)
     lines.append("相似度分布（同维、有效、非 sealed 向量对）:")
     lines.extend(f"- {label}: {count}" for label, count in distribution)
@@ -231,15 +339,28 @@ def run_dedupe_scan(
         lines.append("- 无可输出的向量对。")
         return "\n".join(lines)
 
-    ordered = np.argsort(scores)[::-1][:limit]
-    for rank, pair_index in enumerate(ordered, start=1):
+    ordered = np.argsort(scores)[::-1]
+    rendered = 0
+    for pair_index in ordered:
+        if rendered >= limit:
+            break
         left_id = usable_entries[int(left_indexes[pair_index])][0]
         right_id = usable_entries[int(right_indexes[pair_index])][0]
         left_record = bucket_records[left_id]
         right_record = bucket_records[right_id]
+        if (
+            _is_sealed_for_output(left_record["file_path"])
+            or _is_sealed_for_output(right_record["file_path"])
+        ):
+            continue
+        rendered += 1
+        left_source = f" ({left_record['summary_source']})"
+        right_source = f" ({right_record['summary_source']})"
         lines.append(
-            f"{rank}. {scores[pair_index]:.6f} | "
-            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r} dormant={left_record['dormant']} "
-            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r} dormant={right_record['dormant']}"
+            f"{rendered}. {scores[pair_index]:.6f} | "
+            f"{left_id} name={left_record['name']!r} summary={left_record['summary']!r}{left_source} dormant={left_record['dormant']} "
+            f"<-> {right_id} name={right_record['name']!r} summary={right_record['summary']!r}{right_source} dormant={right_record['dormant']}"
         )
+    if not rendered:
+        lines.append("- 无可输出的向量对。")
     return "\n".join(lines)

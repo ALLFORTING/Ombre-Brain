@@ -1,4 +1,5 @@
 import importlib
+import hashlib
 import json
 import sqlite3
 import sys
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import frontmatter
 import pytest
+from utils import strip_wikilinks
 
 
 def _load_server(tmp_path, monkeypatch):
@@ -213,13 +215,13 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
         name="session_named_memory",
     )
     second_id = await server.bucket_mgr.create(
-        content="second duplicate body",
+        content="second duplicate body [[visible link]]",
         importance=5,
         domain=["dedupe-test"],
         name="second duplicate",
     )
     dormant_id = await server.bucket_mgr.create(
-        content="dormant nearby body",
+        content="",
         importance=5,
         domain=["dedupe-test"],
         name="dormant nearby",
@@ -236,11 +238,26 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
         domain=["dedupe-test"],
         name="ordinary archived memory",
     )
+    unnamed_id = await server.bucket_mgr.create(
+        content="unnamed bucket without a vector",
+        importance=5,
+        domain=["dedupe-test"],
+    )
+    first_body = "first duplicate body [[hidden brackets]]"
     first_path = Path(server.bucket_mgr._find_bucket_file(first_id))
     first_post = frontmatter.load(first_path)
     first_summary = "summary-" + ("x" * 130)
-    first_post["summary"] = first_summary
+    first_post.content = first_body
     first_path.write_text(frontmatter.dumps(first_post), encoding="utf-8")
+    with sqlite3.connect(server.dehydrator.cache_db_path) as conn:
+        conn.execute(
+            "INSERT INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
+            (
+                hashlib.sha256(strip_wikilinks(first_body).encode("utf-8")).hexdigest(),
+                first_summary,
+                server.dehydrator.model,
+            ),
+        )
     assert await server.bucket_mgr.set_dormant(dormant_id, True)
     await server.trace(sealed_id, sealed=1)
     assert await server.bucket_mgr.archive(archive_id)
@@ -258,7 +275,7 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
             ("other-model-row", json.dumps([1.0, 0.0]), "other-model", "2026-09-13T00:00:00"),
         )
 
-    tracked_ids = (first_id, second_id, dormant_id, sealed_id, archive_id)
+    tracked_ids = (first_id, second_id, dormant_id, sealed_id, archive_id, unnamed_id)
     bucket_paths = {
         bucket_id: server.bucket_mgr._find_bucket_file(bucket_id)
         for bucket_id in tracked_ids
@@ -275,10 +292,14 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
         for bucket_id, path in bucket_paths.items()
     }
     embedding_before = Path(server.embedding_engine.db_path).read_bytes()
+    cache_before = Path(server.dehydrator.cache_db_path).read_bytes()
     server.decay_engine.ensure_started.reset_mock()
     server.bucket_mgr.list_all = AsyncMock(side_effect=AssertionError("dedupe must not load buckets"))
     server.embedding_engine._generate_embedding = AsyncMock(
         side_effect=AssertionError("dedupe must not call embedding API")
+    )
+    server.dehydrator.dehydrate = AsyncMock(
+        side_effect=AssertionError("dedupe must not call dehydration API")
     )
 
     result = await server.digest(mode="dedupe")
@@ -287,17 +308,27 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     assert server.decay_engine.ensure_started.await_count == 0
     assert server.bucket_mgr.list_all.await_count == 0
     assert server.embedding_engine._generate_embedding.await_count == 0
+    assert server.dehydrator.dehydrate.await_count == 0
     assert "向量: N=3（当前模型行=6，sealed 跳过=1，无效跳过=0）" in result
-    assert "桶: M=4（sealed=1，元数据不可读=0）" in result
+    assert "桶: M=5（sealed=1，元数据不可读=0）" in result
     assert "归档桶排除: 1" in result
-    assert "差额: K=M-N=1" in result
+    assert "差额: K=M-N=2" in result
     assert "孤儿向量行: 1" in result
+    assert "未命名桶（name=bucket_id）: 1" in result
+    assert f"- {unnamed_id}" in result
+    assert "摘要来源: 缓存命中=1，正文回退=2，名称回退=1" in result
+    assert (
+        result.index("未命名桶 ID 清单:")
+        < result.index(f"- {unnamed_id}")
+        < result.index("embeddings 表 model 分布:")
+    )
     assert f"- {server.embedding_engine.model}: 6" in result
     assert "- other-model: 1" in result
     assert "- 0.95+: 1" in result
     assert "- 0.90-0.95: 2" in result
-    assert f"{first_id} name='session_named_memory' summary={first_summary[:120]!r} dormant=False" in result
-    assert f"{dormant_id} name='dormant nearby' summary='dormant nearby' dormant=True" in result
+    assert f"{first_id} name='session_named_memory' summary={first_summary[:120]!r} (summary) dormant=False" in result
+    assert f"{second_id} name='second duplicate' summary='second duplicate body visible link' (body) dormant=False" in result
+    assert f"{dormant_id} name='dormant nearby' summary='dormant nearby' (name) dormant=True" in result
     assert sealed_id not in result
     assert "SEALED_NAME_MUST_NOT_APPEAR" not in result
     assert "SEALED_BODY_MUST_NOT_APPEAR" not in result
@@ -309,6 +340,7 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     assert "ordinary archived memory" in with_archive
     assert "orphan-vector-row" not in result
     assert embedding_before == Path(server.embedding_engine.db_path).read_bytes()
+    assert cache_before == Path(server.dehydrator.cache_db_path).read_bytes()
     assert before_bytes == {
         bucket_id: Path(path).read_bytes()
         for bucket_id, path in bucket_paths.items()
@@ -320,3 +352,44 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
         }
         for bucket_id, path in bucket_paths.items()
     }
+
+
+@pytest.mark.asyncio
+async def test_digest_dedupe_drops_summary_if_bucket_becomes_sealed_before_output(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first_id = await server.bucket_mgr.create(
+        content="SUMMARY_MUST_NOT_LEAK",
+        importance=5,
+        domain=["dedupe-test"],
+        name="initially unsealed",
+    )
+    second_id = await server.bucket_mgr.create(
+        content="second summary",
+        importance=5,
+        domain=["dedupe-test"],
+        name="second bucket",
+    )
+    first_path = Path(server.bucket_mgr._find_bucket_file(first_id))
+    server.embedding_engine._store_embedding(first_id, [1.0, 0.0])
+    server.embedding_engine._store_embedding(second_id, [1.0, 0.0])
+
+    import digest_dedupe
+
+    original_reader = digest_dedupe._read_unsealed_body
+
+    def seal_after_summary_read(file_path):
+        summary = original_reader(file_path)
+        if Path(file_path) == first_path:
+            post = frontmatter.load(first_path)
+            post["sealed"] = 1
+            first_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return summary
+
+    monkeypatch.setattr(digest_dedupe, "_read_unsealed_body", seal_after_summary_read)
+
+    result = await server.digest(mode="dedupe")
+
+    assert first_id not in result
+    assert "initially unsealed" not in result
+    assert "SUMMARY_MUST_NOT_LEAK" not in result
+    assert "- 无可输出的向量对。" in result
