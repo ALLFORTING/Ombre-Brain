@@ -230,6 +230,9 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_set_cached_summary": "guarded_optional_mutation_after_network",
         "invalidate_cache": "guarded_mutation",
     },
+    "digest_dedupe.py": {
+        "_read_cached_summaries": "dynamic_sql_read_only",
+    },
     "asset_migration_state.py": {
         "__enter__": "manual_writer_scope",
         "__exit__": "manual_writer_scope",
