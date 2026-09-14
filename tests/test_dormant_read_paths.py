@@ -152,6 +152,46 @@ async def test_todos_does_not_wake_dormant(server_module):
 
 
 @pytest.mark.asyncio
+async def test_trace_append_does_not_wake_dormant(server_module):
+    bucket_id = await _create_dormant(server_module, content="trace append anchor")
+
+    await server_module.trace(bucket_id, content="appended", append=True)
+
+    assert (await _metadata(server_module, bucket_id))["dormant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trace_name_and_tags_do_not_wake_dormant(server_module):
+    bucket_id = await _create_dormant(server_module)
+
+    await server_module.trace(bucket_id, name="renamed dormant bucket")
+    assert (await _metadata(server_module, bucket_id))["dormant"] is True
+
+    await server_module.trace(bucket_id, tags="trace,dormant")
+    assert (await _metadata(server_module, bucket_id))["dormant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trace_explicit_dormant_zero_wakes_dormant_bucket(server_module):
+    bucket_id = await _create_dormant(server_module)
+
+    await server_module.trace(bucket_id, dormant=0)
+
+    assert (await _metadata(server_module, bucket_id))["dormant"] is False
+
+
+@pytest.mark.asyncio
+async def test_trace_keeps_active_bucket_active_for_common_updates(server_module):
+    bucket_id = await server_module.bucket_mgr.create(content="active trace anchor")
+
+    await server_module.trace(bucket_id, content="appended", append=True)
+    await server_module.trace(bucket_id, name="renamed active bucket")
+    await server_module.trace(bucket_id, tags="trace,active")
+
+    assert (await _metadata(server_module, bucket_id))["dormant"] is False
+
+
+@pytest.mark.asyncio
 async def test_dream_explicit_wake_switch_clears_dormant(server_module):
     bucket_id = await _create_dormant(server_module)
 

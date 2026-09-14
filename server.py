@@ -6853,8 +6853,6 @@ async def trace(
 
     if not updates:
         return "没有任何字段需要修改。"
-    if "dormant" not in updates:
-        updates["dormant"] = False
 
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
