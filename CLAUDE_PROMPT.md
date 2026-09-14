@@ -53,7 +53,7 @@
 ## `trace` 的安全语义
 
 - `resolved=1` 表示这件事已经处理/可以沉底：降低后续浮现优先级；`resolved=0` 重新激活。它不是 dormant，也不是删除。
-- `dormant=1` 表示自动或手动沉底的休眠状态，主要影响列表/浮现；`trace` 修改通常会唤醒它，除非明确传 `dormant=1`。它不是“已解决”。
+- `dormant=1` 表示自动或手动沉底的休眠状态，主要影响列表/浮现；`trace` 修改不会自动唤醒它；要唤醒请显式传 `dormant=0`。它不是“已解决”。
 - `merge` 会把源桶并入目标桶，并移除源桶；这是高影响维护动作。
 - `append=False` 时正文替换，`append=True` 时追加。
 - 归档后的 session bucket 仍可通过 `trace` 修改：未 sealed 时可以修改或追加正文；sealed 时正文修改受保护。
