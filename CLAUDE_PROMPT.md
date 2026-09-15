@@ -46,7 +46,7 @@
 
 ## `pulse` 的有界列表
 
-- `pulse(show_all=False)` 保持现有行为：返回所有 pinned/protected 桶，以及非 dormant 动态桶的 Top15；不要用 `limit`/`offset` 期待改变这个 Top15 行为。
+- `pulse(show_all=False)` 先组合所有 pinned/protected 桶和非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；不要把 limit 当作改变候选排序的参数。
 - `pulse(show_all=True, limit=50, offset=0)` 按稳定顺序返回可见桶的一个 bounded page。`limit` 最大为 50，`offset` 从 0 开始；根据返回中的总数、当前显示数量和 `还有更多` 判断是否继续下一页。
 - `include_archive` 和 `include_sealed` 仍分别控制归档桶和 sealed 桶可见性；分页不会改变 pinned/protected/dormant/sealed 的原有语义。
 
@@ -55,6 +55,8 @@
 - `resolved=1` 表示这件事已经处理/可以沉底：降低后续浮现优先级；`resolved=0` 重新激活。它不是 dormant，也不是删除。
 - `dormant=1` 表示自动或手动沉底的休眠状态，主要影响列表/浮现；`trace` 修改不会自动唤醒它；要唤醒请显式传 `dormant=0`。它不是“已解决”。
 - `merge` 会把源桶并入目标桶，并移除源桶；这是高影响维护动作。
+- `merge` 会重连所有指向源桶的 `superseded_by` 并清理旧 reverse IDs；merge 不会唤醒原本 dormant 的目标桶。
+- `delete=True` 若发现其他桶的 `superseded_by` 指向待删桶会拒绝；先用 `trace(superseded_by="")` 撤销或改指向。
 - `append=False` 时正文替换，`append=True` 时追加。
 - 归档后的 session bucket 仍可通过 `trace` 修改：未 sealed 时可以修改或追加正文；sealed 时正文修改受保护。
 - `mode` 只有 `summary` 和 `full` 两种值；不要发明其他模式。
@@ -85,7 +87,13 @@
 
 ### supersedes
 
-`hold(..., supersedes_id="...")` 是显式的原地事实演化。目标不存在、无效、受保护或更新失败时会明确报错，不会静默降级成新建。
+`hold(..., supersedes_id="...")` 是显式的原地事实演化，不新建桶。目标不存在、无效、受保护或更新失败时会明确报错，不会静默降级成新建。
+
+### superseded_by
+
+- `trace(superseded_by=...)` 只允许单桶路径：省略参数不改变作废关系；显式 `""` 撤销；`"none"` 表示已作废但无取代者；bucket ID 建立旧桶到有效取代桶的双向链接。
+- 目标必须存在、不是自身且未 sealed；pinned 目标可用。批量 trace 不支持此参数。
+- 作废是元数据操作，不改正文、不创建正文 history snapshot。`breath`/`dream`/`pulse` 会显示 `⊘` 作废标记；旧桶仍可搜索但会排序下沉。
 
 ## 参数约定
 

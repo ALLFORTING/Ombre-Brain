@@ -1221,28 +1221,103 @@ def _bucket_emotion(meta: dict) -> str:
     return f"V{val:.1f}/A{aro:.1f}"
 
 
-def _bucket_summary_line(bucket: dict, score: float | None = None, pinned: bool = False) -> str:
+def _superseded_by_id(metadata: dict) -> str:
+    """Return the normalized successor marker; absent/empty metadata means active."""
+    value = metadata.get("superseded_by", "") if isinstance(metadata, dict) else ""
+    return str(value or "").strip()
+
+
+def _supersedes_ids(metadata: dict) -> list[str]:
+    """Read legacy-tolerant reverse supersession metadata as unique bucket IDs."""
+    value = metadata.get("supersedes", []) if isinstance(metadata, dict) else []
+    if isinstance(value, str):
+        values = _parse_csv_ids(value)
+    elif isinstance(value, list):
+        values = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        values = []
+    return list(dict.fromkeys(values))
+
+
+async def _superseded_marker(bucket: dict) -> str:
+    """Render a successor marker without leaking a sealed successor."""
+    successor_id = _superseded_by_id(bucket.get("metadata", {}))
+    if not successor_id or successor_id == "none":
+        return " ⊘已作废" if successor_id else ""
+    successor = await bucket_mgr.get(successor_id)
+    if not successor or _is_sealed(successor):
+        return " ⊘已作废"
+    successor_name = successor.get("metadata", {}).get("name", successor_id)
+    return f" ⊘已作废→{successor_id}({successor_name})"
+
+
+async def _current_successor_lines(
+    obsolete_buckets: list[dict],
+    returned_ids: set[str],
+) -> list[str]:
+    """List visible successors without loading successor bodies or using budget."""
+    lines = []
+    seen = set()
+    for bucket in obsolete_buckets:
+        old_id = str(bucket.get("id", ""))
+        successor_id = _superseded_by_id(bucket.get("metadata", {}))
+        if (
+            not old_id
+            or not successor_id
+            or successor_id == "none"
+            or successor_id in returned_ids
+            or (old_id, successor_id) in seen
+        ):
+            continue
+        successor = await bucket_mgr.get(successor_id)
+        if not successor or _is_sealed(successor):
+            continue
+        successor_name = successor.get("metadata", {}).get("name", successor_id)
+        lines.append(f"当前有效：[{successor_id}] {successor_name}（取代了 {old_id}）")
+        seen.add((old_id, successor_id))
+    return lines
+
+
+async def _dream_superseded_notice(bucket: dict) -> str:
+    """Explain supersession before a Dream detail body without sealed leakage."""
+    metadata = bucket.get("metadata", {})
+    successor_id = _superseded_by_id(metadata)
+    if not successor_id:
+        return ""
+    if successor_id == "none":
+        return "此桶已作废。"
+    successor = await bucket_mgr.get(successor_id)
+    if not successor or _is_sealed(successor):
+        return "此桶已作废。"
+    successor_name = successor.get("metadata", {}).get("name", successor_id)
+    timestamp = metadata.get("superseded_at", "未知时间")
+    return f"此桶已被 {successor_id}({successor_name}) 取代于 {timestamp}"
+
+
+async def _bucket_summary_line(bucket: dict, score: float | None = None, pinned: bool = False) -> str:
     meta = bucket.get("metadata", {})
     label = meta.get("name", bucket["id"])
+    superseded_marker = await _superseded_marker(bucket)
     topic = _bucket_topic(meta)
     emotion = _bucket_emotion(meta)
     updated = _bucket_date(meta, "updated_at", "last_active", "created")
     if pinned:
         importance = meta.get("importance", "?")
-        return f"📌 [bucket_id:{bucket['id']}] {label} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
+        return f"📌 [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
     weight = f"{score:.2f}" if score is not None else "0.00"
-    return f"💭 [bucket_id:{bucket['id']}] {label} | 主题:{topic} | {emotion} | 权重:{weight} | 更新:{updated}"
+    return f"💭 [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 权重:{weight} | 更新:{updated}"
 
 
-def _dream_summary_line(bucket: dict) -> str:
+async def _dream_summary_line(bucket: dict) -> str:
     meta = bucket.get("metadata", {})
     label = meta.get("name", bucket["id"])
+    superseded_marker = await _superseded_marker(bucket)
     topic = _bucket_topic(meta)
     emotion = _bucket_emotion(meta)
     updated = _bucket_date(meta, "updated_at", "last_active", "created")
     content = strip_wikilinks(bucket.get("content", "")).replace("\n", " ").strip()
     one_line = content[:80] + ("…" if len(content) > 80 else "")
-    return f"[{label}] 主题:{topic} | {one_line} | {emotion} | 更新:{updated} | bucket_id:{bucket['id']}"
+    return f"[{label}]{superseded_marker} 主题:{topic} | {one_line} | {emotion} | 更新:{updated} | bucket_id:{bucket['id']}"
 
 
 def _recent_cutoff(recent_days: int) -> str | None:
@@ -1600,6 +1675,126 @@ def _related_ids(meta: dict) -> list[str]:
     return _parse_csv_ids(str(raw))
 
 
+def _metadata_restore_value(metadata: dict, field: str):
+    """Return a BucketManager.update-compatible value that restores field presence."""
+    return metadata.get(field) if field in metadata else None
+
+
+async def _apply_supersession(
+    source: dict,
+    superseded_by: str,
+    *,
+    preserve_superseded_at: bool = False,
+) -> tuple[bool, str]:
+    """Maintain the forward and reverse supersession metadata together.
+
+    All buckets are validated before writes. If a later metadata write fails, the
+    already-written metadata is compensated with its original value so callers
+    do not report a successful half-link.
+    """
+    source_id = str(source.get("id", ""))
+    source_meta = source.get("metadata", {})
+    requested = str(superseded_by).strip()
+    previous = _superseded_by_id(source_meta)
+
+    if requested and requested != "none" and requested == source_id:
+        return False, "superseded_by 不能指向自身。"
+
+    target = None
+    if requested and requested != "none":
+        target = await bucket_mgr.get(requested)
+        if not target:
+            return False, f"未找到 superseded_by 目标桶: {requested}"
+        if _is_sealed(target):
+            return False, f"superseded_by 目标桶已封存，不能作为取代桶: {requested}"
+
+    previous_target = None
+    if previous and previous != "none":
+        previous_target = await bucket_mgr.get(previous)
+
+    source_update = {
+        "superseded_by": requested or None,
+        "superseded_at": (
+            _metadata_restore_value(source_meta, "superseded_at")
+            if preserve_superseded_at and requested
+            else (datetime.now().isoformat() if requested else None)
+        ),
+    }
+    source_restore = {
+        "superseded_by": _metadata_restore_value(source_meta, "superseded_by"),
+        "superseded_at": _metadata_restore_value(source_meta, "superseded_at"),
+    }
+    operations: list[tuple[str, dict, dict]] = [
+        (source_id, source_update, source_restore)
+    ]
+
+    if previous_target and previous != requested:
+        previous_meta = previous_target.get("metadata", {})
+        operations.append(
+            (
+                previous,
+                {"supersedes": [
+                    item for item in _supersedes_ids(previous_meta)
+                    if item != source_id
+                ]},
+                {"supersedes": _metadata_restore_value(previous_meta, "supersedes")},
+            )
+        )
+    if target:
+        target_meta = target.get("metadata", {})
+        operations.append(
+            (
+                requested,
+                {"supersedes": list(dict.fromkeys(
+                    _supersedes_ids(target_meta) + [source_id]
+                ))},
+                {"supersedes": _metadata_restore_value(target_meta, "supersedes")},
+            )
+        )
+
+    applied: list[tuple[str, dict]] = []
+    for bucket_id, update, restore in operations:
+        if not await bucket_mgr.update(bucket_id, **update):
+            for applied_id, applied_restore in reversed(applied):
+                await bucket_mgr.update(applied_id, **applied_restore)
+            return False, "superseded_by 修改失败，未完成关系写入。"
+        applied.append((bucket_id, restore))
+
+    if requested == "none":
+        return True, "none"
+    if not requested:
+        return True, ""
+    target_name = target.get("metadata", {}).get("name", requested) if target else requested
+    return True, f"{requested} ({target_name})"
+
+
+async def _clear_outgoing_supersession_for_delete(bucket: dict) -> bool:
+    """Remove a soon-to-be-deleted bucket from its successor's reverse list."""
+    successor_id = _superseded_by_id(bucket.get("metadata", {}))
+    if not successor_id or successor_id == "none":
+        return True
+    successor = await bucket_mgr.get(successor_id)
+    if not successor:
+        return True
+    successor_meta = successor.get("metadata", {})
+    return await bucket_mgr.update(
+        successor_id,
+        supersedes=[
+            item for item in _supersedes_ids(successor_meta)
+            if item != bucket.get("id")
+        ],
+    )
+
+
+async def _inbound_supersession_buckets(target_id: str) -> list[dict]:
+    """Find forward supersession pointers without trusting stale reverse lists."""
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    return [
+        bucket for bucket in buckets
+        if _superseded_by_id(bucket.get("metadata", {})) == target_id
+    ]
+
+
 async def _format_related_line(bucket: dict) -> str:
     related = _related_ids(bucket.get("metadata", {}))
     if not related:
@@ -1660,6 +1855,13 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     source_sealed = _is_sealed(source)
     target_sealed = _is_sealed(target)
     if source_sealed != target_sealed: return "合并失败：不允许跨隐私边界合并（sealed 状态不匹配）。"
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    inbound = [
+        bucket for bucket in all_buckets
+        if _superseded_by_id(bucket.get("metadata", {})) == source_id
+    ]
+    if any(bucket.get("id") == target_id for bucket in inbound):
+        return "合并失败：目标桶不能同时被源桶取代。"
     target_content = target.get("content", "").rstrip()
     source_content = source.get("content", "").strip()
     merged_content = (
@@ -1697,14 +1899,79 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         importance=merged_importance,
         valence=merged_valence,
         arousal=merged_arousal,
-        dormant=False,
         todos=merged_todos,
     )
     if not updated:
         return f"合并失败，无法更新目标桶: {target_id}"
 
+    relation_operations: list[tuple[str, dict, dict]] = []
+    inbound_ids = [
+        str(bucket.get("id", "")) for bucket in inbound
+        if str(bucket.get("id", "")) and bucket.get("id") != source_id
+    ]
+    for bucket in all_buckets:
+        holder_id = str(bucket.get("id", ""))
+        holder_meta = bucket.get("metadata", {})
+        reverse_ids = _supersedes_ids(holder_meta)
+        if holder_id == source_id or source_id not in reverse_ids:
+            continue
+        desired_reverse = [item for item in reverse_ids if item != source_id]
+        if holder_id == target_id:
+            desired_reverse = list(dict.fromkeys(desired_reverse + inbound_ids))
+        relation_operations.append(
+            (
+                holder_id,
+                {"supersedes": desired_reverse},
+                {"supersedes": _metadata_restore_value(holder_meta, "supersedes")},
+            )
+        )
+    if not any(operation[0] == target_id for operation in relation_operations) and inbound_ids:
+        relation_operations.append(
+            (
+                target_id,
+                {"supersedes": list(dict.fromkeys(
+                    _supersedes_ids(target_meta) + inbound_ids
+                ))},
+                {"supersedes": _metadata_restore_value(target_meta, "supersedes")},
+            )
+        )
+    for inbound_bucket in inbound:
+        inbound_id = str(inbound_bucket.get("id", ""))
+        if not inbound_id or inbound_id == source_id:
+            continue
+        inbound_meta = inbound_bucket.get("metadata", {})
+        relation_operations.append(
+            (
+                inbound_id,
+                {
+                    "superseded_by": target_id,
+                    "superseded_at": _metadata_restore_value(
+                        inbound_meta, "superseded_at"
+                    ),
+                },
+                {
+                    "superseded_by": _metadata_restore_value(
+                        inbound_meta, "superseded_by"
+                    ),
+                    "superseded_at": _metadata_restore_value(
+                        inbound_meta, "superseded_at"
+                    ),
+                },
+            )
+        )
+
+    applied_relations: list[tuple[str, dict]] = []
+    for relation_id, relation_update, relation_restore in relation_operations:
+        if not await bucket_mgr.update(relation_id, **relation_update):
+            for rollback_id, rollback_update in reversed(applied_relations):
+                await bucket_mgr.update(rollback_id, **rollback_update)
+            return "合并失败：superseded_by 关系重连未完成。"
+        applied_relations.append((relation_id, relation_restore))
+
     deleted = await bucket_mgr.delete(source_id, _allow_sealed=source_sealed)
     if not deleted:
+        for rollback_id, rollback_update in reversed(applied_relations):
+            await bucket_mgr.update(rollback_id, **rollback_update)
         return f"目标桶已更新，但源桶删除失败: {source_id}"
     return (
         f"已合并 {source_id} → {target_id}: "
@@ -2722,7 +2989,7 @@ async def _breath_filtered_impl(
                     ripple_ids=returned_ids,
                     wake_dormant=wake_dormant,
                 )
-                summary = _format_breath_query_summary(bucket, summary)
+                summary = await _format_breath_query_summary(bucket, summary)
                 results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
                 token_used += summary_tokens
             except Exception as exc:
@@ -3007,15 +3274,16 @@ def _order_breath_query_matches(matches: list[dict]) -> list[dict]:
     ]
 
 
-def _format_breath_query_summary(bucket: dict, summary: str) -> str:
+async def _format_breath_query_summary(bucket: dict, summary: str) -> str:
     """Add the stable query-result header used by both Breath query paths."""
     pinned = bool(bucket.get("metadata", {}).get("pinned", False))
     score = float(bucket.get("_breath_score", 0.0))
     channel = str(bucket.get("_breath_channel", "关键词"))
     marker = " 📌" if pinned else ""
+    superseded_marker = await _superseded_marker(bucket)
     header = (
         f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
-        f"[通道:{channel}] {summary}"
+        f"[通道:{channel}]{superseded_marker} {summary}"
     )
     return "[语义关联] " + header if bucket.get("vector_match") else header
 
@@ -3037,6 +3305,7 @@ async def _compose_breath_query_matches(
 ) -> tuple[str, dict]:
     """Compose query results using the same path as normal Breath."""
     results = []
+    shown_buckets = []
     token_used = 0
     token_budget_omitted = 0
     strong_matches = [
@@ -3093,8 +3362,9 @@ async def _compose_breath_query_matches(
                     bucket["id"],
                     wake_dormant=wake_dormant,
                 )
-            summary = _format_breath_query_summary(bucket, summary)
+            summary = await _format_breath_query_summary(bucket, summary)
             results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
+            shown_buckets.append(bucket)
             token_used += summary_tokens
             if decision is not None:
                 decision["final_decision"] = "surfaced"
@@ -3133,6 +3403,12 @@ async def _compose_breath_query_matches(
     summary_lines = []
     if omitted_count:
         summary_lines.append(f"还有{omitted_count}个相关记忆未显示")
+    summary_lines.extend(
+        await _current_successor_lines(
+            shown_buckets + weak_matches,
+            {str(bucket.get("id", "")) for bucket in matches},
+        )
+    )
     summary_lines.append(
         f"共匹配 {matched_count} / 本次显示 {displayed_count} / "
         f"因结果上限省略 {hidden_count} / "
@@ -3341,7 +3617,7 @@ async def _breath_impl(
             )
         results = [
             await _append_bucket_extras(
-                _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned"))),
+                await _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned"))),
                 b,
                 emotion_trend,
             )
@@ -3378,7 +3654,7 @@ async def _breath_impl(
             )
         results = [
             await _append_bucket_extras(
-                _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
+                await _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
                 b,
                 emotion_trend,
             )
@@ -3453,7 +3729,7 @@ async def _breath_impl(
         if summary_mode:
             for b in pinned_buckets:
                 pinned_results.append(await _append_bucket_extras(
-                    _bucket_summary_line(
+                    await _bucket_summary_line(
                         b,
                         pinned=bool(b["metadata"].get("pinned", False)),
                     ),
@@ -3461,7 +3737,7 @@ async def _breath_impl(
                     emotion_trend,
                 ))
             for b in candidates:
-                dynamic_results.append(await _append_bucket_extras(_bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend))
+                dynamic_results.append(await _append_bucket_extras(await _bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend))
         else:
             for b in pinned_buckets:
                 try:
@@ -6622,7 +6898,7 @@ async def hold(
     trigger_date: str = "",
     supersedes_id: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -6917,13 +7193,14 @@ async def trace(
     sealed: int = -1,
     content: str = "",
     related: str = "",
+    superseded_by: str | None = None,
     merge: str = "",
     append: bool = False,
     trigger_date: str = "",
     delete: bool = False,
     confirm_token: str = "",
 ) -> str:
-    # MCP schema note: related must stay in the tool signature for bidirectional links.
+    # MCP schema note: related and superseded_by stay in the signature for relations.
     """Mixed memory operation: metadata/content, relations, merge, seal, and destructive delete; no MCP undo command."""
 
     if not bucket_id or not bucket_id.strip():
@@ -6935,6 +7212,8 @@ async def trace(
     if len(bucket_ids) > 1:
         if merge:
             return "批量 trace 不能与 merge 同时使用。"
+        if superseded_by is not None:
+            return "批量 trace 不支持 superseded_by。"
         results = []
         for current_id in bucket_ids:
             result = await trace(
@@ -6984,7 +7263,29 @@ async def trace(
             or metadata.get("protected")
         ):
             return f"删除失败：记忆桶 {bucket_id} 受到保护。"
+        inbound = await _inbound_supersession_buckets(bucket_id)
+        if inbound:
+            inbound_ids = ", ".join(str(item.get("id", "")) for item in inbound)
+            return (
+                f"删除失败：记忆桶 {bucket_id} 仍被以下作废关系引用: {inbound_ids}。"
+                "请先用 trace(superseded_by='') 解除或改指向。"
+            )
+        successor_id = _superseded_by_id(metadata)
+        successor = (
+            await bucket_mgr.get(successor_id)
+            if successor_id and successor_id != "none"
+            else None
+        )
+        successor_restore = None
+        if successor:
+            successor_meta = successor.get("metadata", {})
+            successor_restore = _metadata_restore_value(successor_meta, "supersedes")
+            cleaned = await _clear_outgoing_supersession_for_delete(bucket)
+            if not cleaned:
+                return "删除失败：无法清理 superseded_by 反向关系。"
         success = await bucket_mgr.delete(bucket_id)
+        if not success and successor:
+            await bucket_mgr.update(successor_id, supersedes=successor_restore)
         # BucketManager owns local ordinary-vector cleanup and failure ordering.
         # The earlier get() already distinguished not-found and protection.
         return (
@@ -6997,6 +7298,22 @@ async def trace(
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
     metadata = bucket.get("metadata", {})
+    requested_superseded_by = None
+    if superseded_by is not None:
+        if not isinstance(superseded_by, str):
+            return "superseded_by 必须是 bucket_id、none 或空字符串。"
+        requested_superseded_by = superseded_by.strip()
+        if requested_superseded_by and requested_superseded_by != "none":
+            if requested_superseded_by == bucket_id:
+                return "superseded_by 不能指向自身。"
+            successor = await bucket_mgr.get(requested_superseded_by)
+            if not successor:
+                return f"未找到 superseded_by 目标桶: {requested_superseded_by}"
+            if _is_sealed(successor):
+                return (
+                    "superseded_by 目标桶已封存，不能作为取代桶: "
+                    f"{requested_superseded_by}"
+                )
     importance_requested = 1 <= importance <= 10
     importance_protected = importance_requested and (
         metadata.get("pinned") or metadata.get("protected")
@@ -7072,12 +7389,13 @@ async def trace(
                 "importance 锁定为 10。"
             )
 
-    if not updates:
+    if not updates and requested_superseded_by is None:
         return "没有任何字段需要修改。"
 
-    success = await bucket_mgr.update(bucket_id, **updates)
-    if not success:
-        return f"修改失败: {bucket_id}"
+    if updates:
+        success = await bucket_mgr.update(bucket_id, **updates)
+        if not success:
+            return f"修改失败: {bucket_id}"
 
     if related_ids:
         for related_id in related_ids:
@@ -7092,6 +7410,15 @@ async def trace(
                     related_id,
                     related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
                 )
+
+    supersession_label = None
+    if requested_superseded_by is not None:
+        success, supersession_label = await _apply_supersession(
+            bucket,
+            requested_superseded_by,
+        )
+        if not success:
+            return supersession_label
 
     changed = ", ".join(
         f"{k}={v}"
@@ -7118,6 +7445,9 @@ async def trace(
             "; importance 未修改：受到 pinned/protected protection，"
             "importance 锁定为 10"
         )
+    if supersession_label is not None:
+        supersession_change = f"superseded_by={supersession_label}"
+        changed += f", {supersession_change}" if changed else supersession_change
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 @mcp.tool()
@@ -7455,10 +7785,11 @@ async def pulse(
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
         sealed_tag = " [封存]" if int(meta.get("sealed", 0) or 0) == 1 else ""
         dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
+        superseded_prefix = "⊘" if _superseded_by_id(meta) else ""
         created_at = _bucket_date(meta, "created_at", "created")
         updated_at = _bucket_date(meta, "updated_at", "last_active", "created")
         lines.append(
-            f"{icon} [{meta.get('name', b['id'])}]{resolved_tag}{sealed_tag}{dormant_tag} "
+            f"{superseded_prefix}{icon} [{meta.get('name', b['id'])}]{resolved_tag}{sealed_tag}{dormant_tag} "
             f"bucket_id:{b['id']} "
             f"主题:{domains} "
             f"情感:V{val:.1f}/A{aro:.1f} "
@@ -7520,11 +7851,13 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
             val = meta.get("valence", 0.5)
             aro = meta.get("arousal", 0.3)
             updated = _bucket_date(meta, "updated_at", "last_active", "created")
+            superseded_notice = await _dream_superseded_notice(bucket)
+            detail_prefix = f"{superseded_notice}\n" if superseded_notice else ""
             details.append(
-                f"[{meta.get('name', bucket_id)}]{resolved_tag} "
+                f"[{meta.get('name', bucket_id)}]{resolved_tag}{await _superseded_marker(bucket)} "
                 f"主题:{domains} V{val:.1f}/A{aro:.1f} 更新:{updated}\n"
                 f"ID: {bucket_id}\n"
-                f"{strip_wikilinks(bucket.get('content', ''))}"
+                f"{detail_prefix}{strip_wikilinks(bucket.get('content', ''))}"
             )
             await bucket_mgr.touch(
                 bucket_id,
@@ -7566,7 +7899,7 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
     parts = []
     for b in recent:
         meta = b["metadata"]
-        parts.append(_dream_summary_line(b))
+        parts.append(await _dream_summary_line(b))
 
     header = (
         "=== Dreaming ===\n"

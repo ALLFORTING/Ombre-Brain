@@ -1346,6 +1346,17 @@
             "default": -1,
             "type": "integer"
           },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "tags": {
             "default": "",
             "type": "string"
