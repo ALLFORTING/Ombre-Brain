@@ -185,7 +185,7 @@ async def test_pulse_show_all_is_bounded_and_offset_is_reported(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_pulse_default_top15_ignores_bounded_page_arguments(tmp_path, monkeypatch):
+async def test_pulse_default_top15_honors_bounded_page_arguments(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     for index in range(18):
         await server.bucket_mgr.create(content=f"pulse top15 marker {index}")
@@ -193,8 +193,8 @@ async def test_pulse_default_top15_ignores_bounded_page_arguments(tmp_path, monk
     result = await server.pulse(show_all=False, limit=1, offset=12)
     listed_lines = [line for line in result.splitlines() if "bucket_id:" in line]
 
-    assert len(listed_lines) == 15
-    assert "动态Top15" in result
+    assert len(listed_lines) == 1
+    assert "动态Top15，limit=1, offset=12" in result
 
 
 @pytest.mark.asyncio
