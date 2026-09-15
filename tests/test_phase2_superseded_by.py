@@ -152,7 +152,13 @@ async def test_delete_rejects_inbound_and_cleans_own_outgoing_reverse(tmp_path, 
     successor_id = await _bucket(server, "successor", name="Successor")
     old_id = await _bucket(server, "old", name="Old")
     await server.trace(old_id, superseded_by=successor_id)
-    deleted = await server.trace(old_id, delete=True)
+    preview = await server.trace(old_id, delete=True)
+    token = next(
+        line.split(":", 1)[1].strip()
+        for line in preview.splitlines()
+        if line.startswith("confirm_token:")
+    )
+    deleted = await server.trace(old_id, delete=True, confirm_token=token)
     assert "已遗忘" in deleted
     assert old_id not in (await server.bucket_mgr.get(successor_id))["metadata"].get("supersedes", [])
 
