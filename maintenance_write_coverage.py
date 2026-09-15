@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -695,3 +696,28 @@ def _os_flags_are_read_only(node: ast.AST | None) -> bool:
 
 def _constant_string(node: ast.AST) -> str | None:
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def main() -> int:
+    """Run the registered production-write coverage audit for this repository."""
+    try:
+        issues = scan_registered_write_coverage(Path(__file__).resolve().parent)
+    except Exception as error:
+        print(f"Write coverage audit failed to scan: {error}", file=sys.stderr)
+        return 2
+
+    if issues:
+        print("Write coverage audit failed:", file=sys.stderr)
+        for issue in issues:
+            print(
+                f"{issue.filename}:{issue.line}: {issue.function}: {issue.primitive}",
+                file=sys.stderr,
+            )
+        return 1
+
+    print("Write coverage audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
