@@ -1026,7 +1026,8 @@ async def breath_hook(request):
         token_budget = 10000
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            parts.append(f"📌 [核心准则] {summary}")
+            marker = "📌 " if b["metadata"].get("pinned", False) else ""
+            parts.append(f"{marker}[核心准则] {summary}")
             token_budget -= count_tokens_approx(summary)
 
         # Diversity: top-1 fixed + shuffle rest from top-20
@@ -2526,6 +2527,7 @@ async def _breath_filtered_impl(
     emotion_trend: bool,
     tags_filter: list[str],
     topic_filter: list[str],
+    min_score: float,
 ) -> str:
     """Retrieve exact-filtered candidates without changing old breath paths."""
     del mode
@@ -2680,12 +2682,21 @@ async def _breath_filtered_impl(
     async def format_active_matches(
         matches: list[dict],
         hidden_count: int,
+        downgraded_count: int = 0,
     ) -> str:
         results = []
         returned_ids = set()
         token_used = 0
-        for bucket in matches:
+        token_budget_omitted = 0
+        strong_matches = [
+            bucket for bucket in matches if not bucket.get("_breath_weak", False)
+        ]
+        weak_matches = [
+            bucket for bucket in matches if bucket.get("_breath_weak", False)
+        ]
+        for index, bucket in enumerate(strong_matches):
             if token_used >= max_tokens:
+                token_budget_omitted += len(strong_matches) - index
                 break
             try:
                 clean_meta = {
@@ -2703,6 +2714,7 @@ async def _breath_filtered_impl(
                 )
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
+                    token_budget_omitted += len(strong_matches) - index
                     break
                 returned_ids.add(bucket["id"])
                 await bucket_mgr.touch(
@@ -2710,25 +2722,44 @@ async def _breath_filtered_impl(
                     ripple_ids=returned_ids,
                     wake_dormant=wake_dormant,
                 )
-                if bucket.get("vector_match"):
-                    summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
-                else:
-                    summary = f"[bucket_id:{bucket['id']}] {summary}"
+                summary = _format_breath_query_summary(bucket, summary)
                 results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
                 token_used += summary_tokens
             except Exception as exc:
                 logger.warning(f"Failed to format filtered search result: {exc}")
                 continue
 
-        if not results:
+        weak_lines = [
+            f"[bucket_id:{bucket['id']}] "
+            f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
+            f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+            for bucket in weak_matches
+        ]
+        if not results and not weak_lines:
             await _fire_webhook("breath", {"mode": "empty", "matches": 0})
             return empty_result("未找到相关记忆。")
         final_text = "\n---\n".join(results)
+        if weak_lines:
+            weak_section = "--- 弱匹配（仅列名） ---\n" + "\n".join(weak_lines)
+            final_text = "\n\n".join(
+                part for part in (final_text, weak_section) if part
+            )
         if hidden_count:
             final_text += f"\n\n还有{hidden_count}个相关桶未显示"
+        final_text += (
+            f"\n共匹配 {len(matches) + hidden_count} / "
+            f"本次显示 {len(results) + len(weak_lines)} / "
+            f"因结果上限省略 {hidden_count} / "
+            f"因 token 预算省略 {token_budget_omitted} / "
+            f"因低于阈值降级 {downgraded_count}"
+        )
         await _fire_webhook(
             "breath",
-            {"mode": "ok", "matches": len(results), "chars": len(final_text)},
+            {
+                "mode": "ok",
+                "matches": len(results) + len(weak_lines),
+                "chars": len(final_text),
+            },
         )
         return _with_emotion_timeline(final_text, emotion_trend)
 
@@ -2740,6 +2771,7 @@ async def _breath_filtered_impl(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
     try:
+        search_trace = {}
         matches = await bucket_mgr.search(
             query,
             limit=max(1000, len(candidates)),
@@ -2748,6 +2780,7 @@ async def _breath_filtered_impl(
             query_arousal=q_arousal,
             include_dormant=True, include_sealed=include_sealed,
             candidate_buckets=candidates,
+            trace=search_trace,
         )
     except Exception as exc:
         logger.error(f"Filtered search failed: {exc}")
@@ -2755,8 +2788,23 @@ async def _breath_filtered_impl(
 
     if resonance_target:
         matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
-    hidden_count = max(0, len(matches) - max_results)
-    return await format_active_matches(matches[:max_results], hidden_count)
+    trace_by_id = {
+        str(entry.get("id", "")): entry
+        for entry in search_trace.get("candidates", [])
+    }
+    matches = _annotate_breath_query_matches(
+        matches,
+        query=query,
+        trace_by_id=trace_by_id,
+        min_score=min_score,
+    )
+    ordered_matches = _order_breath_query_matches(matches)
+    hidden_count = max(0, len(ordered_matches) - max_results)
+    return await format_active_matches(
+        ordered_matches[:max_results],
+        hidden_count,
+        sum(1 for bucket in ordered_matches if bucket.get("_breath_weak", False)),
+    )
 
 
 def _filter_breath_query_matches(
@@ -2789,6 +2837,7 @@ def _breath_cursor_scope(
     date_from: str,
     date_to: str,
     resonance: str,
+    min_score: float,
 ) -> str:
     payload = {
         "query": query,
@@ -2801,6 +2850,7 @@ def _breath_cursor_scope(
         "date_from": date_from,
         "date_to": date_to,
         "resonance": resonance,
+        "min_score": min_score,
     }
     encoded = _json_lib.dumps(
         payload,
@@ -2811,7 +2861,7 @@ def _breath_cursor_scope(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _encode_breath_cursor(bucket_ids: list[str], position: int, scope: str) -> str:
+def _encode_breath_cursor(matches: list[dict], position: int, scope: str) -> str:
     now = time.monotonic()
     for token, state in list(_BREATH_CURSOR_STATES.items()):
         if float(state.get("expires_at", 0)) <= now:
@@ -2824,7 +2874,15 @@ def _encode_breath_cursor(bucket_ids: list[str], position: int, scope: str) -> s
         _BREATH_CURSOR_STATES.pop(oldest, None)
     token = secrets.token_urlsafe(24)
     _BREATH_CURSOR_STATES[token] = {
-        "ids": list(bucket_ids),
+        "matches": [
+            {
+                "id": str(bucket.get("id", "")),
+                "score": float(bucket.get("_breath_score", 0.0)),
+                "channel": str(bucket.get("_breath_channel", "关键词")),
+                "weak": bool(bucket.get("_breath_weak", False)),
+            }
+            for bucket in matches
+        ],
         "position": position,
         "scope": scope,
         "created_at": now,
@@ -2833,28 +2891,133 @@ def _encode_breath_cursor(bucket_ids: list[str], position: int, scope: str) -> s
     return token
 
 
-def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[str], int]:
+def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[dict], int]:
     if not isinstance(cursor, str) or not cursor or len(cursor) > 256:
         raise ValueError("invalid cursor")
     state = _BREATH_CURSOR_STATES.get(cursor)
     if state is None or float(state.get("expires_at", 0)) <= time.monotonic():
         _BREATH_CURSOR_STATES.pop(cursor, None)
         raise ValueError("invalid cursor")
-    bucket_ids = state.get("ids")
+    frozen_matches = state.get("matches")
     position = state.get("position")
     if (
         state.get("scope") != expected_scope
-        or not isinstance(bucket_ids, list)
-        or len(bucket_ids) > 1000
-        or any(not isinstance(bucket_id, str) or not bucket_id for bucket_id in bucket_ids)
-        or len(set(bucket_ids)) != len(bucket_ids)
+        or not isinstance(frozen_matches, list)
+        or len(frozen_matches) > 1000
+        or any(
+            not isinstance(match, dict)
+            or not isinstance(match.get("id"), str)
+            or not match["id"]
+            or not isinstance(match.get("score"), (int, float))
+            or isinstance(match.get("score"), bool)
+            or not 0.0 <= float(match["score"]) <= 1.0
+            or not isinstance(match.get("channel"), str)
+            or not match["channel"]
+            or not isinstance(match.get("weak"), bool)
+            for match in frozen_matches
+        )
+        or len({match["id"] for match in frozen_matches}) != len(frozen_matches)
         or not isinstance(position, int)
         or isinstance(position, bool)
         or position < 0
-        or position > len(bucket_ids)
+        or position > len(frozen_matches)
     ):
         raise ValueError("invalid cursor")
-    return list(bucket_ids), position
+    return [dict(match) for match in frozen_matches], position
+
+
+def _resolve_breath_min_score(min_score: float) -> float:
+    """Resolve the Breath display threshold without changing recall admission."""
+    if min_score == -1:
+        configured = os.getenv("OMBRE_BREATH_MIN_SCORE")
+        if configured is None or not configured.strip():
+            return 0.0
+        try:
+            min_score = float(configured)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OMBRE_BREATH_MIN_SCORE 必须是 0 到 1 之间的数字。") from exc
+    try:
+        resolved = float(min_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_score 必须是 -1 或 0 到 1 之间的数字。") from exc
+    if not 0.0 <= resolved <= 1.0:
+        raise ValueError("min_score 必须是 -1 或 0 到 1 之间的数字。")
+    return resolved
+
+
+def _breath_exact_anchor_match(query: str, bucket: dict) -> bool:
+    query_text = "".join(str(query or "").casefold().split())
+    if not query_text:
+        return False
+    meta = bucket.get("metadata", {})
+    searchable = " ".join((
+        str(meta.get("name", "")),
+        str(bucket.get("content", "")),
+    ))
+    return query_text in "".join(searchable.casefold().split())
+
+
+def _annotate_breath_query_matches(
+    matches: list[dict],
+    *,
+    query: str,
+    trace_by_id: dict[str, dict],
+    min_score: float,
+) -> list[dict]:
+    """Attach transient, normalized recall metadata for Breath presentation."""
+    annotated = []
+    for bucket in matches:
+        rendered = dict(bucket)
+        bid = str(rendered.get("id", ""))
+        trace_scores = trace_by_id.get(bid, {}).get("scores", {})
+        try:
+            fuzzy_score = max(0.0, min(1.0, float(trace_scores.get("fuzzy_lexical", 0.0))))
+        except (TypeError, ValueError):
+            fuzzy_score = 0.0
+        try:
+            semantic_score = max(
+                0.0,
+                min(1.0, float(trace_scores.get("semantic", rendered.get("semantic_score", 0.0)))),
+            )
+        except (TypeError, ValueError):
+            semantic_score = 0.0
+
+        if _breath_exact_anchor_match(query, rendered):
+            score, channel = 1.0, "精确"
+        else:
+            score = max(fuzzy_score, semantic_score)
+            if fuzzy_score > 0.0 and semantic_score > 0.0:
+                channel = "双"
+            elif semantic_score > 0.0:
+                channel = "语义"
+            else:
+                channel = "关键词"
+        rendered["_breath_score"] = score
+        rendered["_breath_channel"] = channel
+        rendered["_breath_weak"] = score < min_score
+        annotated.append(rendered)
+    return annotated
+
+
+def _order_breath_query_matches(matches: list[dict]) -> list[dict]:
+    """Keep recall order within each display group, with weak matches at the tail."""
+    return [
+        *[bucket for bucket in matches if not bucket.get("_breath_weak", False)],
+        *[bucket for bucket in matches if bucket.get("_breath_weak", False)],
+    ]
+
+
+def _format_breath_query_summary(bucket: dict, summary: str) -> str:
+    """Add the stable query-result header used by both Breath query paths."""
+    pinned = bool(bucket.get("metadata", {}).get("pinned", False))
+    score = float(bucket.get("_breath_score", 0.0))
+    channel = str(bucket.get("_breath_channel", "关键词"))
+    marker = " 📌" if pinned else ""
+    header = (
+        f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
+        f"[通道:{channel}] {summary}"
+    )
+    return "[语义关联] " + header if bucket.get("vector_match") else header
 
 
 async def _compose_breath_query_matches(
@@ -2870,18 +3033,25 @@ async def _compose_breath_query_matches(
     wake_dormant: bool = False,
     cache: bool = True,
     next_cursor: str = "",
+    downgraded_count: int = 0,
 ) -> tuple[str, dict]:
     """Compose query results using the same path as normal Breath."""
     results = []
     token_used = 0
     token_budget_omitted = 0
-    for index, bucket in enumerate(matches):
+    strong_matches = [
+        bucket for bucket in matches if not bucket.get("_breath_weak", False)
+    ]
+    weak_matches = [
+        bucket for bucket in matches if bucket.get("_breath_weak", False)
+    ]
+    for index, bucket in enumerate(strong_matches):
         bid = str(bucket.get("id", ""))
         decision = trace_by_id.get(bid) if trace_by_id is not None else None
         if token_used >= max_tokens:
-            token_budget_omitted += len(matches) - index
+            token_budget_omitted += len(strong_matches) - index
             if trace_by_id is not None:
-                for omitted_bucket in matches[index:]:
+                for omitted_bucket in strong_matches[index:]:
                     omitted_decision = trace_by_id.get(
                         str(omitted_bucket.get("id", ""))
                     )
@@ -2909,9 +3079,9 @@ async def _compose_breath_query_matches(
                 )
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
-                token_budget_omitted += len(matches) - index
+                token_budget_omitted += len(strong_matches) - index
                 if trace_by_id is not None:
-                    for omitted_bucket in matches[index:]:
+                    for omitted_bucket in strong_matches[index:]:
                         omitted_decision = trace_by_id.get(
                             str(omitted_bucket.get("id", ""))
                         )
@@ -2923,10 +3093,7 @@ async def _compose_breath_query_matches(
                     bucket["id"],
                     wake_dormant=wake_dormant,
                 )
-            if bucket.get("vector_match"):
-                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
-            else:
-                summary = f"[bucket_id:{bucket['id']}] {summary}"
+            summary = _format_breath_query_summary(bucket, summary)
             results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
             token_used += summary_tokens
             if decision is not None:
@@ -2942,7 +3109,13 @@ async def _compose_breath_query_matches(
         if total_matches is not None
         else len(matches) + hidden_count
     )
-    displayed_count = len(results)
+    weak_lines = [
+        f"[bucket_id:{bucket['id']}] "
+        f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
+        f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+        for bucket in weak_matches
+    ]
+    displayed_count = len(results) + len(weak_lines)
     omitted_count = hidden_count + token_budget_omitted
     composition = {
         "surfaced_count": displayed_count,
@@ -2952,6 +3125,7 @@ async def _compose_breath_query_matches(
         "result_limit_omitted": hidden_count,
         "token_budget_omitted": token_budget_omitted,
         "hidden_count": omitted_count,
+        "downgraded_count": downgraded_count,
     }
     if matched_count == 0:
         return "", composition
@@ -2962,11 +3136,15 @@ async def _compose_breath_query_matches(
     summary_lines.append(
         f"共匹配 {matched_count} / 本次显示 {displayed_count} / "
         f"因结果上限省略 {hidden_count} / "
-        f"因 token 预算省略 {token_budget_omitted}"
+        f"因 token 预算省略 {token_budget_omitted} / "
+        f"因低于阈值降级 {downgraded_count}"
     )
     if next_cursor:
         summary_lines.append(f"下一页 cursor: {next_cursor}")
     final_text = "\n---\n".join(results)
+    if weak_lines:
+        weak_section = "--- 弱匹配（仅列名） ---\n" + "\n".join(weak_lines)
+        final_text = "\n\n".join(part for part in (final_text, weak_section) if part)
     if final_text:
         final_text += "\n\n" + "\n".join(summary_lines)
     else:
@@ -2994,6 +3172,7 @@ async def _breath_impl(
     topic_filter: list[str] | None = None,
     wake_dormant: bool = False,
     cursor: str = "",
+    min_score: float = -1,
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
@@ -3025,6 +3204,10 @@ async def _breath_impl(
         return "date_from cannot be later than date_to."
     if cursor and (not query.strip() or tags_filter or topic_filter):
         return "cursor 仅适用于不带 tags_filter/topic_filter 的 query 检索。"
+    try:
+        resolved_min_score = _resolve_breath_min_score(min_score)
+    except ValueError as exc:
+        return str(exc)
 
     if tags_filter or topic_filter:
         return await _breath_filtered_impl(
@@ -3044,6 +3227,7 @@ async def _breath_impl(
             emotion_trend=emotion_trend,
             tags_filter=tags_filter,
             topic_filter=topic_filter,
+            min_score=resolved_min_score,
         )
 
     # --- Session archive retrieval: archived session buckets are searchable by domain ---
@@ -3157,7 +3341,7 @@ async def _breath_impl(
             )
         results = [
             await _append_bucket_extras(
-                _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned") or b["metadata"].get("protected"))),
+                _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned"))),
                 b,
                 emotion_trend,
             )
@@ -3268,7 +3452,14 @@ async def _breath_impl(
 
         if summary_mode:
             for b in pinned_buckets:
-                pinned_results.append(await _append_bucket_extras(_bucket_summary_line(b, pinned=True), b, emotion_trend))
+                pinned_results.append(await _append_bucket_extras(
+                    _bucket_summary_line(
+                        b,
+                        pinned=bool(b["metadata"].get("pinned", False)),
+                    ),
+                    b,
+                    emotion_trend,
+                ))
             for b in candidates:
                 dynamic_results.append(await _append_bucket_extras(_bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend))
         else:
@@ -3276,7 +3467,8 @@ async def _breath_impl(
                 try:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    line = f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
+                    marker = "📌 " if b["metadata"].get("pinned", False) else ""
+                    line = f"{marker}[核心准则] [bucket_id:{b['id']}] {summary}"
                     t = count_tokens_approx(line)
                     if token_budget - t < 0:
                         break
@@ -3369,19 +3561,31 @@ async def _breath_impl(
         date_from=date_from,
         date_to=date_to,
         resonance=resonance,
+        min_score=resolved_min_score,
     )
     search_trace = {}
     if cursor:
         try:
-            ordered_ids, position = _decode_breath_cursor(cursor, cursor_scope)
+            frozen_matches, position = _decode_breath_cursor(cursor, cursor_scope)
         except ValueError:
             return "cursor 无效、已过期或与当前检索条件不匹配。"
-        page_ids = ordered_ids[position:position + max_results]
-        loaded = []
-        for bucket_id in page_ids:
+        page_records = frozen_matches[position:position + max_results]
+        loaded_by_id = {}
+        for record in page_records:
+            bucket_id = record["id"]
             bucket = await bucket_mgr.get(bucket_id)
             if bucket is not None:
-                loaded.append(bucket)
+                loaded_by_id[bucket_id] = bucket
+        loaded = []
+        for record in page_records:
+            bucket = loaded_by_id.get(record["id"])
+            if bucket is None:
+                continue
+            rendered = dict(bucket)
+            rendered["_breath_score"] = float(record["score"])
+            rendered["_breath_channel"] = record["channel"]
+            rendered["_breath_weak"] = bool(record["weak"])
+            loaded.append(rendered)
         matches = _filter_breath_query_matches(
             loaded,
             recent_cutoff=recent_cutoff,
@@ -3395,7 +3599,8 @@ async def _breath_impl(
                 for bucket in matches
                 if not bucket.get("metadata", {}).get("dormant", False)
             ]
-        next_position = min(position + max_results, len(ordered_ids))
+        ordered_matches = frozen_matches
+        next_position = min(position + max_results, len(ordered_matches))
     else:
         try:
             matches = await bucket_mgr.search(
@@ -3421,13 +3626,26 @@ async def _breath_impl(
         )
         if resonance_target:
             matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
-        ordered_ids = [str(bucket.get("id", "")) for bucket in matches]
-        matches = matches[:max_results]
+        trace_by_id = {
+            str(entry.get("id", "")): entry
+            for entry in search_trace.get("candidates", [])
+        }
+        matches = _annotate_breath_query_matches(
+            matches,
+            query=query,
+            trace_by_id=trace_by_id,
+            min_score=resolved_min_score,
+        )
+        ordered_matches = _order_breath_query_matches(matches)
+        matches = ordered_matches[:max_results]
         next_position = len(matches)
-    total_matches = len(ordered_ids)
+    total_matches = len(ordered_matches)
     hidden_count = max(0, total_matches - len(matches))
+    downgraded_count = sum(
+        1 for match in ordered_matches if match.get("_breath_weak", False)
+    )
     next_cursor = (
-        _encode_breath_cursor(ordered_ids, next_position, cursor_scope)
+        _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
         if next_position < total_matches
         else ""
     )
@@ -3446,6 +3664,7 @@ async def _breath_impl(
         touch=True,
         wake_dormant=wake_dormant,
         next_cursor=next_cursor,
+        downgraded_count=downgraded_count,
     )
     if not final_text:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
@@ -6342,6 +6561,7 @@ async def breath(
             )
         ),
     ] = False,
+    min_score: float = -1,
     cursor: Annotated[
         str,
         Field(
@@ -6379,6 +6599,7 @@ async def breath(
         tags_filter=tags_filter,
         topic_filter=topic_filter,
         cursor=cursor,
+        min_score=min_score,
     )
     return _with_response_seal(result)
 
@@ -7204,7 +7425,8 @@ async def pulse(
         dynamic_buckets.sort(key=pulse_score, reverse=True)
         dynamic_buckets = dynamic_buckets[:15]
         dynamic_count = len(dynamic_buckets)
-        visible_buckets = pinned_buckets + dynamic_buckets
+        ordered_buckets = pinned_buckets + dynamic_buckets
+        visible_buckets = ordered_buckets[offset:offset + limit]
 
     lines = []
     for b in visible_buckets:
@@ -7250,7 +7472,7 @@ async def pulse(
     has_more = (
         offset + len(visible_buckets) < total_buckets
         if show_all
-        else len(visible_buckets) < total_buckets
+        else offset + len(visible_buckets) < len(ordered_buckets)
     )
     if show_all:
         breakdown = f"有界全部列表，limit={limit}, offset={offset}"
@@ -7261,7 +7483,7 @@ async def pulse(
     else:
         display_stats = (
             f"\n总数:{total_buckets}个可见桶，当前显示:{len(visible_buckets)}个"
-            f"（钉选{len(pinned_buckets)}个 + 动态Top15），"
+            f"（钉选{len(pinned_buckets)}个 + 动态Top15，limit={limit}, offset={offset}），"
             f"还有更多:{'是' if has_more else '否'}\n"
         )
     return status + "\n=== 记忆列表 ===\n" + "\n".join(lines) + display_stats

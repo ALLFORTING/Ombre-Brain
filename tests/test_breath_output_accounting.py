@@ -64,7 +64,7 @@ async def test_breath_31_matches_displays_8_and_reports_23(tmp_path, monkeypatch
     assert "还有23个相关记忆未显示" in result
     assert (
         "共匹配 31 / 本次显示 8 / 因结果上限省略 23 / "
-        "因 token 预算省略 0"
+        "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in result
     assert "杩樻湁" not in result
 
@@ -92,7 +92,7 @@ async def test_breath_counts_selected_items_omitted_by_token_budget(
     assert "还有3个相关记忆未显示" in result
     assert (
         "共匹配 4 / 本次显示 1 / 因结果上限省略 1 / "
-        "因 token 预算省略 2"
+        "因 token 预算省略 2 / 因低于阈值降级 0"
     ) in result
     assert server.dehydrator.dehydrate.await_count == 2
 
@@ -136,11 +136,11 @@ async def test_breath_cursor_pages_are_stable_without_duplicates_or_gaps(
 
     assert (
         "共匹配 12 / 本次显示 5 / 因结果上限省略 7 / "
-        "因 token 预算省略 0"
+        "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in second
     assert (
         "共匹配 12 / 本次显示 2 / 因结果上限省略 10 / "
-        "因 token 预算省略 0"
+        "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in third
     assert _next_cursor(first)
     assert _next_cursor(second)
