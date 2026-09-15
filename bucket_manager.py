@@ -1068,6 +1068,27 @@ class BucketManager:
             post["trigger_date"] = kwargs["trigger_date"]
         if "trigger_last_seen" in kwargs:
             post["trigger_last_seen"] = kwargs["trigger_last_seen"]
+        if "superseded_by" in kwargs:
+            if kwargs["superseded_by"] is None:
+                post.metadata.pop("superseded_by", None)
+            else:
+                post["superseded_by"] = str(kwargs["superseded_by"])
+        if "superseded_at" in kwargs:
+            if kwargs["superseded_at"] is None:
+                post.metadata.pop("superseded_at", None)
+            else:
+                post["superseded_at"] = str(kwargs["superseded_at"])
+        if "supersedes" in kwargs:
+            if kwargs["supersedes"] is None:
+                post.metadata.pop("supersedes", None)
+            else:
+                post["supersedes"] = list(
+                    dict.fromkeys(
+                        str(value).strip()
+                        for value in kwargs["supersedes"]
+                        if str(value).strip()
+                    )
+                )
         if "dormant" in kwargs:
             post["dormant"] = bool(kwargs["dormant"])
         if "sealed" in kwargs:
@@ -1578,12 +1599,17 @@ class BucketManager:
                         )
                     if meta.get("resolved", False):
                         hybrid_score *= 0.3
+                    superseded_factor = (
+                        0.1 if str(meta.get("superseded_by", "") or "").strip() else 1.0
+                    )
+                    hybrid_score *= superseded_factor
                     if trace_entry is not None:
                         trace_entry["admitted"] = True
                         trace_entry["resolved"] = bool(meta.get("resolved", False))
                         trace_entry["ranking_penalty"] = (
                             0.3 if meta.get("resolved", False) else 1.0
                         )
+                        trace_entry["superseded_factor"] = superseded_factor
                         trace_entry["final_ranking_score"] = round(hybrid_score, 2)
                         trace_entry["match_tier"] = (
                             3 if exact_score >= 0.95
