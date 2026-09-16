@@ -430,6 +430,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 - `query: str = ""` — 关键词/语义检索；为空时进入浮现模式 / Keyword or semantic query; empty means surfacing mode.
 - `as_of: str = ""` — 非空时做只读历史正文检索；接受 ISO8601 日期或时间，日期按本地日末解释。该模式需要 `query`、不 touch/唤醒桶、不调用当前 embedding；能检索当前仍存在且可见桶的历史正文（包括仅存在于历史正文的关键词），但不支持历史 semantic retrieval、已删除桶或历史 metadata 重建。输出会标示“历史版本”和 `metadata=当前` / Non-empty enables read-only historical-body retrieval. It requires `query`, never touches or wakes buckets, and does not use current embeddings. It searches historical bodies of currently existing visible buckets, including history-only keywords, but cannot provide historical semantic retrieval, deleted buckets, or reconstructed historical metadata. Output is explicitly marked as historical and labels metadata as current.
+- `touch: bool = True` — 默认读取会保留既有 activation/decay 行为。维护、验收或探针检索使用 `touch=False`：不更新 activation 或 `last_active`，不唤醒 dormant，不启动衰减引擎，也不写脱水缓存；query cursor 会冻结该选择。`as_of` 始终只读，忽略 `touch=True` 的写入语义 / Default retrieval keeps normal activation and decay behavior. Use `touch=False` for maintenance, acceptance, or probes that must not update activation or `last_active`, wake dormant buckets, start the decay engine, or write dehydration cache; query cursors freeze this choice. `as_of` is always read-only.
 - `mode: "summary" | "full" = "summary"` — 摘要或全文模式；两种模式都受 `max_results` 限制 / Summary or full mode; both obey `max_results`.
 - `max_results: int = 5` — 非钉选搜索结果上限；有 query 时 sealed 默认整条剔除 / Limit returned search results; sealed buckets are fully hidden by default.
 - `date_from/date_to: str = ""` — 按桶 `updated_at` 过滤，格式 `YYYY-MM-DD` / Filter by bucket `updated_at`, format `YYYY-MM-DD`.
@@ -471,7 +472,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `pulse`
 
-`pulse(show_all=False)` 先组合 pinned/protected 与非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；`pulse(show_all=True, limit=50, offset=0)` 返回 bounded page。`limit` 最大 50，`offset` 从 0 开始。superseded 桶的列表行以 `⊘` 前缀标记。返回末尾给出可见总数、当前显示数量和 `还有更多:是/否`，据此继续下一页；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。
+`pulse(show_all=False)` 先组合 pinned/protected 与非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；`pulse(show_all=True, limit=50, offset=0)` 返回 bounded page。`limit` 最大 50，`offset` 从 0 开始。superseded 桶的列表行以 `⊘` 前缀标记。返回末尾给出可见总数、当前显示数量和 `还有更多:是/否`，据此继续下一页；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。维护、验收或探针列表使用 `touch=False`，它不启动衰减引擎，也不标记 dormant。
 
 #### `archive_session`
 
@@ -1001,10 +1002,10 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 
 > 下列阈值、转换条件和路由列表是当前实现参考，不是 Contract v1 的精确公共保证；v1 只承诺其已明确限定的默认可见性和显式包含边界。
 
-- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse()` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。普通读取只更新访问记账，不解除 dormant；需要显式使用 `breath(include_dormant=True, wake_dormant=True)` 或 `dream(detail_ids="...", wake_dormant=True)` 才会唤醒实际读取的桶。
+- `dormant` 是自然衰减产生的“自动沉底”状态：`pulse(touch=True)` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。普通读取只更新访问记账，不解除 dormant；维护型 `breath(..., touch=False)` 与 `pulse(..., touch=False)` 不更新该记账或 dormant。需要显式使用 `breath(include_dormant=True, wake_dormant=True)` 或 `dream(detail_ids="...", wake_dormant=True)` 才会唤醒实际读取的桶。
 - `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；需要显式 `include_sealed=True` 才显示。
 
-- `dormant` is automatic sinking from natural decay: `pulse()` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. Ordinary reads update activation bookkeeping without waking dormant buckets; explicitly pass `wake_dormant=True` to a dormant-inclusive `breath` call or a detail `dream` call to wake buckets actually read.
+- `dormant` is automatic sinking from natural decay: `pulse(touch=True)` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. Ordinary reads update activation bookkeeping without waking dormant buckets; maintenance `breath(..., touch=False)` and `pulse(..., touch=False)` do not update that bookkeeping or dormant state. Explicitly pass `wake_dormant=True` to a dormant-inclusive `breath` call or a detail `dream` call to wake buckets actually read.
 - `sealed` is manual hiding, only changed by `trace(sealed=1/0)`. Natural decay never creates sealed buckets. Sealed overrides pinned and hides the bucket name, ID, and summary from `breath`, `pulse`, `dream`, and `todos` unless `include_sealed=True`.
 
 ### 参数说明 / Parameters
