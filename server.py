@@ -2914,6 +2914,7 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
         "判定冲突时 bucket_id 必须来自给出的旧记忆，且两段 evidence 必须直接支持判断。"
         "必须遵守以下硬规则：同一天发生的不同事件不构成矛盾；"
         "必须先确认描述的是同一主体、同一事实槽位，再判断两个值是否互斥；"
+        "不同时间点的状态通常是历史演变，不能仅因值不同而判为冲突；"
         "只要主体、事实槽位或互斥关系有任何不确定，same_fact 或 conflict 必须为 false。"
         "\n\n# 新内容\n"
         f"{strip_wikilinks(new_content)[:1500]}"
@@ -2942,6 +2943,9 @@ async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
 def _parse_conflict_response(
     response: str,
     allowed_bucket_ids: set[str],
+    *,
+    new_content: str,
+    old_buckets: list[dict],
 ) -> dict | None:
     """Parse the strict conflict verdict; every invalid shape fails closed."""
     try:
@@ -2964,12 +2968,27 @@ def _parse_conflict_response(
             return None
         payload[key] = payload[key].strip()
     if payload["same_fact"] and payload["conflict"]:
+        old_content_by_id = {
+            str(bucket.get("id", "")): strip_wikilinks(bucket.get("content", ""))
+            for bucket in old_buckets
+        }
+
+        def normalized(value: str) -> str:
+            return " ".join(strip_wikilinks(value).lower().split())
+
         if (
             payload["bucket_id"] not in allowed_bucket_ids
             or not payload["evidence_new"]
             or not payload["evidence_old"]
+            or normalized(payload["evidence_new"]) not in normalized(new_content)
+            or normalized(payload["evidence_old"])
+            not in normalized(old_content_by_id.get(payload["bucket_id"], ""))
         ):
             return None
+        payload["evidence"] = {
+            "new": payload["evidence_new"],
+            "old": payload["evidence_old"],
+        }
     return payload
 
 
@@ -3011,59 +3030,97 @@ def _is_conflict_temporal_token(token: str) -> bool:
     )
 
 
-async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict]:
+def _candidate_haystack(bucket: dict) -> str:
+    meta = bucket.get("metadata", {})
+    return " ".join([
+        str(meta.get("name", "")),
+        str(meta.get("summary", "")),
+        " ".join(map(str, meta.get("tags", []) or [])),
+        strip_wikilinks(bucket.get("content", "")),
+    ])
+
+
+def _candidate_overlap(query_tokens: set[str], bucket: dict) -> set[str]:
+    return query_tokens & _conflict_tokens(_candidate_haystack(bucket))
+
+
+def _is_visible_recall_bucket(bucket: dict) -> bool:
+    """Match normal memory-search visibility without exposing sealed content."""
+    metadata = bucket.get("metadata", {})
+    return not _is_sealed(bucket) and not bool(metadata.get("dormant", False))
+
+
+async def _recall_memory_candidates(content: str, limit: int = 8) -> dict:
+    """Broad, read-only candidate recall shared by doorbell and conflict checks."""
     candidates = []
     seen = set()
-    query_tokens = _conflict_tokens(content)
-
-    def candidate_haystack(bucket: dict) -> str:
-        meta = bucket.get("metadata", {})
-        return " ".join([
-            str(meta.get("name", "")),
-            str(meta.get("summary", "")),
-            " ".join(map(str, meta.get("tags", []) or [])),
-            strip_wikilinks(bucket.get("content", "")),
-        ])
-
-    def candidate_overlap(bucket: dict) -> set[str]:
-        return query_tokens & _conflict_tokens(candidate_haystack(bucket))
+    trace = {}
 
     def add_bucket(bucket: dict) -> None:
-        bucket_id = bucket.get("id")
-        if not bucket_id or bucket_id in seen or _is_sealed(bucket):
-            return
-        overlap = candidate_overlap(bucket)
-        if not any(
-            not _is_conflict_temporal_token(token)
-            for token in overlap
-        ):
+        bucket_id = str(bucket.get("id", "") or "")
+        if not bucket_id or bucket_id in seen or not _is_visible_recall_bucket(bucket):
             return
         seen.add(bucket_id)
         candidates.append(bucket)
 
     try:
-        for bucket in await bucket_mgr.search(content, limit=8, include_sealed=False):
+        ranked = await bucket_mgr.search(
+            content,
+            limit=max(limit, 8),
+            include_sealed=False,
+            trace=trace,
+        )
+        for bucket in ranked:
             add_bucket(bucket)
     except Exception as exc:
-        logger.warning("Conflict search candidates failed: %s", exc)
+        logger.warning("Shared memory candidate search failed: %s", exc)
 
-    if len(candidates) >= limit:
-        return candidates[:limit]
+    # Keep recall broad enough for conflict detection if hybrid ranking does not
+    # admit a lexical candidate. This remains read-only and applies the same
+    # archive, sealed, and dormant visibility rules as normal search.
+    query_tokens = _conflict_tokens(content)
+    if len(candidates) < limit and query_tokens:
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as exc:
+            logger.warning("Shared lexical candidate recall failed: %s", exc)
+        else:
+            lexical = []
+            for bucket in all_buckets:
+                if not _is_visible_recall_bucket(bucket) or str(bucket.get("id", "")) in seen:
+                    continue
+                overlap = _candidate_overlap(query_tokens, bucket)
+                if overlap:
+                    lexical.append((len(overlap), bucket))
+            lexical.sort(key=lambda item: item[0], reverse=True)
+            for _, bucket in lexical:
+                add_bucket(bucket)
+                if len(candidates) >= limit:
+                    break
 
-    if not query_tokens:
-        return candidates[:limit]
+    semantic = trace.get("semantic", {"enabled": False, "status": "not_run"})
+    if semantic.get("status") == "not_run":
+        semantic = {
+            "enabled": bool(embedding_engine and getattr(embedding_engine, "enabled", False)),
+            "status": (
+                "unavailable_or_empty_index"
+                if embedding_engine and getattr(embedding_engine, "enabled", False)
+                else "disabled"
+            ),
+        }
+    return {
+        "candidates": candidates[:limit],
+        "semantic": semantic,
+    }
 
-    try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-    except Exception as exc:
-        logger.warning("Conflict lexical candidates failed: %s", exc)
-        return candidates[:limit]
 
-    lexical = []
-    for bucket in all_buckets:
-        if bucket.get("id") in seen or _is_sealed(bucket):
-            continue
-        overlap = candidate_overlap(bucket)
+async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict]:
+    recall = await _recall_memory_candidates(content, limit=max(limit, 8))
+    candidates = []
+    query_tokens = _conflict_tokens(content)
+
+    for bucket in recall["candidates"]:
+        overlap = _candidate_overlap(query_tokens, bucket)
         temporal_overlap = {
             token for token in overlap if _is_conflict_temporal_token(token)
         }
@@ -3079,38 +3136,83 @@ async def _conflict_candidate_buckets(content: str, limit: int = 3) -> list[dict
             or (temporal_overlap and has_non_temporal_context)
         )
         if qualifies:
-            lexical.append((
-                len(strong_non_temporal_overlap) * 3
-                + len(non_temporal_overlap)
-                + len(temporal_overlap),
-                bucket,
-            ))
-
-    lexical.sort(key=lambda item: item[0], reverse=True)
-    for _, bucket in lexical:
-        add_bucket(bucket)
+            candidates.append(bucket)
         if len(candidates) >= limit:
             break
-
     return candidates[:limit]
 
 
-async def _detect_conflict_warning(content: str) -> str:
+async def _detect_conflict_verdict(content: str) -> dict:
+    """Return a structured, fail-closed conflict verdict without mutating memory."""
     if not _conflict_detection_enabled():
-        return ""
+        return {"status": "disabled", "same_fact": False, "conflict": False}
+    api_key, _base_url, _model = _digest_api_config()
+    if not api_key:
+        return {
+            "status": "unavailable",
+            "reason": "digest_api_not_configured",
+            "same_fact": False,
+            "conflict": False,
+        }
     try:
         old_buckets = await _conflict_candidate_buckets(content, limit=3)
+        if not old_buckets:
+            return {"status": "checked", "same_fact": False, "conflict": False}
         response = await _call_conflict_api(content, old_buckets)
     except Exception as exc:
         logger.warning("Conflict detection failed: %s", exc)
-        return ""
+        return {
+            "status": "unavailable",
+            "reason": "detector_error",
+            "same_fact": False,
+            "conflict": False,
+        }
     verdict = _parse_conflict_response(
         response,
         {str(bucket.get("id", "")) for bucket in old_buckets},
+        new_content=content,
+        old_buckets=old_buckets,
     )
-    if not verdict or not (verdict["same_fact"] and verdict["conflict"]):
+    if not verdict:
+        return {
+            "status": "unavailable",
+            "reason": "invalid_detector_response",
+            "same_fact": False,
+            "conflict": False,
+        }
+    verdict["status"] = "checked"
+    return verdict
+
+
+async def _detect_conflict_warning(content: str) -> str:
+    verdict = await _detect_conflict_verdict(content)
+    if verdict.get("status") == "unavailable":
+        return f"检查未执行：{verdict['reason']}"
+    if not (verdict.get("same_fact") and verdict.get("conflict")):
         return ""
     return _format_conflict_warning(verdict)
+
+
+async def _similarity_doorbell(content: str, threshold: float = 0.80) -> str:
+    """Return a pre-write similarity reminder, never a write or a merge decision."""
+    recall = await _recall_memory_candidates(content, limit=8)
+    semantic = recall.get("semantic", {})
+    if semantic.get("status") != "available":
+        return f"相似检查未执行：embedding {semantic.get('status', 'unavailable')}"
+    scored = []
+    for bucket in recall["candidates"]:
+        try:
+            score = float(bucket.get("semantic_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if score >= threshold:
+            scored.append((score, bucket))
+    if not scored:
+        return ""
+    score, bucket = max(scored, key=lambda item: item[0])
+    metadata = bucket.get("metadata", {})
+    name = str(metadata.get("name") or bucket.get("id"))
+    return f"与 {name} 相似 {score:.2f}，确定要新开一个桶吗"
 
 
 async def _digest_scheduler_loop() -> None:
@@ -7703,6 +7805,7 @@ async def hold(
         if not updated:
             return f"supersedes update failed: {target_id}"
         return f"fact evolved in place: {target_id}"
+    similarity_notice = await _similarity_doorbell(content)
     conflict_warning = await _detect_conflict_warning(content)
     try:
         trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
@@ -7752,6 +7855,8 @@ async def hold(
             except Exception as e:
                 logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
         response = f"🫧feel→{await _format_hold_created(bucket_id)}"
+        if similarity_notice:
+            response += f"\nsimilarity: {similarity_notice}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         return response
@@ -7801,6 +7906,8 @@ async def hold(
             await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
         response = f"📌{await _format_hold_created(bucket_id)}"
+        if similarity_notice:
+            response += f"\nsimilarity: {similarity_notice}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         return response
@@ -7824,6 +7931,8 @@ async def hold(
         response = f"合并→{result_name} {','.join(domain)}"
     else:
         response = await _format_hold_created(result_name)
+        if similarity_notice:
+            response += f"\nsimilarity: {similarity_notice}"
     if conflict_warning:
         response += f"\nconflict: {conflict_warning}"
     return response

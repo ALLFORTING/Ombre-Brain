@@ -391,7 +391,7 @@ The current MCP surface has 25 default tools, 40 tools when diagnostics are enab
 | `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认隐藏 sealed letter，需明确 `include_sealed=True` 才读取 / Read one handoff letter by exact ID; sealed letters stay hidden unless explicitly included |
 | `leave_note` | 逐字保存婷为后续 boot 留下的一封可选留言；它写入独立 notes 表，不创建 memory bucket / Store Ting's exact optional note for a later boot in the independent notes table; never creates a memory bucket |
 | `list_notes` / `get_note` | 查看历史或按 `note_id` 读取全文；sealed 与未到 `open_at` 的 note 默认按存在性隐藏。成功 `get_note` 记录实际完整读取 / List note history or read one full note by ID; sealed and not-yet-open notes are hidden by default, and a successful full get records the read |
-| `hold` | 写入单条记忆或模型自己的 `feel` 反思 / Store one memory or a model `feel` reflection |
+| `hold` | 写入单条记忆或模型自己的 `feel` 反思；创建前会做只读相似提醒和可选冲突检查，但提醒不阻止写入、不自动 merge/related/supersede / Store one memory or a model `feel` reflection; pre-write similarity and optional conflict checks only warn and never block or mutate memory |
 | `grow` | 将日记/长内容拆分并写入多个记忆桶 / Digest journal-style content into multiple memory buckets |
 | `trace` | 混合修改工具：元数据、正文替换/追加、related、superseded_by、merge、seal 以及 `delete=True`。delete 必须先取得并回传短时、一次性的 confirm_token；明确成功才代表写前快照成功；没有 MCP undo/restore 命令 / Mixed mutation tool; delete requires a short-lived, one-shot confirm_token before the write-ahead snapshot and deletion can execute; there is no MCP undo/restore command |
 | `pulse` | 系统状态和记忆桶列表；`show_all=True` 默认最多显示 50 个，可用 `limit`/`offset` 分页；listing 可能更新 bounded dormant metadata / Status and bucket listing; `show_all=True` is bounded to 50 per page by default |
@@ -483,6 +483,12 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 - `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；所有会写入的 maintenance digest 计划都必须先取得、再回传绑定该计划的短时一次性 `confirm_token`；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default. Every mutating maintenance plan requires a short-lived, one-shot confirm_token bound to the exact plan before execution; real runs require `OMBRE_DIGEST_API_KEY`.
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
+
+#### `hold` similarity and conflict warnings
+
+`hold` performs a read-only similarity check before it creates a bucket. It uses the normal visible retrieval corpus (non-archived, non-sealed, non-dormant buckets) and reports a reminder only when the best embedding cosine similarity reaches `0.80`. The reminder never blocks the write and never creates relations, merges buckets, or sets supersession metadata. If embedding is disabled, its provider fails, or no usable index exists, `hold` explicitly reports that the similarity check was not run.
+
+Conflict candidate recall is broad, but the final detector returns structured `same_fact`, `conflict`, and new/old evidence. A conflict warning requires both booleans to be true. Shared years, names, topics, or a few matching keywords are candidate signals only. `OMBRE_CONFLICT_DETECTION_ENABLED` independently controls whether the detector is attempted; `OMBRE_DIGEST_API_KEY` is only its provider capability. A missing key or invalid/provider response is reported as an unavailable check and never blocks `hold`.
 
 #### `asset_ingest_probe`, `asset_render_probe`, and `asset_export_probe`
 
