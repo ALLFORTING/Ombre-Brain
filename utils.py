@@ -163,13 +163,14 @@ def load_config(config_path: str = None) -> dict:
     if env_embed_api_key or env_embed_model or env_embed_base_url:
         config.setdefault("embedding", {})["independent"] = True
 
-    # --- Ensure bucket storage directories exist ---
-    # --- ??????????? ---
+    return config
+
+
+def ensure_bucket_storage(config: dict) -> None:
+    """Create bucket directories only when a runtime actually needs storage."""
     buckets_dir = config["buckets_dir"]
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
-
-    return config
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
