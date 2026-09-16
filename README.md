@@ -376,9 +376,9 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 22 个默认工具、37 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 25 个默认工具、40 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 22 default tools, 37 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 25 default tools, 40 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
 ### 默认 MCP 工具 / Default MCP tools
 
@@ -389,6 +389,8 @@ The current MCP surface has 22 default tools, 37 tools when diagnostics are enab
 | `boot` | 推荐的一次性启动上下文：钉选摘要、到期 trigger、信箱、feel 回声、最近 session、todos，并按 token 预算截断 / Recommended one-shot startup context; observing due triggers may update bounded seen metadata |
 | `breath` | 检索或浮现记忆；`query` 用于定向检索。它是 retrieval-oriented，命中/排序可能更新 activation metadata / Retrieval or surfacing; targeted `query` is preferred when the topic is known, and bounded activation metadata may be updated |
 | `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认隐藏 sealed letter，需明确 `include_sealed=True` 才读取 / Read one handoff letter by exact ID; sealed letters stay hidden unless explicitly included |
+| `leave_note` | 逐字保存婷为后续 boot 留下的一封可选留言；它写入独立 notes 表，不创建 memory bucket / Store Ting's exact optional note for a later boot in the independent notes table; never creates a memory bucket |
+| `list_notes` / `get_note` | 查看历史或按 `note_id` 读取全文；sealed 与未到 `open_at` 的 note 默认按存在性隐藏。成功 `get_note` 记录实际完整读取 / List note history or read one full note by ID; sealed and not-yet-open notes are hidden by default, and a successful full get records the read |
 | `hold` | 写入单条记忆或模型自己的 `feel` 反思 / Store one memory or a model `feel` reflection |
 | `grow` | 将日记/长内容拆分并写入多个记忆桶 / Digest journal-style content into multiple memory buckets |
 | `trace` | 混合修改工具：元数据、正文替换/追加、related、superseded_by、merge、seal 以及 `delete=True`。delete 必须先取得并回传短时、一次性的 confirm_token；明确成功才代表写前快照成功；没有 MCP undo/restore 命令 / Mixed mutation tool; delete requires a short-lived, one-shot confirm_token before the write-ahead snapshot and deletion can execute; there is no MCP undo/restore command |
@@ -420,9 +422,9 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `boot`
 
-`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算（默认及硬上限均为 16000）。各块按“今日触发 → 最新 letter → todos → 最近归档 → 钉选索引 → feel 回声”的顺序出队；发生截断时，返回末尾会区分列出部分截断和完全未输出的块名。预算允许时，最新 letter、todos、最近归档和钉选索引分别预留 1000、1500、1200、4000 字符；实际内容短于保底时，未使用的额度会归还给后续块。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
+`boot` 接受可选的 `pinned_chars` 和 `max_tokens` 参数：前者控制钉选内容的字符预算，后者控制整体返回的 token 预算（默认及硬上限均为 16000）。婷留言永远在第一块：最新的可见 pending note 只会自动递送一次；两封之间没有 boot 时只递送较新的，较旧的保留在历史中但不补投。没有可递送留言时显示最后一封可见实际留言的真实 `created_at`，从未有可见历史时显示“暂无历史留言”。未到 `open_at`、sealed 或被 dismissed 的 note 不泄露。若完整正文无法纳入预算，boot 只提示 `get_note(note_id=...)`，不标记递送。其余各块按“今日触发 → 最新 letter → todos → 最近归档 → 钉选索引 → feel 回声”的顺序出队；发生截断时，返回末尾会区分列出部分截断和完全未输出的块名。预算允许时，最新 letter、todos、最近归档和钉选索引分别预留 1000、1500、1200、4000 字符；实际内容短于保底时，未使用的额度会归还给后续块。具体默认值与边界以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准。
 
-`boot` accepts optional `pinned_chars` and `max_tokens` parameters; the default and hard maximum for `max_tokens` are both 16000. Sections are emitted in this order: daily triggers, latest letter, todos, recent archives, pinned index, and feel echo. When truncation occurs, the response names partially truncated and wholly omitted sections. When the budget permits, latest letter, todos, recent archives, and pinned index reserve 1000, 1500, 1200, and 4000 characters respectively; unused allowance from a shorter section returns to later sections. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
+`boot` accepts optional `pinned_chars` and `max_tokens` parameters; the default and hard maximum for `max_tokens` are both 16000. Ting notes are always first: the newest visible pending note is automatically delivered once, while older eligible pending notes are retained in history and skipped for automatic delivery. A note that cannot fit in full only produces a `get_note(note_id=...)` prompt and remains pending. The remaining sections are emitted in this order: daily triggers, latest letter, todos, recent archives, pinned index, and feel echo. When truncation occurs, the response names partially truncated and wholly omitted sections. When the budget permits, latest letter, todos, recent archives, and pinned index reserve 1000, 1500, 1200, and 4000 characters respectively; unused allowance from a shorter section returns to later sections. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
 
 #### `breath`
 

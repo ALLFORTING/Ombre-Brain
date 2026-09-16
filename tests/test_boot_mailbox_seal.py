@@ -53,6 +53,7 @@ async def test_archive_letter_boot_and_mailbox(tmp_path, monkeypatch):
     assert "seal: test-seal-a" in boot_result
     assert server.count_tokens_approx(boot_result) <= 16000
     section_headers = [
+        "=== boot: 婷留言 ===",
         "=== boot: 今日浮现 ===",
         "=== boot: 最新信箱 ===",
         "=== boot: 未完结 todos ===",

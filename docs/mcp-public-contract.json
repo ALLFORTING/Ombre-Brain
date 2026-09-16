@@ -900,6 +900,34 @@
       }
     },
     {
+      "name": "get_note",
+      "primitive": "tool",
+      "category": "ting_notes",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_with_side_effects",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "note_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "note_id"
+        ]
+      }
+    },
+    {
       "name": "related_backfill",
       "primitive": "tool",
       "category": "maintenance",
@@ -925,6 +953,66 @@
           "threshold": {
             "default": -1,
             "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "leave_note",
+      "primitive": "tool",
+      "category": "ting_notes",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "open_at": {
+            "default": "",
+            "type": "string"
+          },
+          "sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "list_notes",
+      "primitive": "tool",
+      "category": "ting_notes",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
           }
         }
       }
