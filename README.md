@@ -427,6 +427,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 #### `breath`
 
 - `query: str = ""` — 关键词/语义检索；为空时进入浮现模式 / Keyword or semantic query; empty means surfacing mode.
+- `as_of: str = ""` — 非空时做只读历史正文检索；接受 ISO8601 日期或时间，日期按本地日末解释。该模式需要 `query`、不 touch/唤醒桶、不调用当前 embedding；能检索当前仍存在且可见桶的历史正文（包括仅存在于历史正文的关键词），但不支持历史 semantic retrieval、已删除桶或历史 metadata 重建。输出会标示“历史版本”和 `metadata=当前` / Non-empty enables read-only historical-body retrieval. It requires `query`, never touches or wakes buckets, and does not use current embeddings. It searches historical bodies of currently existing visible buckets, including history-only keywords, but cannot provide historical semantic retrieval, deleted buckets, or reconstructed historical metadata. Output is explicitly marked as historical and labels metadata as current.
 - `mode: "summary" | "full" = "summary"` — 摘要或全文模式；两种模式都受 `max_results` 限制 / Summary or full mode; both obey `max_results`.
 - `max_results: int = 5` — 非钉选搜索结果上限；有 query 时 sealed 默认整条剔除 / Limit returned search results; sealed buckets are fully hidden by default.
 - `date_from/date_to: str = ""` — 按桶 `updated_at` 过滤，格式 `YYYY-MM-DD` / Filter by bucket `updated_at`, format `YYYY-MM-DD`.
@@ -441,6 +442,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `tags_filter: list[str] | None = None` — 可选的桶标签精确过滤；列表内任一标签匹配即可，多个标签过滤与 `topic_filter` 之间按 AND 组合 / Optional exact bucket-tag filter; any listed tag may match, and it combines conjunctively with `topic_filter`.
 - `topic_filter: list[str] | None = None` — 可选的归档会话主题精确过滤；列表内任一主题匹配即可。过滤会先于 query 排名，单独使用时按最新记录优先 / Optional exact archived-session topic filter; any listed topic may match. Structured filtering happens before query ranking, and filter-only calls return newest first.
 - 命中桶后，输出中的 todos 会从当前 bucket metadata 重新读取并追加；即使脱水摘要来自旧缓存，todos 也以当前 metadata 为准 / After a bucket is matched, todos are reread from current bucket metadata and appended to the output; current metadata remains authoritative even when the dehydrated summary comes from an older cache entry.
+- `as_of` cursor 会冻结规范化的历史时点；不能拿一个时点的 cursor 改传另一个时点。历史版本边界使用 write-ahead `changed_at`：`T < changed_at` 选快照中的旧正文，`T >= changed_at` 选后续正文；同秒连续写入无法从现有秒级快照进一步区分 / An `as_of` cursor freezes the normalized historical instant. Version boundaries use write-ahead `changed_at`: `T < changed_at` selects the snapshotted old body, while `T >= changed_at` selects the following body. The existing second-precision snapshot model cannot distinguish multiple writes within the same second.
 
 #### `get_letter`
 

@@ -379,6 +379,7 @@ NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
     ("server.py", "breath_hook", "bucket_mgr.touch", "incidental_bucket_activation"),
     ("server.py", "dream_hook", "bucket_mgr.touch", "incidental_bucket_activation"),
     ("bucket_manager.py", "canonicalize_todos", "text.replace", "string_normalization"),
+    ("bucket_manager.py", "get_history_for_bucket_ids", "conn.execute", "read_only_dynamic_sql"),
     ("decay_engine.py", "_has_unresolved_todos", "text.replace", "string_normalization"),
     ("server.py", "_dream_summary_line", "replace", "string_formatting"),
     ("server.py", "_normalize_todos", "text.replace", "string_normalization"),
@@ -389,6 +390,10 @@ NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
     ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
     ("server.py", "_compose_breath_query_matches", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
     ("server.py", "_attachment_probe_scan", "replace", "string_normalization"),
+    ("server.py", "_parse_as_of_timestamp", "replace", "timezone_normalization"),
+    ("server.py", "_parse_as_of_timestamp", "replace", "timestamp_normalization"),
+    ("server.py", "_parse_breath_as_of", "raw.replace", "timestamp_normalization"),
+    ("server.py", "_parse_breath_as_of", "replace", "timezone_normalization"),
     ("server.py", "_rm_verified_view_image", "Image.open", "pillow_image_read"),
     ("server.py", "hold", "replace", "string_normalization"),
     ("server.py", "boot", "replace", "string_normalization"),
@@ -415,6 +420,7 @@ _NON_PATH_CALL_PRIMITIVE_SELECTORS: dict[tuple[str, str, str], str] = {
     # only dynamically assembled SQL needs the explicit exemption.
     ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", "connection.execute"): "sqlite_dynamic",
     ("scripts/rm_frozen_acceptance_probe.py", "sqlite_observation", "connection.execute"): "sqlite_dynamic",
+    ("bucket_manager.py", "get_history_for_bucket_ids", "conn.execute"): "sqlite_dynamic",
 }
 
 _NON_PATH_CALL_EXPECTATIONS = Counter(
