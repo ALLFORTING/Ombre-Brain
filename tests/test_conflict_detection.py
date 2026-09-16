@@ -10,6 +10,7 @@ def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
     monkeypatch.delenv("OMBRE_CONFLICT_DETECTION_ENABLED", raising=False)
+    monkeypatch.setenv("OMBRE_DIGEST_API_KEY", "test-key")
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
@@ -207,7 +208,7 @@ async def test_conflict_candidates_reject_time_only_overlap(
 
     assert candidates == []
     assert warning == ""
-    server._call_conflict_api.assert_awaited_once_with(new_content, [])
+    server._call_conflict_api.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -370,7 +371,7 @@ async def test_invalid_conflict_response_fails_closed(
         "Alpha invoice status is closed."
     )
 
-    assert warning == ""
+    assert warning == "检查未执行：invalid_detector_response"
 
 
 @pytest.mark.asyncio
@@ -391,6 +392,257 @@ async def test_conflict_detection_has_default_on_independent_switch(
     assert warning == ""
     server._conflict_candidate_buckets.assert_not_awaited()
     server._call_conflict_api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_similarity_doorbell_uses_shared_recall_and_threshold(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    high = {
+        "id": "visible-high",
+        "semantic_score": 0.80,
+        "metadata": {"name": "existing visible memory"},
+    }
+    server._recall_memory_candidates = AsyncMock(
+        return_value={"semantic": {"status": "available"}, "candidates": [high]}
+    )
+
+    notice = await server._similarity_doorbell("new closely related content")
+
+    assert notice == "与 existing visible memory 相似 0.80，确定要新开一个桶吗"
+    server._recall_memory_candidates.assert_awaited_once_with(
+        "new closely related content", limit=8
+    )
+
+
+@pytest.mark.asyncio
+async def test_similarity_doorbell_omits_low_similarity(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._recall_memory_candidates = AsyncMock(
+        return_value={
+            "semantic": {"status": "available"},
+            "candidates": [
+                {"id": "low", "semantic_score": 0.7999, "metadata": {"name": "low"}}
+            ],
+        }
+    )
+
+    assert await server._similarity_doorbell("different content") == ""
+
+
+@pytest.mark.asyncio
+async def test_similarity_doorbell_has_no_persistent_side_effect(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    candidate = {
+        "id": "existing",
+        "semantic_score": 0.91,
+        "metadata": {"name": "existing visible memory"},
+    }
+
+    async def fake_search(*args, **kwargs):
+        kwargs["trace"]["semantic"] = {"enabled": True, "status": "available"}
+        return [candidate]
+
+    server.bucket_mgr.search = fake_search
+    server.bucket_mgr.list_all = AsyncMock(return_value=[candidate])
+    server.bucket_mgr.create = AsyncMock()
+    server.bucket_mgr.update = AsyncMock()
+
+    notice = await server._similarity_doorbell("near duplicate")
+
+    assert "0.91" in notice
+    server.bucket_mgr.create.assert_not_awaited()
+    server.bucket_mgr.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_recall_filters_sealed_and_dormant_buckets(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    visible = {"id": "visible", "content": "shared subject", "metadata": {"name": "visible"}}
+    sealed = {"id": "sealed", "content": "shared subject", "metadata": {"name": "sealed", "sealed": 1}}
+    dormant = {"id": "dormant", "content": "shared subject", "metadata": {"name": "dormant", "dormant": True}}
+
+    async def fake_search(*args, **kwargs):
+        kwargs["trace"]["semantic"] = {"enabled": True, "status": "available"}
+        return [visible, sealed, dormant]
+
+    server.bucket_mgr.search = fake_search
+    server.bucket_mgr.list_all = AsyncMock(return_value=[visible, sealed, dormant])
+
+    recall = await server._recall_memory_candidates("shared subject")
+
+    assert [bucket["id"] for bucket in recall["candidates"]] == ["visible"]
+
+
+@pytest.mark.asyncio
+async def test_hold_reports_embedding_unavailable_without_losing_write_receipt(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server.embedding_engine.enabled = False
+    server.bucket_mgr.embedding_engine.enabled = False
+    server._detect_conflict_warning = AsyncMock(return_value="")
+
+    result = await server.hold("stored despite missing embedding")
+
+    assert result.startswith("新建 ")
+    assert "similarity: 相似检查未执行：embedding disabled" in result
+    assert len(await server.bucket_mgr.list_all(include_archive=False)) == 1
+
+
+@pytest.mark.asyncio
+async def test_doorbell_is_read_only_and_hold_keeps_success_fields(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._similarity_doorbell = AsyncMock(return_value="与 old 相似 0.84，确定要新开一个桶吗")
+    server._detect_conflict_warning = AsyncMock(return_value="")
+    server._auto_link_related = AsyncMock(return_value=[])
+
+    result = await server.hold("new bucket with a reminder", tags="manual", importance=4)
+
+    assert "新建 " in result
+    assert "importance=4" in result
+    assert "tags=[conflict-test, manual]" in result
+    assert "domain=[test]" in result
+    assert "similarity: 与 old 相似 0.84" in result
+    server._similarity_doorbell.assert_awaited_once_with("new bucket with a reminder")
+
+
+@pytest.mark.asyncio
+async def test_conflict_verdict_is_structured_and_requires_same_fact(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "old-status",
+        "content": "Alpha membership status is active.",
+        "metadata": {"name": "Alpha membership", "tags": ["membership"]},
+    }
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(
+        return_value=json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": "old-status",
+                "evidence_new": "Alpha membership status is inactive.",
+                "evidence_old": "Alpha membership status is active.",
+            }
+        )
+    )
+
+    verdict = await server._detect_conflict_verdict("Alpha membership status is inactive.")
+
+    assert verdict == {
+        "status": "checked",
+        "same_fact": True,
+        "conflict": True,
+        "bucket_id": "old-status",
+        "evidence_new": "Alpha membership status is inactive.",
+        "evidence_old": "Alpha membership status is active.",
+        "evidence": {
+            "new": "Alpha membership status is inactive.",
+            "old": "Alpha membership status is active.",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_conflict_evidence_is_unavailable_not_a_warning(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "old-status",
+        "content": "Alpha membership status is active.",
+        "metadata": {"name": "Alpha membership", "tags": ["membership"]},
+    }
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(
+        return_value=json.dumps(
+            {
+                "same_fact": True,
+                "conflict": True,
+                "bucket_id": "old-status",
+                "evidence_new": "invented new sentence",
+                "evidence_old": "invented old sentence",
+            }
+        )
+    )
+
+    verdict = await server._detect_conflict_verdict("Alpha membership status is inactive.")
+
+    assert verdict["status"] == "unavailable"
+    assert verdict["reason"] == "invalid_detector_response"
+
+
+@pytest.mark.asyncio
+async def test_state_evolution_at_different_times_is_not_a_conflict(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {
+        "id": "old-status",
+        "content": "Alpha membership was active in August 2026.",
+        "metadata": {"name": "Alpha membership", "tags": ["membership"]},
+    }
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(
+        return_value=json.dumps(
+            {
+                "same_fact": True,
+                "conflict": False,
+                "bucket_id": "",
+                "evidence_new": "",
+                "evidence_old": "",
+            }
+        )
+    )
+
+    verdict = await server._detect_conflict_verdict(
+        "Alpha membership was inactive in September 2026."
+    )
+
+    assert verdict["status"] == "checked"
+    assert verdict["same_fact"] is True
+    assert verdict["conflict"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"same_fact": True, "conflict": False},
+        {"same_fact": False, "conflict": False},
+    ],
+    ids=["same-fact-consistent", "same-topic-different-fact"],
+)
+async def test_non_conflicting_structured_verdict_never_warns(tmp_path, monkeypatch, response):
+    server = _load_server(tmp_path, monkeypatch)
+    old_bucket = {"id": "old", "content": "old", "metadata": {"name": "old", "tags": []}}
+    server._conflict_candidate_buckets = AsyncMock(return_value=[old_bucket])
+    server._call_conflict_api = AsyncMock(
+        return_value=json.dumps(
+            {
+                "bucket_id": "",
+                "evidence_new": "",
+                "evidence_old": "",
+                **response,
+            }
+        )
+    )
+
+    verdict = await server._detect_conflict_verdict("new")
+    warning = await server._detect_conflict_warning("new")
+
+    assert verdict["status"] == "checked"
+    assert verdict["conflict"] is False
+    assert warning == ""
+
+
+@pytest.mark.asyncio
+async def test_conflict_unavailable_is_explicit_and_does_not_block_hold(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.delenv("OMBRE_DIGEST_API_KEY", raising=False)
+    server._similarity_doorbell = AsyncMock(return_value="")
+
+    verdict = await server._detect_conflict_verdict("new factual content")
+    result = await server.hold("new factual content")
+
+    assert verdict["status"] == "unavailable"
+    assert verdict["reason"] == "digest_api_not_configured"
+    assert result.startswith("新建 ")
+    assert "conflict: 检查未执行：digest_api_not_configured" in result
 
 
 @pytest.mark.asyncio
