@@ -12,8 +12,8 @@
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
 #   - Expose the current MCP tool and resource surface:
 #     注册当前 MCP 工具与资源表面：
-#       22 default tools; 15 optional diagnostic tools
-#                22 个默认工具；15 个可选诊断工具
+#       25 default tools; 15 optional diagnostic tools
+#                25 个默认工具；15 个可选诊断工具
 #       memory/session, Remember-Me, and maintenance operations
 #                记忆/会话、Remember-Me 与维护操作
 #       one viewer resource; diagnostics via OMBRE_DIAG_TOOLS
@@ -2335,6 +2335,62 @@ def _format_mailbox(limit: int = 1, include_sealed: bool = False) -> str:
             f"{letter.get('content', '')}"
         )
     return "\n---\n".join(parts)
+
+
+def _format_note_preview(text: str, limit: int = 80) -> str:
+    """Make a bounded one-line preview without changing the stored note body."""
+    compact = " ".join((text or "").split())
+    return compact[:limit] + ("…" if len(compact) > limit else "")
+
+
+def _parse_note_open_at(value: str) -> str:
+    """Normalize an optional local open_at timestamp for note visibility."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("open_at must use ISO local date/time format.") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed.isoformat(timespec="seconds")
+
+
+def _note_delivery_state(note: dict) -> str:
+    if note.get("skipped_at"):
+        return "skipped_for_delivery"
+    if note.get("boot_delivered_at"):
+        return "boot_delivered"
+    return "pending"
+
+
+def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | None]:
+    """Prepare the first boot section without claiming delivery before full text fits."""
+    candidate = bucket_mgr.get_latest_note_delivery_candidate(available_at=now)
+    if candidate:
+        full_text = (
+            "=== boot: 婷留言 ===\n"
+            f"[note_id:{candidate['note_id']}] {candidate['created_at']} "
+            f"{candidate['author']}\n{candidate['text']}"
+        )
+        if count_tokens_approx(full_text) <= max_tokens - BOOT_TRUNCATION_NOTICE_TOKENS:
+            return full_text, int(candidate["note_id"])
+        return (
+            "=== boot: 婷留言 ===\n"
+            f"婷有新留言 #{candidate['note_id']}，全文请用 "
+            f"get_note(note_id={candidate['note_id']}) 读取",
+            None,
+        )
+
+    latest = bucket_mgr.get_latest_visible_note(available_at=now)
+    if latest is None:
+        return "=== boot: 婷留言 ===\n婷留言：无（暂无历史留言）", None
+    return (
+        "=== boot: 婷留言 ===\n"
+        f"婷留言：无（上次留言 #{latest['note_id']}，{latest['created_at']}）",
+        None,
+    )
 
 
 async def _format_due_triggers(active_buckets: list[dict], max_items: int = 10) -> tuple[str, list[str]]:
@@ -7892,6 +7948,85 @@ async def get_letter(letter_id: int, include_sealed: bool = False) -> str:
     return _with_response_seal(body)
 
 
+@mcp.tool()
+async def list_notes(
+    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    include_sealed: bool = False,
+) -> str:
+    """List Ting-note history, newest first; sealed notes require explicit opt-in."""
+    try:
+        notes = bucket_mgr.list_notes(limit=int(limit), include_sealed=include_sealed)
+    except (TypeError, ValueError):
+        return "limit must be an integer between 1 and 100."
+    if not notes:
+        return _with_response_seal("=== 婷留言历史 ===\n（暂无可见留言）")
+    parts = ["=== 婷留言历史 ==="]
+    for note in notes:
+        parts.append(
+            f"[note_id:{note['note_id']}] created_at:{note['created_at']} "
+            f"author:{note['author']} via:{note['via']} "
+            f"delivery:{_note_delivery_state(note)} "
+            f"read:{'yes' if note.get('read_at') else 'no'} "
+            f"open_at:{note.get('open_at') or '-'}\n"
+            f"{_format_note_preview(note.get('text', ''))}"
+        )
+    return _with_response_seal("\n---\n".join(parts))
+
+
+@mcp.tool()
+async def get_note(note_id: int, include_sealed: bool = False) -> str:
+    """Read one Ting note by exact ID; a successful full read records read/delivery state."""
+    try:
+        note_id = int(note_id)
+    except (TypeError, ValueError):
+        return "Please provide a valid note_id."
+    if note_id < 1:
+        return "Please provide a valid note_id."
+    note = bucket_mgr.get_note(note_id, include_sealed=include_sealed)
+    if not note:
+        return _with_response_seal(f"note_id not found: {note_id}")
+    bucket_mgr.mark_note_read(note_id)
+    body = (
+        "=== 婷留言 ===\n"
+        f"[note_id:{note['note_id']}] created_at:{note['created_at']} "
+        f"author:{note['author']} via:{note['via']} "
+        f"open_at:{note.get('open_at') or '-'}\n"
+        f"{note['text']}"
+    )
+    return _with_response_seal(body)
+
+
+@mcp.tool()
+async def leave_note(
+    text: str,
+    sealed: bool = False,
+    open_at: str = "",
+) -> str:
+    """Record Ting's exact words for a later boot; this creates no memory bucket."""
+    if not isinstance(text, str) or not text.strip():
+        return "text 不能为空；未创建留言。"
+    try:
+        normalized_open_at = _parse_note_open_at(open_at)
+    except ValueError as exc:
+        return f"{exc} 未创建留言。"
+    try:
+        note_id = bucket_mgr.record_note(
+            text,
+            author="婷",
+            via="mcp",
+            sealed=bool(sealed),
+            open_at=normalized_open_at,
+        )
+    except Exception:
+        logger.warning("Ting note creation failed")
+        return "留言创建失败；未创建留言。"
+    if note_id is None:
+        return "留言创建失败；未创建留言。"
+    return _with_response_seal(
+        f"已创建婷留言 note_id:{note_id} preview:{text[:20]}"
+    )
+
+
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
@@ -8346,8 +8481,17 @@ async def boot(
 
     todos_text = "=== boot: 未完结 todos ===\n" + await todos()
 
+    note_now = datetime.now().isoformat(timespec="seconds")
+    ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
+    if deliver_note_id is not None and not bucket_mgr.mark_note_boot_delivered(
+        deliver_note_id,
+        delivered_at=note_now,
+    ):
+        ting_note_text, _ = _format_ting_note_for_boot(note_now, max_tokens)
+
     body = _fit_sections_to_budget(
         [
+            ("ting_note", "婷留言", ting_note_text),
             ("triggers", "今日触发", trigger_text),
             ("mailbox", "最新 letter", mailbox_text),
             ("todos", "todos", todos_text),
@@ -8356,7 +8500,10 @@ async def boot(
             ("echo", "feel 回声", echo_text),
         ],
         max_tokens=max_tokens - 20,
-        minimum_chars=BOOT_SECTION_MINIMUM_CHARS,
+        minimum_chars={
+            **BOOT_SECTION_MINIMUM_CHARS,
+            "ting_note": len(ting_note_text),
+        },
     )
     today = datetime.now().date().isoformat()
     for bucket_id in trigger_ids:

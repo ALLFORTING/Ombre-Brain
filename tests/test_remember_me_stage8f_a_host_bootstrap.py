@@ -441,8 +441,8 @@ asyncio.run(main())
         env=_env(tmp_path, OMBRE_DIAG_TOOLS="true"),
     )
 
-    assert len(json.loads(default.stdout)) == 22
-    assert len(json.loads(diagnostic.stdout)) == 37
+    assert len(json.loads(default.stdout)) == 25
+    assert len(json.loads(diagnostic.stdout)) == 40
 
 
 def test_stage8b_ob_schema_snapshot_file_remains_unchanged():

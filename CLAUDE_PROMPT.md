@@ -4,12 +4,13 @@
 
 ## 推荐启动路径
 
-通常先调用 `boot()` 获取一次启动上下文：钉选摘要、到期 trigger、最新信箱、feel 回声、最近 session 和 todos。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
+通常先调用 `boot()` 获取一次启动上下文：婷留言状态、钉选摘要、到期 trigger、最新信箱、feel 回声、最近 session 和 todos。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
 
 然后按需使用：
 
 1. 话题需要定向回忆时，调用 `breath(query="关键词")`；不知道关键词时可使用无参数浮现。
 2. 已知 handoff letter 的 `letter_id` 时，使用 `get_letter(letter_id)` 精确读取；不要为了找一封已知信件枚举整个 mailbox。
+3. 婷明确说“给下一个窗口留言：……”时，调用 `leave_note(text=...)` 逐字保存原话；未实际调用时没有 note，也不会占 note_id。需要历史时用 `list_notes`，已知 `note_id` 时用 `get_note(note_id)`。
 3. 最近记忆确实值得反思或展开时，可调用 `dream()`；它是可选的 reflection/digestion 工具。
 4. 只有既有 feel 对当前上下文有帮助时，才调用 `breath(domain="feel")` 或 `breath(feels=True)`。
 5. 没有需要补充的上下文时，直接自然回应用户。
@@ -23,6 +24,8 @@
 | `boot` | 推荐的一次性启动上下文；读取 trigger 时可能更新 bounded trigger-observation metadata |
 | `breath` | 浮现或定向检索记忆；retrieval-oriented，命中/排序可能更新 activation metadata。`mailbox=True` 只适合读取最近 N 封信 |
 | `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认不返回 sealed letter，只有明确需要时才传 `include_sealed=True` |
+| `leave_note` | 逐字创建一封可选的婷留言；它不是 bucket，不进入记忆检索、embedding、digest 或 decay |
+| `list_notes` / `get_note` | 查询留言历史或读取单封全文；sealed 与未到 `open_at` 的 note 默认按不存在处理，只有明确需要 sealed 时才传 `include_sealed=True` |
 | `hold` | 记住单个事件/信息，或在确有沉淀时写模型自己的 `feel` |
 | `grow` | 处理较长的日记/总结，并拆分成多个记忆桶 |
 | `trace` | 修改元数据、正文、related、resolved、sealed 等；包含 merge 和 `delete=True` 等高影响模式 |
@@ -39,6 +42,7 @@
 - 已知 `letter_id` 时，优先 `get_letter(letter_id)`；默认 `include_sealed=False`，只有显式 `include_sealed=True` 时才能读取 sealed letter。
 - sealed letter 与真实不存在的 `letter_id` 都返回 not found；这是刻意的存在性隐藏，不应据此断言“这封信不存在”。
 - 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
+- boot 只自动递送最新的可见 pending 婷留言一次。两封留言之间没有 boot 时，旧的可见 pending note 会被较新的递送覆盖，但始终可用 `get_note` 查询；不能把“没有留言”编造成一封 note。若 boot 预算不足，提示 `get_note(note_id=...)` 不算递送，直到模型实际获得全文。
 - 闲聊、短期信息和已经准确记住的内容不必重复写入。
 - 确有值得保留的单条信息用 `hold`；较长日记/总结用 `grow`。
 - `feel=True` 记录的是模型带走的感受、问题或观察，不是事件本身的情绪。只有真的有沉淀时才写；不要为了完成流程强行产出。

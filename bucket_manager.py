@@ -248,6 +248,32 @@ class BucketManager:
                 "CREATE INDEX IF NOT EXISTS idx_letters_created_at "
                 "ON letters(created_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notes (
+                    note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    via TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    sealed INTEGER NOT NULL DEFAULT 0,
+                    open_at TEXT,
+                    boot_delivered_at TEXT,
+                    read_at TEXT,
+                    skipped_at TEXT,
+                    skipped_reason TEXT,
+                    dismissed_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notes_boot_delivery "
+                "ON notes(sealed, open_at, boot_delivered_at, skipped_at, note_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notes_created_at "
+                "ON notes(created_at)"
+            )
 
     def _ensure_import_operation_table(self) -> None:
         """Create the lazy O5B operation journal only when capture is used."""
@@ -718,6 +744,216 @@ class BucketManager:
             cur = conn.execute(
                 "UPDATE letters SET sealed = ? WHERE id = ?",
                 (1 if sealed else 0, int(letter_id)),
+            )
+            return cur.rowcount > 0
+
+    @guarded_mutation("bucket_note_write")
+    def record_note(
+        self,
+        text: str,
+        *,
+        author: str = "婷",
+        via: str = "mcp",
+        sealed: bool = False,
+        open_at: str = "",
+    ) -> int | None:
+        """Persist one optional Ting note outside ordinary memory buckets."""
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if not isinstance(author, str) or not author.strip():
+            return None
+        if not isinstance(via, str) or not via.strip():
+            return None
+        normalized_open_at = open_at.strip() if isinstance(open_at, str) else ""
+        with sqlite3.connect(self.history_db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO notes (created_at, author, via, text, sealed, open_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    author.strip(),
+                    via.strip(),
+                    text,
+                    1 if sealed else 0,
+                    normalized_open_at or None,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _note_visible_where(include_sealed: bool = False) -> str:
+        sealed_clause = "" if include_sealed else "AND sealed = 0"
+        return (
+            "(open_at IS NULL OR open_at = '' OR open_at <= ?) "
+            f"{sealed_clause}"
+        )
+
+    def list_notes(
+        self,
+        limit: int = 20,
+        include_sealed: bool = False,
+        *,
+        available_at: str | None = None,
+    ) -> list[dict]:
+        """List visible Ting-note history, newest first, without exposing future notes."""
+        limit = max(1, min(int(limit or 20), 100))
+        available_at = available_at or now_iso()
+        where = self._note_visible_where(include_sealed)
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT note_id, created_at, author, via, text, sealed, open_at,
+                       boot_delivered_at, read_at, skipped_at, skipped_reason,
+                       dismissed_at
+                FROM notes
+                WHERE {where}
+                ORDER BY note_id DESC
+                LIMIT ?
+                """,
+                (available_at, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_note(
+        self,
+        note_id: int,
+        include_sealed: bool = False,
+        *,
+        available_at: str | None = None,
+    ) -> Optional[dict]:
+        """Read one visible Ting note while preserving sealed/future existence hiding."""
+        try:
+            note_id = int(note_id)
+        except (TypeError, ValueError):
+            return None
+        if note_id < 1:
+            return None
+        available_at = available_at or now_iso()
+        where = self._note_visible_where(include_sealed)
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                f"""
+                SELECT note_id, created_at, author, via, text, sealed, open_at,
+                       boot_delivered_at, read_at, skipped_at, skipped_reason,
+                       dismissed_at
+                FROM notes
+                WHERE note_id = ? AND {where}
+                """,
+                (note_id, available_at),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_visible_note(self, *, available_at: str | None = None) -> Optional[dict]:
+        """Return the latest normally visible historical note for boot status text."""
+        notes = self.list_notes(
+            limit=1,
+            include_sealed=False,
+            available_at=available_at,
+        )
+        return notes[0] if notes else None
+
+    def get_latest_note_delivery_candidate(
+        self,
+        *,
+        available_at: str | None = None,
+    ) -> Optional[dict]:
+        """Return the newest visible note still eligible for one-time boot delivery."""
+        available_at = available_at or now_iso()
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT note_id, created_at, author, via, text, sealed, open_at,
+                       boot_delivered_at, read_at, skipped_at, skipped_reason,
+                       dismissed_at
+                FROM notes
+                WHERE sealed = 0
+                  AND dismissed_at IS NULL
+                  AND (open_at IS NULL OR open_at = '' OR open_at <= ?)
+                  AND boot_delivered_at IS NULL
+                  AND skipped_at IS NULL
+                ORDER BY note_id DESC
+                LIMIT 1
+                """,
+                (available_at,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    @guarded_mutation("bucket_note_boot_delivery")
+    def mark_note_boot_delivered(
+        self,
+        note_id: int,
+        *,
+        delivered_at: str | None = None,
+    ) -> bool:
+        """Deliver one newest eligible note and skip only older eligible predecessors."""
+        try:
+            note_id = int(note_id)
+        except (TypeError, ValueError):
+            return False
+        delivered_at = delivered_at or now_iso()
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                """
+                SELECT note_id
+                FROM notes
+                WHERE sealed = 0
+                  AND dismissed_at IS NULL
+                  AND (open_at IS NULL OR open_at = '' OR open_at <= ?)
+                  AND boot_delivered_at IS NULL
+                  AND skipped_at IS NULL
+                ORDER BY note_id DESC
+                LIMIT 1
+                """,
+                (delivered_at,),
+            ).fetchone()
+            if candidate is None or int(candidate["note_id"]) != note_id:
+                conn.rollback()
+                return False
+            conn.execute(
+                "UPDATE notes SET boot_delivered_at = ? WHERE note_id = ?",
+                (delivered_at, note_id),
+            )
+            conn.execute(
+                """
+                UPDATE notes
+                SET skipped_at = ?,
+                    skipped_reason = 'superseded_by_newer_eligible_note'
+                WHERE note_id < ?
+                  AND sealed = 0
+                  AND dismissed_at IS NULL
+                  AND (open_at IS NULL OR open_at = '' OR open_at <= ?)
+                  AND boot_delivered_at IS NULL
+                  AND skipped_at IS NULL
+                """,
+                (delivered_at, note_id, delivered_at),
+            )
+            conn.commit()
+        return True
+
+    @guarded_mutation("bucket_note_read")
+    def mark_note_read(self, note_id: int, *, read_at: str | None = None) -> bool:
+        """Record a successful full get_note read and suppress later automatic delivery."""
+        try:
+            note_id = int(note_id)
+        except (TypeError, ValueError):
+            return False
+        read_at = read_at or now_iso()
+        with sqlite3.connect(self.history_db_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE notes
+                SET read_at = COALESCE(read_at, ?),
+                    boot_delivered_at = COALESCE(boot_delivered_at, ?)
+                WHERE note_id = ?
+                """,
+                (read_at, read_at, note_id),
             )
             return cur.rowcount > 0
 
