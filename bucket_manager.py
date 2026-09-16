@@ -36,7 +36,7 @@ import tempfile
 import inspect
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import frontmatter
 from rapidfuzz import fuzz
@@ -628,6 +628,36 @@ class BucketManager:
                 (bucket_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_history_for_bucket_ids(
+        self, bucket_ids: Iterable[str]
+    ) -> dict[str, list[dict]]:
+        """Read ordered content snapshots for an in-memory historical corpus.
+
+        This intentionally exposes only existing write-ahead rows.  It does
+        not create tables, materialize snapshots, or otherwise mutate history.
+        """
+        ids = list(dict.fromkeys(
+            str(bucket_id).strip() for bucket_id in bucket_ids if str(bucket_id).strip()
+        ))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT id, bucket_id, old_content, changed_at, change_type
+                FROM bucket_history
+                WHERE bucket_id IN ({placeholders})
+                ORDER BY bucket_id ASC, changed_at ASC, id ASC
+                """,
+                ids,
+            ).fetchall()
+        history: dict[str, list[dict]] = {bucket_id: [] for bucket_id in ids}
+        for row in rows:
+            history.setdefault(str(row["bucket_id"]), []).append(dict(row))
+        return history
 
     @guarded_mutation("bucket_letter_write")
     def record_letter(self, content: str, session_id: str, sealed: bool = False) -> None:
@@ -1355,6 +1385,7 @@ class BucketManager:
         include_sealed: bool = False,
         candidate_buckets: list[dict] = None,
         trace: dict | None = None,
+        include_semantic: bool = True,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -1474,7 +1505,7 @@ class BucketManager:
         # --- 第1.5层：语义召回，与关键词分数混合排序 ---
         vector_scores = {}
         semantic_before_error = ""
-        if self.embedding_engine and self.embedding_engine.enabled:
+        if include_semantic and self.embedding_engine and self.embedding_engine.enabled:
             semantic_before_error = str(
                 getattr(self.embedding_engine, "last_error", "") or ""
             )
@@ -1511,7 +1542,12 @@ class BucketManager:
             semantic_after_error = str(
                 getattr(self.embedding_engine, "last_error", "") or ""
             ) if self.embedding_engine else ""
-            if not self.embedding_engine or not self.embedding_engine.enabled:
+            if not include_semantic:
+                trace["semantic"] = {
+                    "enabled": False,
+                    "status": "disabled_for_historical_corpus",
+                }
+            elif not self.embedding_engine or not self.embedding_engine.enabled:
                 trace["semantic"] = {"enabled": False, "status": "disabled"}
             elif semantic_after_error and semantic_after_error != semantic_before_error:
                 trace["semantic"] = {

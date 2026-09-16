@@ -563,6 +563,10 @@
             "default": -1,
             "type": "number"
           },
+          "as_of": {
+            "default": "",
+            "type": "string"
+          },
           "cursor": {
             "default": "",
             "type": "string"

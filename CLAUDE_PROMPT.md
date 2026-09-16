@@ -35,7 +35,7 @@
 
 ## 检索与写入原则
 
-- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索。
+- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索；明确询问过去某时点正文时用 `breath(query="关键词", as_of="ISO8601 日期或时间")`。`as_of` 只读且不 touch，输出正文会标记为历史版本；它是历史 keyword/fuzzy 检索，不使用当前 embedding，无法检索已删除桶或重建历史 metadata。
 - 已知 `letter_id` 时，优先 `get_letter(letter_id)`；默认 `include_sealed=False`，只有显式 `include_sealed=True` 时才能读取 sealed letter。
 - sealed letter 与真实不存在的 `letter_id` 都返回 not found；这是刻意的存在性隐藏，不应据此断言“这封信不存在”。
 - 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
@@ -70,7 +70,7 @@
 - `delete=True` 是 destructive 操作。不存在的桶返回“未找到”；pinned/protected/sealed 桶返回受到保护；已经找到且删除执行未完成时返回明确的删除失败。
 - 删除前会先把正文写入 `bucket_history.sqlite3` 的 history snapshot；history capture 失败会 fail-closed，桶不会被删除。
 - 只有 delete 返回明确成功时，才可以认为删除前 history snapshot 已成功写入。
-- 当前没有 MCP undo/restore，也没有 MCP history 读取工具；history 只用于人工恢复。
+- 当前没有 MCP undo/restore。`breath(as_of=...)` 可只读查询当前仍存在且可见桶的历史正文；它不是已删除桶恢复，也不重建历史 metadata。
 
 ### importance 与保护
 

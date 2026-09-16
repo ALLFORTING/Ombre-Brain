@@ -3416,6 +3416,7 @@ def _breath_cursor_scope(
     date_to: str,
     resonance: str,
     min_score: float,
+    as_of: str = "",
 ) -> str:
     payload = {
         "query": query,
@@ -3429,6 +3430,7 @@ def _breath_cursor_scope(
         "date_to": date_to,
         "resonance": resonance,
         "min_score": min_score,
+        "as_of": as_of,
     }
     encoded = _json_lib.dumps(
         payload,
@@ -3739,6 +3741,355 @@ async def _compose_breath_query_matches(
     return _with_emotion_timeline(final_text, emotion_trend), composition
 
 
+def _parse_as_of_timestamp(value: str) -> datetime | None:
+    """Parse an existing local-history timestamp without inventing a value."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _parse_breath_as_of(value: str) -> tuple[datetime, str]:
+    """Parse a historical lookup time using the local-naive history convention.
+
+    Bucket history uses ``now_iso()`` local ISO timestamps without timezone
+    information. A date-only request therefore means the end of that local
+    calendar day, matching the existing inclusive date-filter convention.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("as_of 必须是 ISO8601 日期或时间。")
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            day = datetime.strptime(raw, "%Y-%m-%d")
+            return day + timedelta(days=1, microseconds=-1), raw
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("as_of 必须是 ISO8601 日期或时间。") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed, raw
+
+
+def _historical_bucket_at(
+    bucket: dict,
+    snapshots: list[dict],
+    as_of: datetime,
+) -> dict | None:
+    """Return the body version effective at ``as_of`` without changing storage.
+
+    ``changed_at`` is the write-ahead snapshot timestamp. It is the only
+    available version boundary, so a version is treated as effective on
+    ``[changed_at, next_changed_at)``; exact equality selects the newer body.
+    A malformed timestamp or a legacy bucket without an exact ``created``
+    timestamp is omitted rather than presented as a fabricated history.
+    """
+    metadata = bucket.get("metadata", {})
+    created = _parse_as_of_timestamp(metadata.get("created", ""))
+    if created is None or as_of < created:
+        return None
+
+    parsed_snapshots: list[tuple[datetime, dict]] = []
+    for snapshot in snapshots:
+        changed_at = _parse_as_of_timestamp(snapshot.get("changed_at", ""))
+        if changed_at is None or changed_at < created:
+            return None
+        parsed_snapshots.append((changed_at, snapshot))
+
+    content = str(bucket.get("content", ""))
+    version_start = created
+    version_end: datetime | None = None
+    for index, (changed_at, snapshot) in enumerate(parsed_snapshots):
+        if as_of < changed_at:
+            content = str(snapshot.get("old_content", ""))
+            version_start = (
+                created if index == 0 else parsed_snapshots[index - 1][0]
+            )
+            version_end = changed_at
+            break
+        version_start = changed_at
+
+    historical_metadata = dict(metadata)
+    successor_id = _superseded_by_id(historical_metadata)
+    superseded_at = _parse_as_of_timestamp(
+        historical_metadata.get("superseded_at", "")
+    )
+    # The history table cannot reconstruct old metadata. Never project today's
+    # supersession marker back before its recorded timestamp (or when absent).
+    if successor_id and (superseded_at is None or as_of < superseded_at):
+        historical_metadata.pop("superseded_by", None)
+        historical_metadata.pop("superseded_at", None)
+
+    return {
+        "id": bucket["id"],
+        "content": content,
+        "metadata": historical_metadata,
+        "_as_of": as_of.isoformat(timespec="seconds"),
+        "_as_of_version_start": version_start.isoformat(timespec="seconds"),
+        "_as_of_version_end": (
+            version_end.isoformat(timespec="seconds") if version_end else ""
+        ),
+    }
+
+
+async def _historical_breath_corpus(
+    *,
+    as_of: datetime,
+    domain_values: list[str],
+    include_dormant: bool,
+    include_sealed: bool,
+) -> list[dict]:
+    """Build an existing-bucket historical body corpus using read-only calls."""
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    visible = _filter_breath_candidates(
+        all_buckets,
+        domain_values=domain_values,
+        include_dormant=include_dormant,
+        include_sealed=include_sealed,
+    )
+    snapshots_by_id = bucket_mgr.get_history_for_bucket_ids(
+        str(bucket.get("id", "")) for bucket in visible
+    )
+    return [
+        historical
+        for bucket in visible
+        if (
+            historical := _historical_bucket_at(
+                bucket,
+                snapshots_by_id.get(str(bucket.get("id", "")), []),
+                as_of,
+            )
+        ) is not None
+    ]
+
+
+async def _format_historical_breath_summary(
+    bucket: dict,
+    body: str,
+    *,
+    requested_as_of: str,
+) -> str:
+    """Render raw historical content without current-summary cache side effects."""
+    metadata = bucket.get("metadata", {})
+    marker = " 📌" if metadata.get("pinned", False) else ""
+    score = float(bucket.get("_breath_score", 0.0))
+    channel = str(bucket.get("_breath_channel", "关键词"))
+    superseded_marker = await _superseded_marker(bucket)
+    version_start = str(bucket.get("_as_of_version_start", ""))
+    version_end = str(bucket.get("_as_of_version_end", ""))
+    version_range = (
+        f"有效至 {version_end}" if version_end else "此后版本"
+    )
+    return (
+        f"[历史版本 · as_of={requested_as_of} · metadata=当前] "
+        f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
+        f"[通道:{channel}]{superseded_marker}\n"
+        f"[正文版本有效: {version_start} — {version_range}]\n"
+        f"{body}"
+    )
+
+
+async def _compose_historical_breath_matches(
+    matches: list[dict],
+    *,
+    max_tokens: int,
+    hidden_count: int,
+    total_matches: int,
+    downgraded_count: int,
+    next_cursor: str,
+    requested_as_of: str,
+) -> str:
+    """Render historical bodies directly; history reads never touch or cache."""
+    results: list[str] = []
+    token_used = 0
+    token_budget_omitted = 0
+    strong_matches = [bucket for bucket in matches if not bucket.get("_breath_weak", False)]
+    weak_matches = [bucket for bucket in matches if bucket.get("_breath_weak", False)]
+    for index, bucket in enumerate(strong_matches):
+        body = strip_wikilinks(str(bucket.get("content", "")))
+        body_tokens = count_tokens_approx(body)
+        if token_used + body_tokens > max_tokens:
+            token_budget_omitted += len(strong_matches) - index
+            break
+        results.append(
+            await _format_historical_breath_summary(
+                bucket,
+                body,
+                requested_as_of=requested_as_of,
+            )
+        )
+        token_used += body_tokens
+
+    weak_lines = [
+        f"[历史版本 · as_of={requested_as_of}] [bucket_id:{bucket['id']}] "
+        f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
+        f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+        for bucket in weak_matches
+    ]
+    displayed_count = len(results) + len(weak_lines)
+    if not displayed_count:
+        return "未找到在该时点存在的相关历史记忆。"
+
+    parts = ["\n---\n".join(results)] if results else []
+    if weak_lines:
+        parts.append("--- 历史弱匹配（仅列名） ---\n" + "\n".join(weak_lines))
+    omitted_count = hidden_count + token_budget_omitted
+    summary_lines = []
+    if omitted_count:
+        summary_lines.append(f"还有{omitted_count}个相关历史记忆未显示")
+    summary_lines.append(
+        f"共匹配 {total_matches} / 本次显示 {displayed_count} / "
+        f"因结果上限省略 {hidden_count} / "
+        f"因 token 预算省略 {token_budget_omitted} / "
+        f"因低于阈值降级 {downgraded_count}"
+    )
+    if next_cursor:
+        summary_lines.append(f"下一页 cursor: {next_cursor}")
+    return "\n\n".join(parts + ["\n".join(summary_lines)])
+
+
+async def _breath_as_of_impl(
+    *,
+    as_of: str,
+    query: str,
+    max_tokens: int,
+    domain: str,
+    valence: float,
+    arousal: float,
+    max_results: int,
+    importance_min: int,
+    recent_days: int,
+    emotion_trend: bool,
+    include_dormant: bool,
+    include_sealed: bool,
+    date_from: str,
+    date_to: str,
+    resonance: str,
+    tags_filter: list[str],
+    topic_filter: list[str],
+    wake_dormant: bool,
+    cursor: str,
+    min_score: float,
+) -> str:
+    """Read the historical-body corpus without activation, cache, or embeddings."""
+    try:
+        as_of_time, requested_as_of = _parse_breath_as_of(as_of)
+        resolved_min_score = _resolve_breath_min_score(min_score)
+    except ValueError as exc:
+        return str(exc)
+    if not query or not query.strip():
+        return "as_of 历史检索需要提供 query，且不支持历史浮现模式。"
+    if wake_dormant:
+        return "as_of 历史检索是只读的，不能 wake_dormant。"
+    if emotion_trend:
+        return "as_of 历史检索不附加当前 emotion_trend。"
+    if importance_min >= 1 or recent_days > 0 or date_from or date_to or resonance:
+        return "as_of 历史检索不支持当前时间/权重过滤参数。"
+    if tags_filter or topic_filter:
+        return "as_of 历史检索暂不支持 tags_filter/topic_filter。"
+    max_results = max(1, min(max_results, 50))
+    max_tokens = min(max_tokens, 20000)
+    domain_values = [part.strip() for part in domain.split(",") if part.strip()]
+    q_valence = valence if 0 <= valence <= 1 else None
+    q_arousal = arousal if 0 <= arousal <= 1 else None
+    cursor_scope = _breath_cursor_scope(
+        query=query,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
+        recent_cutoff=None,
+        include_dormant=include_dormant,
+        include_sealed=include_sealed,
+        date_from="",
+        date_to="",
+        resonance="",
+        min_score=resolved_min_score,
+        as_of=as_of_time.isoformat(timespec="seconds"),
+    )
+    try:
+        corpus = await _historical_breath_corpus(
+            as_of=as_of_time,
+            domain_values=domain_values,
+            include_dormant=include_dormant,
+            include_sealed=include_sealed,
+        )
+    except Exception as exc:
+        logger.error("Historical Breath corpus read failed: %s", exc)
+        return "历史记忆暂时无法访问。"
+
+    search_trace: dict = {}
+    if cursor:
+        try:
+            frozen_matches, position = _decode_breath_cursor(cursor, cursor_scope)
+        except ValueError:
+            return "cursor 无效、已过期或与当前检索条件不匹配。"
+        by_id = {str(bucket.get("id", "")): bucket for bucket in corpus}
+        matches = []
+        for record in frozen_matches[position:position + max_results]:
+            bucket = by_id.get(record["id"])
+            if bucket is None:
+                continue
+            rendered = dict(bucket)
+            rendered["_breath_score"] = float(record["score"])
+            rendered["_breath_channel"] = record["channel"]
+            rendered["_breath_weak"] = bool(record["weak"])
+            matches.append(rendered)
+        ordered_matches = frozen_matches
+        next_position = min(position + max_results, len(ordered_matches))
+    else:
+        try:
+            matches = await bucket_mgr.search(
+                query,
+                limit=1000,
+                query_valence=q_valence,
+                query_arousal=q_arousal,
+                include_dormant=True,
+                include_sealed=True,
+                candidate_buckets=corpus,
+                trace=search_trace,
+                include_semantic=False,
+            )
+        except Exception as exc:
+            logger.error("Historical Breath search failed: %s", exc)
+            return "历史检索过程出错，请稍后重试。"
+        trace_by_id = {
+            str(entry.get("id", "")): entry
+            for entry in search_trace.get("candidates", [])
+        }
+        matches = _annotate_breath_query_matches(
+            matches,
+            query=query,
+            trace_by_id=trace_by_id,
+            min_score=resolved_min_score,
+        )
+        ordered_matches = _order_breath_query_matches(matches)
+        matches = ordered_matches[:max_results]
+        next_position = len(matches)
+
+    total_matches = len(ordered_matches)
+    hidden_count = max(0, total_matches - len(matches))
+    downgraded_count = sum(
+        1 for match in ordered_matches if match.get("_breath_weak", False)
+    )
+    next_cursor = (
+        _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
+        if next_position < total_matches
+        else ""
+    )
+    return await _compose_historical_breath_matches(
+        matches,
+        max_tokens=max_tokens,
+        hidden_count=hidden_count,
+        total_matches=total_matches,
+        downgraded_count=downgraded_count,
+        next_cursor=next_cursor,
+        requested_as_of=requested_as_of,
+    )
+
+
 async def _breath_impl(
     query: str = "",
     max_tokens: int = 10000,
@@ -3760,6 +4111,7 @@ async def _breath_impl(
     wake_dormant: bool = False,
     cursor: str = "",
     min_score: float = -1,
+    as_of: str = "",
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
     """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
@@ -3772,6 +4124,30 @@ async def _breath_impl(
         topic_filter = _normalize_breath_filter(topic_filter, "topic_filter")
     except ValueError as exc:
         return str(exc)
+
+    if (as_of or "").strip():
+        return await _breath_as_of_impl(
+            as_of=as_of,
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            importance_min=importance_min,
+            recent_days=recent_days,
+            emotion_trend=emotion_trend,
+            include_dormant=include_dormant,
+            include_sealed=include_sealed,
+            date_from=date_from,
+            date_to=date_to,
+            resonance=resonance,
+            tags_filter=tags_filter,
+            topic_filter=topic_filter,
+            wake_dormant=wake_dormant,
+            cursor=cursor,
+            min_score=min_score,
+        )
 
     await decay_engine.ensure_started()
     query = _apply_display_aliases(query)
@@ -7144,6 +7520,16 @@ async def breath(
         ),
     ] = False,
     min_score: Annotated[float, Field(description="-1 reads OMBRE_BREATH_MIN_SCORE and otherwise uses 0.0; a non-negative value overrides that threshold.")] = -1,
+    as_of: Annotated[
+        str,
+        Field(
+            description=(
+                "Optional ISO8601 date or timestamp for read-only historical-body "
+                "keyword/fuzzy retrieval. Date-only means the end of the local day; "
+                "historical semantic embeddings and deleted buckets are unavailable."
+            )
+        ),
+    ] = "",
     cursor: Annotated[
         str,
         Field(
@@ -7155,6 +7541,8 @@ async def breath(
     ] = "",
 ) -> str:
     """Retrieval-oriented memory search; surfacing may update bounded activation metadata."""
+    if (as_of or "").strip() and mailbox:
+        return _with_response_seal("as_of 历史检索不支持 mailbox。")
     if mailbox:
         return _with_response_seal(
             _format_mailbox(mailbox_limit, include_sealed=include_sealed)
@@ -7182,6 +7570,7 @@ async def breath(
         topic_filter=topic_filter,
         cursor=cursor,
         min_score=min_score,
+        as_of=as_of,
     )
     return _with_response_seal(result)
 
