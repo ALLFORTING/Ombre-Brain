@@ -56,7 +56,7 @@
 - `dormant=1` 表示自动或手动沉底的休眠状态，主要影响列表/浮现；`trace` 修改不会自动唤醒它；要唤醒请显式传 `dormant=0`。它不是“已解决”。
 - `merge` 会把源桶并入目标桶，并移除源桶；这是高影响维护动作。
 - `merge` 会重连所有指向源桶的 `superseded_by` 并清理旧 reverse IDs；merge 不会唤醒原本 dormant 的目标桶。
-- `delete=True` 若发现其他桶的 `superseded_by` 指向待删桶会拒绝；先用 `trace(superseded_by="")` 撤销或改指向。
+- `delete=True` 若发现其他桶的 `superseded_by` 指向待删桶会优先拒绝；先用 `trace(superseded_by="")` 撤销或改指向。其他 delete 一律先返回目标摘要和短时一次性 `confirm_token`，只有带同一 token 的第二次调用才执行。
 - `append=False` 时正文替换，`append=True` 时追加。
 - 归档后的 session bucket 仍可通过 `trace` 修改：未 sealed 时可以修改或追加正文；sealed 时正文修改受保护。
 - `mode` 只有 `summary` 和 `full` 两种值；不要发明其他模式。
@@ -82,7 +82,7 @@
 
 - `related` 使用逗号分隔的 bucket IDs。
 - 传入的 relation 是追加，不是整体替换；已有 ID 会去重。
-- 对存在的目标桶会写入反向 relation；当前只能增加，不能 remove/clear。
+- 对存在的目标桶会写入反向 relation；用 `unrelate`（逗号分隔 IDs）可双向解除指定关系，不会清除其他 relation，且不能与 `related` 同时使用。
 - 因此只有在关系明确时才使用 `related`，不要把它当作临时标签或试探性搜索。
 
 ### supersedes

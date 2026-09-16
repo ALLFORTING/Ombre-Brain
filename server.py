@@ -70,6 +70,10 @@ _RM_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds"
 _BREATH_CURSOR_TTL_SECONDS = 15 * 60
 _BREATH_CURSOR_MAX_STATES = 256
 _BREATH_CURSOR_STATES: dict[str, dict] = {}
+_MUTATION_CONFIRM_TTL_SECONDS = 5 * 60
+_MUTATION_CONFIRM_MAX_TOKENS = 256
+_mutation_confirm_tokens: dict[str, dict] = {}
+_mutation_confirm_lock = threading.Lock()
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -1675,6 +1679,43 @@ def _related_ids(meta: dict) -> list[str]:
     return _parse_csv_ids(str(raw))
 
 
+async def _unlink_related(source: dict, relation_ids: list[str]) -> bool:
+    """Remove only the requested related links from both sides, with rollback on failure."""
+    source_id = str(source.get("id", ""))
+    source_meta = source.get("metadata", {})
+    requested = set(relation_ids)
+    operations: list[tuple[str, str, str]] = []
+    source_related = _related_ids(source_meta)
+    next_source_related = [
+        relation_id for relation_id in source_related if relation_id not in requested
+    ]
+    if next_source_related != source_related:
+        operations.append(
+            (source_id, ",".join(next_source_related), ",".join(source_related))
+        )
+    for relation_id in relation_ids:
+        if relation_id == source_id:
+            continue
+        relation = await bucket_mgr.get(relation_id)
+        if not relation:
+            continue
+        relation_meta = relation.get("metadata", {})
+        current_related = _related_ids(relation_meta)
+        next_related = [item for item in current_related if item != source_id]
+        if next_related != current_related:
+            operations.append(
+                (relation_id, ",".join(next_related), ",".join(current_related))
+            )
+    applied: list[tuple[str, str]] = []
+    for relation_id, update_value, restore_value in operations:
+        if not await bucket_mgr.update(relation_id, related_buckets=update_value):
+            for applied_id, applied_restore in reversed(applied):
+                await bucket_mgr.update(applied_id, related_buckets=applied_restore)
+            return False
+        applied.append((relation_id, restore_value))
+    return True
+
+
 def _metadata_restore_value(metadata: dict, field: str):
     """Return a BucketManager.update-compatible value that restores field presence."""
     return metadata.get(field) if field in metadata else None
@@ -2017,6 +2058,168 @@ def _pinned_unpin_confirm_token(bucket: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
+def _confirmation_payload_digest(payload: dict) -> str:
+    """Return a canonical digest for an in-memory mutation confirmation plan."""
+    encoded = _json_lib.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _issue_mutation_confirmation(operation: str, payload: dict) -> str:
+    """Create a short-lived, one-shot confirmation token for one exact plan."""
+    now = time.monotonic()
+    with _mutation_confirm_lock:
+        expired = [
+            token
+            for token, entry in _mutation_confirm_tokens.items()
+            if float(entry.get("expires_at", 0)) <= now
+        ]
+        for token in expired:
+            _mutation_confirm_tokens.pop(token, None)
+        while len(_mutation_confirm_tokens) >= _MUTATION_CONFIRM_MAX_TOKENS:
+            _mutation_confirm_tokens.pop(next(iter(_mutation_confirm_tokens)), None)
+        token = secrets.token_urlsafe(18)
+        _mutation_confirm_tokens[token] = {
+            "operation": operation,
+            "payload_digest": _confirmation_payload_digest(payload),
+            "expires_at": now + _MUTATION_CONFIRM_TTL_SECONDS,
+        }
+    return token
+
+
+def _consume_mutation_confirmation(operation: str, payload: dict, token: str) -> bool:
+    """Consume a confirmation only when its operation, plan, and TTL still match."""
+    candidate = (token or "").strip()
+    if not candidate:
+        return False
+    now = time.monotonic()
+    expected_digest = _confirmation_payload_digest(payload)
+    with _mutation_confirm_lock:
+        entry = _mutation_confirm_tokens.get(candidate)
+        if not entry or float(entry.get("expires_at", 0)) <= now:
+            _mutation_confirm_tokens.pop(candidate, None)
+            return False
+        if not (
+            hmac.compare_digest(str(entry.get("operation", "")), operation)
+            and hmac.compare_digest(str(entry.get("payload_digest", "")), expected_digest)
+        ):
+            return False
+        _mutation_confirm_tokens.pop(candidate, None)
+    return True
+
+
+def _delete_confirmation_payload(buckets: list[dict]) -> dict:
+    """Bind a delete confirmation to the exact target state shown in its preview."""
+    targets = []
+    for bucket in buckets:
+        metadata = bucket.get("metadata", {})
+        targets.append(
+            {
+                "bucket_id": str(bucket.get("id", "")),
+                "name": str(metadata.get("name", "")),
+                "importance": int(metadata.get("importance", 0) or 0),
+                "updated_at": str(metadata.get("updated_at", "")),
+                "content_sha256": hashlib.sha256(
+                    str(bucket.get("content", "")).encode("utf-8")
+                ).hexdigest(),
+                "pinned": bool(metadata.get("pinned")),
+                "protected": bool(metadata.get("protected")),
+                "sealed": bool(_is_sealed(bucket)),
+                "superseded_by": _superseded_by_id(metadata),
+            }
+        )
+    return {"targets": targets}
+
+
+def _delete_preview_excerpt(bucket: dict, limit: int = 80) -> str:
+    text = re.sub(r"\s+", " ", strip_wikilinks(str(bucket.get("content", "")))).strip()
+    return text[:limit]
+
+
+def _format_delete_confirmation(buckets: list[dict], token: str) -> str:
+    lines = ["删除确认：本次不会删除。"]
+    for bucket in buckets:
+        metadata = bucket.get("metadata", {})
+        lines.append(
+            f"- bucket_id:{bucket['id']} name:{metadata.get('name', bucket['id'])} "
+            f"importance:{int(metadata.get('importance', 0) or 0)} "
+            f"preview:{_delete_preview_excerpt(bucket)}"
+        )
+    lines.append(f"confirm_token: {token}")
+    lines.append(
+        f"确认有效期: {_MUTATION_CONFIRM_TTL_SECONDS} 秒；请使用相同 bucket_id 和 delete=True 重试。"
+    )
+    return "\n".join(lines)
+
+
+async def _prepare_trace_delete(bucket_ids: list[str]) -> tuple[list[dict] | None, str]:
+    """Validate every delete target before issuing or consuming any confirmation."""
+    buckets = []
+    for bucket_id in bucket_ids:
+        bucket = await bucket_mgr.get(bucket_id)
+        if not bucket:
+            return None, f"未找到记忆桶: {bucket_id}"
+        metadata = bucket.get("metadata", {})
+        if _is_sealed(bucket) or metadata.get("pinned") or metadata.get("protected"):
+            return None, f"删除失败：记忆桶 {bucket_id} 受到保护。"
+        inbound = await _inbound_supersession_buckets(bucket_id)
+        if inbound:
+            inbound_ids = ", ".join(str(item.get("id", "")) for item in inbound)
+            return None, (
+                f"删除失败：记忆桶 {bucket_id} 仍被以下作废关系引用: {inbound_ids}。"
+                "请先用 trace(superseded_by='') 解除或改指向。"
+            )
+        buckets.append(bucket)
+    return buckets, ""
+
+
+async def _execute_trace_delete(bucket: dict) -> str:
+    """Delete one already-confirmed, freshly validated bucket and clean its reverse link."""
+    bucket_id = str(bucket["id"])
+    metadata = bucket.get("metadata", {})
+    successor_id = _superseded_by_id(metadata)
+    successor = (
+        await bucket_mgr.get(successor_id)
+        if successor_id and successor_id != "none"
+        else None
+    )
+    successor_restore = None
+    if successor:
+        successor_meta = successor.get("metadata", {})
+        successor_restore = _metadata_restore_value(successor_meta, "supersedes")
+        cleaned = await _clear_outgoing_supersession_for_delete(bucket)
+        if not cleaned:
+            return "删除失败：无法清理 superseded_by 反向关系。"
+    success = await bucket_mgr.delete(bucket_id)
+    if not success and successor:
+        await bucket_mgr.update(successor_id, supersedes=successor_restore)
+    return (
+        f"已遗忘记忆桶: {bucket_id}"
+        if success
+        else f"删除失败：记忆桶 {bucket_id} 存在，但删除未完成。"
+    )
+
+
+async def _trace_delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> str:
+    """Run the two-stage confirmation protocol for one or more existing delete targets."""
+    buckets, error = await _prepare_trace_delete(bucket_ids)
+    if buckets is None:
+        return error
+    payload = _delete_confirmation_payload(buckets)
+    supplied = (confirm_token or "").strip()
+    if not supplied:
+        token = _issue_mutation_confirmation("trace.delete", payload)
+        return _format_delete_confirmation(buckets, token)
+    if not _consume_mutation_confirmation("trace.delete", payload, supplied):
+        return "删除确认无效、已过期或与当前目标不匹配；请重新预览后确认。"
+    results = [await _execute_trace_delete(bucket) for bucket in buckets]
+    return "\n".join(results)
+
+
 def _extract_session_summary(content: str, max_chars: int = 700) -> str:
     """Extract the Summary section from an archived session bucket."""
     text = strip_wikilinks(content or "").strip()
@@ -2255,18 +2458,33 @@ async def _importance_rebalance_candidates() -> list[dict]:
     return candidates
 
 
-def _importance_rebalance_token(candidates: list[dict]) -> str:
-    payload = []
-    for bucket in candidates:
-        meta = bucket.get("metadata", {})
-        payload.append(
-            "|".join([
-                bucket["id"],
-                str(meta.get("importance", "")),
-                str(meta.get("created") or meta.get("created_at") or ""),
-            ])
-        )
-    return hashlib.sha256("\n".join(payload).encode("utf-8")).hexdigest()[:12]
+def _digest_confirmation_payload(
+    selected: list[tuple[str, list[dict]]],
+    rebalance_candidates: list[dict],
+) -> dict:
+    """Bind digest confirmation to every planned source and metadata transition."""
+    def bucket_state(bucket: dict) -> dict:
+        metadata = bucket.get("metadata", {})
+        return {
+            "bucket_id": str(bucket.get("id", "")),
+            "importance": int(metadata.get("importance", 0) or 0),
+            "created": str(metadata.get("created") or metadata.get("created_at") or ""),
+            "updated_at": str(metadata.get("updated_at", "")),
+            "content_sha256": hashlib.sha256(
+                str(bucket.get("content", "")).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    return {
+        "groups": [
+            {
+                "domain": str(domain),
+                "sources": [bucket_state(bucket) for bucket in buckets],
+            }
+            for domain, buckets in selected
+        ],
+        "importance_rebalance": [bucket_state(bucket) for bucket in rebalance_candidates],
+    }
 
 
 def _group_digest_candidates(candidates: list[dict]) -> dict[str, list[dict]]:
@@ -2336,7 +2554,7 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
     groups = _group_digest_candidates(candidates)
     selected = list(groups.items())[:max(1, max_groups)]
     lines = [
-        "=== 自动消化 dry-run ===" if dry_run else "=== 自动消化执行 ===",
+        "=== 自动消化 dry-run ===",
         f"候选桶数: {len(candidates)}",
         f"主题组数: {len(groups)}",
     ]
@@ -2346,12 +2564,7 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
         ids = ", ".join(bucket["id"] for bucket in buckets)
         lines.append(f"- {domain}: {len(buckets)} 个桶 -> {ids}")
     if rebalance_candidates:
-        rebalance_token = _importance_rebalance_token(rebalance_candidates)
-        lines.append(
-            "=== importance rebalance dry-run ==="
-            if dry_run else "=== importance rebalance execute ==="
-        )
-        lines.append(f"confirm_token: {rebalance_token}")
+        lines.append("=== importance rebalance dry-run ===")
         for bucket in rebalance_candidates:
             meta = bucket.get("metadata", {})
             importance = int(meta.get("importance", 0) or 0)
@@ -2359,14 +2572,21 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
             lines.append(
                 f"- bucket_id:{bucket['id']} importance:{importance}->{importance - 1} created:{created}"
             )
+    payload = _digest_confirmation_payload(selected, rebalance_candidates)
     if dry_run:
-        return "\n".join(lines)
-    if rebalance_candidates:
-        rebalance_token = _importance_rebalance_token(rebalance_candidates)
-        if not hmac.compare_digest((confirm_token or "").strip(), rebalance_token):
-            return "\n".join(lines + [
-                "confirmation required: rerun dry_run and pass confirm_token to apply importance rebalance."
-            ])
+        token = _issue_mutation_confirmation("digest.maintenance", payload)
+        return "\n".join(lines + [f"confirm_token: {token}"])
+    supplied = (confirm_token or "").strip()
+    if not supplied:
+        token = _issue_mutation_confirmation("digest.maintenance", payload)
+        return "\n".join(lines + [
+            f"confirm_token: {token}",
+            "confirmation required: rerun with this confirm_token to apply the digest plan.",
+        ])
+    if not _consume_mutation_confirmation("digest.maintenance", payload, supplied):
+        return "\n".join(lines + [
+            "confirmation required: confirm_token is invalid, expired, or does not match this digest plan."
+        ])
 
     rebalanced_total = 0
     if not selected:
@@ -6784,7 +7004,11 @@ async def digest(
 
 
 @mcp.tool()
-async def related_backfill(dry_run: bool = True, limit: int = 100, threshold: float = -1) -> str:
+async def related_backfill(
+    dry_run: bool = True,
+    limit: int = 100,
+    threshold: Annotated[float, Field(description="-1 uses the configured default threshold; a non-negative value sets the semantic-link threshold.")] = -1,
+) -> str:
     """Controlled related-link maintenance: dry-run by default; execution writes links and skips sealed buckets."""
     await decay_engine.ensure_started()
     try:
@@ -6800,12 +7024,12 @@ async def breath(
     query: str = "",
     max_tokens: int = 10000,
     domain: str = "",
-    valence: float = -1,
-    arousal: float = -1,
+    valence: Annotated[float, Field(description="-1 means no valence filter; 0.0-1.0 filters recall by valence.")] = -1,
+    arousal: Annotated[float, Field(description="-1 means no arousal filter; 0.0-1.0 filters recall by arousal.")] = -1,
     max_results: int = 5,
-    importance_min: int = -1,
+    importance_min: Annotated[int, Field(description="-1 means no minimum-importance filter; 1-10 sets the minimum stored importance.")] = -1,
     mode: str = "summary",
-    recent_days: int = -1,
+    recent_days: Annotated[int, Field(description="-1 means no recency filter; non-negative values restrict recall to that many days.")] = -1,
     emotion_trend: bool = False,
     include_dormant: bool = False,
     include_sealed: bool = False,
@@ -6837,7 +7061,7 @@ async def breath(
             )
         ),
     ] = False,
-    min_score: float = -1,
+    min_score: Annotated[float, Field(description="-1 reads OMBRE_BREATH_MIN_SCORE and otherwise uses 0.0; a non-negative value overrides that threshold.")] = -1,
     cursor: Annotated[
         str,
         Field(
@@ -6885,6 +7109,31 @@ async def breath(
 # 工具 2：hold — 握住，留下来
 # =============================================================
 
+async def _format_hold_created(bucket_id: str) -> str:
+    """Report the persisted values for a newly created hold bucket."""
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return f"新建 {bucket_id}"
+    metadata = bucket.get("metadata", {})
+    tags = metadata.get("tags", [])
+    domains = metadata.get("domain", [])
+    if isinstance(tags, str):
+        tags = _parse_csv_ids(tags)
+    if not isinstance(tags, list):
+        tags = []
+    if isinstance(domains, str):
+        domains = _parse_csv_ids(domains)
+    if not isinstance(domains, list):
+        domains = []
+    name = str(metadata.get("name") or bucket_id)
+    importance = int(metadata.get("importance", 0) or 0)
+    return (
+        f"新建 {bucket_id} | {name} | importance={importance} | "
+        f"tags=[{', '.join(str(tag) for tag in tags)}] | "
+        f"domain=[{', '.join(str(domain) for domain in domains)}]"
+    )
+
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -6893,8 +7142,8 @@ async def hold(
     pinned: bool = False,
     feel: bool = False,
     source_bucket: str = "",
-    valence: float = -1,
-    arousal: float = -1,
+    valence: Annotated[float, Field(description="-1 means unspecified and uses analysis fallback; 0.0-1.0 sets the stored valence.")] = -1,
+    arousal: Annotated[float, Field(description="-1 means unspecified and uses analysis fallback; 0.0-1.0 sets the stored arousal.")] = -1,
     trigger_date: str = "",
     supersedes_id: str = "",
 ) -> str:
@@ -6975,7 +7224,7 @@ async def hold(
                 await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
             except Exception as e:
                 logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
-        response = f"🫧feel→{bucket_id}"
+        response = f"🫧feel→{await _format_hold_created(bucket_id)}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         return response
@@ -7024,7 +7273,7 @@ async def hold(
         if trigger_date:
             await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
-        response = f"📌钉选→{bucket_id} {','.join(domain)}"
+        response = f"📌{await _format_hold_created(bucket_id)}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         return response
@@ -7044,8 +7293,10 @@ async def hold(
     if should_record_emotion:
         _record_emotion_snapshot(valence, arousal, "hold")
 
-    action = "合并→" if is_merged else "新建→"
-    response = f"{action}{result_name} {','.join(domain)}"
+    if is_merged:
+        response = f"合并→{result_name} {','.join(domain)}"
+    else:
+        response = await _format_hold_created(result_name)
     if conflict_warning:
         response += f"\nconflict: {conflict_warning}"
     return response
@@ -7179,20 +7430,21 @@ async def get_letter(letter_id: int, include_sealed: bool = False) -> str:
 @mcp.tool()
 async def trace(
     bucket_id: str,
-    name: str = "",
+    name: Annotated[str, Field(description="An empty string leaves the bucket name unchanged. Batch trace rejects a non-empty name.")] = "",
     domain: str = "",
-    valence: float = -1,
-    arousal: float = -1,
-    importance: int = -1,
+    valence: Annotated[float, Field(description="-1 means unspecified and leaves valence unchanged; 0.0-1.0 sets valence.")] = -1,
+    arousal: Annotated[float, Field(description="-1 means unspecified and leaves arousal unchanged; 0.0-1.0 sets arousal.")] = -1,
+    importance: Annotated[int, Field(description="-1 means unchanged; 1-10 sets the stored importance.")] = -1,
     tags: str = "",
     todos: str | list[str] | None = None,
-    resolved: int = -1,
-    pinned: int = -1,
-    digested: int = -1,
-    dormant: int = -1,
-    sealed: int = -1,
-    content: str = "",
+    resolved: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
+    pinned: Annotated[int, Field(description="-1 means unchanged; 0 means False (unpinning a pinned bucket requires confirm_token); 1 means True.")] = -1,
+    digested: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
+    dormant: Annotated[int, Field(description="-1 means unchanged; 0 means False and explicitly wakes; 1 means True and marks dormant.")] = -1,
+    sealed: Annotated[int, Field(description="-1 means unchanged; 0 means unsealed; 1 means sealed.")] = -1,
+    content: Annotated[str, Field(description="An empty string leaves content unchanged. Batch trace rejects non-empty content.")] = "",
     related: str = "",
+    unrelate: Annotated[str, Field(description="Comma-separated related bucket IDs to remove bidirectionally. Cannot be combined with related.")] = "",
     superseded_by: str | None = None,
     merge: str = "",
     append: bool = False,
@@ -7210,10 +7462,14 @@ async def trace(
     if not bucket_ids:
         return "请提供有效的 bucket_id。"
     if len(bucket_ids) > 1:
+        if name or content:
+            return "批量 trace 不支持修改 content/name，请逐桶操作。"
         if merge:
             return "批量 trace 不能与 merge 同时使用。"
         if superseded_by is not None:
             return "批量 trace 不支持 superseded_by。"
+        if delete:
+            return await _trace_delete_with_confirmation(bucket_ids, confirm_token)
         results = []
         for current_id in bucket_ids:
             result = await trace(
@@ -7232,6 +7488,7 @@ async def trace(
                 sealed=sealed,
                 content="",
                 related=related,
+                unrelate=unrelate,
                 merge="",
                 append=append,
                 trigger_date=trigger_date,
@@ -7253,46 +7510,7 @@ async def trace(
 
     # --- Delete mode / 删除模式 ---
     if delete:
-        bucket = await bucket_mgr.get(bucket_id)
-        if not bucket:
-            return f"未找到记忆桶: {bucket_id}"
-        metadata = bucket.get("metadata", {})
-        if (
-            _is_sealed(bucket)
-            or metadata.get("pinned")
-            or metadata.get("protected")
-        ):
-            return f"删除失败：记忆桶 {bucket_id} 受到保护。"
-        inbound = await _inbound_supersession_buckets(bucket_id)
-        if inbound:
-            inbound_ids = ", ".join(str(item.get("id", "")) for item in inbound)
-            return (
-                f"删除失败：记忆桶 {bucket_id} 仍被以下作废关系引用: {inbound_ids}。"
-                "请先用 trace(superseded_by='') 解除或改指向。"
-            )
-        successor_id = _superseded_by_id(metadata)
-        successor = (
-            await bucket_mgr.get(successor_id)
-            if successor_id and successor_id != "none"
-            else None
-        )
-        successor_restore = None
-        if successor:
-            successor_meta = successor.get("metadata", {})
-            successor_restore = _metadata_restore_value(successor_meta, "supersedes")
-            cleaned = await _clear_outgoing_supersession_for_delete(bucket)
-            if not cleaned:
-                return "删除失败：无法清理 superseded_by 反向关系。"
-        success = await bucket_mgr.delete(bucket_id)
-        if not success and successor:
-            await bucket_mgr.update(successor_id, supersedes=successor_restore)
-        # BucketManager owns local ordinary-vector cleanup and failure ordering.
-        # The earlier get() already distinguished not-found and protection.
-        return (
-            f"已遗忘记忆桶: {bucket_id}"
-            if success
-            else f"删除失败：记忆桶 {bucket_id} 存在，但删除未完成。"
-        )
+        return await _trace_delete_with_confirmation([bucket_id], confirm_token)
 
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
@@ -7371,6 +7589,9 @@ async def trace(
             updates["content"] = content
             updates["_history_change_type"] = "replace"
     related_ids = _parse_csv_ids(related)
+    unrelated_ids = _parse_csv_ids(unrelate)
+    if related_ids and unrelated_ids:
+        return "related 与 unrelate 不能同时使用。"
     if related_ids:
         current_related = _related_ids(bucket.get("metadata", {}))
         updates["related_buckets"] = ",".join(dict.fromkeys(current_related + related_ids))
@@ -7389,7 +7610,7 @@ async def trace(
                 "importance 锁定为 10。"
             )
 
-    if not updates and requested_superseded_by is None:
+    if not updates and requested_superseded_by is None and not unrelated_ids:
         return "没有任何字段需要修改。"
 
     if updates:
@@ -7410,6 +7631,9 @@ async def trace(
                     related_id,
                     related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
                 )
+
+    if unrelated_ids and not await _unlink_related(bucket, unrelated_ids):
+        return "解除 related 失败，未完成双向关系写入。"
 
     supersession_label = None
     if requested_superseded_by is not None:
@@ -7448,6 +7672,9 @@ async def trace(
     if supersession_label is not None:
         supersession_change = f"superseded_by={supersession_label}"
         changed += f", {supersession_change}" if changed else supersession_change
+    if unrelated_ids:
+        unrelate_change = f"unrelate={','.join(unrelated_ids)}"
+        changed += f", {unrelate_change}" if changed else unrelate_change
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 @mcp.tool()

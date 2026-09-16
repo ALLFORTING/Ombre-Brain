@@ -77,7 +77,8 @@ async def test_digest_live_creates_digest_and_marks_sources(tmp_path, monkeypatc
     )
     _age_bucket(server, source_id)
 
-    result = await server.digest(dry_run=False)
+    preview = await server.digest(dry_run=False)
+    result = await server.digest(dry_run=False, confirm_token=_confirm_token(preview))
     source = await server.bucket_mgr.get(source_id)
     all_buckets = await server.bucket_mgr.list_all(include_archive=False)
     digest_buckets = [

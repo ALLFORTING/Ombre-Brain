@@ -391,7 +391,7 @@ The current MCP surface has 22 default tools, 37 tools when diagnostics are enab
 | `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认隐藏 sealed letter，需明确 `include_sealed=True` 才读取 / Read one handoff letter by exact ID; sealed letters stay hidden unless explicitly included |
 | `hold` | 写入单条记忆或模型自己的 `feel` 反思 / Store one memory or a model `feel` reflection |
 | `grow` | 将日记/长内容拆分并写入多个记忆桶 / Digest journal-style content into multiple memory buckets |
-| `trace` | 混合修改工具：元数据、正文替换/追加、related、superseded_by、merge、seal 以及 `delete=True`。delete 明确成功才代表写前快照成功；没有 MCP undo/restore 命令 / Mixed mutation tool; delete is destructive, and only explicit success confirms the write-ahead snapshot; there is no MCP undo/restore command |
+| `trace` | 混合修改工具：元数据、正文替换/追加、related、superseded_by、merge、seal 以及 `delete=True`。delete 必须先取得并回传短时、一次性的 confirm_token；明确成功才代表写前快照成功；没有 MCP undo/restore 命令 / Mixed mutation tool; delete requires a short-lived, one-shot confirm_token before the write-ahead snapshot and deletion can execute; there is no MCP undo/restore command |
 | `pulse` | 系统状态和记忆桶列表；`show_all=True` 默认最多显示 50 个，可用 `limit`/`offset` 分页；listing 可能更新 bounded dormant metadata / Status and bucket listing; `show_all=True` is bounded to 50 per page by default |
 | `dream` | 可选的最近记忆反思/详情读取，不要求每次启动调用 / Optional recent-memory reflection/detail readout; not required on every startup |
 | `seal_letter` | sealed-memory handoff-letter maintenance：改变一封 letter 的可见性，不是普通检索 / Changes handoff-letter visibility; not ordinary retrieval |
@@ -458,7 +458,9 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `todos: str | None = None` — 省略表示不修改；传空字符串清空；传逗号或换行分隔的待办项替换为规范化列表 / Omit to preserve; pass an empty string to clear; pass comma- or newline-separated items to replace with a canonical list.
 - `sealed: int = -1` — `1` 手动封存、`0` 取消、`-1` 不改；sealed 优先级高于 pinned，默认不在 `breath`/`pulse`/`dream`/`todos` 泄漏 / `1` seal, `0` unseal, `-1` unchanged; sealed overrides pinned and is hidden by default.
 - `dormant: int = -1` — `1` 手动沉底、`0` 显式唤醒、`-1` 不改；`trace` 修改不会自动唤醒 dormant，需显式传 `dormant=0` / `1` dormant, `0` explicitly wake, `-1` unchanged; trace updates do not wake dormant buckets unless `dormant=0` is explicitly passed.
-- `related: str = ""` — 逗号分隔 related bucket IDs，写入双向关联 / Comma-separated related bucket IDs; links are bidirectional.
+- `related: str = ""` — 逗号分隔 related bucket IDs，写入双向关联；`unrelate: str = ""` 以逗号分隔 ID 双向解除指定关联，不能和 `related` 同时使用 / Comma-separated related bucket IDs; links are bidirectional. `unrelate` removes only the named links from both sides and cannot be combined with `related`.
+- 批量 `trace` 不支持 `content` 或 `name`，必须逐桶修改；批量 delete 先预览全部目标并以完整目标集合绑定 confirm_token / Batch trace rejects `content` and `name`; batch delete previews every target before issuing a token bound to the complete target set.
+- `delete=True` 的首次调用只返回 bucket id、name、importance、正文前约 80 字和 confirm_token；token 过期、已使用、目标或计划不匹配都会拒绝。仍有 inbound `superseded_by` 指针时会优先拒绝，不会发放可执行 token / The first delete call only previews the target and returns a confirmation token. Expired, used, or mismatched tokens are rejected. Inbound `superseded_by` references are rejected before any executable token is issued.
 - `trigger_date: str = ""` — 前瞻记忆日期，格式 `YYYY-MM-DD`，到期后由 `boot` 的“今日浮现”显示 / Prospective memory date; due items appear in `boot`.
 
 读取中的作废标记 / Supersession readout: `breath` 会保留可检索的旧桶，并在头部显示 `⊘已作废→<id>(<name>)` 或无取代者的 `⊘已作废`；缺席的可见取代桶会以不含正文的 `当前有效：[id] name（取代了 old_id）` 行补充。`dream(detail_ids=...)` 在正文前说明作废/取代时间；`pulse` 行以 `⊘` 前缀标记。作废桶仍参与搜索，但排序会显著下沉 / Breath keeps obsolete buckets searchable and marks them in headers. A visible successor not otherwise returned is listed without its body. Dream details explain supersession before the body, and Pulse prefixes obsolete rows with `⊘`. Obsolete buckets remain searchable but receive a strong ranking penalty.
@@ -475,7 +477,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `digest` 与 `related_backfill`
 
-- `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default; real runs require `OMBRE_DIGEST_API_KEY`.
+- `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；所有会写入的 maintenance digest 计划都必须先取得、再回传绑定该计划的短时一次性 `confirm_token`；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default. Every mutating maintenance plan requires a short-lived, one-shot confirm_token bound to the exact plan before execution; real runs require `OMBRE_DIGEST_API_KEY`.
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
 
 #### `asset_ingest_probe`, `asset_render_probe`, and `asset_export_probe`

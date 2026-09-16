@@ -14,6 +14,13 @@ def _load_server(tmp_path, monkeypatch):
     return server
 
 
+def _confirm_token(result: str) -> str:
+    for line in result.splitlines():
+        if line.startswith("confirm_token:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError("confirm_token not found")
+
+
 @pytest.mark.asyncio
 async def test_trace_append_preserves_content_and_records_history(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
@@ -41,7 +48,8 @@ async def test_trace_replace_and_delete_record_history(tmp_path, monkeypatch):
     )
 
     await server.trace(bucket_id, content="after replace")
-    await server.trace(bucket_id, delete=True)
+    preview = await server.trace(bucket_id, delete=True)
+    await server.trace(bucket_id, delete=True, confirm_token=_confirm_token(preview))
     history = server.bucket_mgr.get_history(bucket_id)
 
     assert [row["change_type"] for row in history[:2]] == ["delete", "replace"]
@@ -160,7 +168,8 @@ async def test_delete_history_capture_failure_does_not_delete_or_report_not_foun
     bucket_id = await server.bucket_mgr.create(content="delete history failure")
     server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
 
-    result = await server.trace(bucket_id, delete=True)
+    preview = await server.trace(bucket_id, delete=True)
+    result = await server.trace(bucket_id, delete=True, confirm_token=_confirm_token(preview))
 
     assert "删除失败" in result
     assert "未找到" not in result
@@ -173,7 +182,8 @@ async def test_delete_execution_failure_is_not_reported_as_not_found(tmp_path, m
     bucket_id = await server.bucket_mgr.create(content="delete execution failure")
     server.bucket_mgr.delete = AsyncMock(return_value=False)
 
-    result = await server.trace(bucket_id, delete=True)
+    preview = await server.trace(bucket_id, delete=True)
+    result = await server.trace(bucket_id, delete=True, confirm_token=_confirm_token(preview))
 
     assert "删除失败" in result
     assert "未找到" not in result
