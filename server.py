@@ -114,6 +114,7 @@ from maintenance_write_gate import (
 from utils import (
     DISPLAY_ALIASES,
     apply_display_aliases,
+    ensure_bucket_storage,
     load_config,
     setup_logging,
     strip_wikilinks,
@@ -124,8 +125,9 @@ from utils import (
 config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
-asset_store = AssetStore(config["buckets_dir"])
-asset_backend_registry = None
+_runtime_components: dict[str, object] | None = None
+_runtime_components_lock = threading.RLock()
+_MISSING_RUNTIME_OVERRIDE = object()
 
 def _apply_display_aliases(text: str) -> str:
     return apply_display_aliases(text)
@@ -318,14 +320,6 @@ async def _fire_webhook(event: str, payload: dict) -> None:
     except Exception as e:
         logger.warning(f"Webhook push failed ({event} → {OMBRE_HOOK_URL}): {e}")
 
-# --- Initialize core components / 初始化核心组件 ---
-embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
-asset_embedding_index = AssetEmbeddingIndex(asset_store, embedding_engine)
-bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
-dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
-decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
-import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
-
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
@@ -334,6 +328,103 @@ mcp = FastMCP(
     host="0.0.0.0",
     port=OMBRE_PORT,
 )
+
+
+def _get_runtime_components() -> dict[str, object]:
+    """Create durable runtime services on first use, never at module import."""
+    global _runtime_components
+    if _runtime_components is not None:
+        return _runtime_components
+    with _runtime_components_lock:
+        if _runtime_components is not None:
+            return _runtime_components
+        components: dict[str, object] = {}
+        ensure_bucket_storage(config)
+        store = AssetStore(config["buckets_dir"])
+        embedding = EmbeddingEngine(config)
+        index = AssetEmbeddingIndex(store, embedding)
+        manager = BucketManager(config, embedding_engine=embedding)
+        dehydrator_instance = Dehydrator(config)
+        decay = DecayEngine(config, manager)
+        importer = ImportEngine(config, manager, dehydrator_instance, embedding)
+        components.update({
+            "asset_store": store,
+            "embedding_engine": embedding,
+            "asset_embedding_index": index,
+            "bucket_mgr": manager,
+            "dehydrator": dehydrator_instance,
+            "decay_engine": decay,
+            "import_engine": importer,
+        })
+        bundle = _bootstrap_remember_me_host(store, embedding)
+        components["remember_me_host_bundle"] = bundle
+        registry = RuntimeAssetBackendRegistry.from_runtime(
+            legacy_store=store,
+            bundle_provider=lambda: components["remember_me_host_bundle"],
+            embedding_index=index,
+        )
+        components["asset_backend_registry"] = registry
+        components["asset_dashboard"] = AssetDashboardService(
+            store,
+            backend_provider=lambda: registry.selected_backend(),
+            max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+            max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
+        )
+        _runtime_components = components
+        return components
+
+
+def _get_runtime_component(name: str):
+    return _get_runtime_components()[name]
+
+
+def _get_remember_me_host_bundle():
+    override = globals().get("remember_me_host_bundle", _MISSING_RUNTIME_OVERRIDE)
+    if override is not _MISSING_RUNTIME_OVERRIDE:
+        return override
+    if _runtime_components is None and not _env_flag_enabled(
+        os.environ.get("OMBRE_RM_RUNTIME_ENABLED", "")
+    ):
+        return None
+    return _get_runtime_component("remember_me_host_bundle")
+
+
+def __getattr__(name: str):
+    if name == "remember_me_host_bundle":
+        return _get_remember_me_host_bundle()
+    raise AttributeError(name)
+
+
+class _LazyRuntimeComponent:
+    """Preserve module-level component access without import-time storage IO."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attribute: str):
+        return getattr(_get_runtime_component(self._name), attribute)
+
+    def __setattr__(self, attribute: str, value) -> None:
+        if attribute == "_name":
+            object.__setattr__(self, attribute, value)
+            return
+        setattr(_get_runtime_component(self._name), attribute, value)
+
+    def __delattr__(self, attribute: str) -> None:
+        delattr(_get_runtime_component(self._name), attribute)
+
+
+asset_store = _LazyRuntimeComponent("asset_store")
+embedding_engine = _LazyRuntimeComponent("embedding_engine")
+asset_embedding_index = _LazyRuntimeComponent("asset_embedding_index")
+bucket_mgr = _LazyRuntimeComponent("bucket_mgr")
+dehydrator = _LazyRuntimeComponent("dehydrator")
+decay_engine = _LazyRuntimeComponent("decay_engine")
+import_engine = _LazyRuntimeComponent("import_engine")
+asset_dashboard = _LazyRuntimeComponent("asset_dashboard")
+asset_backend_registry = _LazyRuntimeComponent("asset_backend_registry")
 
 DIAGNOSTIC_TOOL_NAMES = frozenset({
     "asset_attachment_context_probe",
@@ -4194,17 +4285,9 @@ RM_ASSET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 def _selected_asset_backend():
-    if asset_backend_registry is None:
-        raise AssetBackendError("asset_authority_unavailable")
+    # Keep the module-level seam intact: production receives the lazy proxy,
+    # while tests and explicit runtime overrides may replace the registry.
     return asset_backend_registry.selected_backend()
-
-
-asset_dashboard = AssetDashboardService(
-    asset_store,
-    backend_provider=_selected_asset_backend,
-    max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
-    max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
-)
 _asset_browser_uploads = {}
 _asset_browser_upload_tokens = {}
 _asset_browser_upload_lock = threading.Lock()
@@ -5263,9 +5346,10 @@ def _rm_resolve_asset_download_body(asset_id: str, source: str) -> tuple[dict, P
         asset, path = resolved
         return asset, path, _rm_safe_download_filename(asset)
     if source == "remember_me":
-        if remember_me_host_bundle is None:
+        bundle = _get_remember_me_host_bundle()
+        if bundle is None:
             return None
-        metadata, content = remember_me_host_bundle.core_adapter.resolve_ob_download(asset_id)
+        metadata, content = bundle.core_adapter.resolve_ob_download(asset_id)
         from remember_me_download_links import safe_download_filename
 
         return metadata, content, safe_download_filename(metadata)
@@ -5617,7 +5701,7 @@ def _asset_public_base_url() -> str:
     return raw.rstrip("/")
 
 
-def _bootstrap_remember_me_host():
+def _bootstrap_remember_me_host(store=None, embedding=None):
     if not _env_flag_enabled(os.environ.get("OMBRE_RM_RUNTIME_ENABLED", "")):
         logger.info("remember-me runtime disabled")
         return None
@@ -5634,13 +5718,20 @@ def _bootstrap_remember_me_host():
         if not data_root.is_absolute():
             raise RuntimeError("remember_me_host_bootstrap_failed")
         data_root = data_root.expanduser().resolve()
-        if data_root == asset_store.data_root:
+        legacy_root = (
+            store.data_root
+            if store is not None
+            else Path(config["buckets_dir"]).expanduser().resolve()
+        )
+        if data_root == legacy_root:
             raise RuntimeError("remember_me_host_bootstrap_failed")
 
         from remember_me_host_runtime import create_remember_me_host_bundle
         from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
-        vector_provider = RememberMeVectorProviderAdapter(embedding_engine)
+        vector_provider = RememberMeVectorProviderAdapter(
+            embedding if embedding is not None else EmbeddingEngine(config)
+        )
         bundle = create_remember_me_host_bundle(
             data_root=data_root,
             token_store=_rm_asset_download_tokens,
@@ -5657,14 +5748,6 @@ def _bootstrap_remember_me_host():
 
     logger.info("remember-me runtime enabled")
     return bundle
-
-
-remember_me_host_bundle = _bootstrap_remember_me_host()
-asset_backend_registry = RuntimeAssetBackendRegistry.from_runtime(
-    legacy_store=asset_store,
-    bundle_provider=lambda: remember_me_host_bundle,
-    embedding_index=asset_embedding_index,
-)
 
 
 def _rm_runtime_evidence_headers() -> dict[str, str]:
@@ -5726,11 +5809,10 @@ async def _rm_runtime_evidence(request):
     if auth_error is not None:
         return auth_error
     try:
-        if asset_backend_registry is None:
-            raise AssetBackendError("asset_authority_unavailable")
-        validation = asset_backend_registry._validate_boot()
-        selected = asset_backend_registry.selected_backend()
-        snapshot = asset_backend_registry.snapshot
+        registry = asset_backend_registry
+        validation = registry._validate_boot()
+        selected = registry.selected_backend()
+        snapshot = registry.snapshot
         if snapshot is None:
             raise AssetBackendError("asset_authority_unavailable")
         return JSONResponse(
@@ -5894,7 +5976,7 @@ def _rm_probe_verification_session() -> dict[str, object]:
     removed = False
     result: dict[str, object] = {"status": "FAIL", "error": "verification_probe_failed"}
     try:
-        bundle = remember_me_host_bundle
+        bundle = _get_remember_me_host_bundle()
         adapter = getattr(bundle, "core_adapter", None)
         runtime = getattr(adapter, "_runtime", None)
         service = getattr(runtime, "service", None)

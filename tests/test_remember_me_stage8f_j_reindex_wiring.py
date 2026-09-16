@@ -1085,14 +1085,14 @@ def test_server_rejects_shared_legacy_and_rm_data_root(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
     monkeypatch.setenv(
         "OMBRE_RM_DATA_ROOT",
-        str(server.asset_store.data_root),
+        str(Path(server.config["buckets_dir"]).resolve()),
     )
 
     with pytest.raises(RuntimeError) as caught:
         server._bootstrap_remember_me_host()
 
     assert str(caught.value) == "remember_me_host_bootstrap_failed"
-    assert str(server.asset_store.data_root) not in str(caught.value)
+    assert str(Path(server.config["buckets_dir"]).resolve()) not in str(caught.value)
 
 
 @pytest.mark.asyncio

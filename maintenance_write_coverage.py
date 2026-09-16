@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -269,8 +270,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
     "import_memory.py": {
         "save": "guarded_mutation",
     },
-        "server.py": {
-        "<module>": "startup_initialization",
+    "server.py": {
         "_save_password_hash": "guarded_mutation",
         "_atomic_write_auth_payload": "guarded_caller_only",
         "_write_fd_bytes": "guarded_caller_only",
@@ -324,7 +324,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "generate": "isolated_offline_key_workspace",
         "_exclusive_write": "offline_key_no_replace_publish",
     },
-    "utils.py": {"load_config": "startup_initialization"},
+    "utils.py": {"ensure_bucket_storage": "runtime_initialization"},
 }
 
 GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
@@ -352,62 +352,80 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     },
 }
 
-# Exact call-site exemptions for methods whose names overlap Path mutation
-# primitives. Line anchoring makes nearby code movement or any new call fail
-# until that individual call is audited again.
-NON_PATH_CALL_ALLOWLIST: dict[tuple[str, str, int, str], str] = {
-    ("asset_dashboard.py", "resolve_image", 495, "Image.open"): "pillow_image_read",
-    ("asset_migration_state.py", "_now", 313, "value.replace"): "datetime_timezone",
-    ("asset_migration_state.py", "inspect_existing_migration_state", 1107, "now.replace"): "datetime_timezone",
-    ("asset_migration_state.py", "_parse_timestamp", 1177, "replace"): "datetime_timezone",
-    ("asset_cutover_state.py", "_now", 408, "value.replace"): "datetime_timezone",
-    ("asset_cutover_state.py", "_parse_timestamp", 1718, "parsed.replace"): "datetime_timezone",
-    ("asset_store.py", "_parse_iso8601", 250, "parsed.replace"): "datetime_timezone",
-    ("asset_store.py", "_parse_iso8601", 257, "raw.replace"): "string_normalization",
-    ("asset_store.py", "_parse_iso8601", 261, "parsed.replace"): "datetime_timezone",
-    ("asset_store.py", "_row_datetime", 266, "replace"): "datetime_timezone",
-    ("asset_store.py", "_row_datetime", 268, "parsed.replace"): "datetime_timezone",
-    ("maintenance_write_gate.py", "freeze", 187, "reason.replace"): "string_validation",
-    ("offline_backup_bundle.py", "_timestamp", 2245, "value.replace"): "datetime_timezone",
-    ("production_backup_capture.py", "_now", 700, "value.replace"): "datetime_timezone",
-    ("remember_me_core_adapter.py", "_normalize_timestamp", 620, "replace"): "datetime_timezone",
-    ("remember_me_core_adapter.py", "_normalize_timestamp", 624, "parsed.replace"): "datetime_timezone",
-    ("remember_me_migration_acceptance.py", "_timestamp", 1435, "value.replace"): "datetime_timezone",
-    ("remember_me_mcp_presenter.py", "_verified_image", 399, "Image.open"): "pillow_image_read",
-    ("remember_me_vector_provider.py", "_normalized_backend", 70, "replace"): "string_normalization",
-    ("server.py", "breath_hook", 1065, "bucket_mgr.touch"): "incidental_bucket_activation",
-    ("server.py", "dream_hook", 1113, "bucket_mgr.touch"): "incidental_bucket_activation",
-    ("bucket_manager.py", "canonicalize_todos", 89, "text.replace"): "string_normalization",
-    ("decay_engine.py", "_has_unresolved_todos", 73, "text.replace"): "string_normalization",
-    ("server.py", "_dream_summary_line", 1322, "replace"): "string_formatting",
-    ("server.py", "_normalize_todos", 1588, "text.replace"): "string_normalization",
-    ("server.py", "_days_since", 2413, "dt.replace"): "datetime_timezone",
-    ("server.py", "format_active_matches", 3207, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "_breath_impl", 3834, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "_breath_impl", 3871, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "_breath_impl", 3940, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "_compose_breath_query_matches", 3581, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "_attachment_probe_scan", 4307, "replace"): "string_normalization",
-    ("server.py", "_rm_verified_view_image", 5395, "Image.open"): "pillow_image_read",
-    ("server.py", "hold", 7200, "replace"): "string_normalization",
-    ("server.py", "boot", 7853, "replace"): "string_normalization",
-    ("server.py", "dream", 8089, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("server.py", "dream", 8118, "bucket_mgr.touch"): "incidental_bucket_activation_or_explicit_dormant_wake",
-    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_identifier", 145, "name.replace"): "sqlite_identifier_quote",
-    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", 190, "connection.execute"): "read_only_dynamic_sql",
-    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", 203, "connection.execute"): "read_only_dynamic_sql",
-    ("scripts/rm_frozen_acceptance_probe.py", "sqlite_observation", 264, "connection.execute"): "read_only_dynamic_sql",
-    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", 1191, "self.path.parent.mkdir"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", 1192, "self.path.open"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", 1194, "self.handle.write"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", 1223, "path.parent.mkdir"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", 1226, "temporary.open"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", 1227, "stream.write"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", 1230, "os.replace"): "tmp_evidence_only",
-    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", 1233, "temporary.unlink"): "tmp_evidence_only",
-    ("utils.py", "apply_display_aliases", 27, "text.replace"): "string_alias_replacement",
-    ("remember_me_cutover_operations.py", "_exclusion_reason", 230, "relative.replace"): "string_normalization",
+# Structural exemptions for methods whose names overlap persistence primitives.
+# Identity is the file, containing function, resolved call expression, and its
+# expected occurrence count.  AST line numbers remain diagnostic-only, so
+# comments or unrelated statements cannot invalidate an audited boundary.
+NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
+    ("asset_dashboard.py", "resolve_image", "Image.open", "pillow_image_read"),
+    ("asset_migration_state.py", "_now", "value.replace", "datetime_timezone"),
+    ("asset_migration_state.py", "inspect_existing_migration_state", "now.replace", "datetime_timezone"),
+    ("asset_migration_state.py", "_parse_timestamp", "replace", "datetime_timezone"),
+    ("asset_cutover_state.py", "_now", "value.replace", "datetime_timezone"),
+    ("asset_cutover_state.py", "_parse_timestamp", "parsed.replace", "datetime_timezone"),
+    ("asset_store.py", "_parse_iso8601", "parsed.replace", "datetime_timezone"),
+    ("asset_store.py", "_parse_iso8601", "raw.replace", "string_normalization"),
+    ("asset_store.py", "_parse_iso8601", "parsed.replace", "datetime_timezone"),
+    ("asset_store.py", "_row_datetime", "replace", "datetime_timezone"),
+    ("asset_store.py", "_row_datetime", "parsed.replace", "datetime_timezone"),
+    ("maintenance_write_gate.py", "freeze", "reason.replace", "string_validation"),
+    ("offline_backup_bundle.py", "_timestamp", "value.replace", "datetime_timezone"),
+    ("production_backup_capture.py", "_now", "value.replace", "datetime_timezone"),
+    ("remember_me_core_adapter.py", "_normalize_timestamp", "replace", "datetime_timezone"),
+    ("remember_me_core_adapter.py", "_normalize_timestamp", "parsed.replace", "datetime_timezone"),
+    ("remember_me_migration_acceptance.py", "_timestamp", "value.replace", "datetime_timezone"),
+    ("remember_me_mcp_presenter.py", "_verified_image", "Image.open", "pillow_image_read"),
+    ("remember_me_vector_provider.py", "_normalized_backend", "replace", "string_normalization"),
+    ("server.py", "breath_hook", "bucket_mgr.touch", "incidental_bucket_activation"),
+    ("server.py", "dream_hook", "bucket_mgr.touch", "incidental_bucket_activation"),
+    ("bucket_manager.py", "canonicalize_todos", "text.replace", "string_normalization"),
+    ("decay_engine.py", "_has_unresolved_todos", "text.replace", "string_normalization"),
+    ("server.py", "_dream_summary_line", "replace", "string_formatting"),
+    ("server.py", "_normalize_todos", "text.replace", "string_normalization"),
+    ("server.py", "_days_since", "dt.replace", "datetime_timezone"),
+    ("server.py", "format_active_matches", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "_compose_breath_query_matches", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "_attachment_probe_scan", "replace", "string_normalization"),
+    ("server.py", "_rm_verified_view_image", "Image.open", "pillow_image_read"),
+    ("server.py", "hold", "replace", "string_normalization"),
+    ("server.py", "boot", "replace", "string_normalization"),
+    ("server.py", "dream", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("server.py", "dream", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_identifier", "name.replace", "sqlite_identifier_quote"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", "connection.execute", "read_only_dynamic_sql"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", "connection.execute", "read_only_dynamic_sql"),
+    ("scripts/rm_frozen_acceptance_probe.py", "sqlite_observation", "connection.execute", "read_only_dynamic_sql"),
+    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", "self.path.parent.mkdir", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", "self.path.open", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "__enter__", "self.handle.write", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", "path.parent.mkdir", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", "temporary.open", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", "stream.write", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", "os.replace", "tmp_evidence_only"),
+    ("scripts/rm_frozen_acceptance_probe.py", "_write_json", "temporary.unlink", "tmp_evidence_only"),
+    ("utils.py", "apply_display_aliases", "text.replace", "string_alias_replacement"),
+    ("remember_me_cutover_operations.py", "_exclusion_reason", "relative.replace", "string_normalization"),
+)
+
+_NON_PATH_CALL_PRIMITIVE_SELECTORS: dict[tuple[str, str, str], str] = {
+    # These functions contain several read-only ``connection.execute`` calls;
+    # only dynamically assembled SQL needs the explicit exemption.
+    ("scripts/rm_frozen_acceptance_probe.py", "_sqlite_logical_digest", "connection.execute"): "sqlite_dynamic",
+    ("scripts/rm_frozen_acceptance_probe.py", "sqlite_observation", "connection.execute"): "sqlite_dynamic",
 }
+
+_NON_PATH_CALL_EXPECTATIONS = Counter(
+    (
+        filename,
+        function,
+        call_name,
+        _NON_PATH_CALL_PRIMITIVE_SELECTORS.get((filename, function, call_name)),
+    )
+    for filename, function, call_name, _reason in NON_PATH_CALL_ALLOWLIST
+)
 
 _CALL_NAMES = {
     "commit",
@@ -440,6 +458,7 @@ class _WriteVisitor(ast.NodeVisitor):
         self.stack: list[str] = []
         self.hits: list[WriteCoverageIssue] = []
         self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self.allowlisted_calls: Counter[tuple[str, str, str, str | None]] = Counter()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.functions[node.name] = node
@@ -452,12 +471,22 @@ class _WriteVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         primitive = self._primitive(node)
         function = self.stack[-1] if self.stack else "<module>"
-        allowed = (
+        call_name = _call_name(node.func)
+        allowlist_key = (
             self.filename,
             function,
-            node.lineno,
-            _call_name(node.func),
-        ) in NON_PATH_CALL_ALLOWLIST
+            call_name,
+            _NON_PATH_CALL_PRIMITIVE_SELECTORS.get(
+                (self.filename, function, call_name)
+            ),
+        )
+        selected_primitive = allowlist_key[-1]
+        allowed = (
+            allowlist_key in _NON_PATH_CALL_EXPECTATIONS
+            and (selected_primitive is None or primitive == selected_primitive)
+        )
+        if allowed:
+            self.allowlisted_calls[allowlist_key] += 1
         if primitive and not allowed:
             self.hits.append(WriteCoverageIssue(
                 self.filename,
@@ -519,6 +548,8 @@ def scan_registered_write_coverage(root: str | Path) -> list[WriteCoverageIssue]
                 issues.append(WriteCoverageIssue(
                     filename, hit.function, hit.line, f"guard_missing:{reason}"
                 ))
+    for visitor in visitors.values():
+        issues.extend(_validate_non_path_allowlist(visitor))
     issues.extend(_validate_guarded_callers(visitors))
     return issues
 
@@ -540,11 +571,33 @@ def scan_registered_source(source: str, filename: str) -> list[WriteCoverageIssu
             issues.append(hit if reason is None else WriteCoverageIssue(
                 filename, hit.function, hit.line, f"guard_missing:{reason}"
             ))
+    issues.extend(_validate_non_path_allowlist(visitor))
     return issues
 
 
 def _scan(source: str, filename: str) -> list[WriteCoverageIssue]:
     return _visitor(source, filename).hits
+
+
+def _validate_non_path_allowlist(visitor: _WriteVisitor) -> list[WriteCoverageIssue]:
+    """Require every structural exemption to match its exact expected count."""
+    issues: list[WriteCoverageIssue] = []
+    for (filename, function, call_name, selected_primitive), expected in _NON_PATH_CALL_EXPECTATIONS.items():
+        if filename != visitor.filename:
+            continue
+        actual = visitor.allowlisted_calls[
+            (filename, function, call_name, selected_primitive)
+        ]
+        if actual == expected:
+            continue
+        node = visitor.functions.get(function)
+        issues.append(WriteCoverageIssue(
+            filename,
+            function,
+            node.lineno if node is not None else 0,
+            f"allowlist_structure_mismatch:{call_name}:expected={expected}:actual={actual}",
+        ))
+    return issues
 
 
 def _visitor(source: str, filename: str) -> _WriteVisitor:
@@ -588,6 +641,8 @@ def _boundary_shape_valid(
         return _contains_writer_scope(node) or function in {"__exit__", "_finalize_write"}
     if reason == "startup_initialization":
         return function in {"__init__", "_initialize", "load_config"} or function.startswith("_init")
+    if reason == "runtime_initialization":
+        return function == "ensure_bucket_storage"
     if reason == "standalone_maintenance_script":
         return function in {"main", "migrate", "reclassify", "update_domain_in_file", "write_memory"}
     return reason in {

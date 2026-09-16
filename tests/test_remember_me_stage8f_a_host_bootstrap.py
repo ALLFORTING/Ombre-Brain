@@ -229,7 +229,7 @@ class Handler(logging.Handler):
 logging.getLogger("ombre_brain").addHandler(Handler())
 import server
 print(json.dumps({
-    "bundle_is_none": server.remember_me_host_bundle is None,
+    "runtime_components_initialized": server._runtime_components is not None,
     "host_module_loaded": "remember_me_host_runtime" in sys.modules,
     "data_root_exists": Path(__import__("os").environ["OMBRE_RM_DATA_ROOT"]).exists(),
     "messages": [item for item in messages if item.startswith("remember-me runtime")],
@@ -238,10 +238,10 @@ print(json.dumps({
     completed = _run_python(script, tmp_path, env=env)
     payload = json.loads(completed.stdout)
 
-    assert payload["bundle_is_none"] is True
+    assert payload["runtime_components_initialized"] is False
     assert payload["host_module_loaded"] is False
     assert payload["data_root_exists"] is False
-    assert payload["messages"] == ["remember-me runtime disabled"]
+    assert payload["messages"] == []
 
 
 def test_server_enabled_creates_bundle_with_shared_download_objects(tmp_path):
@@ -261,7 +261,7 @@ class Handler(logging.Handler):
 
 logging.getLogger("ombre_brain").addHandler(Handler())
 import server
-bundle = server.remember_me_host_bundle
+bundle = server._get_runtime_component("remember_me_host_bundle")
 links = bundle.download_links
 print(json.dumps({
     "bundle_created": bundle is not None,
@@ -308,7 +308,7 @@ def test_server_enabled_invalid_config_fails_closed(
     forbidden,
 ):
     completed = _run_python(
-        "import server",
+        "import server; server._bootstrap_remember_me_host()",
         tmp_path,
         env=_env(tmp_path, **env_values),
         check=False,
@@ -403,15 +403,10 @@ def test_stage8f_a_bootstrap_surface_remains_compatible_after_later_wiring():
     assert "await backend.reindex(" in reindex_block
 
     assert server_text.count("@mcp.custom_route") == 37
-    assert "asset_store = AssetStore(config[\"buckets_dir\"])" in server_text
-    bundle_lines = [
-        line
-        for line in server_text.splitlines()
-        if line.startswith("remember_me_host_bundle")
-    ]
-    assert bundle_lines == [
-        "remember_me_host_bundle = _bootstrap_remember_me_host()"
-    ]
+    assert "store = AssetStore(config[\"buckets_dir\"])" in server_text
+    assert 'asset_store = _LazyRuntimeComponent("asset_store")' in server_text
+    assert "def _get_remember_me_host_bundle" in server_text
+    assert "def __getattr__(name: str):" in server_text
     assert "remember_me_host_runtime" in server_text
 
     for path in production_modules:
