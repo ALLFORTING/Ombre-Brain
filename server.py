@@ -3256,6 +3256,7 @@ async def _breath_filtered_impl(
     recent_cutoff: str | None,
     include_dormant: bool,
     wake_dormant: bool,
+    touch: bool,
     include_sealed: bool,
     date_from: str,
     date_to: str,
@@ -3444,20 +3445,26 @@ async def _breath_filtered_impl(
                     original_v = float(clean_meta.get("valence", 0.5))
                     shift = (valence - 0.5) * 0.2
                     clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-                summary = await dehydrator.dehydrate(
-                    strip_wikilinks(bucket["content"]),
-                    clean_meta,
-                )
+                content = strip_wikilinks(bucket["content"])
+                if touch:
+                    summary = await dehydrator.dehydrate(content, clean_meta)
+                else:
+                    summary = await dehydrator.dehydrate(
+                        content,
+                        clean_meta,
+                        cache=False,
+                    )
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
                     token_budget_omitted += len(strong_matches) - index
                     break
                 returned_ids.add(bucket["id"])
-                await bucket_mgr.touch(
-                    bucket["id"],
-                    ripple_ids=returned_ids,
-                    wake_dormant=wake_dormant,
-                )
+                if touch:
+                    await bucket_mgr.touch(
+                        bucket["id"],
+                        ripple_ids=returned_ids,
+                        wake_dormant=wake_dormant,
+                    )
                 summary = await _format_breath_query_summary(bucket, summary)
                 results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
                 token_used += summary_tokens
@@ -3575,6 +3582,7 @@ def _breath_cursor_scope(
     resonance: str,
     min_score: float,
     as_of: str = "",
+    touch: bool = True,
 ) -> str:
     payload = {
         "query": query,
@@ -3589,6 +3597,7 @@ def _breath_cursor_scope(
         "resonance": resonance,
         "min_score": min_score,
         "as_of": as_of,
+        "touch": touch,
     }
     encoded = _json_lib.dumps(
         payload,
@@ -4166,6 +4175,7 @@ async def _breath_as_of_impl(
         resonance="",
         min_score=resolved_min_score,
         as_of=as_of_time.isoformat(timespec="seconds"),
+        touch=False,
     )
     try:
         corpus = await _historical_breath_corpus(
@@ -4267,6 +4277,7 @@ async def _breath_impl(
     tags_filter: list[str] | None = None,
     topic_filter: list[str] | None = None,
     wake_dormant: bool = False,
+    touch: bool = True,
     cursor: str = "",
     min_score: float = -1,
     as_of: str = "",
@@ -4307,7 +4318,8 @@ async def _breath_impl(
             min_score=min_score,
         )
 
-    await decay_engine.ensure_started()
+    if touch:
+        await decay_engine.ensure_started()
     query = _apply_display_aliases(query)
     max_results = max(1, min(max_results, 50))
     max_tokens = min(max_tokens, 20000)
@@ -4342,6 +4354,7 @@ async def _breath_impl(
             recent_cutoff=recent_cutoff,
             include_dormant=include_dormant, include_sealed=include_sealed,
             wake_dormant=wake_dormant,
+            touch=touch,
             date_from=date_from,
             date_to=date_to,
             resonance_target=resonance_target,
@@ -4455,11 +4468,12 @@ async def _breath_impl(
                 emotion_trend,
             )
         # Touch only the already privacy-filtered candidates.
-        for bucket in filtered:
-            await bucket_mgr.touch(
-                bucket["id"],
-                wake_dormant=wake_dormant,
-            )
+        if touch:
+            for bucket in filtered:
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    wake_dormant=wake_dormant,
+                )
         results = [
             await _append_bucket_extras(
                 await _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned"))),
@@ -4492,11 +4506,12 @@ async def _breath_impl(
         candidates.sort(key=lambda b: _resonance_distance(b, resonance_target))
         total = len(candidates)
         candidates = candidates[:max_results]
-        for bucket in candidates:
-            await bucket_mgr.touch(
-                bucket["id"],
-                wake_dormant=wake_dormant,
-            )
+        if touch:
+            for bucket in candidates:
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    wake_dormant=wake_dormant,
+                )
         results = [
             await _append_bucket_extras(
                 await _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
@@ -4561,11 +4576,12 @@ async def _breath_impl(
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
         candidates = candidates[:max_results]
-        for bucket in candidates:
-            await bucket_mgr.touch(
-                bucket["id"],
-                wake_dormant=wake_dormant,
-            )
+        if touch:
+            for bucket in candidates:
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    wake_dormant=wake_dormant,
+                )
         summary_mode = mode == "summary"
         pinned_results = []
         dynamic_results = []
@@ -4587,7 +4603,13 @@ async def _breath_impl(
             for b in pinned_buckets:
                 try:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    content = strip_wikilinks(b["content"])
+                    if touch:
+                        summary = await dehydrator.dehydrate(content, clean_meta)
+                    else:
+                        summary = await dehydrator.dehydrate(
+                            content, clean_meta, cache=False
+                        )
                     marker = "📌 " if b["metadata"].get("pinned", False) else ""
                     line = f"{marker}[核心准则] [bucket_id:{b['id']}] {summary}"
                     t = count_tokens_approx(line)
@@ -4602,7 +4624,13 @@ async def _breath_impl(
                     break
                 try:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    content = strip_wikilinks(b["content"])
+                    if touch:
+                        summary = await dehydrator.dehydrate(content, clean_meta)
+                    else:
+                        summary = await dehydrator.dehydrate(
+                            content, clean_meta, cache=False
+                        )
                     summary_tokens = count_tokens_approx(summary)
                     if summary_tokens > token_budget:
                         break
@@ -4683,6 +4711,7 @@ async def _breath_impl(
         date_to=date_to,
         resonance=resonance,
         min_score=resolved_min_score,
+        touch=touch,
     )
     search_trace = {}
     if cursor:
@@ -4782,8 +4811,9 @@ async def _breath_impl(
             str(entry.get("id", "")): entry
             for entry in search_trace.get("candidates", [])
         },
-        touch=True,
+        touch=touch,
         wake_dormant=wake_dormant,
+        cache=touch,
         next_cursor=next_cursor,
         downgraded_count=downgraded_count,
     )
@@ -7677,6 +7707,16 @@ async def breath(
             )
         ),
     ] = False,
+    touch: Annotated[
+        bool,
+        Field(
+            description=(
+                "Defaults to True. Set False for maintenance or acceptance "
+                "retrieval that must not update activation, last_active, or "
+                "dormant state; as_of is always read-only."
+            )
+        ),
+    ] = True,
     min_score: Annotated[float, Field(description="-1 reads OMBRE_BREATH_MIN_SCORE and otherwise uses 0.0; a non-negative value overrides that threshold.")] = -1,
     as_of: Annotated[
         str,
@@ -7698,7 +7738,7 @@ async def breath(
         ),
     ] = "",
 ) -> str:
-    """Retrieval-oriented memory search; surfacing may update bounded activation metadata."""
+    """Retrieval-oriented memory search; touch=False keeps maintenance retrieval read-only."""
     if (as_of or "").strip() and mailbox:
         return _with_response_seal("as_of 历史检索不支持 mailbox。")
     if mailbox:
@@ -7720,6 +7760,7 @@ async def breath(
         emotion_trend=emotion_trend,
         include_dormant=include_dormant,
         wake_dormant=wake_dormant,
+        touch=touch,
         include_sealed=include_sealed,
         date_from=date_from,
         date_to=date_to,
@@ -8633,9 +8674,19 @@ async def pulse(
         int,
         Field(ge=0, description="Number of ordered bucket summaries to skip."),
     ] = 0,
+    touch: Annotated[
+        bool,
+        Field(
+            description=(
+                "Defaults to True. Set False for maintenance or acceptance "
+                "listing that must not update dormant or decay-related metadata."
+            )
+        ),
+    ] = True,
 ) -> str:
-    """Status/listing readout; listing may update bounded dormant metadata as part of maintenance."""
-    await decay_engine.ensure_started()
+    """Status/listing readout; touch=False keeps maintenance listing read-only."""
+    if touch:
+        await decay_engine.ensure_started()
     try:
         limit = int(limit)
         offset = int(offset)
@@ -8669,7 +8720,8 @@ async def pulse(
     if not buckets:
         return status + "\n记忆库为空。\n总数:0个可见桶，当前显示:0个，还有更多:否"
 
-    await _mark_dormant_buckets(buckets)
+    if touch:
+        await _mark_dormant_buckets(buckets)
     listable_buckets = [
         b for b in buckets
         if include_sealed or not _is_sealed(b)

@@ -667,6 +667,10 @@
             ],
             "default": null
           },
+          "touch": {
+            "default": true,
+            "type": "boolean"
+          },
           "valence": {
             "default": -1,
             "type": "number"
@@ -894,6 +898,10 @@
           },
           "show_all": {
             "default": false,
+            "type": "boolean"
+          },
+          "touch": {
+            "default": true,
             "type": "boolean"
           }
         }

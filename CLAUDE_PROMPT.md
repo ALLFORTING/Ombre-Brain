@@ -38,7 +38,7 @@
 
 ## 检索与写入原则
 
-- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索；明确询问过去某时点正文时用 `breath(query="关键词", as_of="ISO8601 日期或时间")`。`as_of` 只读且不 touch，输出正文会标记为历史版本；它是历史 keyword/fuzzy 检索，不使用当前 embedding，无法检索已删除桶或重建历史 metadata。
+- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索；明确询问过去某时点正文时用 `breath(query="关键词", as_of="ISO8601 日期或时间")`。`as_of` 只读且不 touch，输出正文会标记为历史版本；它是历史 keyword/fuzzy 检索，不使用当前 embedding，无法检索已删除桶或重建历史 metadata。维护、验收或探针读取时用 `breath(..., touch=False)`，不会更新 activation、`last_active` 或 dormant，也不启动衰减引擎或写脱水缓存；query cursor 必须沿用同一 touch 值。
 - 已知 `letter_id` 时，优先 `get_letter(letter_id)`；默认 `include_sealed=False`，只有显式 `include_sealed=True` 时才能读取 sealed letter。
 - sealed letter 与真实不存在的 `letter_id` 都返回 not found；这是刻意的存在性隐藏，不应据此断言“这封信不存在”。
 - 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
@@ -55,6 +55,7 @@
 - `pulse(show_all=False)` 先组合所有 pinned/protected 桶和非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；不要把 limit 当作改变候选排序的参数。
 - `pulse(show_all=True, limit=50, offset=0)` 按稳定顺序返回可见桶的一个 bounded page。`limit` 最大为 50，`offset` 从 0 开始；根据返回中的总数、当前显示数量和 `还有更多` 判断是否继续下一页。
 - `include_archive` 和 `include_sealed` 仍分别控制归档桶和 sealed 桶可见性；分页不会改变 pinned/protected/dormant/sealed 的原有语义。
+- 维护、验收或探针列表使用 `pulse(..., touch=False)`；它不启动衰减引擎，也不标记 dormant。
 
 ## `trace` 的安全语义
 
