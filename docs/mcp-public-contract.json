@@ -894,6 +894,10 @@
             "default": false,
             "type": "boolean"
           },
+          "health": {
+            "default": false,
+            "type": "boolean"
+          },
           "limit": {
             "default": 50,
             "maximum": 50,
@@ -908,6 +912,11 @@
           "show_all": {
             "default": false,
             "type": "boolean"
+          },
+          "todo_stale_days": {
+            "default": 30,
+            "minimum": 1,
+            "type": "integer"
           },
           "touch": {
             "default": true,

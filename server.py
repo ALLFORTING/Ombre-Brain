@@ -8956,11 +8956,197 @@ async def boot(
     return _with_response_seal(f"boot profile: {profile}\n\n{body}")
 
 
+def _health_todo_age_days(metadata: dict) -> float | None:
+    """Return bucket-level todo activity age, or None when it is unavailable."""
+    for field in ("last_active", "updated_at", "created"):
+        value = metadata.get(field)
+        if not value:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(str(value))
+            if timestamp.tzinfo is not None:
+                timestamp = datetime.fromtimestamp(timestamp.timestamp())
+            return max(0.0, (datetime.now() - timestamp).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _health_supersession_report(
+    visible_buckets: list[dict],
+    all_buckets: list[dict],
+) -> dict[str, int]:
+    """Return count-only integrity findings without crossing sealed boundaries.
+
+    The total is the number of distinct visible buckets participating in at
+    least one finding.  Category counts can overlap for a malformed relation.
+    """
+    visible_by_id = {
+        str(bucket.get("id", "")): bucket
+        for bucket in visible_buckets
+        if str(bucket.get("id", ""))
+    }
+    all_by_id = {
+        str(bucket.get("id", "")): bucket
+        for bucket in all_buckets
+        if str(bucket.get("id", ""))
+    }
+    sealed_ids = {
+        bucket_id for bucket_id, bucket in all_by_id.items() if _is_sealed(bucket)
+    }
+    findings = {
+        "missing_successor": set(),
+        "missing_reverse": set(),
+        "stale_reverse": set(),
+        "forward_self": set(),
+        "reverse_self": set(),
+        "cycle": set(),
+        "malformed_successor": set(),
+    }
+
+    def add(kind: str, *bucket_ids: str) -> None:
+        for bucket_id in bucket_ids:
+            if bucket_id in visible_by_id:
+                findings[kind].add(bucket_id)
+
+    for source_id, source in visible_by_id.items():
+        successor_id = _superseded_by_id(source.get("metadata", {}))
+        if not successor_id or successor_id == "none":
+            continue
+        if successor_id == source_id:
+            add("forward_self", source_id)
+            continue
+        if successor_id.casefold() == "none":
+            add("malformed_successor", source_id)
+            continue
+        # A sealed successor is intentionally indistinguishable from a missing
+        # one in ordinary maintenance output, so it contributes no finding.
+        if successor_id in sealed_ids:
+            continue
+        successor = all_by_id.get(successor_id)
+        if successor is None:
+            add("missing_successor", source_id)
+            continue
+        if source_id not in _supersedes_ids(successor.get("metadata", {})):
+            add("missing_reverse", source_id)
+
+    for holder_id, holder in visible_by_id.items():
+        for source_id in _supersedes_ids(holder.get("metadata", {})):
+            if source_id == holder_id:
+                add("reverse_self", holder_id)
+                continue
+            if source_id in sealed_ids:
+                continue
+            source = all_by_id.get(source_id)
+            if source is None:
+                add("stale_reverse", holder_id)
+                continue
+            if _superseded_by_id(source.get("metadata", {})) != holder_id:
+                add("stale_reverse", holder_id, source_id)
+
+    # Each bucket has at most one forward edge.  Walk only visible, non-sealed
+    # edges so a sealed endpoint cannot affect an ordinary health count.
+    for start_id in visible_by_id:
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current_id = start_id
+        cycle_start = None
+        while current_id in visible_by_id:
+            if current_id in positions:
+                cycle_start = positions[current_id]
+                break
+            positions[current_id] = len(path)
+            path.append(current_id)
+            successor_id = _superseded_by_id(
+                visible_by_id[current_id].get("metadata", {})
+            )
+            if not successor_id or successor_id == "none" or successor_id in sealed_ids:
+                break
+            current_id = successor_id
+        if cycle_start is not None:
+            cycle_ids = path[cycle_start:]
+            # A one-node loop is already reported as forward_self above.
+            if len(cycle_ids) > 1:
+                for bucket_id in cycle_ids:
+                    add("cycle", bucket_id)
+
+    total = set().union(*findings.values())
+    return {
+        "total": len(total),
+        **{name: len(bucket_ids) for name, bucket_ids in findings.items()},
+    }
+
+
+def _maintenance_health_report(
+    visible_buckets: list[dict],
+    all_buckets: list[dict],
+    *,
+    todo_stale_days: int,
+) -> str:
+    """Format count-only, read-only maintenance health for ordinary access."""
+    unnamed = 0
+    untagged = 0
+    stale_todos = 0
+    todo_age_unavailable = 0
+    pinned_low_importance = 0
+
+    for bucket in visible_buckets:
+        bucket_id = str(bucket.get("id", ""))
+        metadata = bucket.get("metadata", {})
+        name = metadata.get("name")
+        if name is None or not str(name).strip() or str(name) == bucket_id:
+            unnamed += 1
+        if not any(str(tag).strip() for tag in _structured_metadata_values(metadata, "tags")):
+            untagged += 1
+        if metadata.get("pinned"):
+            try:
+                importance = int(metadata.get("importance", 0) or 0)
+            except (TypeError, ValueError):
+                importance = None
+            if importance is not None and importance < 3:
+                pinned_low_importance += 1
+
+        if metadata.get("resolved", False) or not _canonical_todos(metadata.get("todos")):
+            continue
+        age_days = _health_todo_age_days(metadata)
+        if age_days is None:
+            todo_age_unavailable += 1
+        elif age_days > todo_stale_days:
+            stale_todos += 1
+
+    supersession = _health_supersession_report(visible_buckets, all_buckets)
+    return "\n".join(
+        [
+            "=== maintenance health ===",
+            f"unnamed buckets: {unnamed}",
+            f"untagged buckets: {untagged}",
+            f"stale todo buckets (>{todo_stale_days}d): {stale_todos}",
+            f"todo age unavailable: {todo_age_unavailable}",
+            f"supersession problems: {supersession['total']}",
+            f"pinned importance <3: {pinned_low_importance}",
+        ]
+    )
+
+
 @mcp.tool()
 async def pulse(
     include_archive: bool = False,
     show_all: bool = False,
     include_sealed: bool = False,
+    health: Annotated[
+        bool,
+        Field(description="Enable read-only maintenance health counts. Requires touch=false."),
+    ] = False,
+    todo_stale_days: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Bucket-level inactivity threshold used by health reporting; "
+                "does not represent per-todo age."
+            ),
+        ),
+    ] = 30,
     limit: Annotated[
         int,
         Field(ge=1, le=50, description="Maximum number of bucket summaries to display."),
@@ -8980,6 +9166,16 @@ async def pulse(
     ] = True,
 ) -> str:
     """Status/listing readout; touch=False keeps maintenance listing read-only."""
+    try:
+        todo_stale_days = int(todo_stale_days)
+    except (TypeError, ValueError):
+        return "todo_stale_days 必须是正整数。"
+    if todo_stale_days < 1:
+        return "todo_stale_days 必须是正整数。"
+    if health and touch:
+        return "health=True 需要 touch=False，以保持维护报告只读。"
+    if health and include_sealed:
+        return "health=True 不支持 include_sealed，以保护封存记忆边界。"
     if touch:
         await decay_engine.ensure_started()
     try:
@@ -9012,15 +9208,30 @@ async def pulse(
     except Exception as e:
         logger.error("Pulse bucket listing failed: %s", e); return status + "\n列出记忆桶失败。"
 
-    if not buckets:
-        return status + "\n记忆库为空。\n总数:0个可见桶，当前显示:0个，还有更多:否"
-
     if touch:
         await _mark_dormant_buckets(buckets)
     listable_buckets = [
         b for b in buckets
         if include_sealed or not _is_sealed(b)
     ]
+    health_report = ""
+    if health:
+        try:
+            all_health_buckets = await bucket_mgr.list_all(include_archive=True)
+        except Exception as exc:
+            logger.error("Pulse health listing failed: %s", exc)
+            health_report = "=== maintenance health ===\nhealth unavailable"
+        else:
+            health_report = _maintenance_health_report(
+                listable_buckets,
+                all_health_buckets,
+                todo_stale_days=todo_stale_days,
+            )
+
+    if not buckets:
+        empty = "记忆库为空。\n总数:0个可见桶，当前显示:0个，还有更多:否"
+        return status + "\n" + empty + ("\n" + health_report if health else "")
+
     total_buckets = len(listable_buckets)
     pinned_buckets = [
         b for b in listable_buckets
@@ -9118,7 +9329,13 @@ async def pulse(
             f"（钉选{len(pinned_buckets)}个 + 动态Top15，limit={limit}, offset={offset}），"
             f"还有更多:{'是' if has_more else '否'}\n"
         )
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines) + display_stats
+    return (
+        status
+        + "\n=== 记忆列表 ===\n"
+        + "\n".join(lines)
+        + display_stats
+        + ("\n" + health_report if health else "")
+    )
 
 
 # =============================================================
