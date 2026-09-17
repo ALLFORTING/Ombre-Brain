@@ -63,6 +63,7 @@ logger = logging.getLogger("ombre_brain.bucket")
 _IMPORT_MARKER_FIELD = "_ob_import_operations"
 _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
 _BOOT_DELTA_PROFILES = ("talk", "code", "tg")
+TODO_SAID_BY_VALUES = frozenset({"ting", "model", "system", "unknown"})
 
 
 def canonicalize_todos(raw: Any) -> list[str]:
@@ -96,6 +97,153 @@ def canonicalize_todos(raw: Any) -> list[str]:
         text = str(raw).strip()
         values = [text] if text else []
     return list(dict.fromkeys(values))
+
+
+def _todo_provenance_record(
+    raw: Any,
+    *,
+    strict: bool,
+) -> dict[str, Any] | None:
+    """Validate one optional todo-provenance sidecar record.
+
+    ``todos`` deliberately remains a list of text strings.  This sidecar is
+    therefore allowed to be missing or malformed on existing files without
+    affecting normal todo reads.  Explicit new writes use ``strict=True`` and
+    reject malformed values rather than silently recording invented metadata.
+    """
+    if not isinstance(raw, dict):
+        if strict:
+            raise ValueError("todo provenance entries must be objects.")
+        return None
+    allowed = {"text", "said_by", "said_at", "source_bucket"}
+    unexpected = set(raw) - allowed
+    if unexpected:
+        if strict:
+            raise ValueError("todo provenance entries contain unsupported fields.")
+        return None
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        if strict:
+            raise ValueError("todo provenance text must be a non-empty string.")
+        return None
+    said_by = raw.get("said_by", "unknown")
+    if not isinstance(said_by, str) or said_by not in TODO_SAID_BY_VALUES:
+        if strict:
+            raise ValueError(
+                "todo provenance said_by must be ting, model, system, or unknown."
+            )
+        return None
+    said_at = raw.get("said_at")
+    if said_at is not None:
+        if not isinstance(said_at, str) or not said_at.strip():
+            if strict:
+                raise ValueError("todo provenance said_at must be an ISO-8601 string or null.")
+            return None
+        said_at = said_at.strip()
+        try:
+            datetime.fromisoformat(said_at)
+        except (TypeError, ValueError):
+            if strict:
+                raise ValueError("todo provenance said_at must be an ISO-8601 string or null.")
+            return None
+    source_bucket = raw.get("source_bucket")
+    if source_bucket is not None:
+        if not isinstance(source_bucket, str):
+            if strict:
+                raise ValueError("todo provenance source_bucket must be a string or null.")
+            return None
+        source_bucket = source_bucket.strip() or None
+    return {
+        "text": text.strip(),
+        "said_by": said_by,
+        "said_at": said_at,
+        "source_bucket": source_bucket,
+    }
+
+
+def reconcile_todo_provenance(
+    todos: Any,
+    raw_provenance: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    """Return safe sidecar records for the canonical todo text list.
+
+    First valid record wins for duplicate canonical text.  A missing sidecar
+    record means unknown provenance; this helper never manufactures records
+    for legacy or automatic-extraction todos.
+    """
+    canonical_todos = canonicalize_todos(todos)
+    if raw_provenance is None:
+        return []
+    if not isinstance(raw_provenance, list):
+        if strict:
+            raise ValueError("todo_provenance must be a list.")
+        return []
+    allowed_texts = set(canonical_todos)
+    records_by_text: dict[str, dict[str, Any]] = {}
+    for raw_record in raw_provenance:
+        record = _todo_provenance_record(raw_record, strict=strict)
+        if record is None:
+            continue
+        if record["text"] not in allowed_texts:
+            if strict:
+                raise ValueError("todo provenance text must appear in todos.")
+            continue
+        records_by_text.setdefault(record["text"], record)
+    return [records_by_text[text] for text in canonical_todos if text in records_by_text]
+
+
+def _todo_provenance_is_known(record: dict[str, Any] | None) -> bool:
+    return bool(record) and (
+        record.get("said_by") != "unknown"
+        or record.get("said_at") is not None
+        or record.get("source_bucket") is not None
+    )
+
+
+def merge_todo_provenance(
+    target_todos: Any,
+    target_provenance: Any,
+    source_todos: Any,
+    source_provenance: Any,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Merge todo text and sidecars without arbitrarily choosing attribution."""
+    target = canonicalize_todos(target_todos)
+    source = canonicalize_todos(source_todos)
+    merged_todos = list(dict.fromkeys(target + source))
+    target_records = {
+        record["text"]: record
+        for record in reconcile_todo_provenance(target, target_provenance)
+    }
+    source_records = {
+        record["text"]: record
+        for record in reconcile_todo_provenance(source, source_provenance)
+    }
+    merged_records = []
+    for text in merged_todos:
+        target_record = target_records.get(text)
+        source_record = source_records.get(text)
+        if target_record is None:
+            chosen = source_record
+        elif source_record is None or target_record == source_record:
+            chosen = target_record
+        elif _todo_provenance_is_known(target_record) and not _todo_provenance_is_known(source_record):
+            chosen = target_record
+        elif _todo_provenance_is_known(source_record) and not _todo_provenance_is_known(target_record):
+            chosen = source_record
+        else:
+            # Both sides claim incompatible known provenance.  Preserve the
+            # todo text but deliberately discard unsupported attribution.
+            chosen = {
+                "text": text,
+                "said_by": "unknown",
+                "said_at": None,
+                "source_bucket": None,
+            }
+        if chosen is not None:
+            merged_records.append(dict(chosen))
+    return merged_todos, merged_records
 
 
 class BucketIdempotencyError(RuntimeError):
@@ -1164,6 +1312,7 @@ class BucketManager:
         sealed: bool = False,
         topics: list[str] = None,
         todos: list[str] = None,
+        todo_provenance: list[dict[str, Any]] | None = None,
         _o5b_operation_key: str | None = None,
         _o5b_payload_digest: str | None = None,
         _o5c_memory_mutation_id: str | None = None,
@@ -1176,6 +1325,12 @@ class BucketManager:
         Importance is locked to 10 for pinned/protected buckets.
         pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
         """
+        canonical_todos = canonicalize_todos(todos)
+        canonical_todo_provenance = reconcile_todo_provenance(
+            canonical_todos,
+            todo_provenance,
+            strict=todo_provenance is not None,
+        )
         operation = None
         if _o5b_operation_key is not None:
             operation_payload = {
@@ -1188,7 +1343,9 @@ class BucketManager:
                 "name": name,
             }
             if todos is not None:
-                operation_payload["todos"] = canonicalize_todos(todos)
+                operation_payload["todos"] = canonical_todos
+            if todo_provenance is not None:
+                operation_payload["todo_provenance"] = canonical_todo_provenance
             operation = self._ensure_import_operation(
                 _o5b_operation_key,
                 operation_kind="create",
@@ -1205,7 +1362,14 @@ class BucketManager:
         name = apply_display_aliases(name) if name else name
         tags = apply_display_aliases_to_value(tags or [])
         domain = apply_display_aliases_to_value(domain) if domain else domain
-        todos = apply_display_aliases_to_value(canonicalize_todos(todos))
+        todos = apply_display_aliases_to_value(canonical_todos)
+        todo_provenance = reconcile_todo_provenance(
+            todos,
+            [
+                {**record, "text": apply_display_aliases(record["text"])}
+                for record in canonical_todo_provenance
+            ],
+        )
         bucket_name = sanitize_name(name) if name else bucket_id
         # feel buckets are allowed to have empty domain; others default to ["未分类"]
         if bucket_type == "feel":
@@ -1244,6 +1408,8 @@ class BucketManager:
             "activation_count": 0,
             "todos": todos,
         }
+        if todo_provenance:
+            metadata["todo_provenance"] = todo_provenance
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -1422,6 +1588,10 @@ class BucketManager:
 
         previous_content = str(post.content or "")
         previous_todos = canonicalize_todos(post.get("todos"))
+        previous_todo_provenance = reconcile_todo_provenance(
+            previous_todos,
+            post.get("todo_provenance"),
+        )
         previous_superseded_by = post.get("superseded_by")
 
         if operation is not None:
@@ -1488,10 +1658,31 @@ class BucketManager:
         if "tags" in kwargs:
             kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
             post["tags"] = kwargs["tags"]
-        if "todos" in kwargs:
-            post["todos"] = apply_display_aliases_to_value(
-                canonicalize_todos(kwargs["todos"])
+        if "todos" in kwargs or "todo_provenance" in kwargs:
+            next_todos = (
+                apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
+                if "todos" in kwargs
+                else previous_todos
             )
+            raw_provenance = (
+                kwargs["todo_provenance"]
+                if "todo_provenance" in kwargs
+                else previous_todo_provenance
+            )
+            try:
+                next_todo_provenance = reconcile_todo_provenance(
+                    next_todos,
+                    raw_provenance,
+                    strict="todo_provenance" in kwargs,
+                )
+            except ValueError as exc:
+                logger.warning("Refusing invalid todo provenance update for %s: %s", bucket_id, exc)
+                return False
+            post["todos"] = next_todos
+            if next_todo_provenance:
+                post["todo_provenance"] = next_todo_provenance
+            else:
+                post.metadata.pop("todo_provenance", None)
         if "importance" in kwargs:
             post["importance"] = max(1, min(10, int(kwargs["importance"])))
         if "domain" in kwargs:
@@ -1590,6 +1781,9 @@ class BucketManager:
         if content_changed and str(post.content or "") != previous_content:
             self._record_boot_delta_event(bucket_id, "content_updated")
         current_todos = canonicalize_todos(post.get("todos"))
+        # Boot deltas intentionally track todo text only.  Provenance-only
+        # sidecar changes are metadata refinements and do not create a new
+        # boot-delta event in Phase 5.10.
         if current_todos != previous_todos:
             self._record_boot_delta_event(
                 bucket_id,

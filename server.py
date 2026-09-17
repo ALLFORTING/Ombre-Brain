@@ -83,7 +83,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
-from bucket_manager import BucketManager, canonicalize_todos
+from bucket_manager import (
+    BucketManager,
+    canonicalize_todos,
+    merge_todo_provenance,
+    reconcile_todo_provenance,
+)
 from asset_store import (
     MAX_IMAGE_PIXELS as RM_ASSET_MAX_IMAGE_PIXELS,
     AssetStore,
@@ -1687,6 +1692,30 @@ def _canonical_todos(raw) -> list[str]:
     return canonicalize_todos(_normalize_todos(raw))
 
 
+def _structured_todo_items(todo_items) -> tuple[list[str], list[dict]]:
+    """Validate MCP todo_items without changing legacy todos semantics."""
+    if not isinstance(todo_items, list):
+        raise ValueError("todo_items 必须是数组。")
+    raw_todos = []
+    for item in todo_items:
+        if not isinstance(item, dict):
+            raise ValueError("todo_items 的每一项必须是对象。")
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("todo_items.text 必须是非空字符串。")
+        raw_todos.append(text.strip())
+    todos = _canonical_todos(raw_todos)
+    try:
+        provenance = reconcile_todo_provenance(
+            todos,
+            todo_items,
+            strict=True,
+        )
+    except ValueError as exc:
+        raise ValueError(f"todo_items 无效：{exc}") from exc
+    return todos, provenance
+
+
 def _parse_emotion_history(raw) -> list[dict]:
     if isinstance(raw, list):
         history = raw
@@ -2008,9 +2037,12 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
     if isinstance(source_tags, str):
         source_tags = _parse_csv_ids(source_tags)
     merged_tags = list(dict.fromkeys([*target_tags, *source_tags]))
-    target_todos = _canonical_todos(target_meta.get("todos"))
-    source_todos = _canonical_todos(source_meta.get("todos"))
-    merged_todos = list(dict.fromkeys(target_todos + source_todos))
+    merged_todos, merged_todo_provenance = merge_todo_provenance(
+        _canonical_todos(target_meta.get("todos")),
+        target_meta.get("todo_provenance"),
+        _canonical_todos(source_meta.get("todos")),
+        source_meta.get("todo_provenance"),
+    )
     merged_importance = max(
         int(target_meta.get("importance", 5)),
         int(source_meta.get("importance", 5)),
@@ -2032,6 +2064,7 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         valence=merged_valence,
         arousal=merged_arousal,
         todos=merged_todos,
+        todo_provenance=merged_todo_provenance,
     )
     if not updated:
         return f"合并失败，无法更新目标桶: {target_id}"
@@ -8375,6 +8408,15 @@ async def trace(
     importance: Annotated[int, Field(description="-1 means unchanged; 1-10 sets the stored importance.")] = -1,
     tags: str = "",
     todos: str | list[str] | None = None,
+    todo_items: Annotated[
+        list[dict] | None,
+        Field(
+            description=(
+                "Optional structured todo entries with text, said_by, said_at, "
+                "and source_bucket. Mutually exclusive with legacy todos."
+            )
+        ),
+    ] = None,
     resolved: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
     pinned: Annotated[int, Field(description="-1 means unchanged; 0 means False (unpinning a pinned bucket requires confirm_token); 1 means True.")] = -1,
     digested: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
@@ -8395,6 +8437,16 @@ async def trace(
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    if todos is not None and todo_items is not None:
+        return "todos 与 todo_items 不能同时使用。"
+    structured_todos = None
+    structured_provenance = None
+    if todo_items is not None:
+        try:
+            structured_todos, structured_provenance = _structured_todo_items(todo_items)
+        except ValueError as exc:
+            return str(exc)
 
     bucket_ids = list(dict.fromkeys(_parse_csv_ids(bucket_id)))
     if not bucket_ids:
@@ -8419,6 +8471,7 @@ async def trace(
                 importance=importance,
                 tags=tags,
                 todos=todos,
+                todo_items=todo_items,
                 resolved=resolved,
                 pinned=pinned,
                 digested=digested,
@@ -8499,7 +8552,10 @@ async def trace(
         updates["importance"] = importance
     if tags:
         updates["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-    if todos is not None:
+    if todo_items is not None:
+        updates["todos"] = structured_todos
+        updates["todo_provenance"] = structured_provenance
+    elif todos is not None:
         updates["todos"] = _canonical_todos(todos)
     if resolved in (0, 1):
         updates["resolved"] = bool(resolved)
@@ -8716,8 +8772,18 @@ async def archive_session(
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def todos() -> str:
-    """Return todos from every unresolved bucket, grouped by bucket."""
+async def todos(
+    include_provenance: Annotated[
+        bool,
+        Field(
+            description=(
+                "Defaults to false. When true, group the dedicated todo output "
+                "by explicit provenance without changing ordinary todo text."
+            )
+        ),
+    ] = False,
+) -> str:
+    """Return unresolved todos; provenance output is an explicit opt-in."""
     await decay_engine.ensure_started()
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=True)
@@ -8726,6 +8792,12 @@ async def todos() -> str:
         return "待办汇总暂时无法读取。"
 
     groups = []
+    provenance_groups = {
+        "ting": [],
+        "model": [],
+        "system": [],
+        "unknown": [],
+    }
     for bucket in all_buckets:
         meta = bucket.get("metadata", {})
         if _is_sealed(bucket):
@@ -8737,12 +8809,48 @@ async def todos() -> str:
             continue
         name = meta.get("name", bucket["id"])
         importance = meta.get("importance", "?")
+        if include_provenance:
+            provenance_by_text = {
+                record["text"]: record
+                for record in reconcile_todo_provenance(
+                    _canonical_todos(meta.get("todos")),
+                    meta.get("todo_provenance"),
+                )
+            }
+            for item in items:
+                record = provenance_by_text.get(item, {})
+                said_by = record.get("said_by", "unknown")
+                said_at = record.get("said_at")
+                suffix = f" | said_at:{said_at}" if said_at else ""
+                provenance_groups[said_by].append(
+                    (
+                        int(meta.get("importance", 0) or 0),
+                        f"- {item} [bucket_id:{bucket['id']}] {name} "
+                        f"| 重要度:{importance}{suffix}",
+                    )
+                )
+            continue
         lines = [
             f"[bucket_id:{bucket['id']}] {name} | 重要度:{importance}",
             *(f"- {item}" for item in items),
         ]
         groups.append((int(meta.get("importance", 0) or 0), "\n".join(lines)))
 
+    if include_provenance:
+        headings = {
+            "ting": "=== 婷明确说的 ===",
+            "model": "=== 模型自己列的 ===",
+            "system": "=== 系统 ===",
+            "unknown": "=== 出处未知 ===",
+        }
+        sections = []
+        for said_by in ("ting", "model", "system", "unknown"):
+            entries = provenance_groups[said_by]
+            if not entries:
+                continue
+            entries.sort(key=lambda item: item[0], reverse=True)
+            sections.append(headings[said_by] + "\n" + "\n".join(text for _, text in entries))
+        return "\n\n".join(sections) if sections else "当前没有未完成待办。"
     if not groups:
         return "当前没有未完成待办。"
     groups.sort(key=lambda item: item[0], reverse=True)
