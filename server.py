@@ -2440,6 +2440,7 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
 
 
 BOOT_TRUNCATION_NOTICE_TOKENS = 160
+BOOT_DELTA_MAX_TOKENS = 600
 BOOT_SECTION_MINIMUM_CHARS = {
     "mailbox": 1000,
     "todos": 1500,
@@ -2469,11 +2470,13 @@ def _fit_sections_to_budget(
     max_tokens: int,
     *,
     minimum_chars: dict[str, int] | None = None,
+    atomic_sections: set[str] | None = None,
 ) -> str:
     """Fit named sections in priority order and report every omitted block."""
     if not sections:
         return ""
     minimum_chars = minimum_chars or {}
+    atomic_sections = atomic_sections or set()
     total_tokens = sum(count_tokens_approx(text) for _, _, text in sections)
     if total_tokens <= max_tokens:
         return "\n\n".join(text for _, _, text in sections)
@@ -2522,6 +2525,11 @@ def _fit_sections_to_budget(
             used += section_tokens
             continue
 
+        if key in atomic_sections:
+            omitted.append(display_name)
+            priority_exhausted = True
+            continue
+
         prefix = _prefix_within_token_budget(text, available)
         if prefix:
             output.append(prefix)
@@ -2544,6 +2552,96 @@ def _fit_sections_to_budget(
         )
     output.append(notice)
     return "\n\n".join(output)
+
+
+def _boot_delta_locator(bucket: dict) -> str:
+    """Return a bounded stable locator without exposing bucket content."""
+    meta = bucket.get("metadata", {})
+    name = str(meta.get("name", bucket.get("id", ""))).strip()
+    if len(name) > 80:
+        name = name[:77].rstrip() + "..."
+    return f"[bucket_id:{bucket['id']}] {name or bucket['id']}"
+
+
+def _format_boot_delta(
+    *,
+    checkpoint: dict | None,
+    high_water: int,
+    visible_buckets: list[dict],
+) -> str:
+    """Format complete, bounded boot-delta records from the durable event log."""
+    header = "=== boot: 增量摘要 ==="
+    if checkpoint is None:
+        return f"{header}\n（暂无上次 boot 基线）"
+
+    visible_by_id = {
+        str(bucket.get("id", "")): bucket
+        for bucket in visible_buckets
+        if bucket.get("id") and not _is_sealed(bucket)
+    }
+    events = bucket_mgr.get_boot_delta_events(
+        int(checkpoint["last_event_id"]),
+        high_water,
+    )
+    records: list[tuple[str, int, int, str]] = []
+    for event in events:
+        bucket = visible_by_id.get(str(event.get("bucket_id", "")))
+        if bucket is None:
+            continue
+        payload = event.get("payload", {})
+        event_type = event.get("event_type")
+        if event_type == "created":
+            detail = "新建"
+        elif event_type == "content_updated":
+            detail = "正文已修改"
+        elif event_type == "todos_updated":
+            closed = int(payload.get("closed_count", 0) or 0)
+            opened = int(payload.get("opened_count", 0) or 0)
+            if closed:
+                detail = f"todo 已关闭 {closed} 项"
+            elif opened:
+                detail = f"todo 已更新，新增 {opened} 项"
+            else:
+                detail = "todo 状态已更新"
+        elif event_type == "superseded":
+            detail = (
+                "已标记 invalidated"
+                if payload.get("mode") == "none"
+                else "已标记 superseded"
+            )
+        else:
+            continue
+        importance = int(bucket.get("metadata", {}).get("importance", 0) or 0)
+        records.append(
+            (
+                str(event.get("occurred_at", "")),
+                importance,
+                int(event.get("id", 0) or 0),
+                f"- {_boot_delta_locator(bucket)}：{detail}",
+            )
+        )
+
+    if not records:
+        return f"{header}\n（无新增变化）"
+
+    records.sort(key=lambda item: item[:3], reverse=True)
+    selected: list[str] = []
+    omitted = 0
+    for index, (_, _, _, record) in enumerate(records):
+        remaining = len(records) - index - 1
+        candidate = [header, *selected, record]
+        if remaining:
+            candidate.append(f"（还有 {remaining} 项未展开）")
+        if count_tokens_approx("\n".join(candidate)) <= BOOT_DELTA_MAX_TOKENS:
+            selected.append(record)
+            continue
+        omitted = len(records) - index
+        break
+
+    lines = [header, *selected]
+    if omitted:
+        lines.append(f"（还有 {omitted} 项未展开）")
+    return "\n".join(lines)
 
 
 def _digest_api_config() -> tuple[str, str, str]:
@@ -8584,6 +8682,17 @@ async def boot(
         logger.error("Boot failed to list buckets: %s", exc)
         return _with_response_seal("boot 暂时无法读取记忆库。")
 
+    checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+    high_water = bucket_mgr.get_boot_delta_high_water()
+    visible_buckets = list({
+        bucket["id"]: bucket for bucket in [*active_buckets, *archive_buckets]
+    }.values())
+    delta_text = _format_boot_delta(
+        checkpoint=checkpoint,
+        high_water=high_water,
+        visible_buckets=visible_buckets,
+    )
+
     trigger_text, trigger_ids = await _format_due_triggers(active_buckets)
 
     pinned = [
@@ -8639,25 +8748,61 @@ async def boot(
     ):
         ting_note_text, _ = _format_ting_note_for_boot(note_now, max_tokens)
 
-    body = _fit_sections_to_budget(
-        [
-            ("ting_note", "婷留言", ting_note_text),
-            ("triggers", "今日触发", trigger_text),
-            ("mailbox", "最新 letter", mailbox_text),
-            ("todos", "todos", todos_text),
-            ("sessions", "最近归档", sessions_text),
-            ("pinned", "钉选索引", pinned_text),
-            ("echo", "feel 回声", echo_text),
-        ],
-        max_tokens=max_tokens - 20,
-        minimum_chars={
-            **BOOT_SECTION_MINIMUM_CHARS,
-            "ting_note": len(ting_note_text),
-        },
-    )
+    def _compose_boot_body(current_delta_text: str) -> str:
+        return _fit_sections_to_budget(
+            [
+                ("ting_note", "婷留言", ting_note_text),
+                ("delta", "增量摘要", current_delta_text),
+                ("triggers", "今日触发", trigger_text),
+                ("mailbox", "最新 letter", mailbox_text),
+                ("todos", "todos", todos_text),
+                ("sessions", "最近归档", sessions_text),
+                ("pinned", "钉选索引", pinned_text),
+                ("echo", "feel 回声", echo_text),
+            ],
+            max_tokens=max_tokens - 20,
+            minimum_chars={
+                **BOOT_SECTION_MINIMUM_CHARS,
+                "ting_note": len(ting_note_text),
+                "delta": len(current_delta_text),
+            },
+            atomic_sections={"delta"},
+        )
+
+    body = _compose_boot_body(delta_text)
     today = datetime.now().date().isoformat()
     for bucket_id in trigger_ids:
         await bucket_mgr.update(bucket_id, trigger_last_seen=today)
+
+    expected_event_id = (
+        int(checkpoint["last_event_id"]) if checkpoint is not None else None
+    )
+    if not bucket_mgr.advance_boot_delta_checkpoint(expected_event_id, high_water):
+        # Another boot completed first. Rebuild against its checkpoint so this
+        # response cannot replay that already-delivered delta batch.
+        checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+        high_water = bucket_mgr.get_boot_delta_high_water()
+        delta_text = _format_boot_delta(
+            checkpoint=checkpoint,
+            high_water=high_water,
+            visible_buckets=visible_buckets,
+        )
+        body = _compose_boot_body(delta_text)
+        expected_event_id = (
+            int(checkpoint["last_event_id"]) if checkpoint is not None else None
+        )
+        if not bucket_mgr.advance_boot_delta_checkpoint(expected_event_id, high_water):
+            # A later concurrent boot owns the checkpoint; its successful
+            # advance remains authoritative and no event is discarded here.
+            checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+            high_water = bucket_mgr.get_boot_delta_high_water()
+            body = _compose_boot_body(
+                _format_boot_delta(
+                    checkpoint=checkpoint,
+                    high_water=high_water,
+                    visible_buckets=visible_buckets,
+                )
+            )
     return _with_response_seal(body)
 
 

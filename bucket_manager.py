@@ -274,6 +274,30 @@ class BucketManager:
                 "CREATE INDEX IF NOT EXISTS idx_notes_created_at "
                 "ON notes(created_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS boot_delta_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bucket_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_boot_delta_events_bucket_id "
+                "ON boot_delta_events(bucket_id, id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS boot_delta_checkpoint (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    last_event_id INTEGER NOT NULL,
+                    completed_at TEXT NOT NULL
+                )
+                """
+            )
 
     def _ensure_import_operation_table(self) -> None:
         """Create the lazy O5B operation journal only when capture is used."""
@@ -637,6 +661,112 @@ class BucketManager:
                 """,
                 (bucket_id, old_content or "", now_iso(), change_type),
             )
+
+    @guarded_mutation("boot_delta_event_write")
+    def _record_boot_delta_event(
+        self,
+        bucket_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a compact business change for the next successful boot."""
+        serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO boot_delta_events
+                    (bucket_id, event_type, payload_json, occurred_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (bucket_id, event_type, serialized, now_iso()),
+            )
+
+    def get_boot_delta_checkpoint(self) -> dict[str, Any] | None:
+        """Return the database-scoped last successful boot checkpoint."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT last_event_id, completed_at
+                FROM boot_delta_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_boot_delta_high_water(self) -> int:
+        """Return the current boot-delta event high-water mark without writing."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM boot_delta_events"
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def get_boot_delta_events(
+        self,
+        after_event_id: int,
+        through_event_id: int,
+    ) -> list[dict[str, Any]]:
+        """Read one stable boot-delta event range, oldest first."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, bucket_id, event_type, payload_json, occurred_at
+                FROM boot_delta_events
+                WHERE id > ? AND id <= ?
+                ORDER BY id ASC
+                """,
+                (int(after_event_id), int(through_event_id)),
+            ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            try:
+                payload = json.loads(event.pop("payload_json"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            event["payload"] = payload if isinstance(payload, dict) else {}
+            events.append(event)
+        return events
+
+    @guarded_mutation("boot_delta_checkpoint_write")
+    def advance_boot_delta_checkpoint(
+        self,
+        expected_event_id: int | None,
+        next_event_id: int,
+    ) -> bool:
+        """CAS-advance the checkpoint only after a boot body has been completed."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT last_event_id FROM boot_delta_checkpoint WHERE singleton = 1"
+            ).fetchone()
+            current = int(row["last_event_id"]) if row is not None else None
+            if current != expected_event_id:
+                conn.rollback()
+                return False
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO boot_delta_checkpoint
+                        (singleton, last_event_id, completed_at)
+                    VALUES (1, ?, ?)
+                    """,
+                    (int(next_event_id), now_iso()),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE boot_delta_checkpoint
+                    SET last_event_id = ?, completed_at = ?
+                    WHERE singleton = 1
+                    """,
+                    (int(next_event_id), now_iso()),
+                )
+            conn.commit()
+        return True
 
     def get_history(self, bucket_id: str, limit: int = 20) -> list[dict]:
         """Return recent write-ahead snapshots for manual recovery."""
@@ -1151,6 +1281,7 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        self._record_boot_delta_event(bucket_id, "created")
         if not sealed:
             await self._refresh_ordinary_embedding_best_effort(bucket_id, content)
         return bucket_id
@@ -1233,6 +1364,10 @@ class BucketManager:
         except Exception as e:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
+
+        previous_content = str(post.content or "")
+        previous_todos = canonicalize_todos(post.get("todos"))
+        previous_superseded_by = post.get("superseded_by")
 
         if operation is not None:
             marker = self._operation_marker(post, o5b_operation_key)
@@ -1395,6 +1530,29 @@ class BucketManager:
             await self._refresh_ordinary_embedding_best_effort(
                 bucket_id,
                 post.content,
+            )
+
+        if content_changed and str(post.content or "") != previous_content:
+            self._record_boot_delta_event(bucket_id, "content_updated")
+        current_todos = canonicalize_todos(post.get("todos"))
+        if current_todos != previous_todos:
+            self._record_boot_delta_event(
+                bucket_id,
+                "todos_updated",
+                {
+                    "closed_count": len(set(previous_todos) - set(current_todos)),
+                    "opened_count": len(set(current_todos) - set(previous_todos)),
+                },
+            )
+        current_superseded_by = post.get("superseded_by")
+        if (
+            current_superseded_by != previous_superseded_by
+            and str(current_superseded_by or "").strip()
+        ):
+            self._record_boot_delta_event(
+                bucket_id,
+                "superseded",
+                {"mode": str(current_superseded_by).strip()},
             )
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
