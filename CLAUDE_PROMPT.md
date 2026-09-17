@@ -4,7 +4,7 @@
 
 ## 推荐启动路径
 
-通常先调用 `boot()` 获取一次启动上下文：婷留言状态、钉选摘要、到期 trigger、最新信箱、feel 回声、最近 session 和 todos。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
+通常先调用 `boot()` 获取一次启动上下文：婷留言状态、上次成功 boot 之后的可见 bucket 增量、钉选摘要、到期 trigger、最新信箱、feel 回声、最近 session 和 todos。增量段首次会说明没有历史基线；之后只列新建、正文、todo、superseded/invalidated 的简短可见变化。它不会泄露 sealed 或已删除 bucket，也不判断 superseded 关系中谁是真相。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
 
 然后按需使用：
 
