@@ -453,6 +453,8 @@ async def test_import_create_and_preserve_raw_lineage_kinds(tmp_path, monkeypatc
         assert edges[0]["lineage_kind"] == (
             "preserve_raw_created" if preserve_raw else "created"
         )
+        created = await manager.get(edges[0]["memory_id"])
+        assert created["metadata"]["provenance_kind"] == "unknown"
 
 
 @pytest.mark.asyncio

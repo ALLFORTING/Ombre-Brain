@@ -817,6 +817,10 @@
             "default": false,
             "type": "boolean"
           },
+          "provenance_kind": {
+            "default": "",
+            "type": "string"
+          },
           "source_bucket": {
             "default": "",
             "type": "string"
@@ -1456,6 +1460,10 @@
           "pinned": {
             "default": -1,
             "type": "integer"
+          },
+          "provenance_kind": {
+            "default": "",
+            "type": "string"
           },
           "related": {
             "default": "",
