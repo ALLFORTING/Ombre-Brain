@@ -1383,7 +1383,12 @@
       "output_kind": "text",
       "input_schema_contract": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "include_provenance": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
       }
     },
     {
@@ -1489,6 +1494,21 @@
               },
               {
                 "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "todo_items": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
               },
               {
                 "type": "null"
