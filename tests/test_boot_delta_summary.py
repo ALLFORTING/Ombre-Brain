@@ -163,6 +163,13 @@ def test_boot_delta_schema_has_event_log_and_success_checkpoint(tmp_path, monkey
         checkpoint_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(boot_delta_checkpoint)")
         }
+        profile_checkpoint_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(boot_delta_profile_checkpoints)"
+            )
+        }
 
     assert {"id", "bucket_id", "event_type", "payload_json", "occurred_at"} <= event_columns
     assert {"singleton", "last_event_id", "completed_at"} <= checkpoint_columns
+    assert {"profile", "last_event_id", "completed_at"} <= profile_checkpoint_columns

@@ -540,6 +540,15 @@
           "pinned_chars": {
             "default": 5000,
             "type": "integer"
+          },
+          "profile": {
+            "default": "talk",
+            "enum": [
+              "talk",
+              "code",
+              "tg"
+            ],
+            "type": "string"
           }
         }
       }
