@@ -87,6 +87,7 @@ from bucket_manager import (
     BucketManager,
     canonicalize_todos,
     merge_todo_provenance,
+    normalize_provenance_kind,
     reconcile_todo_provenance,
 )
 from asset_store import (
@@ -1230,6 +1231,7 @@ async def _merge_or_create(
     name: str = "",
     trigger_date: str = "",
     todos: list | None = None,
+    provenance_kind: str | None = None,
 ) -> tuple[str, bool]:
     """
     Reuse a deterministic duplicate if found; otherwise create a new bucket.
@@ -1283,6 +1285,7 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
         todos=incoming_todos,
+        provenance_kind=provenance_kind,
     )
     await _auto_link_related(bucket_id)
     if trigger_date:
@@ -1692,6 +1695,13 @@ def _canonical_todos(raw) -> list[str]:
     return canonicalize_todos(_normalize_todos(raw))
 
 
+def _parse_explicit_provenance_kind(value) -> str | None:
+    """Validate a public assertion without treating an omitted value as one."""
+    if value is None or value == "":
+        return None
+    return normalize_provenance_kind(value, strict=True)
+
+
 def _structured_todo_items(todo_items) -> tuple[list[str], list[dict]]:
     """Validate MCP todo_items without changing legacy todos semantics."""
     if not isinstance(todo_items, list):
@@ -1979,7 +1989,13 @@ async def _with_related_line(text: str, bucket: dict) -> str:
 
 
 async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = False) -> str:
-    lines = [text]
+    # This helper is used by current-time Breath composition only. Historical
+    # ``as_of`` output intentionally bypasses it because history has no
+    # provenance snapshots.
+    provenance_kind = normalize_provenance_kind(
+        bucket.get("metadata", {}).get("provenance_kind")
+    )
+    lines = [f"[prov={provenance_kind}] {text}"]
     current_todos = _canonical_todos(
         bucket.get("metadata", {}).get("todos")
     )
@@ -2065,6 +2081,7 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         arousal=merged_arousal,
         todos=merged_todos,
         todo_provenance=merged_todo_provenance,
+        provenance_kind="unknown",
     )
     if not updated:
         return f"合并失败，无法更新目标桶: {target_id}"
@@ -2973,6 +2990,7 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
             valence=0.5,
             arousal=0.3,
             bucket_type="dynamic",
+            provenance_kind="summary",
             name=f"digest_{domain}_{datetime.now().date().isoformat()}",
         )
         await bucket_mgr.update(digest_id, source_bucket=",".join(source_ids))
@@ -2994,6 +3012,7 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
         valence=0.5,
         arousal=0.3,
         bucket_type="dynamic",
+        provenance_kind="system",
         name=f"digest_log_{datetime.now().date().isoformat()}",
     )
     lines.append(f"已消化: {digested_total} 个桶")
@@ -8031,6 +8050,7 @@ async def hold(
     arousal: Annotated[float, Field(description="-1 means unspecified and uses analysis fallback; 0.0-1.0 sets the stored arousal.")] = -1,
     trigger_date: str = "",
     supersedes_id: str = "",
+    provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
     await decay_engine.ensure_started()
@@ -8038,6 +8058,10 @@ async def hold(
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+    try:
+        explicit_provenance_kind = _parse_explicit_provenance_kind(provenance_kind)
+    except ValueError as exc:
+        return str(exc)
     content = _apply_display_aliases(content)
     target_id = supersedes_id.strip()
     if target_id:
@@ -8054,7 +8078,10 @@ async def hold(
         if metadata.get("pinned") or metadata.get("protected"):
             return f"supersedes target not found or invalid: {target_id}"
         try:
-            updated = await bucket_mgr.update(target_id, content=content)
+            update_kwargs = {"content": content}
+            if explicit_provenance_kind is not None:
+                update_kwargs["provenance_kind"] = explicit_provenance_kind
+            updated = await bucket_mgr.update(target_id, **update_kwargs)
         except Exception as exc:
             logger.warning(f"Explicit supersession failed for {target_id}: {exc}")
             return f"supersedes update failed: {target_id}"
@@ -8094,6 +8121,7 @@ async def hold(
             name=feel_name,
             bucket_type="feel",
             todos=_canonical_todos(feel_analysis.get("todos")),
+            provenance_kind=(explicit_provenance_kind or "inference"),
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
@@ -8155,6 +8183,7 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
             todos=analysis_todos,
+            provenance_kind=explicit_provenance_kind,
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold")
@@ -8179,6 +8208,7 @@ async def hold(
         name=suggested_name,
         trigger_date=trigger_date,
         todos=analysis_todos,
+        provenance_kind=explicit_provenance_kind,
     )
     if should_record_emotion:
         _record_emotion_snapshot(valence, arousal, "hold")
@@ -8268,6 +8298,7 @@ async def grow(content: str) -> str:
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
                 todos=_canonical_todos(item.get("todos")),
+                provenance_kind="summary",
             )
 
             if is_merged:
@@ -8423,6 +8454,7 @@ async def trace(
     dormant: Annotated[int, Field(description="-1 means unchanged; 0 means False and explicitly wakes; 1 means True and marks dormant.")] = -1,
     sealed: Annotated[int, Field(description="-1 means unchanged; 0 means unsealed; 1 means sealed.")] = -1,
     content: Annotated[str, Field(description="An empty string leaves content unchanged. Batch trace rejects non-empty content.")] = "",
+    provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Batch trace rejects it.")] = "",
     related: str = "",
     unrelate: Annotated[str, Field(description="Comma-separated related bucket IDs to remove bidirectionally. Cannot be combined with related.")] = "",
     superseded_by: str | None = None,
@@ -8440,6 +8472,10 @@ async def trace(
 
     if todos is not None and todo_items is not None:
         return "todos 与 todo_items 不能同时使用。"
+    try:
+        explicit_provenance_kind = _parse_explicit_provenance_kind(provenance_kind)
+    except ValueError as exc:
+        return str(exc)
     structured_todos = None
     structured_provenance = None
     if todo_items is not None:
@@ -8454,6 +8490,8 @@ async def trace(
     if len(bucket_ids) > 1:
         if name or content:
             return "批量 trace 不支持修改 content/name，请逐桶操作。"
+        if explicit_provenance_kind is not None:
+            return "批量 trace 不支持 provenance_kind，请逐桶操作。"
         if merge:
             return "批量 trace 不能与 merge 同时使用。"
         if superseded_by is not None:
@@ -8507,6 +8545,9 @@ async def trace(
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
     metadata = bucket.get("metadata", {})
+    previous_provenance_kind = normalize_provenance_kind(
+        metadata.get("provenance_kind")
+    )
     requested_superseded_by = None
     if superseded_by is not None:
         if not isinstance(superseded_by, str):
@@ -8582,6 +8623,8 @@ async def trace(
         else:
             updates["content"] = content
             updates["_history_change_type"] = "replace"
+    if explicit_provenance_kind is not None:
+        updates["provenance_kind"] = explicit_provenance_kind
     related_ids = _parse_csv_ids(related)
     unrelated_ids = _parse_csv_ids(unrelate)
     if related_ids and unrelated_ids:
@@ -8641,11 +8684,21 @@ async def trace(
     changed = ", ".join(
         f"{k}={v}"
         for k, v in updates.items()
-        if k not in ("content", "_history_change_type")
+        if k not in ("content", "_history_change_type", "provenance_kind")
     )
     if "content" in updates:
         content_label = "content=已追加" if append else "content=已替换"
         changed += (f", {content_label}" if changed else content_label)
+    if explicit_provenance_kind is not None or "content" in updates:
+        next_provenance_kind = (
+            explicit_provenance_kind
+            if explicit_provenance_kind is not None
+            else "unknown"
+        )
+        provenance_change = (
+            f"provenance_kind={previous_provenance_kind}->{next_provenance_kind}"
+        )
+        changed += f", {provenance_change}" if changed else provenance_change
     # Explicit hint about resolved state change semantics
     # 特别提示 resolved 状态变化的语义
     if "resolved" in updates:
@@ -8758,6 +8811,7 @@ async def archive_session(
         name=session_name,
         sealed=sealed,
         topics=normalized_topics,
+        provenance_kind="summary",
     )
     await bucket_mgr.archive(bucket_id)
     if letter.strip():

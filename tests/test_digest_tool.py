@@ -85,11 +85,17 @@ async def test_digest_live_creates_digest_and_marks_sources(tmp_path, monkeypatc
         bucket for bucket in all_buckets
         if "auto-digested" in bucket["metadata"].get("tags", [])
     ]
+    log_buckets = [
+        bucket for bucket in all_buckets
+        if "digest-log" in bucket["metadata"].get("tags", [])
+    ]
 
     assert "已消化: 1 个桶" in result
     assert source["metadata"]["digested"] is True
     assert source["metadata"]["source_bucket"] == digest_buckets[0]["id"]
     assert digest_buckets[0]["content"] == "condensed digest body"
+    assert digest_buckets[0]["metadata"]["provenance_kind"] == "summary"
+    assert log_buckets[0]["metadata"]["provenance_kind"] == "system"
 
 
 def _confirm_token(result):

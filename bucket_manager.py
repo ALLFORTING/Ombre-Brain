@@ -64,6 +64,23 @@ _IMPORT_MARKER_FIELD = "_ob_import_operations"
 _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
 _BOOT_DELTA_PROFILES = ("talk", "code", "tg")
 TODO_SAID_BY_VALUES = frozenset({"ting", "model", "system", "unknown"})
+PROVENANCE_KIND_VALUES = frozenset({"unknown", "summary", "inference", "system"})
+
+
+def normalize_provenance_kind(raw: Any, *, strict: bool = False) -> str:
+    """Return a safe bucket-body provenance classification.
+
+    Existing frontmatter is intentionally permissive: absent or corrupted
+    values are read as ``unknown`` and never rewritten.  New explicit writes
+    instead fail closed so a caller cannot silently manufacture a label.
+    """
+    if isinstance(raw, str) and raw in PROVENANCE_KIND_VALUES:
+        return raw
+    if strict:
+        raise ValueError(
+            "provenance_kind must be unknown, summary, inference, or system."
+        )
+    return "unknown"
 
 
 def canonicalize_todos(raw: Any) -> list[str]:
@@ -1306,6 +1323,7 @@ class BucketManager:
         valence: float = 0.5,
         arousal: float = 0.3,
         bucket_type: str = "dynamic",
+        provenance_kind: str | None = None,
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
@@ -1326,6 +1344,11 @@ class BucketManager:
         pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
         """
         canonical_todos = canonicalize_todos(todos)
+        normalized_provenance_kind = (
+            normalize_provenance_kind(provenance_kind, strict=True)
+            if provenance_kind is not None
+            else "unknown"
+        )
         canonical_todo_provenance = reconcile_todo_provenance(
             canonical_todos,
             todo_provenance,
@@ -1344,6 +1367,8 @@ class BucketManager:
             }
             if todos is not None:
                 operation_payload["todos"] = canonical_todos
+            if provenance_kind is not None:
+                operation_payload["provenance_kind"] = normalized_provenance_kind
             if todo_provenance is not None:
                 operation_payload["todo_provenance"] = canonical_todo_provenance
             operation = self._ensure_import_operation(
@@ -1408,6 +1433,8 @@ class BucketManager:
             "activation_count": 0,
             "todos": todos,
         }
+        if provenance_kind is not None:
+            metadata["provenance_kind"] = normalized_provenance_kind
         if todo_provenance:
             metadata["todo_provenance"] = todo_provenance
         if pinned:
@@ -1593,6 +1620,11 @@ class BucketManager:
             post.get("todo_provenance"),
         )
         previous_superseded_by = post.get("superseded_by")
+        explicit_provenance_kind = (
+            normalize_provenance_kind(kwargs["provenance_kind"], strict=True)
+            if "provenance_kind" in kwargs
+            else None
+        )
 
         if operation is not None:
             marker = self._operation_marker(post, o5b_operation_key)
@@ -1655,6 +1687,12 @@ class BucketManager:
                 return False
             kwargs["content"] = apply_display_aliases(kwargs["content"])
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
+        # A body rewrite invalidates any previous provenance claim unless the
+        # caller deliberately provides a replacement classification.
+        if explicit_provenance_kind is not None:
+            post["provenance_kind"] = explicit_provenance_kind
+        elif content_changed:
+            post["provenance_kind"] = "unknown"
         if "tags" in kwargs:
             kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
             post["tags"] = kwargs["tags"]
@@ -2643,6 +2681,9 @@ class BucketManager:
             metadata.setdefault("source_bucket", "")
             metadata.setdefault("trigger_date", "")
             metadata.setdefault("trigger_last_seen", "")
+            metadata["provenance_kind"] = normalize_provenance_kind(
+                metadata.get("provenance_kind")
+            )
             metadata["sealed"] = 1 if int(metadata.get("sealed", 0) or 0) == 1 else 0
             return {
                 "id": post.get("id", Path(file_path).stem),
@@ -2689,6 +2730,10 @@ class BucketManager:
                     original_name = post.get("name")
                     original_tags = post.get("tags")
                     post.content = apply_display_aliases(post.content)
+                    # Alias cleanup can rewrite the body. It is not a
+                    # provenance-preserving metadata operation.
+                    if str(post.content) != str(original_content):
+                        post["provenance_kind"] = "unknown"
                     if original_name is not None:
                         post["name"] = apply_display_aliases(original_name)
                     if original_tags is not None:
