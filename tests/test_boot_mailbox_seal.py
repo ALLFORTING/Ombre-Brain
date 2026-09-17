@@ -106,9 +106,9 @@ async def test_boot_defaults_and_clamps_max_tokens_to_16000(tmp_path, monkeypatc
 
     monkeypatch.setattr(server, "_fit_sections_to_budget", capture_fit)
 
-    assert server.boot.__defaults__ == (5000, 16000)
+    assert server.boot.__defaults__ == (5000, 16000, "talk")
     await server.boot(max_tokens=99999)
-    assert observed["max_tokens"] == 16000 - 20
+    assert observed["max_tokens"] == 16000 - 40
 
 
 def test_fit_sections_outputs_blocks_that_exactly_fit(tmp_path, monkeypatch):

@@ -4,7 +4,7 @@
 
 ## 推荐启动路径
 
-通常先调用 `boot()` 获取一次启动上下文：婷留言状态、上次成功 boot 之后的可见 bucket 增量、钉选摘要、到期 trigger、最新信箱、feel 回声、最近 session 和 todos。增量段首次会说明没有历史基线；之后只列新建、正文、todo、superseded/invalidated 的简短可见变化。它不会泄露 sealed 或已删除 bucket，也不判断 superseded 关系中谁是真相。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
+通常先调用 `boot(profile="talk")` 获取正常启动上下文。`talk` 适合长聊天窗口；`boot(profile="code")` 使用结构化 domain/tags 与 pinned/protected/importance 聚焦工程和操作约束；`boot(profile="tg")` 提供更紧凑的桥接上下文。三个 profile 都保留婷留言、可见 delta、到期 trigger 和 sealed 存在性隐藏；profile 不改变事实、superseded 规则或留言投递生命周期。增量 checkpoint 按 profile 独立保存，因此一个场景成功 boot 不会消费其他场景的后续变化。`boot()` 是推荐的首个上下文调用，但不是每次对话都必须执行的协议步骤。
 
 然后按需使用：
 

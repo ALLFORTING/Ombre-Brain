@@ -2447,6 +2447,89 @@ BOOT_SECTION_MINIMUM_CHARS = {
     "sessions": 1200,
     "pinned": 4000,
 }
+BOOT_PROFILE_CONFIG = {
+    "talk": {
+        "max_tokens": 16000,
+        "pinned_chars": 5000,
+        "delta_tokens": 600,
+        "trigger_items": 10,
+        "include_mailbox": True,
+        "include_sessions": True,
+        "include_echo": True,
+        "section_minimums": BOOT_SECTION_MINIMUM_CHARS,
+    },
+    "code": {
+        "max_tokens": 12000,
+        "pinned_chars": 2500,
+        "delta_tokens": 400,
+        "trigger_items": 10,
+        "include_mailbox": True,
+        "include_sessions": True,
+        "include_echo": False,
+        "section_minimums": {
+            "mailbox": 700,
+            "todos": 1200,
+            "sessions": 800,
+            "pinned": 2500,
+        },
+    },
+    "tg": {
+        "max_tokens": 4000,
+        "pinned_chars": 600,
+        "delta_tokens": 220,
+        "trigger_items": 5,
+        "include_mailbox": False,
+        "include_sessions": False,
+        "include_echo": False,
+        "section_minimums": {
+            "todos": 600,
+            "pinned": 600,
+        },
+    },
+}
+BOOT_PROFILE_CODE_ROOTS = frozenset({"项目", "工程", "工具", "环境", "部署"})
+BOOT_PROFILE_TG_TODO_MIN_IMPORTANCE = 8
+BOOT_PROFILE_NAMES = frozenset(BOOT_PROFILE_CONFIG)
+
+
+def _profile_metadata_labels(bucket: dict) -> set[str]:
+    """Return normalized structured labels without inspecting bucket prose."""
+    meta = bucket.get("metadata", {})
+    labels = []
+    for key in ("domain", "tags", "topics"):
+        value = meta.get(key, [])
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            labels.extend(str(item).strip() for item in value if str(item).strip())
+    return {label.split("/", 1)[0].casefold() for label in labels}
+
+
+def _profile_is_code_context(bucket: dict) -> bool:
+    return bool(_profile_metadata_labels(bucket) & BOOT_PROFILE_CODE_ROOTS)
+
+
+def _profile_is_global_constraint(bucket: dict) -> bool:
+    meta = bucket.get("metadata", {})
+    return bool(
+        meta.get("pinned")
+        or meta.get("protected")
+        or int(meta.get("importance", 0) or 0) >= 9
+    )
+
+
+def _profile_allows_bucket(bucket: dict, profile: str) -> bool:
+    """Conservatively filter display-only profile sections from metadata."""
+    if _is_sealed(bucket):
+        return False
+    if profile == "talk":
+        return True
+    if profile == "code":
+        return _profile_is_global_constraint(bucket) or _profile_is_code_context(bucket)
+    return _profile_is_global_constraint(bucket) or (
+        int(bucket.get("metadata", {}).get("importance", 0) or 0)
+        >= BOOT_PROFILE_TG_TODO_MIN_IMPORTANCE
+    )
 
 
 def _prefix_within_token_budget(text: str, token_budget: int) -> str:
@@ -2568,6 +2651,7 @@ def _format_boot_delta(
     checkpoint: dict | None,
     high_water: int,
     visible_buckets: list[dict],
+    max_tokens: int = BOOT_DELTA_MAX_TOKENS,
 ) -> str:
     """Format complete, bounded boot-delta records from the durable event log."""
     header = "=== boot: 增量摘要 ==="
@@ -2632,7 +2716,7 @@ def _format_boot_delta(
         candidate = [header, *selected, record]
         if remaining:
             candidate.append(f"（还有 {remaining} 项未展开）")
-        if count_tokens_approx("\n".join(candidate)) <= BOOT_DELTA_MAX_TOKENS:
+        if count_tokens_approx("\n".join(candidate)) <= max_tokens:
             selected.append(record)
             continue
         omitted = len(records) - index
@@ -8665,15 +8749,52 @@ async def todos() -> str:
     return "\n---\n".join(text for _, text in groups)
 
 
+def _format_tg_todos(all_buckets: list[dict]) -> str:
+    """Return TG's bounded high-priority todo view without any write path."""
+    groups = []
+    for bucket in all_buckets:
+        meta = bucket.get("metadata", {})
+        if _is_sealed(bucket) or meta.get("resolved", False):
+            continue
+        if not _profile_allows_bucket(bucket, "tg"):
+            continue
+        items = _normalize_todos(meta.get("todos"))
+        if not items:
+            continue
+        importance = int(meta.get("importance", 0) or 0)
+        groups.append(
+            (
+                importance,
+                f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
+                f"| 重要度:{importance}\n"
+                + "\n".join(f"- {item}" for item in items),
+            )
+        )
+    groups.sort(key=lambda item: item[0], reverse=True)
+    if not groups:
+        return "当前没有高优先级未完成待办。"
+    return "\n---\n".join(text for _, text in groups[:5])
+
+
 @mcp.tool()
 async def boot(
     pinned_chars: int = 5000,
     max_tokens: Annotated[int, Field(ge=1000, le=16000)] = 16000,
+    profile: Annotated[Literal["talk", "code", "tg"], Field(description="Boot context profile: talk, code, or tg.")] = "talk",
 ) -> str:
-    """Recommended one-shot startup context; observing due triggers may update bounded trigger-seen metadata."""
+    """Recommended startup context for the selected talk, code, or TG profile."""
+    if not isinstance(profile, str) or profile not in BOOT_PROFILE_NAMES:
+        return "profile 必须是 talk、code 或 tg。"
     await decay_engine.ensure_started()
-    pinned_chars = max(80, min(int(pinned_chars or 5000), 5000))
-    max_tokens = max(1000, min(int(max_tokens or 16000), 16000))
+    profile_config = BOOT_PROFILE_CONFIG[profile]
+    pinned_chars = max(
+        80,
+        min(int(pinned_chars or 5000), int(profile_config["pinned_chars"])),
+    )
+    max_tokens = min(
+        max(1000, min(int(max_tokens or 16000), 16000)),
+        int(profile_config["max_tokens"]),
+    )
 
     try:
         active_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -8682,7 +8803,7 @@ async def boot(
         logger.error("Boot failed to list buckets: %s", exc)
         return _with_response_seal("boot 暂时无法读取记忆库。")
 
-    checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+    checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
     high_water = bucket_mgr.get_boot_delta_high_water()
     visible_buckets = list({
         bucket["id"]: bucket for bucket in [*active_buckets, *archive_buckets]
@@ -8690,15 +8811,22 @@ async def boot(
     delta_text = _format_boot_delta(
         checkpoint=checkpoint,
         high_water=high_water,
-        visible_buckets=visible_buckets,
+        visible_buckets=[
+            bucket for bucket in visible_buckets
+            if _profile_allows_bucket(bucket, profile)
+        ],
+        max_tokens=int(profile_config["delta_tokens"]),
     )
 
-    trigger_text, trigger_ids = await _format_due_triggers(active_buckets)
+    trigger_text, trigger_ids = await _format_due_triggers(
+        active_buckets,
+        max_items=int(profile_config["trigger_items"]),
+    )
 
     pinned = [
         b for b in active_buckets
         if (b.get("metadata", {}).get("pinned") or b.get("metadata", {}).get("protected"))
-        and not _is_sealed(b)
+        and _profile_allows_bucket(b, profile)
     ]
     pinned.sort(
         key=lambda b: _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
@@ -8721,7 +8849,7 @@ async def boot(
     sessions = [
         b for b in archive_buckets
         if "session" in b.get("metadata", {}).get("domain", [])
-        and not _is_sealed(b)
+        and _profile_allows_bucket(b, profile)
     ]
     sessions.sort(
         key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"),
@@ -8738,7 +8866,9 @@ async def boot(
         "\n---\n".join(session_lines) if session_lines else "（暂无 session 归档）"
     )
 
-    todos_text = "=== boot: 未完结 todos ===\n" + await todos()
+    todos_text = "=== boot: 未完结 todos ===\n" + (
+        _format_tg_todos(visible_buckets) if profile == "tg" else await todos()
+    )
 
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
@@ -8749,20 +8879,24 @@ async def boot(
         ting_note_text, _ = _format_ting_note_for_boot(note_now, max_tokens)
 
     def _compose_boot_body(current_delta_text: str) -> str:
+        sections = [
+            ("ting_note", "婷留言", ting_note_text),
+            ("delta", "增量摘要", current_delta_text),
+            ("triggers", "今日触发", trigger_text),
+        ]
+        if profile_config["include_mailbox"]:
+            sections.append(("mailbox", "最新 letter", mailbox_text))
+        sections.append(("todos", "todos", todos_text))
+        if profile_config["include_sessions"]:
+            sections.append(("sessions", "最近归档", sessions_text))
+        sections.append(("pinned", "钉选索引", pinned_text))
+        if profile_config["include_echo"]:
+            sections.append(("echo", "feel 回声", echo_text))
         return _fit_sections_to_budget(
-            [
-                ("ting_note", "婷留言", ting_note_text),
-                ("delta", "增量摘要", current_delta_text),
-                ("triggers", "今日触发", trigger_text),
-                ("mailbox", "最新 letter", mailbox_text),
-                ("todos", "todos", todos_text),
-                ("sessions", "最近归档", sessions_text),
-                ("pinned", "钉选索引", pinned_text),
-                ("echo", "feel 回声", echo_text),
-            ],
-            max_tokens=max_tokens - 20,
+            sections,
+            max_tokens=max_tokens - 40,
             minimum_chars={
-                **BOOT_SECTION_MINIMUM_CHARS,
+                **profile_config["section_minimums"],
                 "ting_note": len(ting_note_text),
                 "delta": len(current_delta_text),
             },
@@ -8777,33 +8911,49 @@ async def boot(
     expected_event_id = (
         int(checkpoint["last_event_id"]) if checkpoint is not None else None
     )
-    if not bucket_mgr.advance_boot_delta_checkpoint(expected_event_id, high_water):
+    if not bucket_mgr.advance_boot_delta_checkpoint(
+        expected_event_id,
+        high_water,
+        profile=profile,
+    ):
         # Another boot completed first. Rebuild against its checkpoint so this
         # response cannot replay that already-delivered delta batch.
-        checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+        checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
         high_water = bucket_mgr.get_boot_delta_high_water()
         delta_text = _format_boot_delta(
             checkpoint=checkpoint,
             high_water=high_water,
-            visible_buckets=visible_buckets,
+            visible_buckets=[
+                bucket for bucket in visible_buckets
+                if _profile_allows_bucket(bucket, profile)
+            ],
+            max_tokens=int(profile_config["delta_tokens"]),
         )
         body = _compose_boot_body(delta_text)
         expected_event_id = (
             int(checkpoint["last_event_id"]) if checkpoint is not None else None
         )
-        if not bucket_mgr.advance_boot_delta_checkpoint(expected_event_id, high_water):
+        if not bucket_mgr.advance_boot_delta_checkpoint(
+            expected_event_id,
+            high_water,
+            profile=profile,
+        ):
             # A later concurrent boot owns the checkpoint; its successful
             # advance remains authoritative and no event is discarded here.
-            checkpoint = bucket_mgr.get_boot_delta_checkpoint()
+            checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
             high_water = bucket_mgr.get_boot_delta_high_water()
             body = _compose_boot_body(
                 _format_boot_delta(
                     checkpoint=checkpoint,
                     high_water=high_water,
-                    visible_buckets=visible_buckets,
+                    visible_buckets=[
+                        bucket for bucket in visible_buckets
+                        if _profile_allows_bucket(bucket, profile)
+                    ],
+                    max_tokens=int(profile_config["delta_tokens"]),
                 )
             )
-    return _with_response_seal(body)
+    return _with_response_seal(f"boot profile: {profile}\n\n{body}")
 
 
 @mcp.tool()

@@ -62,6 +62,7 @@ logger = logging.getLogger("ombre_brain.bucket")
 
 _IMPORT_MARKER_FIELD = "_ob_import_operations"
 _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
+_BOOT_DELTA_PROFILES = ("talk", "code", "tg")
 
 
 def canonicalize_todos(raw: Any) -> list[str]:
@@ -298,6 +299,37 @@ class BucketManager:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS boot_delta_profile_checkpoints (
+                    profile TEXT PRIMARY KEY,
+                    last_event_id INTEGER NOT NULL,
+                    completed_at TEXT NOT NULL
+                )
+                """
+            )
+            profile_count = conn.execute(
+                "SELECT COUNT(*) FROM boot_delta_profile_checkpoints"
+            ).fetchone()[0]
+            legacy_checkpoint = conn.execute(
+                """
+                SELECT last_event_id, completed_at
+                FROM boot_delta_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if profile_count == 0 and legacy_checkpoint is not None:
+                conn.executemany(
+                    """
+                    INSERT INTO boot_delta_profile_checkpoints
+                        (profile, last_event_id, completed_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (profile, int(legacy_checkpoint[0]), legacy_checkpoint[1])
+                        for profile in _BOOT_DELTA_PROFILES
+                    ],
+                )
 
     def _ensure_import_operation_table(self) -> None:
         """Create the lazy O5B operation journal only when capture is used."""
@@ -681,16 +713,17 @@ class BucketManager:
                 (bucket_id, event_type, serialized, now_iso()),
             )
 
-    def get_boot_delta_checkpoint(self) -> dict[str, Any] | None:
-        """Return the database-scoped last successful boot checkpoint."""
+    def get_boot_delta_checkpoint(self, profile: str = "talk") -> dict[str, Any] | None:
+        """Return one profile's last successful boot checkpoint."""
         with sqlite3.connect(self.history_db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
                 SELECT last_event_id, completed_at
-                FROM boot_delta_checkpoint
-                WHERE singleton = 1
-                """
+                FROM boot_delta_profile_checkpoints
+                WHERE profile = ?
+                """,
+                (profile,),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -735,35 +768,57 @@ class BucketManager:
         self,
         expected_event_id: int | None,
         next_event_id: int,
+        profile: str = "talk",
     ) -> bool:
-        """CAS-advance the checkpoint only after a boot body has been completed."""
+        """CAS-advance one profile checkpoint after its boot body completes."""
         with sqlite3.connect(self.history_db_path) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT last_event_id FROM boot_delta_checkpoint WHERE singleton = 1"
+                """
+                SELECT last_event_id
+                FROM boot_delta_profile_checkpoints
+                WHERE profile = ?
+                """,
+                (profile,),
             ).fetchone()
             current = int(row["last_event_id"]) if row is not None else None
             if current != expected_event_id:
                 conn.rollback()
                 return False
             if row is None:
-                conn.execute(
-                    """
-                    INSERT INTO boot_delta_checkpoint
-                        (singleton, last_event_id, completed_at)
-                    VALUES (1, ?, ?)
-                    """,
-                    (int(next_event_id), now_iso()),
-                )
+                existing_count = conn.execute(
+                    "SELECT COUNT(*) FROM boot_delta_profile_checkpoints"
+                ).fetchone()[0]
+                if existing_count == 0:
+                    conn.executemany(
+                        """
+                        INSERT INTO boot_delta_profile_checkpoints
+                            (profile, last_event_id, completed_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (item, int(next_event_id), now_iso())
+                            for item in _BOOT_DELTA_PROFILES
+                        ],
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO boot_delta_profile_checkpoints
+                            (profile, last_event_id, completed_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (profile, int(next_event_id), now_iso()),
+                    )
             else:
                 conn.execute(
                     """
-                    UPDATE boot_delta_checkpoint
+                    UPDATE boot_delta_profile_checkpoints
                     SET last_event_id = ?, completed_at = ?
-                    WHERE singleton = 1
+                    WHERE profile = ?
                     """,
-                    (int(next_event_id), now_iso()),
+                    (int(next_event_id), now_iso(), profile),
                 )
             conn.commit()
         return True
