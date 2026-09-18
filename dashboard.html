@@ -4,28 +4,109 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ombre Brain</title>
+<script id="dashboard-theme-bootstrap">
+(() => {
+  const storageKey = 'ombre-brain-dashboard-theme';
+  const defaultTheme = 'default';
+  const themes = ['default', 'iris', 'blush', 'blue-gray', 'matcha'];
+  const normalize = (value) => themes.includes(value) ? value : defaultTheme;
+  const syncControls = (theme) => {
+    if (!document.querySelectorAll) return;
+    document.querySelectorAll('[name="dashboard-theme"]').forEach((control) => {
+      control.checked = control.value === theme;
+    });
+  };
+  const apply = (value, persist = false) => {
+    const theme = normalize(value);
+    document.documentElement.dataset.dashboardTheme = theme;
+    syncControls(theme);
+    if (persist) {
+      try { localStorage.setItem(storageKey, theme); } catch (_) {}
+    }
+    return theme;
+  };
+  let savedTheme = defaultTheme;
+  try { savedTheme = localStorage.getItem(storageKey) || defaultTheme; } catch (_) {}
+  apply(savedTheme);
+  window.OmbreDashboardTheme = { storageKey, themes, defaultTheme, normalize, apply };
+})();
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link href="/dashboard-assets.css" rel="stylesheet">
 <style>
   :root {
-    --bg: #FDFCF0;
-    --bg-gradient: radial-gradient(ellipse at 30% 20%, #FDFCF0 0%, #EDE4D3 60%, #E2D1B3 100%);
-    --surface: rgba(255, 255, 255, 0.45);
-    --surface-solid: #F7F2E8;
-    --border: rgba(180, 165, 140, 0.3);
-    --border-strong: rgba(160, 140, 110, 0.5);
-    --text: #3A3530;
-    --text-dim: #8A8070;
-    --text-light: #B0A590;
-    --accent: #2F4F4F;
-    --accent-light: #3D6363;
-    --accent-glow: rgba(47, 79, 79, 0.12);
-    --positive: #4A7C59;
-    --negative: #8B4A4A;
-    --warning: #9A7B4F;
+    /* Theme layer. These default values intentionally preserve the original Dashboard exactly. */
+    --page-bg: #FDFCF0;
+    --page-gradient: radial-gradient(ellipse at 30% 20%, #FDFCF0 0%, #EDE4D3 60%, #E2D1B3 100%);
+    --elevated-surface: #F7F2E8;
+    --secondary-surface: rgba(255, 255, 255, 0.45);
+    --header-surface: rgba(253, 252, 240, 0.7);
+    --tabs-surface: rgba(253, 252, 240, 0.5);
+    --control-surface-start: #FAF6ED;
+    --control-surface-end: #EDE4D3;
+    --theme-border: rgba(180, 165, 140, 0.3);
+    --theme-border-strong: rgba(160, 140, 110, 0.5);
+    --theme-accent: #2F4F4F;
+    --theme-accent-light: #3D6363;
+    --theme-accent-glow: rgba(47, 79, 79, 0.12);
+    --body-text: #3A3530;
+    --muted-text: #8A8070;
+    --subtle-text: #B0A590;
+    --selected-text: #F0EDE4;
     --shadow-light: rgba(255, 252, 240, 0.7);
     --shadow-dark: rgba(163, 148, 120, 0.4);
     --shadow-dark-subtle: rgba(163, 148, 120, 0.2);
+    --primary-shadow: rgba(40, 65, 65, 0.25);
+    --primary-shadow-hover: rgba(40, 65, 65, 0.3);
+    --button-highlight: rgba(255,255,255,0.08);
+    --button-highlight-hover: rgba(255,255,255,0.15);
+    --button-pressed-shadow: rgba(0,0,0,0.2);
+    --button-pressed-highlight: rgba(255,255,255,0.05);
+    --modal-shadow: rgba(0,0,0,0.12);
+    --overlay-surface: rgba(25, 28, 26, 0.5);
+    --control-text-strong: #fff;
+    --network-dynamic: #2F4F4F;
+    --network-permanent: #9A7B4F;
+    --network-feel: #8B6A6A;
+    --network-archived: #B0A590;
+    --network-edge-rgb: 47, 79, 79;
+    --metric-fuzzy: #2F4F4F;
+    --metric-exact: #6B4E71;
+    --metric-emotion: #8B6A6A;
+    --metric-time: #9A7B4F;
+    --metric-importance: #4A7C59;
+    --metric-semantic: #2C6E91;
+    --metric-default: #777;
+
+    /* Existing component aliases keep the surrounding Dashboard CSS stable. */
+    --bg: var(--page-bg);
+    --bg-gradient: var(--page-gradient);
+    --surface: var(--secondary-surface);
+    --surface-solid: var(--elevated-surface);
+    --border: var(--theme-border);
+    --border-strong: var(--theme-border-strong);
+    --text: var(--body-text);
+    --text-dim: var(--muted-text);
+    --text-light: var(--subtle-text);
+    --accent: var(--theme-accent);
+    --accent-light: var(--theme-accent-light);
+    --accent-glow: var(--theme-accent-glow);
+    --positive: #4A7C59;
+    --negative: #8B4A4A;
+    --warning: #9A7B4F;
+  }
+
+  html[data-dashboard-theme="iris"] {
+    --page-bg: #F3EEF7; --page-gradient: radial-gradient(ellipse at 30% 20%, #F3EEF7 0%, #DDD2E8 60%, #C3B2D6 100%); --elevated-surface: #DDD2E8; --secondary-surface: rgba(243, 238, 247, 0.68); --header-surface: rgba(243, 238, 247, 0.82); --tabs-surface: rgba(243, 238, 247, 0.66); --control-surface-start: #F3EEF7; --control-surface-end: #DDD2E8; --theme-border: #C3B2D6; --theme-border-strong: #A691BF; --theme-accent: #84709C; --theme-accent-light: #A691BF; --theme-accent-glow: rgba(132, 112, 156, 0.14); --body-text: #403A3D; --muted-text: #625B60; --subtle-text: #817980; --shadow-light: rgba(255,255,255,0.72); --shadow-dark: rgba(132,112,156,0.35); --shadow-dark-subtle: rgba(132,112,156,0.2); --primary-shadow: rgba(132,112,156,0.25); --primary-shadow-hover: rgba(132,112,156,0.3); --network-dynamic: #84709C; --network-permanent: #A691BF; --network-feel: #C3B2D6; --network-archived: #DDD2E8; --network-edge-rgb: 132,112,156; --metric-fuzzy: #84709C; --metric-exact: #A691BF; --metric-emotion: #C3B2D6; --metric-time: #A691BF; --metric-importance: #84709C; --metric-semantic: #84709C;
+  }
+  html[data-dashboard-theme="blush"] {
+    --page-bg: #F9F0F0; --page-gradient: radial-gradient(ellipse at 30% 20%, #F9F0F0 0%, #EBD5D5 60%, #D9B8B8 100%); --elevated-surface: #EBD5D5; --secondary-surface: rgba(249, 240, 240, 0.68); --header-surface: rgba(249, 240, 240, 0.82); --tabs-surface: rgba(249, 240, 240, 0.66); --control-surface-start: #F9F0F0; --control-surface-end: #EBD5D5; --theme-border: #D9B8B8; --theme-border-strong: #C29595; --theme-accent: #9E7373; --theme-accent-light: #C29595; --theme-accent-glow: rgba(158, 115, 115, 0.14); --body-text: #403A3D; --muted-text: #625B60; --subtle-text: #817980; --shadow-light: rgba(255,255,255,0.72); --shadow-dark: rgba(158,115,115,0.35); --shadow-dark-subtle: rgba(158,115,115,0.2); --primary-shadow: rgba(158,115,115,0.25); --primary-shadow-hover: rgba(158,115,115,0.3); --network-dynamic: #9E7373; --network-permanent: #C29595; --network-feel: #D9B8B8; --network-archived: #EBD5D5; --network-edge-rgb: 158,115,115; --metric-fuzzy: #9E7373; --metric-exact: #C29595; --metric-emotion: #D9B8B8; --metric-time: #C29595; --metric-importance: #9E7373; --metric-semantic: #9E7373;
+  }
+  html[data-dashboard-theme="blue-gray"] {
+    --page-bg: #EEF4F8; --page-gradient: radial-gradient(ellipse at 30% 20%, #EEF4F8 0%, #CBDCE6 60%, #9EB9C9 100%); --elevated-surface: #CBDCE6; --secondary-surface: rgba(238, 244, 248, 0.7); --header-surface: rgba(238, 244, 248, 0.84); --tabs-surface: rgba(238, 244, 248, 0.68); --control-surface-start: #EEF4F8; --control-surface-end: #CBDCE6; --theme-border: #9EB9C9; --theme-border-strong: #738FA3; --theme-accent: #4F6475; --theme-accent-light: #738FA3; --theme-accent-glow: rgba(79, 100, 117, 0.14); --body-text: #403A3D; --muted-text: #5D6469; --subtle-text: #778087; --shadow-light: rgba(255,255,255,0.72); --shadow-dark: rgba(79,100,117,0.35); --shadow-dark-subtle: rgba(79,100,117,0.2); --primary-shadow: rgba(79,100,117,0.25); --primary-shadow-hover: rgba(79,100,117,0.3); --network-dynamic: #4F6475; --network-permanent: #738FA3; --network-feel: #9EB9C9; --network-archived: #CBDCE6; --network-edge-rgb: 79,100,117; --metric-fuzzy: #4F6475; --metric-exact: #738FA3; --metric-emotion: #9EB9C9; --metric-time: #738FA3; --metric-importance: #4F6475; --metric-semantic: #4F6475;
+  }
+  html[data-dashboard-theme="matcha"] {
+    --page-bg: #EEF5EA; --page-gradient: radial-gradient(ellipse at 30% 20%, #EEF5EA 0%, #CFE0C3 60%, #A9C19D 100%); --elevated-surface: #CFE0C3; --secondary-surface: rgba(238, 245, 234, 0.7); --header-surface: rgba(238, 245, 234, 0.84); --tabs-surface: rgba(238, 245, 234, 0.68); --control-surface-start: #EEF5EA; --control-surface-end: #CFE0C3; --theme-border: #A9C19D; --theme-border-strong: #829E77; --theme-accent: #5E7A56; --theme-accent-light: #829E77; --theme-accent-glow: rgba(94, 122, 86, 0.14); --body-text: #403A3D; --muted-text: #5B6558; --subtle-text: #788174; --shadow-light: rgba(255,255,255,0.72); --shadow-dark: rgba(94,122,86,0.35); --shadow-dark-subtle: rgba(94,122,86,0.2); --primary-shadow: rgba(94,122,86,0.25); --primary-shadow-hover: rgba(94,122,86,0.3); --network-dynamic: #5E7A56; --network-permanent: #829E77; --network-feel: #A9C19D; --network-archived: #CFE0C3; --network-edge-rgb: 94,122,86; --metric-fuzzy: #5E7A56; --metric-exact: #829E77; --metric-emotion: #A9C19D; --metric-time: #829E77; --metric-importance: #5E7A56; --metric-semantic: #5E7A56;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -47,7 +128,7 @@
     align-items: center;
     gap: 20px;
     backdrop-filter: blur(12px);
-    background: rgba(253, 252, 240, 0.7);
+    background: var(--header-surface);
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
@@ -95,7 +176,7 @@
     display: flex;
     padding: 0 40px;
     gap: 4px;
-    background: rgba(253, 252, 240, 0.5);
+    background: var(--tabs-surface);
     backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
   }
@@ -130,7 +211,7 @@
     font-weight: 400;
     border: none;
     border-radius: 24px;
-    background: linear-gradient(145deg, #FAF6ED, #EDE4D3);
+    background: linear-gradient(145deg, var(--control-surface-start), var(--control-surface-end));
     color: var(--text-dim);
     cursor: pointer;
     font-family: inherit;
@@ -147,9 +228,9 @@
     box-shadow: inset 2px 2px 5px var(--shadow-dark-subtle), inset -2px -2px 5px var(--shadow-light);
   }
   .filter-btn.active {
-    color: #F0EDE4;
+    color: var(--selected-text);
     background: linear-gradient(145deg, var(--accent-light), var(--accent));
-    box-shadow: inset 3px 3px 6px rgba(0,0,0,0.2), inset -2px -2px 4px rgba(255,255,255,0.05);
+    box-shadow: inset 3px 3px 6px var(--button-pressed-shadow), inset -2px -2px 4px var(--button-pressed-highlight);
   }
 
   .bucket-list { display: flex; flex-direction: column; gap: 8px; }
@@ -404,7 +485,7 @@
   .btn-primary {
     padding: 12px 28px;
     background: linear-gradient(145deg, var(--accent-light), var(--accent));
-    color: #F0EDE4;
+    color: var(--selected-text);
     border: none;
     border-radius: 24px;
     font-family: inherit;
@@ -412,7 +493,7 @@
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: 6px 6px 12px rgba(40, 65, 65, 0.25), -4px -4px 10px var(--shadow-light), inset 0 1px 0 rgba(255,255,255,0.1);
+    box-shadow: 6px 6px 12px var(--primary-shadow), -4px -4px 10px var(--shadow-light), inset 0 1px 0 var(--button-highlight);
     letter-spacing: 0.4px;
     position: relative;
     overflow: hidden;
@@ -422,20 +503,20 @@
     position: absolute;
     inset: 0;
     border-radius: 24px;
-    background: linear-gradient(145deg, rgba(255,255,255,0.08), transparent);
+    background: linear-gradient(145deg, var(--button-highlight), transparent);
     pointer-events: none;
   }
   .btn-primary:hover {
-    box-shadow: 8px 8px 16px rgba(40, 65, 65, 0.3), -5px -5px 12px var(--shadow-light), inset 0 1px 0 rgba(255,255,255,0.15);
+    box-shadow: 8px 8px 16px var(--primary-shadow-hover), -5px -5px 12px var(--shadow-light), inset 0 1px 0 var(--button-highlight-hover);
     transform: translateY(-2px);
   }
   .btn-primary:active {
     transform: translateY(0);
-    box-shadow: inset 3px 3px 6px rgba(0,0,0,0.2), inset -2px -2px 4px rgba(255,255,255,0.05);
+    box-shadow: inset 3px 3px 6px var(--button-pressed-shadow), inset -2px -2px 4px var(--button-pressed-highlight);
   }
   .btn-secondary {
     padding: 12px 28px;
-    background: linear-gradient(145deg, #FAF6ED, #EDE4D3);
+    background: linear-gradient(145deg, var(--control-surface-start), var(--control-surface-end));
     color: var(--accent);
     border: none;
     border-radius: 24px;
@@ -511,7 +592,7 @@
   }
   .breath-controls button {
     background: linear-gradient(145deg, var(--accent-light), var(--accent));
-    color: #F0EDE4;
+    color: var(--selected-text);
     border: none;
     padding: 12px 26px;
     border-radius: 24px;
@@ -520,7 +601,7 @@
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: 6px 6px 12px rgba(40, 65, 65, 0.25), -4px -4px 10px var(--shadow-light), inset 0 1px 0 rgba(255,255,255,0.1);
+    box-shadow: 6px 6px 12px var(--primary-shadow), -4px -4px 10px var(--shadow-light), inset 0 1px 0 var(--button-highlight);
     position: relative;
     overflow: hidden;
   }
@@ -529,16 +610,16 @@
     position: absolute;
     inset: 0;
     border-radius: 24px;
-    background: linear-gradient(145deg, rgba(255,255,255,0.08), transparent);
+    background: linear-gradient(145deg, var(--button-highlight), transparent);
     pointer-events: none;
   }
   .breath-controls button:hover {
-    box-shadow: 8px 8px 16px rgba(40, 65, 65, 0.3), -5px -5px 12px var(--shadow-light);
+    box-shadow: 8px 8px 16px var(--primary-shadow-hover), -5px -5px 12px var(--shadow-light);
     transform: translateY(-2px);
   }
   .breath-controls button:active {
     transform: translateY(0);
-    box-shadow: inset 3px 3px 6px rgba(0,0,0,0.2), inset -2px -2px 4px rgba(255,255,255,0.05);
+    box-shadow: inset 3px 3px 6px var(--button-pressed-shadow), inset -2px -2px 4px var(--button-pressed-highlight);
   }
   .breath-controls label {
     font-size: 12px;
@@ -669,6 +750,31 @@
     font-size: 12px;
     text-align: center;
   }
+  .theme-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+  .theme-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 42px;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface-solid);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .theme-option:hover { border-color: var(--accent); }
+  .theme-option:has(input:checked) {
+    border-color: var(--accent);
+    background: var(--accent-glow);
+  }
+  .theme-option input { accent-color: var(--accent); }
   @media (max-width: 768px) {
     .header { padding: 20px; flex-wrap: wrap; }
     .header h1 { font-size: 22px; }
@@ -779,10 +885,10 @@
 
 <div class="content" id="network-view" style="display:none">
   <div class="network-legend">
-    <div class="legend-item"><span class="legend-dot" style="background:#2F4F4F"></span> dynamic</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#9A7B4F"></span> permanent</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#8B6A6A"></span> feel</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#B0A590"></span> archived</div>
+    <div class="legend-item"><span class="legend-dot" style="background:var(--network-dynamic)"></span> dynamic</div>
+    <div class="legend-item"><span class="legend-dot" style="background:var(--network-permanent)"></span> permanent</div>
+    <div class="legend-item"><span class="legend-dot" style="background:var(--network-feel)"></span> feel</div>
+    <div class="legend-item"><span class="legend-dot" style="background:var(--network-archived)"></span> archived</div>
   </div>
   <canvas id="network-canvas"></canvas>
 </div>
@@ -907,6 +1013,17 @@
   <div style="max-width:580px;margin:0 auto;">
 
     <div class="config-section">
+      <h3>主题</h3>
+      <div id="dashboard-theme-selector" class="theme-options" role="radiogroup" aria-label="Dashboard 主题">
+        <label class="theme-option"><input type="radio" name="dashboard-theme" value="default"> 默认</label>
+        <label class="theme-option"><input type="radio" name="dashboard-theme" value="iris"> 灰紫鸢尾</label>
+        <label class="theme-option"><input type="radio" name="dashboard-theme" value="blush"> 烟粉豆沙</label>
+        <label class="theme-option"><input type="radio" name="dashboard-theme" value="blue-gray"> 奶雾蓝灰</label>
+        <label class="theme-option"><input type="radio" name="dashboard-theme" value="matcha"> 抹茶雾绿</label>
+      </div>
+    </div>
+
+    <div class="config-section">
       <h3>服务状态</h3>
       <div id="settings-status" style="font-size:13px;color:var(--text-dim);line-height:2;">加载中…</div>
       <button onclick="loadSettingsStatus()" style="margin-top:8px;font-size:12px;padding:4px 12px;">刷新状态</button>
@@ -963,7 +1080,7 @@
 
 <!-- Auth Overlay -->
 <div id="auth-overlay" style="position:fixed;inset:0;z-index:9999;background:var(--bg-gradient);background-attachment:fixed;display:flex;align-items:center;justify-content:center;">
-  <div style="background:var(--surface);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:24px;padding:48px 40px;max-width:400px;width:90%;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,0.12);">
+  <div style="background:var(--surface);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:24px;padding:48px 40px;max-width:400px;width:90%;text-align:center;box-shadow:0 8px 40px var(--modal-shadow);">
     <h2 style="font-family:'Cormorant Garamond',serif;font-size:28px;color:var(--accent);margin-bottom:8px;">◐ Ombre Brain</h2>
     <p style="color:var(--text-dim);font-size:13px;margin-bottom:28px;" id="auth-subtitle">验证身份</p>
 
@@ -973,13 +1090,13 @@
       <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">首次使用，请设置访问密码</p>
       <input type="password" id="auth-setup-pwd" placeholder="设置密码（至少6位）" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
       <input type="password" id="auth-setup-pwd2" placeholder="确认密码" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doSetup()" />
-      <button onclick="doSetup()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">设置密码并进入</button>
+      <button onclick="doSetup()" style="width:100%;padding:12px;background:var(--accent);color:var(--control-text-strong);border:none;border-radius:10px;font-size:14px;cursor:pointer;">设置密码并进入</button>
     </div>
 
     <!-- Login form -->
     <div id="auth-login-form" style="display:none;">
       <input type="password" id="auth-login-pwd" placeholder="输入访问密码" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doLogin()" />
-      <button onclick="doLogin()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">登录</button>
+      <button onclick="doLogin()" style="width:100%;padding:12px;background:var(--accent);color:var(--control-text-strong);border:none;border-radius:10px;font-size:14px;cursor:pointer;">登录</button>
     </div>
 
     <div id="auth-error" style="color:var(--negative);font-size:13px;margin-top:12px;display:none;"></div>
@@ -988,6 +1105,19 @@
 
 <script src="/dashboard-assets.js"></script>
 <script>
+function initializeDashboardThemeSelector() {
+  const theme = window.OmbreDashboardTheme;
+  if (!theme) return;
+  document.querySelectorAll('[name="dashboard-theme"]').forEach((control) => {
+    control.addEventListener('change', () => {
+      if (control.checked) theme.apply(control.value, true);
+    });
+  });
+  theme.apply(document.documentElement.dataset.dashboardTheme || theme.defaultTheme);
+}
+
+initializeDashboardThemeSelector();
+
 // ========================================
 // Auth system / 认证系统
 // ========================================
@@ -1536,6 +1666,11 @@ function closeDetail() {
 }
 
 var networkData = null;
+function dashboardCssColor(name, fallback) {
+  var value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
 async function loadNetwork() {
   var canvas = document.getElementById('network-canvas');
   var ctx = canvas.getContext('2d');
@@ -1544,9 +1679,9 @@ async function loadNetwork() {
   ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
   var W = canvas.offsetWidth, H = canvas.offsetHeight;
 
-  ctx.fillStyle = '#FDFCF0';
+  ctx.fillStyle = dashboardCssColor('--bg', '#FDFCF0');
   ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = '#8A8070';
+  ctx.fillStyle = dashboardCssColor('--text-dim', '#8A8070');
   ctx.font = '14px Inter, sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('加载记忆网络…', W/2, H/2);
@@ -1563,7 +1698,7 @@ async function loadNetwork() {
 function drawNetwork(ctx, W, H, data) {
   var nodes = data.nodes, edges = data.edges;
   if (!nodes.length) {
-    ctx.fillStyle = '#8A8070';
+    ctx.fillStyle = dashboardCssColor('--text-dim', '#8A8070');
     ctx.fillText('没有记忆桶', W/2, H/2);
     return;
   }
@@ -1618,7 +1753,7 @@ function drawNetwork(ctx, W, H, data) {
     });
   }
 
-  ctx.fillStyle = '#FDFCF0';
+  ctx.fillStyle = dashboardCssColor('--bg', '#FDFCF0');
   ctx.fillRect(0, 0, W, H);
 
   edges.forEach(function(e) {
@@ -1627,16 +1762,21 @@ function drawNetwork(ctx, W, H, data) {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = 'rgba(47, 79, 79, ' + (e.similarity * 0.35) + ')';
+    ctx.strokeStyle = 'rgba(' + dashboardCssColor('--network-edge-rgb', '47, 79, 79') + ', ' + (e.similarity * 0.35) + ')';
     ctx.lineWidth = Math.max(0.5, e.similarity * 2);
     ctx.stroke();
   });
 
-  var colors = { dynamic: '#2F4F4F', permanent: '#9A7B4F', feel: '#8B6A6A', archived: '#B0A590' };
+  var colors = {
+    dynamic: dashboardCssColor('--network-dynamic', '#2F4F4F'),
+    permanent: dashboardCssColor('--network-permanent', '#9A7B4F'),
+    feel: dashboardCssColor('--network-feel', '#8B6A6A'),
+    archived: dashboardCssColor('--network-archived', '#B0A590'),
+  };
   nodes.forEach(function(n) {
     var p = positions[n.id];
     var r = Math.max(4, Math.min(14, n.score * 0.8));
-    var color = colors[n.type] || '#2F4F4F';
+    var color = colors[n.type] || colors.dynamic;
 
     ctx.beginPath();
     ctx.arc(p.x, p.y, r + 4, 0, Math.PI * 2);
@@ -1649,13 +1789,13 @@ function drawNetwork(ctx, W, H, data) {
     ctx.fill();
 
     if (n.pinned) {
-      ctx.strokeStyle = '#9A7B4F';
+      ctx.strokeStyle = colors.permanent;
       ctx.lineWidth = 2;
       ctx.stroke();
     }
 
     var name = n.name.length > 10 ? n.name.slice(0, 10) + '…' : n.name;
-    ctx.fillStyle = '#3A3530';
+    ctx.fillStyle = dashboardCssColor('--text', '#3A3530');
     ctx.font = '11px Inter, sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(name, p.x, p.y + r + 14);
@@ -1742,12 +1882,12 @@ async function runBreathDebug() {
     }
 
     var barColors = {
-      fuzzy_lexical: '#2F4F4F',
-      exact_match: '#6B4E71',
-      emotion: '#8B6A6A',
-      time: '#9A7B4F',
-      importance: '#4A7C59',
-      semantic: '#2C6E91',
+      fuzzy_lexical: dashboardCssColor('--metric-fuzzy', '#2F4F4F'),
+      exact_match: dashboardCssColor('--metric-exact', '#6B4E71'),
+      emotion: dashboardCssColor('--metric-emotion', '#8B6A6A'),
+      time: dashboardCssColor('--metric-time', '#9A7B4F'),
+      importance: dashboardCssColor('--metric-importance', '#4A7C59'),
+      semantic: dashboardCssColor('--metric-semantic', '#2C6E91'),
     };
 
     results.innerHTML = data.results.map(function(r, i) {
@@ -1761,7 +1901,7 @@ async function runBreathDebug() {
         return '<div class="score-bar-group">' +
           '<div class="score-bar-label"><span>' + key + (wt === undefined ? '' : '×' + wt) + '</span><span>' + val.toFixed(2) + '</span></div>' +
           '<div class="score-bar-track">' +
-            '<div class="score-bar-fill" style="width:' + pct + '%;background:' + (barColors[key] || '#777') + '"></div>' +
+            '<div class="score-bar-fill" style="width:' + pct + '%;background:' + (barColors[key] || dashboardCssColor('--metric-default', '#777')) + '"></div>' +
           '</div>' +
         '</div>';
       }).join('');
