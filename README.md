@@ -896,6 +896,12 @@ Dashboard uses a separate password and setup flow; Dashboard/API authentication 
 `OMBRE_HTTP_ALLOWED_ORIGINS` 是逗号分隔的明确浏览器 origin 列表，例如 `https://app.example.test,https://admin.example.test`。未设置或为空时，不允许跨 origin 浏览器访问；不要使用 `*`。这是浏览器 CORS 策略，不是认证，普通非浏览器或 server-to-server 客户端不会因此获得 MCP 访问权限。当前 HTTP middleware 的 methods、headers 和 exposed headers 为 `*`，credentials 未启用。
 `OMBRE_HTTP_ALLOWED_ORIGINS` is a comma-separated list of explicit browser origins, such as `https://app.example.test,https://admin.example.test`. Unset or empty means no cross-origin browser access; do not use `*`. CORS is a browser policy, not authentication, so ordinary non-browser or server-to-server clients do not gain MCP access from it. The current HTTP middleware allows all methods, headers, and exposed headers, with credentials disabled.
 
+### 普通可移植导出 / Ordinary portable export
+
+本地 CLI 可创建仅含未密封普通记忆的可移植目录导出；它不是完整灾难恢复，也不包含 Remember-Me 外部根目录或 Raw Evidence。格式、隐私边界和明确省略项见 [ordinary portable export](docs/ordinary-portable-export.md)。
+
+A local CLI can create a portable directory export of ordinary unsealed memory only. It is not full disaster recovery and does not include the external Remember-Me root or Raw Evidence. See [ordinary portable export](docs/ordinary-portable-export.md) for format, privacy boundaries, and explicit omissions.
+
 ### 自动备份 / Automatic GitHub Backup
 
 Ombre Brain 支持通过 GitHub Actions 每日导出完整库快照到私有备份仓库（推荐名 `ob-backup`）。备份内容包括所有桶、archive、feel、情绪时间线、信箱/历史 SQLite 等支持文件；文件按日期保存为 `backups/YYYY-MM-DD.json`，保留全部历史版本。
