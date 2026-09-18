@@ -57,6 +57,11 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_safe_rmtree": "contained_temporary_cleanup",
         "_remove_file": "contained_temporary_cleanup",
     },
+    "portable_export.py": {
+        "_write_payload": "isolated_offline_workspace",
+        "export_ordinary_portable": "isolated_offline_workspace",
+        "_read_history": "dynamic_sql_read_only",
+    },
     "production_backup_capture.py": {
         "__init__": "permission_tightening_only",
         "acknowledge": "owned_encrypted_bundle_cleanup",
