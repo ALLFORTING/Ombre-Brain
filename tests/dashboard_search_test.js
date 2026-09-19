@@ -17,7 +17,7 @@ test("Dashboard search renders grouped ID results and empty states", () => {
 test("Dashboard search exposes sealed state, direct full-ID detail, and copy isolation", () => {
   assert.match(dashboard, /已封存/);
   assert.match(dashboard, /payload\.normalized_query\.length === 12 && idMatches\.length === 1 && idMatches\[0\]\.match_reason === 'id_exact'/);
-  assert.match(dashboard, /showDetail\(idMatches\[0\]\.id\)/);
+  assert.match(dashboard, /openDetail\(idMatches\[0\]\.id\)/);
   assert.match(dashboard, /bucket-copy-id/);
   assert.match(dashboard, /event\.stopPropagation\(\)/);
   assert.match(dashboard, /navigator\.clipboard\.writeText\(id\)/);

@@ -412,6 +412,60 @@
     overflow-y: auto;
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
+  .bucket-id-link {
+    appearance: none;
+    border: 0;
+    border-bottom: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+  }
+  .bucket-id-link:hover { color: var(--text); border-bottom-color: var(--text); }
+  .bucket-id-sealed-status {
+    color: var(--warning);
+    font-size: 10px;
+    margin-left: 3px;
+  }
+  .bucket-id-missing {
+    color: var(--text-light);
+    text-decoration: line-through;
+    text-decoration-color: var(--negative);
+  }
+  .detail-references { margin-top: 20px; }
+  .detail-references h3 {
+    color: var(--accent);
+    font-size: 14px;
+    font-weight: 500;
+    margin: 0 0 10px;
+  }
+  .detail-references-empty {
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 12px;
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+  }
+  .detail-reference-list { display: grid; gap: 8px; }
+  .detail-reference-row {
+    align-items: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    color: var(--text);
+    cursor: pointer;
+    display: flex;
+    font: inherit;
+    gap: 8px;
+    padding: 10px 12px;
+    text-align: left;
+    width: 100%;
+  }
+  .detail-reference-row:hover { border-color: var(--accent); }
+  .detail-reference-name { font-size: 12px; font-weight: 500; }
+  .detail-reference-id, .detail-reference-kinds { color: var(--text-dim); font-size: 11px; }
+  .detail-reference-kinds { margin-left: auto; }
   .detail-actions {
     display: flex;
     gap: 10px;
@@ -1493,7 +1547,7 @@ function renderBucketRows(buckets) {
 
 function bindBucketRowActions(container) {
   container.querySelectorAll('.bucket-row[data-bucket-id]').forEach(function(row) {
-    row.addEventListener('click', function() { showDetail(row.dataset.bucketId); });
+    row.addEventListener('click', function() { openDetail(row.dataset.bucketId); });
   });
   container.querySelectorAll('.bucket-copy-id').forEach(function(button) {
     button.addEventListener('click', function(event) {
@@ -1542,7 +1596,7 @@ function renderSearchResults(payload) {
   }
   bindBucketRowActions(list);
   if (payload.mode === 'id' && payload.normalized_query.length === 12 && idMatches.length === 1 && idMatches[0].match_reason === 'id_exact') {
-    showDetail(idMatches[0].id);
+    openDetail(idMatches[0].id);
   }
 }
 
@@ -1591,7 +1645,7 @@ function renderArchives(archives) {
   }
   list.innerHTML = archives.map(function(item) {
     const timeAgo = formatTimeAgo(item.last_active || item.created);
-    return '<div class="bucket-row archive-row" onclick="showDetail(\'' + item.id + '\')">' +
+    return '<div class="bucket-row archive-row" onclick="openDetail(\'' + item.id + '\')">' +
       '<span class="icon">▤</span>' +
       '<span class="name" title="' + esc(item.name) + '">' + esc(item.name) + '</span>' +
       '<span class="domain">会话归档</span>' +
@@ -1626,23 +1680,152 @@ document.getElementById('archive-next').addEventListener('click', function() {
 });
 var currentDetailId = '';
 var currentDetail = null;
+
+function detailHistoryState(detailId) {
+  return Object.assign({}, history.state || {}, {
+    dashboardDetail: true,
+    detailId: detailId || null
+  });
+}
+
+function initializeDetailHistory() {
+  if (!history.state || history.state.dashboardDetail !== true) {
+    history.replaceState(detailHistoryState(null), '');
+  }
+}
+
+function openDetail(id) {
+  if (!id) return;
+  var state = history.state || {};
+  if (!(state.dashboardDetail === true && state.detailId === id)) {
+    history.pushState(detailHistoryState(id), '');
+  }
+  showDetail(id);
+}
+
+function closeDetailPanel() {
+  document.getElementById('detail-panel').classList.remove('open');
+  currentDetail = null;
+  currentDetailId = '';
+}
+
+function renderContentWithBucketLinks(container, text, bucketLinks) {
+  var content = String(text || '');
+  var links = bucketLinks || {};
+  var pattern = /\b[0-9a-f]{12}\b/gi;
+  var offset = 0;
+  var match;
+  container.textContent = '';
+
+  while ((match = pattern.exec(content)) !== null) {
+    container.appendChild(document.createTextNode(content.slice(offset, match.index)));
+    var visibleId = match[0];
+    var bucketId = visibleId.toLowerCase();
+    var target = links[bucketId] || {id: bucketId, exists: false};
+    if (target.exists) {
+      var link = document.createElement('button');
+      link.type = 'button';
+      link.className = 'bucket-id-link';
+      link.textContent = visibleId;
+      link.title = String(target.name || target.id) + (target.sealed ? '（已封存）' : '');
+      link.addEventListener('click', function(targetId) {
+        return function() { openDetail(targetId); };
+      }(target.id));
+      container.appendChild(link);
+      if (target.sealed) {
+        var sealed = document.createElement('span');
+        sealed.className = 'bucket-id-sealed-status';
+        sealed.textContent = '已封存';
+        container.appendChild(sealed);
+      }
+    } else {
+      var missing = document.createElement('span');
+      missing.className = 'bucket-id-missing';
+      missing.textContent = visibleId;
+      missing.title = '目标不存在或已删除';
+      container.appendChild(missing);
+    }
+    offset = pattern.lastIndex;
+  }
+  container.appendChild(document.createTextNode(content.slice(offset)));
+}
+
+function renderReferencedBy(container, references) {
+  var items = Array.isArray(references) ? references : [];
+  container.textContent = '';
+  var heading = document.createElement('h3');
+  heading.textContent = '被引用于';
+  container.appendChild(heading);
+  if (!items.length) {
+    var empty = document.createElement('div');
+    empty.className = 'detail-references-empty';
+    empty.textContent = '暂无引用';
+    container.appendChild(empty);
+    return;
+  }
+
+  var list = document.createElement('div');
+  list.className = 'detail-reference-list';
+  items.forEach(function(item) {
+    var row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'detail-reference-row';
+    row.title = item.sealed ? '已封存' : '';
+    row.addEventListener('click', function() { openDetail(item.id); });
+
+    var name = document.createElement('span');
+    name.className = 'detail-reference-name';
+    name.textContent = String(item.name || item.id || '未命名');
+    row.appendChild(name);
+    if (item.sealed) {
+      var sealed = document.createElement('span');
+      sealed.className = 'bucket-sealed';
+      sealed.textContent = '已封存';
+      row.appendChild(sealed);
+    }
+    var id = document.createElement('span');
+    id.className = 'detail-reference-id';
+    id.textContent = String(item.id || '');
+    row.appendChild(id);
+    var kinds = document.createElement('span');
+    kinds.className = 'detail-reference-kinds';
+    kinds.textContent = (item.reference_kinds || []).map(function(kind) {
+      return kind === 'content' ? '正文' : kind === 'related_buckets' ? '关联' : kind;
+    }).join(' / ');
+    row.appendChild(kinds);
+    list.appendChild(row);
+  });
+  container.appendChild(list);
+}
+
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
   currentDetailId = id;
+  currentDetail = null;
   content.innerHTML = '<div class="loading">加载中…</div>';
   panel.classList.add('open');
 
   try {
-    var res = await fetch(BASE + '/api/bucket/' + id);
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id));
     var b = await res.json();
+    if (currentDetailId !== id) return;
+    if (!res.ok) {
+      if (res.status === 404) {
+        content.innerHTML = '<div class="loading">桶不存在或已删除</div>';
+        return;
+      }
+      throw new Error((b && b.error) || ('HTTP ' + res.status));
+    }
     var meta = b.metadata || {};
     var rawContent = b.raw_content != null ? b.raw_content : b.content;
     currentDetail = {
       id: id,
       rawContent: rawContent || '',
       displayContent: b.content || '',
-      metadata: meta
+      metadata: meta,
+      bucketLinks: b.bucket_links || {},
+      referencedBy: b.referenced_by || []
     };
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
@@ -1667,8 +1850,16 @@ async function showDetail(id) {
         '<button class="btn-secondary" type="button" onclick="beginDetailEdit()">编辑</button>' +
         '<button class="detail-delete-btn" type="button" onclick="deleteDetailBucket()">删除</button>' +
       '</div>' +
-      '<div id="detail-body"><div class="detail-content">' + esc(b.content) + '</div></div>';
+      '<div id="detail-body"><div class="detail-content"></div></div>' +
+      '<section id="detail-references" class="detail-references"></section>';
+    renderContentWithBucketLinks(
+      content.querySelector('.detail-content'), b.content, currentDetail.bucketLinks
+    );
+    renderReferencedBy(
+      content.querySelector('#detail-references'), currentDetail.referencedBy
+    );
   } catch (e) {
+    if (currentDetailId !== id) return;
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
 }
@@ -1692,7 +1883,10 @@ function beginDetailEdit() {
 function cancelDetailEdit() {
   var body = document.getElementById('detail-body');
   if (!body || !currentDetail) return;
-  body.innerHTML = '<div class="detail-content">' + esc(currentDetail.displayContent) + '</div>';
+  body.innerHTML = '<div class="detail-content"></div>';
+  renderContentWithBucketLinks(
+    body.querySelector('.detail-content'), currentDetail.displayContent, currentDetail.bucketLinks
+  );
 }
 
 async function saveDetailContent() {
@@ -1757,10 +1951,22 @@ async function deleteDetailBucket() {
 }
 
 function closeDetail() {
-  document.getElementById('detail-panel').classList.remove('open');
-  currentDetail = null;
-  currentDetailId = '';
+  var state = history.state || {};
+  if (state.dashboardDetail === true && state.detailId) {
+    history.back();
+    return;
+  }
+  closeDetailPanel();
 }
+
+window.addEventListener('popstate', function(event) {
+  var state = event.state || {};
+  if (state.dashboardDetail === true && state.detailId) {
+    showDetail(state.detailId);
+  } else {
+    closeDetailPanel();
+  }
+});
 
 var networkData = null;
 function dashboardCssColor(name, fallback) {
@@ -2081,6 +2287,7 @@ async function saveConfig(persist) {
   }
 }
 
+initializeDetailHistory();
 checkAuth().then(() => loadBuckets());
 
 // --- Import functions ---

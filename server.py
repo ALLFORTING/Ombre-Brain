@@ -9697,6 +9697,7 @@ _DASHBOARD_LEADING_BUCKET_ID_RE = re.compile(
 )
 _DASHBOARD_ID_PREFIX_RE = re.compile(r"^id\s*:\s*(.*)$", re.IGNORECASE)
 _DASHBOARD_NAME_PREFIX_RE = re.compile(r"^name\s*:\s*(.*)$", re.IGNORECASE)
+_DASHBOARD_BODY_BUCKET_ID_RE = re.compile(r"\b[0-9a-f]{12}\b", re.IGNORECASE)
 
 
 def _dashboard_valid_bucket_id_prefix(value: str) -> str:
@@ -9787,8 +9788,36 @@ def _dashboard_name_matches(all_buckets: list[dict], query: str) -> list[dict]:
     ]
 
 
+def _dashboard_bucket_links(content: str, all_buckets: list[dict]) -> dict[str, dict]:
+    """Describe every full bucket ID mentioned in Dashboard display content."""
+    mentioned_ids = {
+        match.group(0).casefold()
+        for match in _DASHBOARD_BODY_BUCKET_ID_RE.finditer(str(content or ""))
+    }
+    buckets_by_id = {
+        str(bucket.get("id", "")).casefold(): bucket
+        for bucket in all_buckets
+    }
+    links = {}
+    for bucket_id in sorted(mentioned_ids):
+        target = buckets_by_id.get(bucket_id)
+        if not target:
+            links[bucket_id] = {"id": bucket_id, "exists": False}
+            continue
+        meta = target.get("metadata", {})
+        links[bucket_id] = {
+            "id": target.get("id", bucket_id),
+            "exists": True,
+            "name": meta.get("name", target.get("id", bucket_id)),
+            "sealed": bool(int(meta.get("sealed", 0) or 0)),
+            "dormant": bool(meta.get("dormant", False)),
+            "type": meta.get("type", "dynamic"),
+        }
+    return links
+
+
 def _dashboard_bucket_references(
-    all_buckets: list[dict], target_ids: set[str]
+    all_buckets: list[dict], target_ids: set[str], *, include_dormant: bool = False
 ) -> list[dict]:
     """Find Dashboard-visible content and related_buckets references to target IDs."""
     if not target_ids:
@@ -9813,11 +9842,16 @@ def _dashboard_bucket_references(
         if related_ids & target_ids:
             kinds.append("related_buckets")
         if kinds:
-            results.append(_dashboard_search_result(
+            result = _dashboard_search_result(
                 bucket,
                 match_reason="reference",
                 reference_kinds=kinds,
-            ))
+            )
+            if include_dormant:
+                result["dormant"] = bool(
+                    bucket.get("metadata", {}).get("dormant", False)
+                )
+            results.append(result)
     return results
 
 
@@ -9959,13 +9993,29 @@ async def api_bucket_detail(request):
             return _dashboard_write_error(route, 500, "bucket_delete_failed")
         return JSONResponse({"id": bucket_id, "deleted": True})
 
-    return JSONResponse({
+    response = {
         "id": bucket["id"],
         "metadata": meta,
         "content": strip_wikilinks(bucket.get("content", "")),
         "raw_content": bucket.get("content", ""),
         "score": decay_engine.calculate_score(meta),
-    })
+    }
+    if method == "GET":
+        display_content = response["content"]
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
+        except Exception:
+            logger.exception("Dashboard bucket detail enrichment failed")
+            return JSONResponse({"error": "bucket_detail_enrichment_failed"}, status_code=500)
+        response["bucket_links"] = _dashboard_bucket_links(
+            display_content, all_buckets
+        )
+        response["referenced_by"] = _dashboard_bucket_references(
+            all_buckets,
+            {str(bucket.get("id", "")).casefold()},
+            include_dormant=True,
+        )
+    return JSONResponse(response)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
