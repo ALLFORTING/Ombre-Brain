@@ -9687,6 +9687,140 @@ def _dashboard_bucket_summary(bucket: dict) -> dict:
     }
 
 
+_DASHBOARD_BUCKET_ID_MARKER_RE = re.compile(
+    r"(?:^|\[)\s*bucket_id\s*:\s*([0-9a-fA-F]+)(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_DASHBOARD_LEADING_BUCKET_ID_RE = re.compile(
+    r"^\s*([0-9a-fA-F]+)(?=$|\s+name\s*=)",
+    re.IGNORECASE,
+)
+_DASHBOARD_ID_PREFIX_RE = re.compile(r"^id\s*:\s*(.*)$", re.IGNORECASE)
+_DASHBOARD_NAME_PREFIX_RE = re.compile(r"^name\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def _dashboard_valid_bucket_id_prefix(value: str) -> str:
+    """Return a canonical 6-12 character hexadecimal Dashboard bucket prefix."""
+    candidate = str(value or "").strip()
+    if 6 <= len(candidate) <= 12 and re.fullmatch(r"[0-9a-fA-F]+", candidate):
+        return candidate.casefold()
+    return ""
+
+
+def _dashboard_extract_bucket_id_prefix(value: str) -> str:
+    """Extract a bucket prefix from Dashboard-friendly OB output formats."""
+    text = str(value or "").strip()
+    marker = _DASHBOARD_BUCKET_ID_MARKER_RE.search(text)
+    if marker:
+        return _dashboard_valid_bucket_id_prefix(marker.group(1))
+    leading = _DASHBOARD_LEADING_BUCKET_ID_RE.match(text)
+    if leading:
+        return _dashboard_valid_bucket_id_prefix(leading.group(1))
+    return ""
+
+
+def _dashboard_search_query(raw_query: str) -> dict:
+    """Normalize Dashboard-only ID/name query syntax without changing MCP search."""
+    query = str(raw_query or "").strip()
+    name_match = _DASHBOARD_NAME_PREFIX_RE.match(query)
+    if name_match:
+        return {
+            "mode": "name",
+            "normalized_query": name_match.group(1).strip(),
+            "id_prefix": "",
+        }
+
+    id_match = _DASHBOARD_ID_PREFIX_RE.match(query)
+    if id_match:
+        candidate = id_match.group(1).strip()
+        return {
+            "mode": "id",
+            "normalized_query": (
+                _dashboard_extract_bucket_id_prefix(candidate)
+                or _dashboard_valid_bucket_id_prefix(candidate)
+                or candidate.casefold()
+            ),
+            "id_prefix": (
+                _dashboard_extract_bucket_id_prefix(candidate)
+                or _dashboard_valid_bucket_id_prefix(candidate)
+            ),
+        }
+
+    id_prefix = _dashboard_extract_bucket_id_prefix(query)
+    if id_prefix:
+        return {
+            "mode": "id",
+            "normalized_query": id_prefix,
+            "id_prefix": id_prefix,
+        }
+    return {"mode": "text", "normalized_query": query, "id_prefix": ""}
+
+
+def _dashboard_search_result(
+    bucket: dict,
+    *,
+    score: float | None = None,
+    match_reason: str = "",
+    reference_kinds: list[str] | None = None,
+) -> dict:
+    """Return a stable Dashboard-only search result, including sealed state."""
+    result = _dashboard_bucket_summary(bucket)
+    if score is not None:
+        result["score"] = score
+    result["sealed"] = bool(int(bucket.get("metadata", {}).get("sealed", 0) or 0))
+    if match_reason:
+        result["match_reason"] = match_reason
+    if reference_kinds:
+        result["reference_kinds"] = reference_kinds
+    return result
+
+
+def _dashboard_name_matches(all_buckets: list[dict], query: str) -> list[dict]:
+    """Provide a Dashboard name-first ordering without changing generic search."""
+    needle = query.casefold()
+    if not needle:
+        return []
+    return [
+        bucket
+        for bucket in all_buckets
+        if needle in str(bucket.get("metadata", {}).get("name", "")).casefold()
+    ]
+
+
+def _dashboard_bucket_references(
+    all_buckets: list[dict], target_ids: set[str]
+) -> list[dict]:
+    """Find Dashboard-visible content and related_buckets references to target IDs."""
+    if not target_ids:
+        return []
+    id_patterns = {
+        target_id: re.compile(
+            rf"(?<![0-9a-fA-F]){re.escape(target_id)}(?![0-9a-fA-F])",
+            re.IGNORECASE,
+        )
+        for target_id in target_ids
+    }
+    results = []
+    for bucket in all_buckets:
+        kinds = []
+        content = str(bucket.get("content", ""))
+        if any(pattern.search(content) for pattern in id_patterns.values()):
+            kinds.append("content")
+        related_ids = {
+            relation_id.casefold()
+            for relation_id in _related_ids(bucket.get("metadata", {}))
+        }
+        if related_ids & target_ids:
+            kinds.append("related_buckets")
+        if kinds:
+            results.append(_dashboard_search_result(
+                bucket,
+                match_reason="reference",
+                reference_kinds=kinds,
+            ))
+    return results
+
+
 def _is_session_archive(bucket: dict) -> bool:
     meta = bucket.get("metadata", {})
     domains = {
@@ -9836,29 +9970,83 @@ async def api_bucket_detail(request):
 
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
-    """Search buckets by query."""
+    """Search Dashboard buckets with optional ID/name-specific result groups."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
-    if err: return err
-    query = request.query_params.get("q", "")
+    if err:
+        return err
+    query = str(request.query_params.get("q", "")).strip()
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10, include_sealed=True)
-        result = []
-        for b in matches:
-            meta = b.get("metadata", {})
-            result.append({
-                "id": b["id"],
-                "name": meta.get("name", b["id"]),
-                "score": b.get("score", 0),
-                "domain": meta.get("domain", []),
-                "valence": meta.get("valence", 0.5),
-                "arousal": meta.get("arousal", 0.3),
-                "content_preview": strip_wikilinks(b.get("content", ""))[:200],
-            })
-        return JSONResponse(result)
-    except Exception: logger.exception("Dashboard search failed"); return JSONResponse({"error": "search_failed"}, status_code=500)
+        parsed = _dashboard_search_query(query)
+        normalized_query = parsed["normalized_query"]
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        generic_matches = await bucket_mgr.search(
+            normalized_query,
+            limit=10,
+            include_sealed=True,
+        ) if normalized_query else []
+
+        id_matches = []
+        references = []
+        if parsed["mode"] == "id":
+            prefix = parsed["id_prefix"]
+            matched_buckets = [
+                bucket for bucket in all_buckets
+                if prefix and str(bucket.get("id", "")).casefold().startswith(prefix)
+            ]
+            matched_buckets.sort(key=lambda bucket: (
+                str(bucket.get("id", "")).casefold() != prefix,
+                str(bucket.get("id", "")).casefold(),
+            ))
+            id_matches = [
+                _dashboard_search_result(
+                    bucket,
+                    match_reason=(
+                        "id_exact"
+                        if str(bucket.get("id", "")).casefold() == prefix and len(prefix) == 12
+                        else "id_prefix"
+                    ),
+                )
+                for bucket in matched_buckets
+            ]
+            references = _dashboard_bucket_references(
+                all_buckets,
+                {str(bucket.get("id", "")).casefold() for bucket in matched_buckets},
+            )
+
+        related_by_id = {}
+        if parsed["mode"] == "name":
+            for bucket in _dashboard_name_matches(all_buckets, normalized_query):
+                related_by_id[str(bucket.get("id", ""))] = _dashboard_search_result(
+                    bucket,
+                    match_reason="name",
+                )
+        for bucket in generic_matches:
+            bucket_id = str(bucket.get("id", ""))
+            related_by_id.setdefault(
+                bucket_id,
+                _dashboard_search_result(
+                    bucket,
+                    score=bucket.get("score", 0),
+                    match_reason="related",
+                ),
+            )
+
+        return JSONResponse({
+            "query": query,
+            "mode": parsed["mode"],
+            "normalized_query": normalized_query,
+            "groups": {
+                "id_matches": id_matches,
+                "references": references,
+                "related": list(related_by_id.values()),
+            },
+        })
+    except Exception:
+        logger.exception("Dashboard search failed")
+        return JSONResponse({"error": "search_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/network", methods=["GET"])

@@ -236,7 +236,7 @@
   .bucket-list { display: flex; flex-direction: column; gap: 8px; }
   .bucket-row {
     display: grid;
-    grid-template-columns: 32px 200px 100px 80px 60px 100px 1fr;
+    grid-template-columns: 32px 185px 100px 80px 60px 90px 72px 1fr;
     gap: 12px;
     padding: 14px 20px;
     border-radius: 16px;
@@ -286,6 +286,38 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .bucket-copy-id {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: 12px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    padding: 5px 7px;
+  }
+  .bucket-copy-id:hover { border-color: var(--accent); color: var(--accent); }
+  .bucket-sealed {
+    display: inline-block;
+    margin-left: 5px;
+    color: var(--warning);
+    font-size: 10px;
+    font-weight: 400;
+  }
+  .search-group { margin: 0 0 24px; }
+  .search-group-title {
+    margin: 0 0 10px;
+    color: var(--accent);
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .search-empty {
+    padding: 14px 20px;
+    border: 1px dashed var(--border);
+    border-radius: 14px;
+    color: var(--text-dim);
+    font-size: 12px;
   }
 
   .v-bar {
@@ -1434,30 +1466,95 @@ function renderBuckets(buckets) {
     list.innerHTML = '<div class="loading">没有记忆桶</div>';
     return;
   }
-  list.innerHTML = buckets.map(function(b) {
+  list.innerHTML = renderBucketRows(buckets);
+  bindBucketRowActions(list);
+}
+
+function renderBucketRows(buckets) {
+  return buckets.map(function(b) {
     var icon = b.pinned ? '📌' : b.type === 'feel' ? '🫧' : b.digested ? '🌿' : b.resolved ? '💤' : '💭';
-    var vPos = Math.round(b.valence * 100);
-    var modelV = b.model_valence != null ? ' → V' + b.model_valence.toFixed(1) : '';
+    var vPos = Math.round(Number(b.valence || 0.5) * 100);
+    var modelV = b.model_valence != null ? ' → V' + Number(b.model_valence).toFixed(1) : '';
     var timeAgo = formatTimeAgo(b.last_active || b.created);
-    return '<div class="bucket-row" onclick="showDetail(\'' + b.id + '\')">' +
+    var score = Number(b.score || 0).toFixed(2);
+    var sealed = b.sealed ? '<span class="bucket-sealed">已封存</span>' : '';
+    return '<div class="bucket-row" data-bucket-id="' + esc(b.id) + '">' +
       '<span class="icon">' + icon + '</span>' +
-      '<span class="name" title="' + esc(b.name) + '">' + esc(b.name) + '</span>' +
-      '<span class="domain">' + (b.domain || []).join(', ') + '</span>' +
+      '<span class="name" title="' + esc(b.name) + '">' + esc(b.name) + sealed + '</span>' +
+      '<span class="domain">' + esc((b.domain || []).join(', ')) + '</span>' +
       '<span class="emotion"><span class="v-bar"><span class="v-dot" style="left:' + vPos + '%"></span></span>' + modelV + '</span>' +
-      '<span class="score">' + b.score.toFixed(2) + '</span>' +
+      '<span class="score">' + score + '</span>' +
       '<span class="time">' + timeAgo + '</span>' +
+      '<button class="bucket-copy-id" type="button" data-bucket-id="' + esc(b.id) + '">复制 ID</button>' +
       '<span class="preview">' + esc(b.content_preview) + '</span>' +
     '</div>';
   }).join('');
 }
 
+function bindBucketRowActions(container) {
+  container.querySelectorAll('.bucket-row[data-bucket-id]').forEach(function(row) {
+    row.addEventListener('click', function() { showDetail(row.dataset.bucketId); });
+  });
+  container.querySelectorAll('.bucket-copy-id').forEach(function(button) {
+    button.addEventListener('click', function(event) {
+      event.stopPropagation();
+      copyBucketId(button.dataset.bucketId, button);
+    });
+  });
+}
+
+async function copyBucketId(id, button) {
+  if (!id || !navigator.clipboard || !navigator.clipboard.writeText) return;
+  try {
+    await navigator.clipboard.writeText(id);
+    var original = button.textContent;
+    button.textContent = '已复制';
+    setTimeout(function() { button.textContent = original; }, 1200);
+  } catch (e) {
+    console.error('Copy bucket ID failed:', e);
+  }
+}
+
+function renderSearchGroup(title, buckets, emptyText) {
+  return '<section class="search-group">' +
+    '<h3 class="search-group-title">' + esc(title) + '</h3>' +
+    (buckets.length
+      ? '<div class="bucket-list">' + renderBucketRows(buckets) + '</div>'
+      : '<div class="search-empty">' + esc(emptyText) + '</div>') +
+    '</section>';
+}
+
+function renderSearchResults(payload) {
+  var groups = payload.groups || {};
+  var idMatches = Array.isArray(groups.id_matches) ? groups.id_matches : [];
+  var references = Array.isArray(groups.references) ? groups.references : [];
+  var related = Array.isArray(groups.related) ? groups.related : [];
+  var list = document.getElementById('bucket-list');
+  if (payload.mode === 'id') {
+    list.innerHTML =
+      renderSearchGroup('此 ID 的桶', idMatches, '没有找到匹配的 bucket ID。') +
+      renderSearchGroup('提到此 ID 的 ' + references.length + ' 个桶', references, '没有桶提到此 ID。') +
+      renderSearchGroup('关键词 / 相关记忆', related, '没有相关记忆。');
+  } else {
+    list.innerHTML = renderSearchGroup(
+      '关键词 / 相关记忆', related, '没有相关记忆。'
+    );
+  }
+  bindBucketRowActions(list);
+  if (payload.mode === 'id' && payload.normalized_query.length === 12 && idMatches.length === 1 && idMatches[0].match_reason === 'id_exact') {
+    showDetail(idMatches[0].id);
+  }
+}
+
 async function searchBuckets(query) {
   try {
     var res = await fetch(BASE + '/api/search?q=' + encodeURIComponent(query));
-    var results = await res.json();
-    renderBuckets(results);
+    var payload = await res.json();
+    if (!res.ok || !payload || !payload.groups) throw new Error(payload.error || 'search_failed');
+    renderSearchResults(payload);
   } catch (e) {
     console.error('Search failed:', e);
+    document.getElementById('bucket-list').innerHTML = '<div class="loading">搜索失败</div>';
   }
 }
 
