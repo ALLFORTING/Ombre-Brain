@@ -82,7 +82,11 @@ async def main():
         resource_templates = (await client.list_resource_templates()).resourceTemplates
     print(json.dumps({
         "tools": [
-            {"name": tool.name, "input_schema": tool.inputSchema}
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema,
+            }
             for tool in tools
         ],
         "resources": [str(resource.uri) for resource in resources],
@@ -244,7 +248,7 @@ def _validate_manifest():
 
 def test_manifest_is_valid_and_current_counts_are_derived():
     _validate_manifest()
-    assert len(DEFAULT_TOOLS) == 25
+    assert len(DEFAULT_TOOLS) == 26
     assert len(DIAGNOSTIC_TOOLS) == 15
     assert len(TOOL_ENTRIES) == len(DEFAULT_TOOLS) + len(DIAGNOSTIC_TOOLS)
     assert DEFAULT_TOOLS.isdisjoint(DIAGNOSTIC_TOOLS)
@@ -277,6 +281,14 @@ def test_default_input_schemas_match_manifest_contract(tmp_path):
         if name in DEFAULT_TOOLS
     }
     assert actual == expected
+
+
+def test_tg_summary_tool_description_uses_server_contract(tmp_path):
+    surface = _registered_surface(tmp_path)
+    actual = next(
+        tool for tool in surface["tools"] if tool["name"] == "refresh_tg_summary"
+    )
+    assert actual["description"] == server.TG_SUMMARY_TOOL_DESCRIPTION
 
 
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])

@@ -554,6 +554,38 @@
       }
     },
     {
+      "name": "refresh_tg_summary",
+      "primitive": "tool",
+      "category": "memory_session",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "bucket_id": {
+            "type": "string"
+          },
+          "source_hash": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_id",
+          "source_hash",
+          "summary"
+        ]
+      }
+    },
+    {
       "name": "breath",
       "primitive": "tool",
       "category": "memory_session",
