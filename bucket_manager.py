@@ -1845,6 +1845,50 @@ class BucketManager:
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
 
+    @guarded_async_mutation("bucket_tg_summary_refresh")
+    async def refresh_tg_summary(
+        self,
+        bucket_id: str,
+        summary: str,
+        source_sha256: str,
+    ) -> tuple[str, str]:
+        """Store a TG summary only when the source body still has the expected hash."""
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return "missing", ""
+        try:
+            post = frontmatter.load(file_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load bucket for TG summary refresh %s: %s",
+                bucket_id,
+                exc,
+            )
+            return "invalid", ""
+        if _is_sealed_bucket(post):
+            return "sealed", ""
+
+        current_source_sha256 = hashlib.sha256(
+            str(post.content or "").encode("utf-8")
+        ).hexdigest()
+        if current_source_sha256 != source_sha256:
+            return "source_hash_mismatch", current_source_sha256
+
+        post["tg_summary"] = summary
+        post["tg_summary_source_hash"] = current_source_sha256
+        post["tg_summary_updated_at"] = now_iso()
+        post["last_active"] = now_iso()
+        post["updated_at"] = _date_only()
+        try:
+            self._write_post_atomic(file_path, post)
+        except OSError as exc:
+            logger.error(
+                "Failed to write TG summary refresh for %s: %s", bucket_id, exc
+            )
+            return "write_failed", current_source_sha256
+        logger.info("Refreshed TG summary for bucket %s", bucket_id)
+        return "updated", current_source_sha256
+
     # ---------------------------------------------------------
     # Wikilink injection — DISABLED
     # 自动添加 Obsidian 双链 — 已禁用

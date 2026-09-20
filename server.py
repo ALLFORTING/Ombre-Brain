@@ -2462,6 +2462,45 @@ def _format_boot_preview(
     return preview
 
 
+def _tg_summary_source_hash(content: str) -> str:
+    """Hash the stored bucket body; metadata-only changes must not stale TG summaries."""
+    return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+
+def _tg_summary_state(bucket: dict) -> tuple[str, str, str]:
+    """Return valid, missing, or stale plus the current source hash and summary."""
+    metadata = bucket.get("metadata", {})
+    summary = metadata.get("tg_summary")
+    source_hash = _tg_summary_source_hash(bucket.get("content", ""))
+    if not isinstance(summary, str) or not summary.strip():
+        return "missing", source_hash, ""
+    stored_hash = str(metadata.get("tg_summary_source_hash", "") or "").strip()
+    if not stored_hash or not hmac.compare_digest(stored_hash, source_hash):
+        return "stale", source_hash, summary.strip()
+    return "valid", source_hash, summary.strip()
+
+
+def _format_tg_summary_refresh_notice(bucket_id: str, state: str, source_hash: str) -> str:
+    """Tell the caller how to refresh a missing or stale TG summary safely."""
+    label = "尚未生成" if state == "missing" else "已过期"
+    return (
+        f"[…TG summary {label}：bucket {bucket_id}；当前原文 source_hash:{source_hash}；"
+        f"请先用 dream(detail_ids=\"{bucket_id}\") 读取全文，再按 refresh_tg_summary "
+        "的 generation contract 生成并保存压缩版]"
+    )
+
+
+def _format_tg_summary_preview(bucket: dict, source_hash: str, summary: str) -> str:
+    """Render a valid caller-generated TG summary with a source-of-truth reminder."""
+    bucket_id = str(bucket.get("id", ""))
+    return (
+        f"[TG 压缩版：bucket {bucket_id}；source_hash:{source_hash}]\n"
+        f"{summary}\n"
+        f"[这是压缩版；原 bucket 是唯一真实来源；需要细节时用 "
+        f"dream(detail_ids=\"{bucket_id}\") 读取全文]"
+    )
+
+
 async def _format_due_triggers(
     active_buckets: list[dict],
     max_items: int = 10,
@@ -2520,6 +2559,19 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
 BOOT_TRUNCATION_NOTICE_TOKENS = 160
 BOOT_TG_TRUNCATION_NOTICE_TOKENS = 600
 BOOT_DELTA_MAX_TOKENS = 600
+TG_SUMMARY_MAX_CHARS = 1200
+TG_SUMMARY_GENERATION_CONTRACT = """\
+TG summary 是 pinned bucket 的紧凑开机上下文，不是新的事实来源；原 bucket 正文永远是 source of truth。
+调用方必须先用 dream(detail_ids=...) 阅读当前原文，再忠实压缩，绝不补充原文没有的信息。
+若原文含行首中文编号 part（如 一、/二、/三、），必须覆盖每个 part 的核心内容，不能因前面较长而遗漏后面部分。
+优先保留当前状态、重要关系或身份、明确约束、协作规则、婷的稳定偏好和仍有效的重要事实；删除重复、铺垫、例子及低价值措辞。
+摘要最多 1200 个 Unicode 字符，适合 TG 紧凑上下文；summary 正文只写压缩后的有效内容，不要附加“这是压缩版”、原 bucket 是 source of truth 或 dream 全文指引——这些由 TG boot 统一追加。
+"""
+TG_SUMMARY_TOOL_DESCRIPTION = (
+    "Store a caller-generated TG pinned-summary; no external model is called.\n\n"
+    "TG summary generation contract:\n"
+    + TG_SUMMARY_GENERATION_CONTRACT
+)
 BOOT_SECTION_MINIMUM_CHARS = {
     "mailbox": 1000,
     "todos": 1500,
@@ -9116,11 +9168,21 @@ async def boot(
     pinned_lines = []
     for bucket in pinned:
         meta = bucket.get("metadata", {})
-        preview = _format_boot_preview(
-            bucket,
-            pinned_chars,
-            show_truncation=profile == "tg",
-        )
+        if profile == "tg":
+            summary_state, source_hash, summary = _tg_summary_state(bucket)
+            if summary_state == "valid":
+                preview = _format_tg_summary_preview(bucket, source_hash, summary)
+            else:
+                preview = _format_boot_preview(
+                    bucket,
+                    pinned_chars,
+                    show_truncation=True,
+                )
+                preview += "\n" + _format_tg_summary_refresh_notice(
+                    str(bucket["id"]), summary_state, source_hash
+                )
+        else:
+            preview = _format_boot_preview(bucket, pinned_chars)
         pinned_lines.append(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
         )
@@ -9261,6 +9323,78 @@ async def boot(
                 )
             )
     return _with_response_seal(f"boot profile: {profile}\n\n{body}")
+
+
+@mcp.tool(description=TG_SUMMARY_TOOL_DESCRIPTION)
+async def refresh_tg_summary(
+    bucket_id: str,
+    summary: Annotated[
+        str,
+        Field(
+            description=(
+                "Caller-generated TG summary, at most 1200 Unicode characters. "
+                "Follow the stable TG summary generation contract in this tool description."
+            )
+        ),
+    ],
+    source_hash: Annotated[
+        str,
+        Field(
+            description=(
+                "SHA-256 source_hash reported by TG boot for this bucket. "
+                "The write is rejected if the stored body changed since that hash."
+            )
+        ),
+    ],
+) -> str:
+    """Persist one caller-generated TG summary after source-hash validation."""
+    normalized_id = (bucket_id or "").strip()
+    normalized_summary = (summary or "").strip()
+    normalized_hash = (source_hash or "").strip().lower()
+    if not normalized_id:
+        return "请提供有效的 bucket_id。"
+    if not normalized_summary:
+        return "TG summary 不能为空。"
+    if len(normalized_summary) > TG_SUMMARY_MAX_CHARS:
+        return (
+            f"TG summary 超过 {TG_SUMMARY_MAX_CHARS} 字符上限；"
+            "请压缩后重试。"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+        return "source_hash 必须是 TG boot 返回的 64 位 SHA-256。"
+
+    bucket = await bucket_mgr.get(normalized_id)
+    if not bucket:
+        return f"未找到记忆桶: {normalized_id}"
+    if _is_sealed(bucket):
+        return f"记忆桶已封存，不能刷新 TG summary: {normalized_id}"
+    current_hash = _tg_summary_source_hash(bucket.get("content", ""))
+    if not hmac.compare_digest(normalized_hash, current_hash):
+        return (
+            f"TG summary 未保存：原文已变化。bucket {normalized_id} 当前 source_hash:{current_hash}；"
+            f"请用 dream(detail_ids=\"{normalized_id}\") 重新读取后生成。"
+        )
+
+    outcome, current_hash = await bucket_mgr.refresh_tg_summary(
+        normalized_id,
+        normalized_summary,
+        normalized_hash,
+    )
+    if outcome == "updated":
+        return (
+            f"TG summary 已刷新：bucket {normalized_id}；source_hash:{current_hash}；"
+            "TG boot 将使用该压缩版，原 bucket 仍是唯一真实来源。"
+        )
+    if outcome == "source_hash_mismatch":
+        return (
+            f"TG summary 未保存：原文已变化。bucket {normalized_id} 当前 source_hash:{current_hash}；"
+            f"请用 dream(detail_ids=\"{normalized_id}\") 重新读取后生成。"
+        )
+    if outcome == "sealed":
+        return f"记忆桶已封存，不能刷新 TG summary: {normalized_id}"
+    if outcome == "missing":
+        return f"未找到记忆桶: {normalized_id}"
+    return f"TG summary 保存失败: {normalized_id}"
 
 
 def _health_todo_age_days(metadata: dict) -> float | None:
