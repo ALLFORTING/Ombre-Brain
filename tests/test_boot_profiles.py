@@ -174,11 +174,38 @@ async def test_tg_is_compact_and_keeps_global_constraint_and_high_todo(
     assert constraint_id in tg
     assert high_todo_id in tg
     assert low_todo_id not in tg
-    assert "=== boot: 最新信箱 ===" not in tg
+    assert "=== boot: 最新信箱 ===" in tg
     assert "=== boot: 最近 3 次归档 ===" not in tg
     assert "=== boot: 回声 ===" not in tg
     assert len(tg) < len(talk)
     assert server.count_tokens_approx(tg) <= server.BOOT_PROFILE_CONFIG["tg"]["max_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_tg_mailbox_shows_only_latest_visible_letter_without_sessions(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.archive_session("older session", letter="TG_OLDER_VISIBLE_LETTER")
+    await server.archive_session("latest session", letter="TG_LATEST_VISIBLE_LETTER")
+    await server.archive_session(
+        "sealed session", letter="TG_SEALED_LETTER_MUST_NOT_LEAK", sealed=True
+    )
+    await server.leave_note("TG_FUTURE_NOTE_MUST_NOT_LEAK", open_at="2099-01-01T00:00:00")
+
+    talk = await server.boot(profile="talk")
+    code = await server.boot(profile="code")
+    tg = await server.boot(profile="tg")
+
+    for result in (talk, code, tg):
+        assert "TG_LATEST_VISIBLE_LETTER" in result
+        assert "TG_OLDER_VISIBLE_LETTER" not in result
+        assert "TG_SEALED_LETTER_MUST_NOT_LEAK" not in result
+    assert "TG_FUTURE_NOTE_MUST_NOT_LEAK" not in tg
+    assert "=== boot: 最新信箱 ===" in tg
+    assert "=== boot: 最近 3 次归档 ===" not in tg
+    assert "older session" not in tg
+    assert "latest session" not in tg
 
 
 @pytest.mark.asyncio
