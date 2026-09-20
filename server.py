@@ -2443,7 +2443,31 @@ def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | No
     )
 
 
-async def _format_due_triggers(active_buckets: list[dict], max_items: int = 10) -> tuple[str, list[str]]:
+def _format_boot_preview(
+    bucket: dict,
+    max_chars: int,
+    *,
+    show_truncation: bool = False,
+) -> str:
+    """Return a display-safe bucket preview with an optional truncation marker."""
+    content = strip_wikilinks(bucket.get("content", "")).strip()
+    preview = content[:max_chars]
+    if show_truncation and len(content) > len(preview):
+        bucket_id = str(bucket.get("id", ""))
+        return (
+            f"{preview}\n"
+            f"[…已截断：bucket {bucket_id}，显示 {len(preview)} / {len(content)} 字符；"
+            f"完整内容可用 dream(detail_ids=\"{bucket_id}\") 读取]"
+        )
+    return preview
+
+
+async def _format_due_triggers(
+    active_buckets: list[dict],
+    max_items: int = 10,
+    *,
+    show_preview_truncation: bool = False,
+) -> tuple[str, list[str]]:
     today = datetime.now().date().isoformat()
     due = []
     for bucket in active_buckets:
@@ -2461,7 +2485,11 @@ async def _format_due_triggers(active_buckets: list[dict], max_items: int = 10) 
     lines = []
     for bucket in shown:
         meta = bucket.get("metadata", {})
-        preview = strip_wikilinks(bucket.get("content", "")).strip()[:300]
+        preview = _format_boot_preview(
+            bucket,
+            300,
+            show_truncation=show_preview_truncation,
+        )
         lines.append(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
             f"trigger_date:{meta.get('trigger_date')}\n{preview}"
@@ -2490,6 +2518,7 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
 
 
 BOOT_TRUNCATION_NOTICE_TOKENS = 160
+BOOT_TG_TRUNCATION_NOTICE_TOKENS = 600
 BOOT_DELTA_MAX_TOKENS = 600
 BOOT_SECTION_MINIMUM_CHARS = {
     "mailbox": 1000,
@@ -2528,10 +2557,11 @@ BOOT_PROFILE_CONFIG = {
         "pinned_chars": 600,
         "delta_tokens": 220,
         "trigger_items": 5,
-        "include_mailbox": False,
+        "include_mailbox": True,
         "include_sessions": False,
         "include_echo": False,
         "section_minimums": {
+            "mailbox": 600,
             "todos": 600,
             "pinned": 600,
         },
@@ -2604,17 +2634,20 @@ def _fit_sections_to_budget(
     *,
     minimum_chars: dict[str, int] | None = None,
     atomic_sections: set[str] | None = None,
+    omission_item_refs: dict[str, list[str]] | None = None,
+    truncation_notice_tokens: int = BOOT_TRUNCATION_NOTICE_TOKENS,
 ) -> str:
     """Fit named sections in priority order and report every omitted block."""
     if not sections:
         return ""
     minimum_chars = minimum_chars or {}
     atomic_sections = atomic_sections or set()
+    omission_item_refs = omission_item_refs or {}
     total_tokens = sum(count_tokens_approx(text) for _, _, text in sections)
     if total_tokens <= max_tokens:
         return "\n\n".join(text for _, _, text in sections)
 
-    content_budget = max(0, max_tokens - BOOT_TRUNCATION_NOTICE_TOKENS)
+    content_budget = max(0, max_tokens - truncation_notice_tokens)
     requested_tokens = {}
     for key, _, text in sections:
         minimum = max(0, minimum_chars.get(key, 0))
@@ -2637,6 +2670,47 @@ def _fit_sections_to_budget(
     complete = []
     partial = []
     omitted = []
+
+    def _omission_detail(
+        key: str,
+        display_name: str,
+        emitted_text: str,
+        *,
+        partial_output: bool,
+    ) -> str:
+        refs = omission_item_refs.get(key, [])
+        if not refs:
+            return display_name
+        emitted_refs = [ref for ref in refs if ref in emitted_text]
+        omitted_refs = [ref for ref in refs if ref not in emitted_text]
+        complete_count = len(emitted_refs)
+        if partial_output and emitted_refs:
+            last_emitted = emitted_refs[-1]
+            if last_emitted not in omitted_refs:
+                omitted_refs.append(last_emitted)
+                complete_count -= 1
+        omitted_label = "、".join(omitted_refs) or "正文尾部"
+        continuation = ""
+        if key == "mailbox":
+            letter_ids = [
+                ref.split(":", 1)[1]
+                for ref in omitted_refs
+                if ref.startswith("letter_id:")
+            ]
+            if letter_ids:
+                continuation = (
+                    "；完整内容请用 "
+                    + "、".join(
+                        f"get_letter(letter_id={letter_id})"
+                        for letter_id in letter_ids
+                    )
+                    + " 读取"
+                )
+        return (
+            f"{display_name}（原 {len(refs)} 项，完整输出 {complete_count} 项；"
+            f"省略/截断：{omitted_label}{continuation}）"
+        )
+
     used = 0
     priority_exhausted = False
 
@@ -2647,7 +2721,9 @@ def _fit_sections_to_budget(
         )
         is_reserved = key in reserved_tokens
         if priority_exhausted and not is_reserved:
-            omitted.append(display_name)
+            omitted.append(
+                _omission_detail(key, display_name, "", partial_output=False)
+            )
             continue
 
         available = max(0, content_budget - used - later_reserve)
@@ -2659,17 +2735,23 @@ def _fit_sections_to_budget(
             continue
 
         if key in atomic_sections:
-            omitted.append(display_name)
+            omitted.append(
+                _omission_detail(key, display_name, "", partial_output=False)
+            )
             priority_exhausted = True
             continue
 
         prefix = _prefix_within_token_budget(text, available)
         if prefix:
             output.append(prefix)
-            partial.append(display_name)
+            partial.append(
+                _omission_detail(key, display_name, prefix, partial_output=True)
+            )
             used += count_tokens_approx(prefix)
         else:
-            omitted.append(display_name)
+            omitted.append(
+                _omission_detail(key, display_name, "", partial_output=False)
+            )
         priority_exhausted = True
 
     notice_lines = ["已按 boot 预算截断："]
@@ -2678,11 +2760,24 @@ def _fit_sections_to_budget(
     if omitted:
         notice_lines.append("- 未输出：" + "、".join(omitted))
     notice = "\n".join(notice_lines)
-    if count_tokens_approx(notice) > BOOT_TRUNCATION_NOTICE_TOKENS:
-        notice = _prefix_within_token_budget(
-            notice,
-            BOOT_TRUNCATION_NOTICE_TOKENS,
-        )
+    if count_tokens_approx(notice) > truncation_notice_tokens:
+        if omission_item_refs:
+            overflow = (
+                "\n- 省略 ID 清单超出本次 TG 预算；仅列出前缀，"
+                "未列出的稳定 ID 无法在当前紧凑输出中完整列出。"
+            )
+            notice = (
+                _prefix_within_token_budget(
+                    notice,
+                    max(0, truncation_notice_tokens - count_tokens_approx(overflow)),
+                )
+                + overflow
+            )
+        else:
+            notice = _prefix_within_token_budget(
+                notice,
+                truncation_notice_tokens,
+            )
     output.append(notice)
     return "\n\n".join(output)
 
@@ -2702,6 +2797,7 @@ def _format_boot_delta(
     high_water: int,
     visible_buckets: list[dict],
     max_tokens: int = BOOT_DELTA_MAX_TOKENS,
+    include_omitted_ids: bool = False,
 ) -> str:
     """Format complete, bounded boot-delta records from the durable event log."""
     header = "=== boot: 增量摘要 ==="
@@ -2717,7 +2813,7 @@ def _format_boot_delta(
         int(checkpoint["last_event_id"]),
         high_water,
     )
-    records: list[tuple[str, int, int, str]] = []
+    records: list[tuple[str, int, int, str, str]] = []
     for event in events:
         bucket = visible_by_id.get(str(event.get("bucket_id", "")))
         if bucket is None:
@@ -2751,6 +2847,7 @@ def _format_boot_delta(
                 str(event.get("occurred_at", "")),
                 importance,
                 int(event.get("id", 0) or 0),
+                str(bucket["id"]),
                 f"- {_boot_delta_locator(bucket)}：{detail}",
             )
         )
@@ -2760,21 +2857,41 @@ def _format_boot_delta(
 
     records.sort(key=lambda item: item[:3], reverse=True)
     selected: list[str] = []
-    omitted = 0
-    for index, (_, _, _, record) in enumerate(records):
+    omitted_ids: list[str] = []
+
+    def _omitted_suffix(bucket_ids: list[str]) -> str:
+        suffix = f"（还有 {len(bucket_ids)} 项未展开"
+        if not include_omitted_ids:
+            return suffix + "）"
+        suffix += "：bucket_id:" + "、".join(bucket_ids) + "）"
+        available = max_tokens - count_tokens_approx(header)
+        if count_tokens_approx(suffix) <= available:
+            return suffix
+        prefix = f"（还有 {len(bucket_ids)} 项未展开：bucket_id:"
+        overflow = "；ID 清单超出 TG delta 预算，仅列出前缀）"
+        shown_ids = []
+        for bucket_id in bucket_ids:
+            candidate = "、".join([*shown_ids, bucket_id])
+            if count_tokens_approx(prefix + candidate + overflow) > available:
+                break
+            shown_ids.append(bucket_id)
+        return prefix + "、".join(shown_ids) + overflow
+
+    for index, (_, _, _, _, record) in enumerate(records):
         remaining = len(records) - index - 1
         candidate = [header, *selected, record]
         if remaining:
-            candidate.append(f"（还有 {remaining} 项未展开）")
+            remaining_ids = [item[3] for item in records[index + 1 :]]
+            candidate.append(_omitted_suffix(remaining_ids))
         if count_tokens_approx("\n".join(candidate)) <= max_tokens:
             selected.append(record)
             continue
-        omitted = len(records) - index
+        omitted_ids = [item[3] for item in records[index:]]
         break
 
     lines = [header, *selected]
-    if omitted:
-        lines.append(f"（还有 {omitted} 项未展开）")
+    if omitted_ids:
+        lines.append(_omitted_suffix(omitted_ids))
     return "\n".join(lines)
 
 
@@ -8978,11 +9095,13 @@ async def boot(
             if _profile_allows_bucket(bucket, profile)
         ],
         max_tokens=int(profile_config["delta_tokens"]),
+        include_omitted_ids=profile == "tg",
     )
 
     trigger_text, trigger_ids = await _format_due_triggers(
         active_buckets,
         max_items=int(profile_config["trigger_items"]),
+        show_preview_truncation=profile == "tg",
     )
 
     pinned = [
@@ -8997,7 +9116,11 @@ async def boot(
     pinned_lines = []
     for bucket in pinned:
         meta = bucket.get("metadata", {})
-        preview = strip_wikilinks(bucket.get("content", "")).strip()[:pinned_chars]
+        preview = _format_boot_preview(
+            bucket,
+            pinned_chars,
+            show_truncation=profile == "tg",
+        )
         pinned_lines.append(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
         )
@@ -9054,6 +9177,24 @@ async def boot(
         sections.append(("pinned", "钉选索引", pinned_text))
         if profile_config["include_echo"]:
             sections.append(("echo", "feel 回声", echo_text))
+        omission_item_refs = None
+        truncation_notice_tokens = BOOT_TRUNCATION_NOTICE_TOKENS
+        if profile == "tg":
+            def _stable_refs(text: str) -> list[str]:
+                return list(dict.fromkeys(re.findall(
+                    r"\[((?:bucket|note|letter)_id:[^\]]+)\]",
+                    text,
+                )))
+
+            omission_item_refs = {
+                "ting_note": _stable_refs(ting_note_text),
+                "delta": _stable_refs(current_delta_text),
+                "triggers": [f"bucket_id:{bucket_id}" for bucket_id in trigger_ids],
+                "mailbox": _stable_refs(mailbox_text),
+                "todos": _stable_refs(todos_text),
+                "pinned": [f"bucket_id:{bucket['id']}" for bucket in pinned],
+            }
+            truncation_notice_tokens = BOOT_TG_TRUNCATION_NOTICE_TOKENS
         return _fit_sections_to_budget(
             sections,
             max_tokens=max_tokens - 40,
@@ -9063,6 +9204,8 @@ async def boot(
                 "delta": len(current_delta_text),
             },
             atomic_sections={"delta"},
+            omission_item_refs=omission_item_refs,
+            truncation_notice_tokens=truncation_notice_tokens,
         )
 
     body = _compose_boot_body(delta_text)
@@ -9090,6 +9233,7 @@ async def boot(
                 if _profile_allows_bucket(bucket, profile)
             ],
             max_tokens=int(profile_config["delta_tokens"]),
+            include_omitted_ids=profile == "tg",
         )
         body = _compose_boot_body(delta_text)
         expected_event_id = (
@@ -9113,6 +9257,7 @@ async def boot(
                         if _profile_allows_bucket(bucket, profile)
                     ],
                     max_tokens=int(profile_config["delta_tokens"]),
+                    include_omitted_ids=profile == "tg",
                 )
             )
     return _with_response_seal(f"boot profile: {profile}\n\n{body}")
@@ -9687,6 +9832,174 @@ def _dashboard_bucket_summary(bucket: dict) -> dict:
     }
 
 
+_DASHBOARD_BUCKET_ID_MARKER_RE = re.compile(
+    r"(?:^|\[)\s*bucket_id\s*:\s*([0-9a-fA-F]+)(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_DASHBOARD_LEADING_BUCKET_ID_RE = re.compile(
+    r"^\s*([0-9a-fA-F]+)(?=$|\s+name\s*=)",
+    re.IGNORECASE,
+)
+_DASHBOARD_ID_PREFIX_RE = re.compile(r"^id\s*:\s*(.*)$", re.IGNORECASE)
+_DASHBOARD_NAME_PREFIX_RE = re.compile(r"^name\s*:\s*(.*)$", re.IGNORECASE)
+_DASHBOARD_BODY_BUCKET_ID_RE = re.compile(r"\b[0-9a-f]{12}\b", re.IGNORECASE)
+
+
+def _dashboard_valid_bucket_id_prefix(value: str) -> str:
+    """Return a canonical 6-12 character hexadecimal Dashboard bucket prefix."""
+    candidate = str(value or "").strip()
+    if 6 <= len(candidate) <= 12 and re.fullmatch(r"[0-9a-fA-F]+", candidate):
+        return candidate.casefold()
+    return ""
+
+
+def _dashboard_extract_bucket_id_prefix(value: str) -> str:
+    """Extract a bucket prefix from Dashboard-friendly OB output formats."""
+    text = str(value or "").strip()
+    marker = _DASHBOARD_BUCKET_ID_MARKER_RE.search(text)
+    if marker:
+        return _dashboard_valid_bucket_id_prefix(marker.group(1))
+    leading = _DASHBOARD_LEADING_BUCKET_ID_RE.match(text)
+    if leading:
+        return _dashboard_valid_bucket_id_prefix(leading.group(1))
+    return ""
+
+
+def _dashboard_search_query(raw_query: str) -> dict:
+    """Normalize Dashboard-only ID/name query syntax without changing MCP search."""
+    query = str(raw_query or "").strip()
+    name_match = _DASHBOARD_NAME_PREFIX_RE.match(query)
+    if name_match:
+        return {
+            "mode": "name",
+            "normalized_query": name_match.group(1).strip(),
+            "id_prefix": "",
+        }
+
+    id_match = _DASHBOARD_ID_PREFIX_RE.match(query)
+    if id_match:
+        candidate = id_match.group(1).strip()
+        return {
+            "mode": "id",
+            "normalized_query": (
+                _dashboard_extract_bucket_id_prefix(candidate)
+                or _dashboard_valid_bucket_id_prefix(candidate)
+                or candidate.casefold()
+            ),
+            "id_prefix": (
+                _dashboard_extract_bucket_id_prefix(candidate)
+                or _dashboard_valid_bucket_id_prefix(candidate)
+            ),
+        }
+
+    id_prefix = _dashboard_extract_bucket_id_prefix(query)
+    if id_prefix:
+        return {
+            "mode": "id",
+            "normalized_query": id_prefix,
+            "id_prefix": id_prefix,
+        }
+    return {"mode": "text", "normalized_query": query, "id_prefix": ""}
+
+
+def _dashboard_search_result(
+    bucket: dict,
+    *,
+    score: float | None = None,
+    match_reason: str = "",
+    reference_kinds: list[str] | None = None,
+) -> dict:
+    """Return a stable Dashboard-only search result, including sealed state."""
+    result = _dashboard_bucket_summary(bucket)
+    if score is not None:
+        result["score"] = score
+    result["sealed"] = bool(int(bucket.get("metadata", {}).get("sealed", 0) or 0))
+    if match_reason:
+        result["match_reason"] = match_reason
+    if reference_kinds:
+        result["reference_kinds"] = reference_kinds
+    return result
+
+
+def _dashboard_name_matches(all_buckets: list[dict], query: str) -> list[dict]:
+    """Provide a Dashboard name-first ordering without changing generic search."""
+    needle = query.casefold()
+    if not needle:
+        return []
+    return [
+        bucket
+        for bucket in all_buckets
+        if needle in str(bucket.get("metadata", {}).get("name", "")).casefold()
+    ]
+
+
+def _dashboard_bucket_links(content: str, all_buckets: list[dict]) -> dict[str, dict]:
+    """Describe every full bucket ID mentioned in Dashboard display content."""
+    mentioned_ids = {
+        match.group(0).casefold()
+        for match in _DASHBOARD_BODY_BUCKET_ID_RE.finditer(str(content or ""))
+    }
+    buckets_by_id = {
+        str(bucket.get("id", "")).casefold(): bucket
+        for bucket in all_buckets
+    }
+    links = {}
+    for bucket_id in sorted(mentioned_ids):
+        target = buckets_by_id.get(bucket_id)
+        if not target:
+            links[bucket_id] = {"id": bucket_id, "exists": False}
+            continue
+        meta = target.get("metadata", {})
+        links[bucket_id] = {
+            "id": target.get("id", bucket_id),
+            "exists": True,
+            "name": meta.get("name", target.get("id", bucket_id)),
+            "sealed": bool(int(meta.get("sealed", 0) or 0)),
+            "dormant": bool(meta.get("dormant", False)),
+            "type": meta.get("type", "dynamic"),
+        }
+    return links
+
+
+def _dashboard_bucket_references(
+    all_buckets: list[dict], target_ids: set[str], *, include_dormant: bool = False
+) -> list[dict]:
+    """Find Dashboard-visible content and related_buckets references to target IDs."""
+    if not target_ids:
+        return []
+    id_patterns = {
+        target_id: re.compile(
+            rf"(?<![0-9a-fA-F]){re.escape(target_id)}(?![0-9a-fA-F])",
+            re.IGNORECASE,
+        )
+        for target_id in target_ids
+    }
+    results = []
+    for bucket in all_buckets:
+        kinds = []
+        content = str(bucket.get("content", ""))
+        if any(pattern.search(content) for pattern in id_patterns.values()):
+            kinds.append("content")
+        related_ids = {
+            relation_id.casefold()
+            for relation_id in _related_ids(bucket.get("metadata", {}))
+        }
+        if related_ids & target_ids:
+            kinds.append("related_buckets")
+        if kinds:
+            result = _dashboard_search_result(
+                bucket,
+                match_reason="reference",
+                reference_kinds=kinds,
+            )
+            if include_dormant:
+                result["dormant"] = bool(
+                    bucket.get("metadata", {}).get("dormant", False)
+                )
+            results.append(result)
+    return results
+
+
 def _is_session_archive(bucket: dict) -> bool:
     meta = bucket.get("metadata", {})
     domains = {
@@ -9825,40 +10138,110 @@ async def api_bucket_detail(request):
             return _dashboard_write_error(route, 500, "bucket_delete_failed")
         return JSONResponse({"id": bucket_id, "deleted": True})
 
-    return JSONResponse({
+    response = {
         "id": bucket["id"],
         "metadata": meta,
         "content": strip_wikilinks(bucket.get("content", "")),
         "raw_content": bucket.get("content", ""),
         "score": decay_engine.calculate_score(meta),
-    })
+    }
+    if method == "GET":
+        display_content = response["content"]
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=True)
+        except Exception:
+            logger.exception("Dashboard bucket detail enrichment failed")
+            return JSONResponse({"error": "bucket_detail_enrichment_failed"}, status_code=500)
+        response["bucket_links"] = _dashboard_bucket_links(
+            display_content, all_buckets
+        )
+        response["referenced_by"] = _dashboard_bucket_references(
+            all_buckets,
+            {str(bucket.get("id", "")).casefold()},
+            include_dormant=True,
+        )
+    return JSONResponse(response)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
-    """Search buckets by query."""
+    """Search Dashboard buckets with optional ID/name-specific result groups."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
-    if err: return err
-    query = request.query_params.get("q", "")
+    if err:
+        return err
+    query = str(request.query_params.get("q", "")).strip()
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10, include_sealed=True)
-        result = []
-        for b in matches:
-            meta = b.get("metadata", {})
-            result.append({
-                "id": b["id"],
-                "name": meta.get("name", b["id"]),
-                "score": b.get("score", 0),
-                "domain": meta.get("domain", []),
-                "valence": meta.get("valence", 0.5),
-                "arousal": meta.get("arousal", 0.3),
-                "content_preview": strip_wikilinks(b.get("content", ""))[:200],
-            })
-        return JSONResponse(result)
-    except Exception: logger.exception("Dashboard search failed"); return JSONResponse({"error": "search_failed"}, status_code=500)
+        parsed = _dashboard_search_query(query)
+        normalized_query = parsed["normalized_query"]
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        generic_matches = await bucket_mgr.search(
+            normalized_query,
+            limit=10,
+            include_sealed=True,
+        ) if normalized_query else []
+
+        id_matches = []
+        references = []
+        if parsed["mode"] == "id":
+            prefix = parsed["id_prefix"]
+            matched_buckets = [
+                bucket for bucket in all_buckets
+                if prefix and str(bucket.get("id", "")).casefold().startswith(prefix)
+            ]
+            matched_buckets.sort(key=lambda bucket: (
+                str(bucket.get("id", "")).casefold() != prefix,
+                str(bucket.get("id", "")).casefold(),
+            ))
+            id_matches = [
+                _dashboard_search_result(
+                    bucket,
+                    match_reason=(
+                        "id_exact"
+                        if str(bucket.get("id", "")).casefold() == prefix and len(prefix) == 12
+                        else "id_prefix"
+                    ),
+                )
+                for bucket in matched_buckets
+            ]
+            references = _dashboard_bucket_references(
+                all_buckets,
+                {str(bucket.get("id", "")).casefold() for bucket in matched_buckets},
+            )
+
+        related_by_id = {}
+        if parsed["mode"] == "name":
+            for bucket in _dashboard_name_matches(all_buckets, normalized_query):
+                related_by_id[str(bucket.get("id", ""))] = _dashboard_search_result(
+                    bucket,
+                    match_reason="name",
+                )
+        for bucket in generic_matches:
+            bucket_id = str(bucket.get("id", ""))
+            related_by_id.setdefault(
+                bucket_id,
+                _dashboard_search_result(
+                    bucket,
+                    score=bucket.get("score", 0),
+                    match_reason="related",
+                ),
+            )
+
+        return JSONResponse({
+            "query": query,
+            "mode": parsed["mode"],
+            "normalized_query": normalized_query,
+            "groups": {
+                "id_matches": id_matches,
+                "references": references,
+                "related": list(related_by_id.values()),
+            },
+        })
+    except Exception:
+        logger.exception("Dashboard search failed")
+        return JSONResponse({"error": "search_failed"}, status_code=500)
 
 
 @mcp.custom_route("/api/network", methods=["GET"])
