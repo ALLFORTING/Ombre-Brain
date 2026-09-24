@@ -846,6 +846,74 @@ class BucketManager:
             "marker": marker,
         }
 
+    @guarded_mutation("digest_operation_write")
+    def write_digest_operation(
+        self, operation_id: str, kind: str, plan: dict, *,
+        owner: str, status: str = "running", outputs: dict | None = None,
+        completed: list[str] | None = None, recover: bool = False,
+    ) -> None:
+        """Persist one digest-only execution record before touching memory files."""
+        if kind not in {"consolidation", "rebalance"} or status not in {"running", "failed", "complete"}:
+            raise ValueError("invalid digest operation")
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS digest_operations (
+                    operation_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                    plan_json TEXT NOT NULL, owner TEXT NOT NULL,
+                    status TEXT NOT NULL, outputs_json TEXT NOT NULL,
+                    completed_json TEXT NOT NULL, updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT kind, plan_json, owner, status, outputs_json, completed_json "
+                "FROM digest_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            plan_json = json.dumps(plan, ensure_ascii=False, sort_keys=True)
+            if row is not None and row[:2] != (kind, plan_json):
+                raise ValueError("digest operation plan changed")
+            if row is not None and row[2] != owner and not recover:
+                raise ValueError("digest operation owned by another process")
+            if row is not None and row[3] == "complete":
+                raise ValueError("digest operation already complete")
+            if row is not None and recover and (
+                json.loads(row[4]) != (outputs or {})
+                or json.loads(row[5]) != (completed or [])
+            ):
+                raise ValueError("digest operation changed; request a new resume token")
+            if row is None:
+                conn.execute("""
+                    INSERT INTO digest_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (operation_id, kind, plan_json, owner, status,
+                      json.dumps(outputs or {}, ensure_ascii=False),
+                      json.dumps(completed or [], ensure_ascii=False), now_iso()))
+            else:
+                conn.execute("""
+                    UPDATE digest_operations SET owner = ?, status = ?, outputs_json = ?,
+                        completed_json = ?, updated_at = ? WHERE operation_id = ?
+                """, (owner, status, json.dumps(outputs or {}, ensure_ascii=False),
+                      json.dumps(completed or [], ensure_ascii=False), now_iso(), operation_id))
+
+    def read_digest_operations(self, *, open_only: bool = False) -> list[dict]:
+        with sqlite3.connect(self.history_db_path) as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'digest_operations'"
+            ).fetchone()
+            if not table:
+                return []
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM digest_operations"
+            if open_only:
+                query += " WHERE status != 'complete'"
+            rows = conn.execute(query + " ORDER BY updated_at").fetchall()
+        return [
+            {**dict(row), "plan": json.loads(row["plan_json"]),
+             "outputs": json.loads(row["outputs_json"]),
+             "completed": json.loads(row["completed_json"])}
+            for row in rows
+        ]
+
     @guarded_mutation("bucket_history_write")
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
         """Persist the old content before a destructive content change."""

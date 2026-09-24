@@ -105,6 +105,169 @@ def _confirm_token(result):
     raise AssertionError("confirm_token not found")
 
 
+def _named_token(result, label):
+    for line in result.splitlines():
+        if line.startswith(label + ":"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"{label} not found")
+
+
+@pytest.mark.asyncio
+async def test_digest_plan_tokens_are_separate_and_no_empty_consolidation_token(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._call_digest_api = AsyncMock(return_value="summary")
+    low = await server.bucket_mgr.create(content="old low", importance=2, domain=["low"])
+    high = await server.bucket_mgr.create(content="old high", importance=9, domain=["high"])
+    _age_bucket(server, low)
+    _age_bucket(server, high)
+    preview = await server.digest(dry_run=True)
+    consolidation_token = _named_token(preview, "confirm_token")
+    rebalance_token = _named_token(preview, "rebalance_confirm_token")
+
+    first = await server.digest(dry_run=False, confirm_token=consolidation_token)
+    assert "已消化: 1 个桶" in first
+    assert (await server.bucket_mgr.get(high))["metadata"]["importance"] == 9
+    second = await server.digest(dry_run=False, confirm_token=rebalance_token)
+    assert "importance rebalanced: 1" in second
+    assert (await server.bucket_mgr.get(high))["metadata"]["importance"] == 8
+    assert "confirmation required" in await server.digest(dry_run=False, confirm_token=consolidation_token)
+
+    fresh = _load_server(tmp_path / "fresh", monkeypatch)
+    permanent = await fresh.bucket_mgr.create(content="old permanent", importance=9,
+                                               domain=["high"], bucket_type="permanent")
+    _age_bucket(fresh, permanent)
+    assert "confirm_token:" not in await fresh.digest(dry_run=True)
+
+
+@pytest.mark.asyncio
+async def test_digest_rebalance_limit_only_limits_preview(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    ids = []
+    for importance in (10, 9, 8):
+        bucket_id = await server.bucket_mgr.create(content=f"old high {importance}",
+                                                    importance=importance, domain=["high"])
+        _age_bucket(server, bucket_id)
+        ids.append(bucket_id)
+    preview = await server.digest(dry_run=True, limit=1)
+    assert "总候选 3 项 / 当前显示 1 项 / 确认后实际执行 3 项" in preview
+    assert sum(f"bucket_id:{bucket_id}" in preview for bucket_id in ids) == 1
+    result = await server.digest(dry_run=False, limit=1, confirm_token=_confirm_token(preview))
+    assert "importance rebalanced: 3" in result
+    assert [(await server.bucket_mgr.get(bucket_id))["metadata"]["importance"]
+            for bucket_id in ids] == [9, 8, 7]
+
+
+@pytest.mark.asyncio
+async def test_digest_rebalance_failure_retries_only_unfinished_write(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    ids = []
+    for index in range(2):
+        bucket_id = await server.bucket_mgr.create(content=f"old high {index}",
+                                                    importance=9, domain=["high"])
+        _age_bucket(server, bucket_id)
+        ids.append(bucket_id)
+    token = _confirm_token(await server.digest(dry_run=True))
+    original = server.bucket_mgr.update
+    writes = 0
+
+    async def fail_second(bucket_id, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            return False
+        return await original(bucket_id, **kwargs)
+
+    monkeypatch.setattr(server.bucket_mgr, "update", fail_second)
+    failed = await server.digest(dry_run=False, confirm_token=token)
+    assert "partial failure" in failed
+    assert "completed steps: 1" in failed
+    assert "confirmation required" in await server.digest(dry_run=False, confirm_token=token)
+    monkeypatch.setattr(server.bucket_mgr, "update", original)
+    resumed = await server.digest(dry_run=False, confirm_token=_named_token(failed, "resume_confirm_token"))
+    assert "importance rebalanced: 2" in resumed
+    assert [(await server.bucket_mgr.get(bucket_id))["metadata"]["importance"] for bucket_id in ids] == [8, 8]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crash_after", [1, 3, 4])
+async def test_digest_consolidation_crash_after_bucket_write_replays_marker(tmp_path, monkeypatch, crash_after):
+    server = _load_server(tmp_path, monkeypatch)
+    server._call_digest_api = AsyncMock(return_value="stable summary")
+    source_id = await server.bucket_mgr.create(content="old low", importance=2, domain=["low"])
+    _age_bucket(server, source_id)
+    token = _confirm_token(await server.digest(dry_run=True))
+    original_write = server.bucket_mgr.write_digest_operation
+    crashed = False
+
+    def crash_before_step_record(*args, **kwargs):
+        nonlocal crashed
+        if len(kwargs.get("completed") or []) == crash_after and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash after atomic bucket write")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(server.bucket_mgr, "write_digest_operation", crash_before_step_record)
+    failed = await server.digest(dry_run=False, confirm_token=token)
+    assert "partial failure" in failed
+    assert f"completed steps: {crash_after}" in failed  # in-memory step preceded journal write
+    monkeypatch.setattr(server.bucket_mgr, "write_digest_operation", original_write)
+    restarted = _load_server(tmp_path, monkeypatch)
+    restarted._call_digest_api = AsyncMock(side_effect=AssertionError("provider must not repeat"))
+    preview = await restarted.digest(dry_run=True)
+    resumed = await restarted.digest(dry_run=False, confirm_token=_named_token(preview, "resume_confirm_token"))
+    assert "已消化: 1 个桶" in resumed
+    all_buckets = await restarted.bucket_mgr.list_all(include_archive=False)
+    assert sum("auto-digested" in b["metadata"].get("tags", []) for b in all_buckets) == 1
+    assert sum("digest-log" in b["metadata"].get("tags", []) for b in all_buckets) == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_rebalance_crash_after_update_replays_marker(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="old high", importance=9, domain=["high"])
+    _age_bucket(server, bucket_id)
+    token = _confirm_token(await server.digest(dry_run=True))
+    original_write = server.bucket_mgr.write_digest_operation
+    crashed = False
+
+    def crash_before_step_record(*args, **kwargs):
+        nonlocal crashed
+        if kwargs.get("completed") == [f"rebalance:{bucket_id}"] and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash after importance update")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(server.bucket_mgr, "write_digest_operation", crash_before_step_record)
+    failed = await server.digest(dry_run=False, confirm_token=token)
+    assert "partial failure" in failed
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["importance"] == 8
+    monkeypatch.setattr(server.bucket_mgr, "write_digest_operation", original_write)
+    restarted = _load_server(tmp_path, monkeypatch)
+    preview = await restarted.digest(dry_run=True)
+    resume_token = _named_token(preview, "resume_confirm_token")
+    assert "unfinished rebalance" in await restarted.digest(dry_run=True, confirm_token=resume_token)
+    assert (await restarted.bucket_mgr.get(bucket_id))["metadata"]["importance"] == 8
+    resumed = await restarted.digest(dry_run=False, confirm_token=resume_token)
+    assert "importance rebalanced: 1" in resumed
+    assert (await restarted.bucket_mgr.get(bucket_id))["metadata"]["importance"] == 8
+
+
+@pytest.mark.asyncio
+async def test_digest_token_rejects_changed_state_and_expiry(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first = await server.bucket_mgr.create(content="old high", importance=9, domain=["high"])
+    _age_bucket(server, first)
+    stale = _confirm_token(await server.digest(dry_run=True))
+    assert await server.bucket_mgr.update(first, content="changed old high")
+    assert "confirmation required" in await server.digest(dry_run=False, confirm_token=stale)
+    assert (await server.bucket_mgr.get(first))["metadata"]["importance"] == 9
+
+    token = _confirm_token(await server.digest(dry_run=True))
+    server._mutation_confirm_tokens[token]["expires_at"] = 0
+    assert "confirmation required" in await server.digest(dry_run=False, confirm_token=token)
+    assert (await server.bucket_mgr.get(first))["metadata"]["importance"] == 9
+
+
 @pytest.mark.asyncio
 async def test_digest_rebalance_dry_run_lists_metadata_without_content(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)

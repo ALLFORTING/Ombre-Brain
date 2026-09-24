@@ -494,7 +494,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `digest` 与 `related_backfill`
 
-- `digest(dry_run=True, max_groups=10)` 默认只列出将被消化的候选，不改数据；所有会写入的 maintenance digest 计划都必须先取得、再回传绑定该计划的短时一次性 `confirm_token`；正式执行依赖 `OMBRE_DIGEST_API_KEY` / `digest(dry_run=True, max_groups=10)` only lists candidates by default. Every mutating maintenance plan requires a short-lived, one-shot confirm_token bound to the exact plan before execution; real runs require `OMBRE_DIGEST_API_KEY`.
+- `digest(dry_run=True, max_groups=10)` 默认只预览，不改数据。消化与 importance rebalance 分别提供一次性、5 分钟有效的 `confirm_token` / `rebalance_confirm_token`；一次确认只执行对应计划。`limit` 只限制 rebalance 预览显示，确认仍执行提示的全部候选；`type=permanent` 不参与自动 rebalance。执行失败会返回 `operation_id` 与 `resume_confirm_token`，步骤状态存于 digest 专用记录，重试识别已写入的桶和元数据标记。进程重启后可再次 dry-run 取得续做 token。消化调用需要 `OMBRE_DIGEST_API_KEY`；仅 rebalance 不需要 provider。 / The two mutation plans have separate one-shot, five-minute tokens. `limit` caps displayed rebalance rows, not execution. A failed operation returns a resumable operation ID; a new dry-run after restart issues a fresh resume token.
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
 
 #### `hold` similarity and conflict warnings

@@ -31,7 +31,7 @@
 | `trace` | 修改元数据、正文、related、resolved、sealed 等；包含 merge 和 `delete=True` 等高影响模式 |
 | `pulse` | 用户请求系统状态或桶列表时使用；`show_all=True` 默认每页最多 50 个，可用 `limit`/`offset` 继续枚举；listing 可能更新 bounded dormant metadata |
 | `dream` | 可选的最近记忆反思/详情读取；不要求自动调用 |
-| `digest` | 受控维护工具；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 |
+| `digest` | 受控维护工具；默认 `dry_run=True`；消化与 importance rebalance 使用各自的确认 token，一次只执行一类；`limit` 仅限制 rebalance 预览显示；失败后用返回的续做 token 继续，消化可能产生 provider/API 成本 |
 | `related_backfill` | 受控维护/回填工具；默认 `dry_run=True`，执行模式会写 semantic related links |
 | `seal_letter` | sealed-memory handoff-letter 维护；改变 letter 可见性，不是普通检索 |
 | `rm_asset_reindex_embeddings` | Remember-Me 维护/回填；处理缺失或过期 vectors，不改变 asset bytes 或 metadata |

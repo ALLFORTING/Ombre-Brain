@@ -75,6 +75,7 @@ _MUTATION_CONFIRM_TTL_SECONDS = 5 * 60
 _MUTATION_CONFIRM_MAX_TOKENS = 256
 _mutation_confirm_tokens: dict[str, dict] = {}
 _mutation_confirm_lock = threading.Lock()
+_digest_running_operations: set[str] = set()
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -3126,7 +3127,7 @@ async def _importance_rebalance_candidates() -> list[dict]:
     candidates = []
     for bucket in buckets:
         meta = bucket.get("metadata", {})
-        if meta.get("pinned") or meta.get("protected") or _is_sealed(bucket):
+        if meta.get("type") == "permanent" or meta.get("pinned") or meta.get("protected") or _is_sealed(bucket):
             continue
         importance = int(meta.get("importance", 0) or 0)
         if importance < 8:
@@ -3143,32 +3144,32 @@ async def _importance_rebalance_candidates() -> list[dict]:
     return candidates
 
 
-def _digest_confirmation_payload(
-    selected: list[tuple[str, list[dict]]],
-    rebalance_candidates: list[dict],
-) -> dict:
-    """Bind digest confirmation to every planned source and metadata transition."""
-    def bucket_state(bucket: dict) -> dict:
-        metadata = bucket.get("metadata", {})
-        return {
-            "bucket_id": str(bucket.get("id", "")),
-            "importance": int(metadata.get("importance", 0) or 0),
-            "created": str(metadata.get("created") or metadata.get("created_at") or ""),
-            "updated_at": str(metadata.get("updated_at", "")),
-            "content_sha256": hashlib.sha256(
-                str(bucket.get("content", "")).encode("utf-8")
-            ).hexdigest(),
-        }
+def _digest_bucket_state(bucket: dict) -> dict:
+    metadata = bucket.get("metadata", {})
+    return {
+        "bucket_id": str(bucket.get("id", "")),
+        "importance": int(metadata.get("importance", 0) or 0),
+        "type": str(metadata.get("type", "dynamic")),
+        "pinned": bool(metadata.get("pinned")),
+        "protected": bool(metadata.get("protected")),
+        "sealed": _is_sealed(bucket),
+        "digested": bool(metadata.get("digested")),
+        "resolved": bool(metadata.get("resolved")),
+        "created": str(metadata.get("created") or metadata.get("created_at") or ""),
+        "last_active": str(metadata.get("last_active", "")),
+        "updated_at": str(metadata.get("updated_at", "")),
+        "content_sha256": hashlib.sha256(str(bucket.get("content", "")).encode("utf-8")).hexdigest(),
+    }
 
+
+def _digest_confirmation_payload(selected: list[tuple[str, list[dict]]], rebalance_candidates: list[dict]) -> dict:
+    """Retain the prior plan shape while issuing a token for each kind separately."""
     return {
         "groups": [
-            {
-                "domain": str(domain),
-                "sources": [bucket_state(bucket) for bucket in buckets],
-            }
+            {"domain": str(domain), "sources": [_digest_bucket_state(bucket) for bucket in buckets]}
             for domain, buckets in selected
         ],
-        "importance_rebalance": [bucket_state(bucket) for bucket in rebalance_candidates],
+        "importance_rebalance": [_digest_bucket_state(bucket) for bucket in rebalance_candidates],
     }
 
 
@@ -3233,102 +3234,241 @@ async def _run_dedupe_scan(limit: int = 30, include_archive: bool = False) -> st
     )
 
 
-async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "") -> str:
+def _digest_step_key(operation_id: str, step: str) -> str:
+    return f"digest:{operation_id}:{step}"
+
+
+def _digest_resume_payload(operation: dict) -> dict:
+    return {"operation_id": operation["operation_id"], "kind": operation["kind"],
+            "plan_digest": _confirmation_payload_digest(operation["plan"])}
+
+
+def _digest_planned_steps(kind: str, plan: dict) -> list[str]:
+    if kind == "rebalance":
+        return [f"rebalance:{state['bucket_id']}" for state in plan["importance_rebalance"]]
+    steps = []
+    for index, group in enumerate(plan["groups"]):
+        steps.extend([f"g{index}:create", f"g{index}:link"])
+        steps.extend(f"g{index}:source:{state['bucket_id']}" for state in group["sources"])
+    return [*steps, "log:create"]
+
+
+def _claim_digest_token(token: str, kind: str, plan: dict, *, operation: dict | None = None) -> dict | None:
+    """Create/claim the durable record before consuming a process-local token."""
+    candidate = (token or "").strip()
+    expected = _digest_resume_payload(operation) if operation else plan
+    operation_name = "digest.resume" if operation else f"digest.{kind}"
+    now = time.monotonic()
+    with _mutation_confirm_lock:
+        entry = _mutation_confirm_tokens.get(candidate)
+        if (not entry or float(entry.get("expires_at", 0)) <= now or
+                entry.get("operation") != operation_name or
+                entry.get("payload_digest") != _confirmation_payload_digest(expected)):
+            return None
+        operation_id = operation["operation_id"] if operation else secrets.token_hex(12)
+        if operation_id in _digest_running_operations:
+            return None
+        if operation:
+            bucket_mgr.write_digest_operation(
+                operation_id, kind, plan, owner=_RM_PROCESS_BOOT_ID,
+                status="running", outputs=operation["outputs"], completed=operation["completed"],
+                recover=operation["owner"] != _RM_PROCESS_BOOT_ID,
+            )
+        else:
+            bucket_mgr.write_digest_operation(operation_id, kind, plan, owner=_RM_PROCESS_BOOT_ID)
+        records = bucket_mgr.read_digest_operations()
+        claimed = next(row for row in records if row["operation_id"] == operation_id)
+        _mutation_confirm_tokens.pop(candidate, None)
+        _digest_running_operations.add(operation_id)
+    return claimed
+
+
+async def _digest_apply_step(operation: dict, step: str, operation_kind: str,
+                             payload: dict, target_id: str | None = None) -> str:
+    key = _digest_step_key(operation["operation_id"], step)
+    result = await bucket_mgr.apply_import_operation(
+        key, operation_kind=operation_kind, target_bucket_id=target_id, payload=payload,
+    )
+    inspected = bucket_mgr.inspect_import_operation(key)
+    if not inspected or not inspected["marker"]:
+        raise RuntimeError(f"digest step {step} has no durable write marker")
+    written = await bucket_mgr.get(result["result_id"])
+    if not written:
+        raise RuntimeError(f"digest step {step} has no resulting bucket")
+    if operation_kind == "update":
+        for field, expected in payload["kwargs"].items():
+            if written["metadata"].get(field) != expected:
+                raise RuntimeError(f"digest step {step} did not write {field}")
+    if step not in operation["completed"]:
+        operation["completed"].append(step)
+        bucket_mgr.write_digest_operation(
+            operation["operation_id"], operation["kind"], operation["plan"],
+            owner=_RM_PROCESS_BOOT_ID, outputs=operation["outputs"],
+            completed=operation["completed"],
+        )
+    return result["result_id"]
+
+
+async def _digest_require_source(state: dict, step: str, operation: dict) -> dict:
+    bucket = await bucket_mgr.get(state["bucket_id"])
+    if not bucket:
+        raise RuntimeError(f"digest source missing: {state['bucket_id']}")
+    if step not in operation["completed"] and _digest_bucket_state(bucket) != state:
+        marker = bucket_mgr.inspect_import_operation(_digest_step_key(operation["operation_id"], step))
+        if not marker or not marker["marker"]:
+            raise RuntimeError(f"digest source changed: {state['bucket_id']}")
+    return bucket
+
+
+async def _execute_digest_operation(operation: dict) -> str:
+    operation_id, kind, plan = operation["operation_id"], operation["kind"], operation["plan"]
+    try:
+        if kind == "consolidation":
+            digested_total = 0
+            log_entries = []
+            for index, group in enumerate(plan["groups"]):
+                domain, states = group["domain"], group["sources"]
+                source_ids = [state["bucket_id"] for state in states]
+                digest_step = f"g{index}:create"
+                buckets = [await _digest_require_source(state, f"g{index}:source:{state['bucket_id']}", operation)
+                           for state in states]
+                output_key = f"g{index}:provider"
+                if output_key not in operation["outputs"]:
+                    operation["outputs"][output_key] = await _call_digest_api(domain, buckets)
+                    bucket_mgr.write_digest_operation(
+                        operation_id, kind, plan, owner=_RM_PROCESS_BOOT_ID,
+                        outputs=operation["outputs"], completed=operation["completed"],
+                    )
+                for state in states:
+                    await _digest_require_source(state, f"g{index}:source:{state['bucket_id']}", operation)
+                digest_id = await _digest_apply_step(operation, digest_step, "create", {
+                    "content": operation["outputs"][output_key], "tags": ["digest", "auto-digested"],
+                    "importance": 6, "domain": [domain, "digest"], "valence": 0.5,
+                    "arousal": 0.3, "provenance_kind": "summary",
+                    "name": f"digest_{domain}_{plan['date']}",
+                })
+                await _digest_apply_step(operation, f"g{index}:link", "update",
+                                         {"kwargs": {"source_bucket": ",".join(source_ids)}}, digest_id)
+                for state in states:
+                    source_id = state["bucket_id"]
+                    step = f"g{index}:source:{source_id}"
+                    await _digest_require_source(state, step, operation)
+                    await _digest_apply_step(operation, step, "update",
+                                             {"kwargs": {"digested": True, "source_bucket": digest_id}}, source_id)
+                    digested_total += 1
+                log_entries.append(f"[{digest_id}] {domain}: {', '.join(source_ids)}")
+            log_content = ("# 自动消化日志\n\n" + f"- 时间: {plan['date']}\n"
+                           + f"- 消化桶数: {digested_total}\n\n" + "\n".join(log_entries))
+            log_id = await _digest_apply_step(operation, "log:create", "create", {
+                "content": log_content, "tags": ["digest-log"], "importance": 5,
+                "domain": ["system", "digest"], "valence": 0.5, "arousal": 0.3,
+                "provenance_kind": "system",
+                "name": f"digest_log_{plan['date']}",
+            })
+            result = f"已消化: {digested_total} 个桶\ndigest log bucket: {log_id}"
+        else:
+            for state in plan["importance_rebalance"]:
+                bucket_id = state["bucket_id"]
+                step = f"rebalance:{bucket_id}"
+                bucket = await _digest_require_source(state, step, operation)
+                meta = bucket["metadata"]
+                if step not in operation["completed"] and (meta.get("type") == "permanent" or
+                        meta.get("pinned") or meta.get("protected") or _is_sealed(bucket)):
+                    raise RuntimeError(f"rebalance source protected: {bucket_id}")
+                await _digest_apply_step(operation, step, "update",
+                                         {"kwargs": {"importance": state["importance"] - 1}}, bucket_id)
+            result = f"importance rebalanced: {len(plan['importance_rebalance'])}"
+        bucket_mgr.write_digest_operation(
+            operation_id, kind, plan, owner=_RM_PROCESS_BOOT_ID, status="complete",
+            outputs=operation["outputs"], completed=operation["completed"],
+        )
+        return f"operation_id: {operation_id}\n{result}"
+    except Exception as exc:
+        bucket_mgr.write_digest_operation(
+            operation_id, kind, plan, owner=_RM_PROCESS_BOOT_ID, status="failed",
+            outputs=operation["outputs"], completed=operation["completed"],
+        )
+        token = _issue_mutation_confirmation("digest.resume", _digest_resume_payload(operation))
+        remaining = [step for step in _digest_planned_steps(kind, plan)
+                     if step not in operation["completed"]]
+        logger.error("Digest operation %s failed: %s", operation_id, exc)
+        return (f"operation_id: {operation_id}\npartial failure: {type(exc).__name__}: {exc}\n"
+                f"completed steps: {len(operation['completed'])}\n"
+                f"remaining steps ({len(remaining)}): {', '.join(remaining[:20])}"
+                f"{' ...' if len(remaining) > 20 else ''}\nresume_confirm_token: {token}")
+    finally:
+        with _mutation_confirm_lock:
+            _digest_running_operations.discard(operation_id)
+
+
+async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token: str = "",
+                      limit: int = 30) -> str:
+    if not isinstance(limit, int) or limit < 0:
+        return "limit 必须是非负整数。"
+    display_limit = min(limit, 500)
+    open_operations = bucket_mgr.read_digest_operations(open_only=True)
+    supplied = (confirm_token or "").strip()
+    if supplied and not dry_run:
+        for pending in open_operations:
+            claimed = _claim_digest_token(supplied, pending["kind"], pending["plan"], operation=pending)
+            if claimed:
+                return await _execute_digest_operation(claimed)
+
     candidates = await _digest_candidates()
     rebalance_candidates = await _importance_rebalance_candidates()
     groups = _group_digest_candidates(candidates)
     selected = list(groups.items())[:max(1, max_groups)]
-    lines = [
-        "=== 自动消化 dry-run ===",
-        f"候选桶数: {len(candidates)}",
-        f"主题组数: {len(groups)}",
-    ]
-    if not selected and not rebalance_candidates:
-        return "\n".join(lines + ["No digest or importance rebalance candidates."])
+    lines = ["=== 自动消化 dry-run ===", f"候选桶数: {len(candidates)}", f"主题组数: {len(groups)}"]
     for domain, buckets in selected:
-        ids = ", ".join(bucket["id"] for bucket in buckets)
-        lines.append(f"- {domain}: {len(buckets)} 个桶 -> {ids}")
+        lines.append(f"- {domain}: {len(buckets)} 个桶 -> {', '.join(bucket['id'] for bucket in buckets)}")
     if rebalance_candidates:
         lines.append("=== importance rebalance dry-run ===")
+        total = len(rebalance_candidates)
+        lines.append(f"总候选 {total} 项 / 当前显示 {min(total, display_limit)} 项 / 确认后实际执行 {total} 项")
+        distribution: dict[str, int] = {}
         for bucket in rebalance_candidates:
+            importance = int(bucket.get("metadata", {}).get("importance", 0) or 0)
+            key = f"{importance}->{importance - 1}"
+            distribution[key] = distribution.get(key, 0) + 1
+        lines.append("分布: " + ", ".join(f"{key}: {count}" for key, count in sorted(distribution.items(), reverse=True)))
+        for bucket in rebalance_candidates[:display_limit]:
             meta = bucket.get("metadata", {})
             importance = int(meta.get("importance", 0) or 0)
             created = meta.get("created") or meta.get("created_at") or ""
-            lines.append(
-                f"- bucket_id:{bucket['id']} importance:{importance}->{importance - 1} created:{created}"
-            )
-    payload = _digest_confirmation_payload(selected, rebalance_candidates)
-    if dry_run:
-        token = _issue_mutation_confirmation("digest.maintenance", payload)
-        return "\n".join(lines + [f"confirm_token: {token}"])
-    supplied = (confirm_token or "").strip()
-    if not supplied:
-        token = _issue_mutation_confirmation("digest.maintenance", payload)
-        return "\n".join(lines + [
-            f"confirm_token: {token}",
-            "confirmation required: rerun with this confirm_token to apply the digest plan.",
-        ])
-    if not _consume_mutation_confirmation("digest.maintenance", payload, supplied):
-        return "\n".join(lines + [
-            "confirmation required: confirm_token is invalid, expired, or does not match this digest plan."
-        ])
+            lines.append(f"- bucket_id:{bucket['id']} importance:{importance}->{importance - 1} created:{created}")
 
-    rebalanced_total = 0
-    if not selected:
-        for bucket in rebalance_candidates:
-            meta = bucket.get("metadata", {})
-            importance = int(meta.get("importance", 0) or 0)
-            await bucket_mgr.update(bucket["id"], importance=importance - 1)
-            rebalanced_total += 1
-        lines.append(f"importance rebalanced: {rebalanced_total}")
-        return "\n".join(lines)
-
-    digested_total = 0
-    log_entries = []
-    for domain, buckets in selected:
-        digest_content = await _call_digest_api(domain, buckets)
-        source_ids = [bucket["id"] for bucket in buckets]
-        digest_id = await bucket_mgr.create(
-            content=digest_content,
-            tags=["digest", "auto-digested"],
-            importance=6,
-            domain=[domain, "digest"],
-            valence=0.5,
-            arousal=0.3,
-            bucket_type="dynamic",
-            provenance_kind="summary",
-            name=f"digest_{domain}_{datetime.now().date().isoformat()}",
-        )
-        await bucket_mgr.update(digest_id, source_bucket=",".join(source_ids))
-        for bucket_id in source_ids:
-            await bucket_mgr.update(bucket_id, digested=True, source_bucket=digest_id)
-            digested_total += 1
-        log_entries.append(f"[{digest_id}] {domain}: {', '.join(source_ids)}")
-    log_content = (
-        "# 自动消化日志\n\n"
-        f"- 时间: {datetime.now().isoformat(timespec='seconds')}\n"
-        f"- 消化桶数: {digested_total}\n\n"
-        + "\n".join(log_entries)
-    )
-    log_id = await bucket_mgr.create(
-        content=log_content,
-        tags=["digest-log"],
-        importance=5,
-        domain=["system", "digest"],
-        valence=0.5,
-        arousal=0.3,
-        bucket_type="dynamic",
-        provenance_kind="system",
-        name=f"digest_log_{datetime.now().date().isoformat()}",
-    )
-    lines.append(f"已消化: {digested_total} 个桶")
-    lines.append(f"digest log bucket: {log_id}")
-    for bucket in rebalance_candidates:
-        meta = bucket.get("metadata", {})
-        importance = int(meta.get("importance", 0) or 0)
-        await bucket_mgr.update(bucket["id"], importance=importance - 1)
-        rebalanced_total += 1
-    lines.append(f"importance rebalanced: {rebalanced_total}")
+    payloads = {
+        "consolidation": {"groups": _digest_confirmation_payload(selected, [])["groups"],
+                          "date": datetime.now().date().isoformat()},
+        "rebalance": {"importance_rebalance": _digest_confirmation_payload([], rebalance_candidates)["importance_rebalance"]},
+    }
+    pending_by_kind = {item["kind"]: item for item in open_operations}
+    if not selected and not rebalance_candidates and not open_operations:
+        return "\n".join(lines + ["No digest or importance rebalance candidates."])
+    for kind in ("consolidation", "rebalance"):
+        if kind in pending_by_kind:
+            pending = pending_by_kind[kind]
+            remaining = [step for step in _digest_planned_steps(kind, pending["plan"])
+                         if step not in pending["completed"]]
+            lines.append(f"unfinished {kind} operation_id: {pending['operation_id']}; "
+                         f"completed steps: {len(pending['completed'])}; remaining steps: {len(remaining)}")
+            if not supplied:
+                token = _issue_mutation_confirmation("digest.resume", _digest_resume_payload(pending))
+                lines.append(f"resume_confirm_token: {token}")
+            continue
+        if kind == "consolidation" and not selected or kind == "rebalance" and not rebalance_candidates:
+            continue
+        payload = payloads[kind]
+        if supplied and not dry_run:
+            claimed = _claim_digest_token(supplied, kind, payload)
+            if claimed:
+                return await _execute_digest_operation(claimed)
+        if not supplied:
+            token = _issue_mutation_confirmation(f"digest.{kind}", payload)
+            label = "confirm_token" if kind == "consolidation" or not selected else "rebalance_confirm_token"
+            lines.append(f"{label}: {token}")
+    if not dry_run:
+        lines.append("confirmation required: supply the matching, unexpired confirm_token for exactly one plan.")
     return "\n".join(lines)
 
 
@@ -8171,7 +8311,7 @@ async def digest(
     include_archive: bool = False,
     limit: int = 30,
 ) -> str:
-    """Memory maintenance, or a local read-only embedding dedupe scan when mode='dedupe'."""
+    """Preview separate consolidation/rebalance plans; confirm one with a short-lived token. limit controls preview rows only."""
     normalized_mode = (mode or "maintenance").strip().lower()
     if normalized_mode == "dedupe":
         try:
@@ -8183,7 +8323,7 @@ async def digest(
         return "mode 必须是 maintenance 或 dedupe。"
     await decay_engine.ensure_started()
     try:
-        return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token)
+        return await _run_digest(dry_run=dry_run, max_groups=max_groups, confirm_token=confirm_token, limit=limit)
     except Exception as exc:
         logger.error("Digest failed: %s", exc)
         return "自动消化失败。"

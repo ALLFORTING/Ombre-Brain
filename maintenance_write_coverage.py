@@ -79,6 +79,8 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_write_post_atomic": "guarded_caller_only",
         "plan_import_operation": "guarded_mutation",
         "apply_import_operation": "guarded_async_mutation",
+        "write_digest_operation": "guarded_mutation",
+        "read_digest_operations": "dynamic_sql_read_only",
         "record_history": "guarded_mutation",
         "_record_boot_delta_event": "guarded_mutation",
         "advance_boot_delta_checkpoint": "guarded_mutation",
