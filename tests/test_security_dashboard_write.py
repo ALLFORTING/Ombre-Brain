@@ -60,6 +60,14 @@ def _authenticated_client(server):
     return client
 
 
+def _delete_preview(client, bucket_id):
+    response = client.delete(f"/api/bucket/{bucket_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "preview"
+    assert response.json()["deleted"] is False
+    return response.json()
+
+
 @pytest.mark.security
 def test_login_requires_same_origin_and_handles_non_string_passwords(
     tmp_path, monkeypatch
@@ -192,7 +200,7 @@ def test_dashboard_write_calls_use_auth_fetch_without_multipart_override():
     assert "function beginDetailEdit()" in dashboard
     assert "async function deleteDetailBucket()" in dashboard
     assert "取消" in dashboard
-    assert "高风险删除" in dashboard
+    assert "deletePlanPrompt" in dashboard
     assert "method: 'PATCH'" in dashboard
     assert "method: 'DELETE'" in dashboard
 
@@ -242,7 +250,7 @@ def test_dashboard_bucket_patch_updates_all_bucket_states_and_preserves_wikilink
         assert history[0]["old_content"] == f"old [[Original Link {index}]]"
 
 
-def test_dashboard_bucket_delete_overrides_all_bucket_protections_and_records_history(
+def test_dashboard_bucket_delete_requires_server_plan_and_preserves_protections(
     tmp_path, monkeypatch
 ):
     server = _load_server(tmp_path, monkeypatch)
@@ -252,11 +260,23 @@ def test_dashboard_bucket_delete_overrides_all_bucket_protections_and_records_hi
         bucket_id = asyncio.run(
             server.bucket_mgr.create(content=f"delete body {index}", **options)
         )
-        response = client.delete(
-            f"/api/bucket/{bucket_id}",
-        )
+        response = client.delete(f"/api/bucket/{bucket_id}")
+        if options:
+            assert response.status_code == 409
+            assert response.json()["plan"][0]["protections"]
+            assert "confirm_token" not in response.json()
+            assert asyncio.run(server.bucket_mgr.get(bucket_id)) is not None
+            continue
         assert response.status_code == 200
-        assert response.json() == {"id": bucket_id, "deleted": True}
+        preview = response.json()
+        assert preview["plan"][0]["bucket_id"] == bucket_id
+        assert asyncio.run(server.bucket_mgr.get(bucket_id)) is not None
+        confirmed = client.request("DELETE",
+            f"/api/bucket/{bucket_id}",
+            json={"confirm_token": preview["confirm_token"]},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json() == {"id": bucket_id, "deleted": True}
         assert asyncio.run(server.bucket_mgr.get(bucket_id)) is None
         assert server.bucket_mgr.get_history(bucket_id)[0]["change_type"] == "delete"
 
@@ -285,13 +305,97 @@ def test_dashboard_bucket_delete_history_failure_is_fail_closed(tmp_path, monkey
     server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
     client = _authenticated_client(server)
 
-    response = client.delete(f"/api/bucket/{bucket_id}")
+    token = _delete_preview(client, bucket_id)["confirm_token"]
+    response = client.request("DELETE",
+        f"/api/bucket/{bucket_id}", json={"confirm_token": token}
+    )
 
     assert response.status_code == 500
-    assert response.json() == {"error": "bucket_delete_failed"}
+    assert response.json()["error"] == "bucket_delete_failed"
+    assert response.json()["deleted"] is False
     assert (asyncio.run(server.bucket_mgr.get(bucket_id)))["content"] == (
         "delete history authority"
     )
+
+
+def test_dashboard_delete_token_is_once_only_expires_and_rejects_state_change(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    target = asyncio.run(server.bucket_mgr.create("target"))
+    first = _delete_preview(client, target)["confirm_token"]
+    asyncio.run(server.bucket_mgr.update(target, importance=7))
+    stale = client.request("DELETE", f"/api/bucket/{target}", json={"confirm_token": first})
+    assert stale.status_code == 409
+    assert asyncio.run(server.bucket_mgr.get(target)) is not None
+    second = _delete_preview(client, target)["confirm_token"]
+    server._mutation_confirm_tokens[second]["expires_at"] = 0
+    assert client.request("DELETE",
+        f"/api/bucket/{target}", json={"confirm_token": second}
+    ).status_code == 409
+    third = _delete_preview(client, target)["confirm_token"]
+    assert client.request("DELETE",
+        f"/api/bucket/{target}", json={"confirm_token": third}
+    ).json()["deleted"] is True
+    assert third not in server._mutation_confirm_tokens
+    assert client.request("DELETE",
+        f"/api/bucket/{target}", json={"confirm_token": third}
+    ).status_code == 404
+
+
+def test_dashboard_delete_rechecks_incoming_supersession_and_cleans_outgoing(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    target = asyncio.run(server.bucket_mgr.create("target"))
+    source = asyncio.run(server.bucket_mgr.create("source"))
+    token = _delete_preview(client, target)["confirm_token"]
+    asyncio.run(server.trace(source, superseded_by=target))
+    blocked = client.request("DELETE", f"/api/bucket/{target}", json={"confirm_token": token})
+    assert blocked.status_code == 409
+    assert blocked.json()["plan"][0]["incoming_supersession"] == [source]
+    assert asyncio.run(server.bucket_mgr.get(target)) is not None
+    asyncio.run(server.trace(source, superseded_by=""))
+    successor = asyncio.run(server.bucket_mgr.create("successor"))
+    asyncio.run(server.trace(target, superseded_by=successor))
+    token = _delete_preview(client, target)["confirm_token"]
+    assert client.request("DELETE",
+        f"/api/bucket/{target}", json={"confirm_token": token}
+    ).json()["deleted"] is True
+    reverse = (asyncio.run(server.bucket_mgr.get(successor)))["metadata"]
+    assert target not in server._supersedes_ids(reverse)
+
+
+def test_import_review_delete_uses_same_two_stage_plan(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    target = asyncio.run(server.bucket_mgr.create("review target"))
+    payload = {"decisions": [{"bucket_id": target, "action": "delete"}]}
+    preview = client.post("/api/import/review", json=payload)
+    assert preview.status_code == 200
+    assert preview.json()["status"] == "preview"
+    assert asyncio.run(server.bucket_mgr.get(target)) is not None
+    payload["decisions"][0]["confirm_token"] = preview.json()["confirm_token"]
+    result = client.post("/api/import/review", json=payload)
+    assert result.status_code == 200
+    assert result.json()["deleted"] is True
+    assert asyncio.run(server.bucket_mgr.get(target)) is None
+
+
+def test_mcp_delete_preview_token_can_confirm_on_dashboard(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    client = _authenticated_client(server)
+    target = asyncio.run(server.bucket_mgr.create("shared delete plan"))
+    preview = asyncio.run(server.trace(target, delete=True))
+    token = preview.split("confirm_token:", 1)[1].splitlines()[0].strip()
+    result = client.request(
+        "DELETE", f"/api/bucket/{target}", json={"confirm_token": token}
+    )
+    assert result.status_code == 200
+    assert result.json()["deleted"] is True
+    assert token not in server._mutation_confirm_tokens
 
 
 def test_dashboard_bucket_patch_keeps_auth_csrf_and_origin_protection(

@@ -2302,7 +2302,7 @@ def _consume_mutation_confirmation(operation: str, payload: dict, token: str) ->
     return True
 
 
-def _delete_confirmation_payload(buckets: list[dict]) -> dict:
+def _delete_confirmation_payload(buckets: list[dict], plans: list[dict]) -> dict:
     """Bind a delete confirmation to the exact target state shown in its preview."""
     targets = []
     for bucket in buckets:
@@ -2322,7 +2322,7 @@ def _delete_confirmation_payload(buckets: list[dict]) -> dict:
                 "superseded_by": _superseded_by_id(metadata),
             }
         )
-    return {"targets": targets}
+    return {"targets": targets, "plan": plans}
 
 
 def _delete_preview_excerpt(bucket: dict, limit: int = 80) -> str:
@@ -2330,15 +2330,24 @@ def _delete_preview_excerpt(bucket: dict, limit: int = 80) -> str:
     return text[:limit]
 
 
-def _format_delete_confirmation(buckets: list[dict], token: str) -> str:
+def _format_delete_confirmation(buckets: list[dict], plans: list[dict], token: str) -> str:
     lines = ["删除确认：本次不会删除。"]
-    for bucket in buckets:
+    for bucket, plan in zip(buckets, plans):
         metadata = bucket.get("metadata", {})
         lines.append(
             f"- bucket_id:{bucket['id']} name:{metadata.get('name', bucket['id'])} "
             f"importance:{int(metadata.get('importance', 0) or 0)} "
             f"preview:{_delete_preview_excerpt(bucket)}"
         )
+        if plan["outgoing_supersession"]:
+            lines.append(
+                f"  将清理 successor {plan['outgoing_supersession']} 的反向 supersedes 记录。"
+            )
+        if plan["incoming_related"]:
+            lines.append(
+                "  incoming related_buckets 引用（现有删除流程不清理）: "
+                + ", ".join(plan["incoming_related"])
+            )
     lines.append(f"confirm_token: {token}")
     lines.append(
         f"确认有效期: {_MUTATION_CONFIRM_TTL_SECONDS} 秒；请使用相同 bucket_id 和 delete=True 重试。"
@@ -2346,28 +2355,58 @@ def _format_delete_confirmation(buckets: list[dict], token: str) -> str:
     return "\n".join(lines)
 
 
-async def _prepare_trace_delete(bucket_ids: list[str]) -> tuple[list[dict] | None, str]:
+async def _prepare_trace_delete(
+    bucket_ids: list[str],
+) -> tuple[list[dict] | None, str, list[dict]]:
     """Validate every delete target before issuing or consuming any confirmation."""
     buckets = []
+    plans = []
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
     for bucket_id in bucket_ids:
         bucket = await bucket_mgr.get(bucket_id)
         if not bucket:
-            return None, f"未找到记忆桶: {bucket_id}"
+            return None, f"未找到记忆桶: {bucket_id}", plans
         metadata = bucket.get("metadata", {})
-        if _is_sealed(bucket) or metadata.get("pinned") or metadata.get("protected"):
-            return None, f"删除失败：记忆桶 {bucket_id} 受到保护。"
-        inbound = await _inbound_supersession_buckets(bucket_id)
+        protections = [
+            name for name, active in (
+                ("sealed", _is_sealed(bucket)),
+                ("pinned", metadata.get("pinned")),
+                ("protected", metadata.get("protected")),
+            ) if active
+        ]
+        inbound = [
+            item for item in all_buckets
+            if _superseded_by_id(item.get("metadata", {})) == bucket_id
+        ]
+        related = sorted(
+            str(item.get("id", "")) for item in all_buckets
+            if not _is_sealed(item)
+            and bucket_id in _related_ids(item.get("metadata", {}))
+        )
+        plan = {
+            "bucket_id": bucket_id,
+            "name": str(metadata.get("name", bucket_id)),
+            "importance": int(metadata.get("importance", 0) or 0),
+            "protections": protections,
+            "incoming_supersession": sorted(str(item.get("id", "")) for item in inbound),
+            "incoming_related": related,
+            "outgoing_supersession": _superseded_by_id(metadata),
+            "related_cleanup": False,
+        }
+        plans.append(plan)
+        if protections:
+            return None, f"删除失败：记忆桶 {bucket_id} 受到保护。", plans
         if inbound:
             inbound_ids = ", ".join(str(item.get("id", "")) for item in inbound)
             return None, (
                 f"删除失败：记忆桶 {bucket_id} 仍被以下作废关系引用: {inbound_ids}。"
                 "请先用 trace(superseded_by='') 解除或改指向。"
-            )
+            ), plans
         buckets.append(bucket)
-    return buckets, ""
+    return buckets, "", plans
 
 
-async def _execute_trace_delete(bucket: dict) -> str:
+async def _execute_trace_delete(bucket: dict) -> tuple[bool, str]:
     """Delete one already-confirmed, freshly validated bucket and clean its reverse link."""
     bucket_id = str(bucket["id"])
     metadata = bucket.get("metadata", {})
@@ -2383,31 +2422,80 @@ async def _execute_trace_delete(bucket: dict) -> str:
         successor_restore = _metadata_restore_value(successor_meta, "supersedes")
         cleaned = await _clear_outgoing_supersession_for_delete(bucket)
         if not cleaned:
-            return "删除失败：无法清理 superseded_by 反向关系。"
+            return False, "删除失败：无法清理 superseded_by 反向关系。"
     success = await bucket_mgr.delete(bucket_id)
     if not success and successor:
         await bucket_mgr.update(successor_id, supersedes=successor_restore)
-    return (
+    return success, (
         f"已遗忘记忆桶: {bucket_id}"
         if success
         else f"删除失败：记忆桶 {bucket_id} 存在，但删除未完成。"
     )
 
 
-async def _trace_delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> str:
-    """Run the two-stage confirmation protocol for one or more existing delete targets."""
-    buckets, error = await _prepare_trace_delete(bucket_ids)
+async def _delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> dict:
+    """One delete plan and confirmation flow shared by MCP and Dashboard routes."""
+    buckets, error, plans = await _prepare_trace_delete(bucket_ids)
     if buckets is None:
-        return error
-    payload = _delete_confirmation_payload(buckets)
+        return {"status": "blocked", "message": error, "plan": plans}
+    payload = _delete_confirmation_payload(buckets, plans)
     supplied = (confirm_token or "").strip()
     if not supplied:
         token = _issue_mutation_confirmation("trace.delete", payload)
-        return _format_delete_confirmation(buckets, token)
+        return {
+            "status": "preview",
+            "message": _format_delete_confirmation(buckets, plans, token),
+            "plan": plans,
+            "confirm_token": token,
+            "expires_in_seconds": _MUTATION_CONFIRM_TTL_SECONDS,
+        }
     if not _consume_mutation_confirmation("trace.delete", payload, supplied):
-        return "删除确认无效、已过期或与当前目标不匹配；请重新预览后确认。"
+        return {
+            "status": "invalid",
+            "message": "删除确认无效、已过期或与当前目标不匹配；请重新预览后确认。",
+            "plan": plans,
+        }
     results = [await _execute_trace_delete(bucket) for bucket in buckets]
-    return "\n".join(results)
+    return {
+        "status": "deleted" if all(ok for ok, _ in results) else "failed",
+        "message": "\n".join(message for _, message in results),
+        "plan": plans,
+        "deleted_ids": [
+            bucket["id"] for bucket, (ok, _) in zip(buckets, results) if ok
+        ],
+    }
+
+
+async def _trace_delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> str:
+    """Preserve the MCP text contract while using the shared delete plan."""
+    outcome = await _delete_with_confirmation(bucket_ids, confirm_token)
+    return outcome["message"]
+
+
+def _dashboard_delete_response(bucket_id: str, outcome: dict, *, review: bool = False):
+    from starlette.responses import JSONResponse
+
+    status = outcome["status"]
+    if status == "deleted":
+        body = {"id": bucket_id, "deleted": True}
+        if review:
+            body.update(applied=1, errors=0)
+        return JSONResponse(body)
+    body = {
+        "id": bucket_id,
+        "deleted": False,
+        "status": status,
+        "plan": outcome.get("plan", []),
+        "message": outcome["message"],
+    }
+    if status == "preview":
+        body["confirm_token"] = outcome["confirm_token"]
+        body["expires_in_seconds"] = outcome["expires_in_seconds"]
+    else:
+        body["error"] = "bucket_delete_failed" if status == "failed" else "delete_confirmation_required"
+    if review:
+        body.update(applied=0, errors=0 if status == "preview" else 1)
+    return JSONResponse(body, status_code=200 if status == "preview" else 500 if status == "failed" else 409)
 
 
 def _extract_session_summary(content: str, max_chars: int = 700) -> str:
@@ -10311,19 +10399,24 @@ async def api_bucket_detail(request):
 
     if method == "DELETE":
         try:
-            deleted = await bucket_mgr.delete(
-                bucket_id,
-                _dashboard_override=True,
-            )
+            raw_body = await request.body()
+            body = _json_lib.loads(raw_body) if raw_body else {}
+        except (UnicodeDecodeError, ValueError):
+            return _dashboard_write_error(route, 400, "invalid_json")
+        if not isinstance(body, dict) or set(body) - {"confirm_token"}:
+            return _dashboard_write_error(route, 400, "invalid_delete_request")
+        confirm_token = body.get("confirm_token", "")
+        if not isinstance(confirm_token, str):
+            return _dashboard_write_error(route, 400, "invalid_delete_request")
+        try:
+            outcome = await _delete_with_confirmation([bucket_id], confirm_token)
         except Exception:
             logger.error(
                 "Dashboard bucket delete failed route=%s code=bucket_delete_failed",
                 route,
             )
             return _dashboard_write_error(route, 500, "bucket_delete_failed")
-        if not deleted:
-            return _dashboard_write_error(route, 500, "bucket_delete_failed")
-        return JSONResponse({"id": bucket_id, "deleted": True})
+        return _dashboard_delete_response(bucket_id, outcome)
 
     response = {
         "id": bucket["id"],
@@ -11357,9 +11450,27 @@ async def api_import_review(request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     decisions = body.get("decisions", [])
     if not decisions:
         return JSONResponse({"error": "No decisions provided"}, status_code=400)
+    if not isinstance(decisions, list):
+        return JSONResponse({"error": "invalid_decisions"}, status_code=400)
+    if any(isinstance(d, dict) and d.get("action") == "delete" for d in decisions):
+        if len(decisions) != 1:
+            return JSONResponse({"error": "delete_requires_single_decision"}, status_code=400)
+        decision = decisions[0]
+        bid = decision.get("bucket_id", "")
+        token = decision.get("confirm_token", "")
+        if not isinstance(bid, str) or not bid or not isinstance(token, str):
+            return JSONResponse({"error": "invalid_delete_request"}, status_code=400)
+        try:
+            outcome = await _delete_with_confirmation([bid], token)
+        except Exception:
+            logger.error("Dashboard import-review delete failed code=bucket_delete_failed")
+            return JSONResponse({"error": "bucket_delete_failed"}, status_code=500)
+        return _dashboard_delete_response(bid, outcome, review=True)
 
     applied = 0
     errors = 0
@@ -11383,10 +11494,6 @@ async def api_import_review(request):
                     continue
             elif action == "noise":
                 if not await bucket_mgr.update(bid, resolved=True, importance=1):
-                    errors += 1
-                    continue
-            elif action == "delete":
-                if not await bucket_mgr.delete(bid):
                     errors += 1
                     continue
             else:

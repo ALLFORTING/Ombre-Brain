@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -97,7 +97,7 @@ def test_import_review_and_pause_work_when_maintenance_is_open(tmp_path, monkeyp
 
 
 @pytest.mark.security
-def test_import_review_reports_partial_delete_failures(tmp_path, monkeypatch):
+def test_import_review_rejects_multi_delete_without_mutation(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setattr(server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(
@@ -116,9 +116,9 @@ def test_import_review_reports_partial_delete_failures(tmp_path, monkeypatch):
 
     response = asyncio.run(exercise())
 
-    assert response.status_code == 409
-    assert response.body == b'{"applied":1,"errors":1}'
-    assert delete.await_args_list == [call("bucket-1"), call("bucket-2")]
+    assert response.status_code == 400
+    assert response.body == b'{"error":"delete_requires_single_decision"}'
+    delete.assert_not_awaited()
 
 
 @pytest.mark.security

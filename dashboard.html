@@ -1921,24 +1921,42 @@ async function saveDetailContent() {
   }
 }
 
+function deletePlanPrompt(plan) {
+  var target = (plan || [])[0] || {};
+  var lines = [
+    '确认删除 bucket ' + (target.bucket_id || '?') + ' (' + (target.name || '?') + ')？',
+    '此操作不可撤销。'
+  ];
+  if (target.outgoing_supersession) lines.push('将清理 successor ' + target.outgoing_supersession + ' 的反向 supersedes 记录。');
+  if ((target.incoming_related || []).length) lines.push('incoming related_buckets 引用不会由现有删除流程清理: ' + target.incoming_related.join(', '));
+  return lines.join('\n');
+}
+
 async function deleteDetailBucket() {
   var id = currentDetailId;
   if (!id) return;
-  var metadata = currentDetail ? currentDetail.metadata || {} : {};
-  var protectedStates = [];
-  if (metadata.pinned) protectedStates.push('pinned');
-  if (metadata.protected) protectedStates.push('protected');
-  if (Number(metadata.sealed || 0) === 1) protectedStates.push('sealed');
-  var prompt = protectedStates.length
-    ? '此 bucket 当前为 ' + protectedStates.join(' / ') + ' 状态，属于高风险删除。此操作不可撤销，请再次确认删除。'
-    : '此操作不可撤销，确认删除这个 bucket 吗？';
-  if (!confirm(prompt)) return;
   try {
-    var res = await authFetch('/api/bucket/' + encodeURIComponent(id), {method: 'DELETE'});
+    var route = '/api/bucket/' + encodeURIComponent(id);
+    var res = await authFetch(route, {method: 'DELETE'});
     if (!res) return;
     var data = await res.json();
     if (!res.ok) {
-      alert(data.error || '删除失败');
+      alert(data.message || data.error || '删除失败');
+      return;
+    }
+    if (data.status !== 'preview' || !data.confirm_token) {
+      alert('删除预览无效');
+      return;
+    }
+    if (!confirm(deletePlanPrompt(data.plan))) return;
+    res = await authFetch(route, {
+      method: 'DELETE', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({confirm_token: data.confirm_token})
+    });
+    if (!res) return;
+    data = await res.json();
+    if (!res.ok || !data.deleted) {
+      alert(data.message || data.error || '删除失败');
       return;
     }
     currentDetail = null;
@@ -2393,7 +2411,7 @@ async function loadImportResults() {
           <button onclick="reviewAction('${b.id}','pin')" title="固定为永久记忆">📌 固定</button>
           <button onclick="reviewAction('${b.id}','important')" title="标为重要">⭐ 重要</button>
           <button onclick="reviewAction('${b.id}','noise')" title="标为噪声并resolve">🗑 噪声</button>
-          <button onclick="if(confirm('确定删除？'))reviewAction('${b.id}','delete')" title="彻底删除" style="color:var(--negative);">✕ 删除</button>
+          <button onclick="reviewAction('${b.id}','delete')" title="彻底删除" style="color:var(--negative);">✕ 删除</button>
         </div>
       </div>
     `).join('');
@@ -2436,7 +2454,7 @@ async function importResponseError(resp, fallback) {
 
 async function reviewAction(bid, action) {
   try {
-    const resp = await authFetch('/api/import/review', {
+    let resp = await authFetch('/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
     });
@@ -2444,6 +2462,30 @@ async function reviewAction(bid, action) {
     if (!resp.ok) {
       alert('处理失败: ' + await importResponseError(resp, '请稍后重试'));
       return;
+    }
+    if (action === 'delete') {
+      const preview = await resp.json();
+      if (preview.status !== 'preview' || !preview.confirm_token) {
+        alert('删除预览无效');
+        return;
+      }
+      if (!confirm(deletePlanPrompt(preview.plan))) return;
+      resp = await authFetch('/api/import/review', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ decisions: [{
+          bucket_id: bid, action, confirm_token: preview.confirm_token
+        }] })
+      });
+      if (!resp) return;
+      if (!resp.ok) {
+        alert('处理失败: ' + await importResponseError(resp, '请稍后重试'));
+        return;
+      }
+      const completed = await resp.json();
+      if (!completed.deleted) {
+        alert('删除未完成');
+        return;
+      }
     }
     // Remove card from UI
     const card = document.getElementById('ir-' + bid);

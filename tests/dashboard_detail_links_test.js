@@ -15,6 +15,39 @@ function sourceBetween(start, end) {
   return dashboard.slice(startAt, endAt);
 }
 
+test("Dashboard detail delete previews server plan before submitting its token", async () => {
+  const source = sourceBetween("function deletePlanPrompt", "function closeDetail()");
+  const calls = [];
+  let prompts = 0;
+  let closed = 0;
+  let reloaded = 0;
+  const authFetch = async (url, options) => {
+    calls.push({url, options});
+    const body = calls.length === 1
+      ? {status: "preview", deleted: false, confirm_token: "one-shot",
+         plan: [{bucket_id: "target", name: "Target"}]}
+      : {deleted: true};
+    return {ok: true, json: async () => body};
+  };
+  const api = new Function(
+    "authFetch", "confirm", "closeDetail", "loadBuckets", `
+      var currentDetailId = "target";
+      var currentDetail = {};
+      ${source}
+      return {deleteDetailBucket};
+    `
+  )(authFetch, () => { prompts += 1; return true; },
+    () => { closed += 1; }, async () => { reloaded += 1; });
+  await api.deleteDetailBucket();
+  assert.equal(calls.length, 2);
+  assert.equal(prompts, 1);
+  assert.equal(calls[0].options.method, "DELETE");
+  assert.equal(calls[0].options.body, undefined);
+  assert.equal(JSON.parse(calls[1].options.body).confirm_token, "one-shot");
+  assert.equal(closed, 1);
+  assert.equal(reloaded, 1);
+});
+
 test("Dashboard detail renders bucket IDs with DOM text nodes and explicit states", () => {
   const renderer = sourceBetween(
     "function renderContentWithBucketLinks", "function renderReferencedBy"

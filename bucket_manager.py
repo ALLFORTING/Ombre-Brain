@@ -1910,7 +1910,6 @@ class BucketManager:
         bucket_id: str,
         *,
         _allow_sealed: bool = False,
-        _dashboard_override: bool = False,
     ) -> bool:
         """
         Delete a memory bucket file.
@@ -1930,7 +1929,7 @@ class BucketManager:
 
         try:
             post = frontmatter.load(file_path)
-            if not _dashboard_override and (
+            if (
                 (not _allow_sealed and _is_sealed_bucket(post))
                 or post.get("pinned")
                 or post.get("protected")
