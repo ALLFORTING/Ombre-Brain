@@ -347,22 +347,122 @@ async def test_decay_todo_and_legacy_missing_todos_behave_differently(bucket_mgr
     assert todo_bucket["metadata"].get("resolved") is not True
     assert result["compressed"] == 1
     assert result["auto_resolved"] == 1
-    assert legacy_bucket["content"].endswith("...")
+    assert legacy_bucket["content"] == "legacy body eligible for decay"
+    assert legacy_bucket["metadata"]["tags"] == ["compressed"]
     assert legacy_bucket["metadata"]["resolved"] is True
 
 
 @pytest.mark.asyncio
-async def test_decay_compression_uses_existing_history_for_recovery(bucket_mgr):
-    original = "original body that must be recoverable"
-    bucket_id = await bucket_mgr.create(content=original, importance=1)
+@pytest.mark.parametrize("summary", [None, "A shorter metadata summary"])
+async def test_decay_compression_preserves_canonical_body_and_provenance(bucket_mgr, summary):
+    original = ("完整正文 with important details " * 12).rstrip()
+    bucket_id = await bucket_mgr.create(
+        content=original,
+        importance=5,
+        provenance_kind="inference",
+    )
+    assert await bucket_mgr.update(bucket_id, source_bucket="source-1")
+    if summary is None:
+        _age_bucket(bucket_mgr, bucket_id)
+    else:
+        _age_bucket(bucket_mgr, bucket_id, summary=summary)
+    before = await bucket_mgr.get(bucket_id)
+    assert before["content"] == original
+    assert bucket_mgr.get_history(bucket_id) == []
+
+    from decay_engine import DecayEngine
+
+    engine = DecayEngine({"decay": {"threshold": -1}}, bucket_mgr)
+    first = await engine.run_decay_cycle()
+    after = await bucket_mgr.get(bucket_id)
+
+    assert first["compressed"] == 1
+    assert after["content"] == original
+    assert after["metadata"]["tags"].count("compressed") == 1
+    assert after["metadata"]["provenance_kind"] == "inference"
+    assert after["metadata"]["source_bucket"] == "source-1"
+    assert bucket_mgr.get_history(bucket_id) == []
+
+    second = await engine.run_decay_cycle()
+    repeated = await bucket_mgr.get(bucket_id)
+    assert second["compressed"] == 0
+    assert repeated["content"] == original
+    assert repeated["metadata"]["tags"].count("compressed") == 1
+    assert bucket_mgr.get_history(bucket_id) == []
+
+
+@pytest.mark.asyncio
+async def test_decay_compression_preserves_existing_history(bucket_mgr):
+    original = "original body that must remain canonical"
+    bucket_id = await bucket_mgr.create(content="previous body", importance=5)
+    assert await bucket_mgr.update(bucket_id, content=original)
     _age_bucket(bucket_mgr, bucket_id)
+    history_before = bucket_mgr.get_history(bucket_id)
 
     from decay_engine import DecayEngine
 
     engine = DecayEngine({"decay": {"threshold": -1}}, bucket_mgr)
     result = await engine.run_decay_cycle()
-    history = bucket_mgr.get_history(bucket_id)
 
     assert result["compressed"] == 1
-    assert history[0]["change_type"] == "decay_compression"
-    assert history[0]["old_content"] == original
+    assert (await bucket_mgr.get(bucket_id))["content"] == original
+    assert history_before[0]["old_content"] == "previous body"
+    assert bucket_mgr.get_history(bucket_id) == history_before
+
+
+@pytest.mark.asyncio
+async def test_failed_compression_update_is_not_counted(bucket_mgr):
+    bucket_id = await bucket_mgr.create(content="body must stay intact", importance=5)
+    _age_bucket(bucket_mgr, bucket_id)
+
+    from decay_engine import DecayEngine
+
+    engine = DecayEngine({"decay": {"threshold": -1}}, bucket_mgr)
+    bucket_mgr.update = AsyncMock(return_value=False)
+    result = await engine.run_decay_cycle()
+
+    assert result["compressed"] == 0
+    assert (await bucket_mgr.get(bucket_id))["content"] == "body must stay intact"
+    assert "compressed" not in (await bucket_mgr.get(bucket_id))["metadata"]["tags"]
+    assert "content" not in bucket_mgr.update.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["permanent", "pinned", "protected", "resolved"])
+async def test_decay_compression_keeps_existing_protections(bucket_mgr, state):
+    original = "protected decay body"
+    bucket_id = await bucket_mgr.create(
+        content=original,
+        importance=5,
+        bucket_type="permanent" if state == "permanent" else "dynamic",
+        pinned=state == "pinned",
+        protected=state == "protected",
+    )
+    _age_bucket(bucket_mgr, bucket_id, **({"resolved": True} if state == "resolved" else {}))
+
+    from decay_engine import DecayEngine
+
+    engine = DecayEngine({"decay": {"threshold": -1}}, bucket_mgr)
+    result = await engine.run_decay_cycle()
+    bucket = await bucket_mgr.get(bucket_id)
+
+    assert result["compressed"] == 0
+    assert bucket["content"] == original
+    assert "compressed" not in bucket["metadata"]["tags"]
+
+
+@pytest.mark.asyncio
+async def test_dream_detail_reads_full_compressed_body(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    original = ("complete dream detail body " * 20).rstrip()
+    bucket_id = await server.bucket_mgr.create(content=original, importance=5)
+    _age_bucket(server.bucket_mgr, bucket_id)
+
+    from decay_engine import DecayEngine
+
+    engine = DecayEngine({"decay": {"threshold": -1}}, server.bucket_mgr)
+    assert (await engine.run_decay_cycle())["compressed"] == 1
+
+    detail = await server.dream(detail_ids=bucket_id)
+    assert original in detail
+    assert (await server.bucket_mgr.get(bucket_id))["content"] == original

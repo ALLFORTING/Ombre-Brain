@@ -304,7 +304,7 @@ class DecayEngine:
 
             lowest_score = min(lowest_score, score)
 
-            # --- Compress old, unresolved, low-weight dynamic buckets instead of deleting them. ---
+            # --- Mark old, unresolved, low-weight dynamic buckets as compressed. ---
             if not meta.get("resolved", False):
                 tags = list(meta.get("tags", []) or [])
                 imp = int(meta.get("importance", 5))
@@ -317,21 +317,23 @@ class DecayEngine:
                     and "compressed" not in tags
                     and not has_todos
                 ):
-                    summary = str(meta.get("summary", "") or "").strip()
-                    compressed_content = summary if summary else f"{bucket.get('content', '')[:100]}..."
                     try:
-                        await self.bucket_mgr.update(
+                        success = await self.bucket_mgr.update(
                             bucket["id"],
-                            content=compressed_content,
                             tags=list(dict.fromkeys(tags + ["compressed"])),
-                            _history_change_type="decay_compression",
                         )
-                        compressed += 1
-                        logger.info(
-                            f"Decay compressed / 衰减压缩: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(score={score:.4f}, days={days_since_update:.0f})"
-                        )
+                        if success:
+                            compressed += 1
+                            logger.info(
+                                f"Decay compressed / 衰减压缩: "
+                                f"{meta.get('name', bucket['id'])} "
+                                f"(score={score:.4f}, days={days_since_update:.0f})"
+                            )
+                        else:
+                            logger.warning(
+                                "Compression state update failed for %s",
+                                bucket["id"],
+                            )
                     except Exception as e:
                         logger.warning(f"Compression failed / 压缩失败: {e}")
 

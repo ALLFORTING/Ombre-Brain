@@ -121,7 +121,9 @@ async def test_decay_skips_sealed_content_mutation(tmp_path, monkeypatch):
     result = await engine.run_decay_cycle()
 
     assert result["compressed"] == 1
-    assert (await server.bucket_mgr.get(plain_id))["content"].endswith("...")
+    plain = await server.bucket_mgr.get(plain_id)
+    assert plain["content"] == "plain content eligible for decay compression"
+    assert "compressed" in plain["metadata"]["tags"]
     assert (await server.bucket_mgr.get(sealed_id))["content"] == (
         "sealed content must remain unchanged"
     )
