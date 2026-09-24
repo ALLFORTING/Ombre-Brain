@@ -438,7 +438,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 - `recent_days: int = -1` — 最近 N 天过滤；可与 `domain="feel"` 组合 / Recent N-day filter; can combine with `domain="feel"`.
 - `mailbox: bool = False`, `mailbox_limit: int = 1` — 返回信箱留言列表；默认最新一封 / Return mailbox letters; latest one by default.
 - `resonance: str = ""` — 例如 `"0.2,0.7"`，按 valence/arousal 情绪距离排序；可与 `query` 组合 / Sort by emotional distance to `valence,arousal`; combines with `query`.
-- `emotion_trend: bool = False` — 附带持久化情绪时间线 / Attach persisted emotion timeline.
+- `emotion_trend: bool = False` — 附带受 `max_tokens` 约束的原始情绪时间线 JSON 数组；新记录带可选 `bucket_id`，已确认关联 sealed 桶的记录会过滤。旧记录缺少来源 ID，无法可靠辨认历史 sealed 来源，留待 Data Repair；不会按时间猜测或清理。 / Attach a budgeted raw timeline; identifiable sealed sources are filtered. Legacy entries without source IDs remain a known privacy limitation pending Data Repair.
 - `feels: bool = False` — 专门检索 feel 桶，相当于 `domain="feel"` / Search feel buckets only, equivalent to `domain="feel"`.
 - `include_dormant: bool = False` — 是否搜索自动沉底桶 / Include auto-dormant buckets.
 - `wake_dormant: bool = False` — 是否将本次实际返回的 dormant 桶显式唤醒；仅与 `include_dormant=True` 一起使用时有实际效果 / Explicitly wake dormant buckets actually returned by this call; meaningful only with `include_dormant=True`.
@@ -488,6 +488,8 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 `archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。`topics` 是可选的结构化主题标签列表；有帮助时可提供大约 3–8 个适度范围的标签。
 
 `archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` creates a `session_YYYY-MM-DD_NN` archive bucket with `domain=["session"]`. When `letter` is provided, it is also stored in the independent `letters` mailbox table and surfaced by the next `boot()`. `topics` is an optional list of structured topic labels; when useful, provide roughly 3–8 moderately scoped labels such as `项目/OB`, `项目/RM`, `学习/生化`, `关系/沟通`, or `日常/作息`. Avoid labels that are too broad or excessively narrow.
+
+新的 sealed session 归档不写入普通情绪时间线；普通归档的 timeline 记录关联其 bucket ID。ordinary portable export 只导出能验证来源属于非 sealed 桶的 timeline 记录，旧无来源记录仍保留在源文件和私有完整备份中，不导入 ordinary portable export。
 
 #### `digest` 与 `related_backfill`
 

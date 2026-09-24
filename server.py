@@ -54,6 +54,7 @@ import zlib
 import re
 import json as _json_lib
 import httpx
+import frontmatter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1232,6 +1233,7 @@ async def _merge_or_create(
     trigger_date: str = "",
     todos: list | None = None,
     provenance_kind: str | None = None,
+    source_id_out: list[str] | None = None,
 ) -> tuple[str, bool]:
     """
     Reuse a deterministic duplicate if found; otherwise create a new bucket.
@@ -1274,6 +1276,8 @@ async def _merge_or_create(
                         raise RuntimeError(
                             f"failed to preserve todos for duplicate bucket {bucket['id']}"
                         )
+            if source_id_out is not None:
+                source_id_out.append(bucket["id"])
             return metadata.get("name", bucket["id"]), True
 
     bucket_id = await bucket_mgr.create(
@@ -1290,6 +1294,8 @@ async def _merge_or_create(
     await _auto_link_related(bucket_id)
     if trigger_date:
         await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
+    if source_id_out is not None:
+        source_id_out.append(bucket_id)
     return bucket_id, False
 
 
@@ -1770,16 +1776,21 @@ def _load_emotion_timeline() -> list[dict]:
 
 
 @guarded_mutation("emotion_timeline_write")
-def _record_emotion_snapshot(valence: float, arousal: float, source: str) -> None:
+def _record_emotion_snapshot(
+    valence: float, arousal: float, source: str, bucket_id: str = ""
+) -> None:
     if not (0 <= valence <= 1 and 0 <= arousal <= 1):
         return
     timeline = _load_emotion_timeline()
-    timeline.append({
+    entry = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "valence": round(float(valence), 3),
         "arousal": round(float(arousal), 3),
         "source": source,
-    })
+    }
+    if bucket_id:
+        entry["bucket_id"] = bucket_id
+    timeline.append(entry)
     path = _emotion_timeline_path()
     temp_path = f"{path}.tmp"
     try:
@@ -1791,15 +1802,53 @@ def _record_emotion_snapshot(valence: float, arousal: float, source: str) -> Non
         logger.warning(f"Failed to persist emotion timeline: {e}")
 
 
-def _with_emotion_timeline(text: str, enabled: bool) -> str:
+def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) -> str:
     if not enabled:
         return text
+    visibility: dict[str, bool] = {}
+    visible = []
+    for item in _load_emotion_timeline():
+        # Legacy entries have no reliable provenance. Keep them readable without
+        # guessing from timestamps; historical sealed cleanup is Data Repair.
+        if "bucket_id" in item:
+            bucket_id = item.get("bucket_id")
+            if not isinstance(bucket_id, str) or not bucket_id:
+                continue
+            if bucket_id not in visibility:
+                try:
+                    path = bucket_mgr._find_bucket_file(bucket_id)
+                    post = frontmatter.load(path) if path else None
+                    visibility[bucket_id] = bool(
+                        post is not None and int(post.get("sealed", 0) or 0) != 1
+                    )
+                except (OSError, TypeError, ValueError):
+                    visibility[bucket_id] = False
+            if not visibility[bucket_id]:
+                continue
+        visible.append(item)
     timeline = sorted(
-        _load_emotion_timeline(),
+        visible,
         key=lambda item: str(item.get("timestamp", "")),
     )
-    payload = _json_lib.dumps(timeline, ensure_ascii=False, separators=(",", ":"))
-    return f"{text}\n\nemotion_history: {payload}"
+    prefix = f"{text}\n\nemotion_history: "
+    def encode(items: list[dict]) -> str:
+        return _json_lib.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    budget = max(0, int(max_tokens))
+    if count_tokens_approx(prefix + "[]") > budget:
+        return text
+    if count_tokens_approx(prefix + encode(timeline)) <= budget:
+        return prefix + encode(timeline)
+    # Keep the newest complete records, preserving chronological raw-array order.
+    chosen: list[dict] = []
+    notice = "\nemotion_history_truncated: true"
+    if count_tokens_approx(prefix + "[]" + notice) > budget:
+        return text
+    for item in reversed(timeline):
+        candidate = [item, *chosen]
+        if count_tokens_approx(prefix + encode(candidate) + notice) > budget:
+            break
+        chosen = candidate
+    return prefix + encode(chosen) + notice
 
 
 def _related_ids(meta: dict) -> list[str]:
@@ -8160,7 +8209,7 @@ async def breath(
         importance_min=importance_min,
         mode=mode,
         recent_days=recent_days,
-        emotion_trend=emotion_trend,
+        emotion_trend=emotion_trend if (as_of or "").strip() else False,
         include_dormant=include_dormant,
         wake_dormant=wake_dormant,
         touch=touch,
@@ -8174,6 +8223,8 @@ async def breath(
         min_score=min_score,
         as_of=as_of,
     )
+    if emotion_trend and not (as_of or "").strip():
+        result = _with_emotion_timeline(result, True, min(max_tokens, 20000))
     return _with_response_seal(result)
 
 
@@ -8293,7 +8344,7 @@ async def hold(
             provenance_kind=(explicit_provenance_kind or "inference"),
         )
         if should_record_emotion:
-            _record_emotion_snapshot(valence, arousal, "hold")
+            _record_emotion_snapshot(valence, arousal, "hold", bucket_id)
         if trigger_date:
             await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
@@ -8355,7 +8406,7 @@ async def hold(
             provenance_kind=explicit_provenance_kind,
         )
         if should_record_emotion:
-            _record_emotion_snapshot(valence, arousal, "hold")
+            _record_emotion_snapshot(valence, arousal, "hold", bucket_id)
         if trigger_date:
             await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
         await _auto_link_related(bucket_id)
@@ -8367,6 +8418,7 @@ async def hold(
         return response
 
     # --- Step 2: merge or create / 合并或新建 ---
+    source_ids: list[str] = []
     result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
@@ -8378,9 +8430,10 @@ async def hold(
         trigger_date=trigger_date,
         todos=analysis_todos,
         provenance_kind=explicit_provenance_kind,
+        source_id_out=source_ids,
     )
     if should_record_emotion:
-        _record_emotion_snapshot(valence, arousal, "hold")
+        _record_emotion_snapshot(valence, arousal, "hold", source_ids[0])
 
     if is_merged:
         response = f"合并→{result_name} {','.join(domain)}"
@@ -8985,8 +9038,8 @@ async def archive_session(
     await bucket_mgr.archive(bucket_id)
     if letter.strip():
         bucket_mgr.record_letter(letter.strip(), bucket_id, sealed=sealed)
-    if 0 <= valence <= 1 and 0 <= arousal <= 1:
-        _record_emotion_snapshot(valence, arousal, "archive")
+    if not sealed and 0 <= valence <= 1 and 0 <= arousal <= 1:
+        _record_emotion_snapshot(valence, arousal, "archive", bucket_id)
     return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"
 
 

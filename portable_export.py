@@ -428,14 +428,25 @@ def _copy_blob(source: Path, destination: Path, digest: str) -> dict[str, Any]:
     return _write_payload(destination, payload)
 
 
-def _read_emotion_timeline(source_root: Path) -> tuple[Any, bool]:
+def _read_emotion_timeline(
+    source_root: Path, visible_ids: set[str]
+) -> tuple[list[dict[str, Any]], bool]:
     path = source_root / ".emotion_timeline.json"
     if not path.exists():
         return [], False
     try:
-        return json.loads(path.read_text(encoding="utf-8")), True
+        timeline = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PortableExportError("emotion_timeline_invalid") from exc
+    if not isinstance(timeline, list) or any(not isinstance(item, dict) for item in timeline):
+        raise PortableExportError("emotion_timeline_invalid")
+    # An ordinary portable export cannot prove the privacy of legacy entries
+    # without a source ID. Exclude them from the export, without touching source.
+    return [
+        item for item in timeline
+        if isinstance(item.get("bucket_id"), str)
+        and item["bucket_id"] in visible_ids
+    ], True
 
 
 async def export_ordinary_portable(
@@ -483,7 +494,9 @@ async def export_ordinary_portable(
             history = _read_history(history_snapshot, visible_ids)
             letters = _read_letters(history_snapshot)
             notes = _read_notes(history_snapshot)
-            emotion_timeline, timeline_present = _read_emotion_timeline(source_root)
+            emotion_timeline, timeline_present = _read_emotion_timeline(
+                source_root, visible_ids
+            )
 
             records_dir = staging / "records"
             file_metadata: dict[str, dict[str, Any]] = {}

@@ -105,6 +105,8 @@ def test_export_preserves_visible_ordinary_data_and_hides_sealed(tmp_path):
     assert [row["old_content"] for row in _records(destination, "bucket_history.jsonl")] == ["older", "newer"]
     assert _records(destination, "letters.jsonl")[0]["content"] == "visible letter"
     assert _records(destination, "notes.jsonl")[0]["text"] == "visible note"
+    # Unattributed legacy timeline data may have come from sealed sessions.
+    assert json.loads((destination / "records" / "emotion_timeline.json").read_text()) == []
     asset = _records(destination, "assets.jsonl")[0]
     assert (destination / asset["blob_path"]).read_bytes() == b"clean asset"
     manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
@@ -113,6 +115,29 @@ def test_export_preserves_visible_ordinary_data_and_hides_sealed(tmp_path):
     exported_bytes = b"".join(path.read_bytes() for path in destination.rglob("*") if path.is_file())
     assert hidden.encode() not in exported_bytes
     assert not any(path.name.endswith(".snapshot.sqlite3") for path in destination.rglob("*"))
+
+
+def test_portable_timeline_exports_only_verified_visible_sources(tmp_path):
+    root = tmp_path / "buckets"
+    root.mkdir()
+    _bucket(root, "dynamic", "visible.md", {"id": "visible", "sealed": 0}, "open")
+    _bucket(root, "archive", "sealed.md", {"id": "sealed", "sealed": 1}, "closed")
+    timeline = [
+        {"source": "hold", "bucket_id": "visible", "valence": 0.6},
+        {"source": "archive", "bucket_id": "sealed", "valence": 0.1},
+        {"source": "hold", "valence": 0.4},
+        {"source": "hold", "bucket_id": "missing", "valence": 0.2},
+    ]
+    (root / ".emotion_timeline.json").write_text(
+        json.dumps(timeline), encoding="utf-8"
+    )
+    destination = tmp_path / "out"
+    _run(buckets_dir=root, destination=destination)
+    exported = json.loads(
+        (destination / "records" / "emotion_timeline.json").read_text(encoding="utf-8")
+    )
+    assert exported == [timeline[0]]
+    assert json.loads((root / ".emotion_timeline.json").read_text()) == timeline
 
 
 def test_empty_store_is_deterministic_and_manifest_is_last(tmp_path):
