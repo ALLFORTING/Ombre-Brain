@@ -38,7 +38,7 @@
 
 ## 检索与写入原则
 
-- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索；明确询问过去某时点正文时用 `breath(query="关键词", as_of="ISO8601 日期或时间")`。`as_of` 只读且不 touch，输出正文会标记为历史版本；它是历史 keyword/fuzzy 检索，不使用当前 embedding，无法检索已删除桶或重建历史 metadata。维护、验收或探针读取时用 `breath(..., touch=False)`，不会更新 activation、`last_active` 或 dormant，也不启动衰减引擎或写脱水缓存；query cursor 必须沿用同一 touch 值。
+- 用户提到“上次”“之前”“还记得”时，优先用 `breath(query="关键词")` 定向检索；明确询问过去某时点正文时用 `breath(query="关键词", as_of="ISO8601 日期或时间")`。`as_of` 只读且不 touch，输出正文会标记为历史版本；它是历史 keyword/fuzzy 检索，不使用当前 embedding，无法检索已删除桶或重建历史 metadata。维护、验收或探针读取时用 `breath(..., touch=False)`，不会更新 activation、`last_active` 或 dormant，也不启动衰减引擎或写脱水缓存，但可读取当前 model/prompt_version 的有效缓存；query cursor 必须沿用同一 touch 值。
 - 已知 `letter_id` 时，优先 `get_letter(letter_id)`；默认 `include_sealed=False`，只有显式 `include_sealed=True` 时才能读取 sealed letter。
 - sealed letter 与真实不存在的 `letter_id` 都返回 not found；这是刻意的存在性隐藏，不应据此断言“这封信不存在”。
 - 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
@@ -67,6 +67,8 @@
 - `append=False` 时正文替换，`append=True` 时追加。
 - 归档后的 session bucket 仍可通过 `trace` 修改：未 sealed 时可以修改或追加正文；sealed 时正文修改受保护。
 - `mode` 只有 `summary` 和 `full` 两种值；不要发明其他模式。
+- 有 query（包括 tags/topic 过滤的 query）时，`mode="full"` 返回 canonical body，预算截断会标记 `[显示=原文·已截断]`；默认摘要标记 `[显示=压缩摘要·非原文]`。摘要服务不可用时，原文回退会明确标记。无 query 浮现路径的 `full` 维持既有行为。`[prov]` 表示 canonical body 来源，不能把它当成摘要来源。
+- query 计数行中的“前页已消费 + 本次显示 + 因组装失败省略 + 后续剩余”构成当前可见匹配集合；下一页 cursor 指向尚未消费的匹配项。不要把“因结果上限省略”和“因 token 预算省略”另加到总数中，它们已包含在后续剩余里。
 
 ### 批量 trace
 

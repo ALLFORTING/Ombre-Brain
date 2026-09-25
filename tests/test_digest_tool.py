@@ -420,11 +420,21 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     first_post.content = first_body
     first_path.write_text(frontmatter.dumps(first_post), encoding="utf-8")
     with sqlite3.connect(server.dehydrator.cache_db_path) as conn:
+        from dehydration_cache_identity import DEHYDRATE_PROMPT_VERSION
+        conn.execute(
+            "INSERT INTO dehydration_cache_v2 (content_hash, summary, model, prompt_version) VALUES (?, ?, ?, ?)",
+            (
+                hashlib.sha256(strip_wikilinks(first_body).encode("utf-8")).hexdigest(),
+                first_summary,
+                server.dehydrator.model,
+                DEHYDRATE_PROMPT_VERSION,
+            ),
+        )
         conn.execute(
             "INSERT INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
             (
                 hashlib.sha256(strip_wikilinks(first_body).encode("utf-8")).hexdigest(),
-                first_summary,
+                "STALE_LEGACY_CACHE_MUST_NOT_APPEAR",
                 server.dehydrator.model,
             ),
         )
@@ -487,6 +497,7 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     assert "未命名桶（name=bucket_id）: 1" in result
     assert f"- {unnamed_id}" in result
     assert "摘要来源: 缓存命中=1，正文回退=2，名称回退=1" in result
+    assert "STALE_LEGACY_CACHE_MUST_NOT_APPEAR" not in result
     assert (
         result.index("未命名桶 ID 清单:")
         < result.index(f"- {unnamed_id}")

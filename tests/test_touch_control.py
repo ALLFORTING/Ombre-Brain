@@ -54,7 +54,8 @@ async def test_breath_touch_false_keeps_query_results_but_not_activation_or_cach
     assert after["activation_count"] == before["activation_count"]
     assert after["last_active"] == before["last_active"]
     server.decay_engine.ensure_started.assert_not_awaited()
-    assert server.dehydrator.dehydrate.await_args.kwargs["cache"] is False
+    assert server.dehydrator.dehydrate.await_args.kwargs["cache_read"] is True
+    assert server.dehydrator.dehydrate.await_args.kwargs["cache_write"] is False
 
 
 @pytest.mark.asyncio
@@ -69,7 +70,8 @@ async def test_breath_default_touch_preserves_activation_behavior(tmp_path, monk
     assert bucket_id in result
     assert after["activation_count"] > before["activation_count"]
     server.decay_engine.ensure_started.assert_awaited_once()
-    assert "cache" not in server.dehydrator.dehydrate.await_args.kwargs
+    assert server.dehydrator.dehydrate.await_args.kwargs["cache_read"] is True
+    assert server.dehydrator.dehydrate.await_args.kwargs["cache_write"] is True
 
 
 @pytest.mark.asyncio

@@ -163,6 +163,8 @@ grow(content="今天去医院体检，结果还好；晚上和朋友吃饭聊了
 
 ### 场景 5：用户想找某段记忆（breath 带 query 检索）
 
+**R-1/R-2 当前契约**：普通及结构化过滤的 query 检索中，`mode="full"` 展示 canonical body，预算不足时确定性截断并标记 `[显示=原文·已截断]`；默认 `summary` 展示 `[显示=压缩摘要·非原文]`，短正文直接展示时标记 `[显示=原文]`。摘要组装失败优先回退到 canonical body，标记“摘要服务暂不可用”，并记录 WARNING；`[prov]` 仍只表示 canonical body 来源。无 query 浮现路径的既有 `full` 语义未在本 Phase 修改。`touch=False` 可以读取当前 model/prompt_version 的缓存，但不写缓存或更新 activation。query cursor 指向下一条尚未消费的冻结匹配项；计数行区分前页已消费、本次显示、组装失败省略、后续剩余和本页预算/结果上限未显示项。sealed 不参与公开计数。
+
 **用户操作**：例如"还记得我之前说过关于实习的事吗"
 
 **Claude 行为**：
@@ -172,35 +174,16 @@ breath(query="实习", domain="成长", valence=0.7, arousal=0.5)
 
 **系统内部发生什么**：
 
-1. `decay_engine.ensure_started()`
-2. 检测到 `query` 非空，进入**检索模式**
-3. 解析 `domain_filter = ["成长"]`，`q_valence=0.7`，`q_arousal=0.5`
-4. **关键词检索**：`bucket_mgr.search(query, limit=20, domain_filter, q_valence, q_arousal)`
-   - **Layer 1**：domain 预筛 → 仅保留 domain 包含"成长"的桶；若为空则回退全量
-   - **Layer 1.5**（embedding 已开启时）：`embedding_engine.search_similar(query, top_k=50)` → 用 embedding 候选集替换/缩小精排范围
-   - **Layer 2**：多维加权精排：
-     - `_calc_topic_score()`: `fuzz.partial_ratio(query, name)×3 + domain×2.5 + tags×2 + body×1`，归一化 0~1
-     - `_calc_emotion_score()`: `1 - √((v差²+a差²)/2)`，0~1
-     - `_calc_time_score()`: `e^(-0.02×days_since_last_active)`，0~1
-     - `importance_score`: `importance / 10`
-     - `total = topic×4 + emotion×2 + time×1.5 + importance×1`，归一化到 0~100
-     - 过滤 `score >= fuzzy_threshold`（默认 50）
-     - 通过阈值后，`resolved` 桶仅在排序时降权 ×0.3（不影响是否被检出）
-     - 返回最多 `limit` 条
-5. 排除 pinned/protected 桶（它们在浮现模式展示）
-6. **向量补充通道**（server.py 额外层）：`embedding_engine.search_similar(query, top_k=20)` → 相似度 > 0.5 的桶补充到结果集（标记 `vector_match=True`）
-7. 对每个结果：
-   - 记忆重构：若传了 `q_valence`，展示层 valence 做微调：`shift = (q_valence - 0.5) × 0.2`，最大 ±0.1
-   - `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
-   - `bucket_mgr.touch(bucket_id)` — 刷新 `last_active` + `activation_count += 1` + 触发 `_time_ripple()`（对 48h 内创建的邻近桶 activation_count + 0.3，最多 5 个桶）
-8. **随机漂流**：若检索结果 < 3 且 `random.random() < 0.4`，随机从 `decay_score < 2.0` 的旧桶里取 1~3 条，标注 `[surface_type: random]`
+1. `touch=True` 时启动 decay 引擎；`touch=False` 保持只读。
+2. `bucket_mgr.search()` 检索候选，应用可见性/日期过滤、匹配注释与稳定排序；sealed 默认不进入结果或计数。
+3. 对选中的有序匹配项串行组装。`summary` 使用当前版本缓存或脱水服务；`full` 直接使用 canonical body。组装异常时记录 WARNING 并展示带失败标记的 canonical body 截断版。
+4. 按 `max_tokens` 和 `max_results` 消费前缀；预算未显示的候选留给下一页。`touch=True` 保持已显示强匹配项的既有 touch 行为。
+5. 输出互斥计数及下一页 cursor。cursor 与 query 条件、`mode`、`touch` 绑定。
 
 **返回结果**：
 ```
-[bucket_id:abc123] [重要度:7] [主题:成长] 实习offer获得：...
-[语义关联] [bucket_id:def456] 求职经历...
---- 忽然想起来 ---
-[surface_type: random] 某段旧记忆...
+[prov=...] [bucket_id:abc123] [显示=压缩摘要·非原文] 实习 offer 获得：...
+共匹配 1 / 前页已消费 0 / 本次显示 1 / 因组装失败省略 0 / 后续剩余 0 / ...
 ```
 
 ---
@@ -450,12 +433,12 @@ CREATE TABLE embeddings (
 | `breath()` 检索 | `bucket_mgr.search()` 异常 | 返回 `"检索过程出错，请稍后重试。"` |
 | `breath()` 检索 | embedding 不可用 / API 失败 | `logger.warning()` 记录，跳过向量通道，仅用 keyword 检索 |
 | `breath()` 检索 | 结果 < 3 条 | 40% 概率从低权重旧桶随机浮现 1~3 条，标注 `[surface_type: random]` |
-| `hold()` 自动打标 | `dehydrator.analyze()` 失败 | 降级到默认值：`domain=["未分类"], valence=0.5, arousal=0.3, tags=[], name=""` |
+| `hold()` 自动打标 | `dehydrator.analyze()` 失败 | 使用默认 metadata，回执明确标注失败分类；缺失名称由规范化正文前 20 个 Unicode 字符确定性补足 |
 | `hold()` 合并检测 | `bucket_mgr.search()` 失败 | `logger.warning()`，直接走新建路径 |
 | `hold()` 合并 | `dehydrator.merge()` 失败 | `logger.warning()`，跳过合并，直接新建 |
 | `hold()` embedding | API 失败 | `try/except` 吞掉，embedding 缺失但不影响存储 |
-| `grow()` 日记拆分 | `dehydrator.digest()` 失败 | 返回 `"日记整理失败: {e}"` |
-| `grow()` 单条处理失败 | 单个 item 异常 | `logger.warning()` + 标注 `⚠️条目名`，其他条目正常继续 |
+| `grow()` 日记拆分 | `dehydrator.digest()` 失败 | 返回有限分类 `reason=rate_limited/parse_error/connection_error/provider_unconfigured/provider_error`，不暴露 SDK 异常文本 |
+| `grow()` 单条处理失败 | 单个 item 写入异常 | `logger.warning()` + 标注 `⚠️条目名 reason=persistence_error`，其他条目正常继续 |
 | `grow()` 内容 < 30 字 | — | 快速路径：`analyze()` + `_merge_or_create()`，跳过 `digest()`（节省 token） |
 | `trace()` | `bucket_mgr.get()` 返回 None | 返回 `"未找到记忆桶: {bucket_id}"` |
 | `trace()` | 未传任何可修改字段 | 返回 `"没有任何字段需要修改。"` |
@@ -465,7 +448,7 @@ CREATE TABLE embeddings (
 | `decay_cycle` | `list_all()` 失败 | 返回 `{"checked":0, "archived":0, ..., "error": str(e)}`，不终止后台循环 |
 | `decay_cycle` | 单桶 `calculate_score()` 失败 | `logger.warning()`，跳过该桶继续 |
 | 所有 feel 操作 | `source_bucket` 不存在 | `logger.warning()` 记录，feel 桶本身仍成功创建 |
-| `dehydrator.dehydrate()` / `analyze()` / `merge()` / `digest()` | API 不可用（`api_available=False`）| **直接向 MCP 调用端明确报错（`RuntimeError`）**，无本地降级。本地关键词提取质量不足以替代语义打标与合并，静默降级比报错更危险（可能产生错误分类记忆）。 |
+| `dehydrator.dehydrate()` / `analyze()` / `merge()` / `digest()` | API 不可用（`api_available=False`）| 底层抛出 `RuntimeError`；query breath 使用有标记的 canonical body fallback，grow/hold 的自动 metadata 失败使用有标记的默认值，不伪装成自动分析成功。 |
 | `embedding_engine.search_similar()` | `enabled=False` | 直接返回 `[]`，调用方 fallback 到 keyword 搜索 |
 
 ---

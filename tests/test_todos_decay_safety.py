@@ -57,7 +57,10 @@ def test_todo_parsers_treat_missing_or_malformed_llm_fields_as_empty(test_config
 
     dehydrator = Dehydrator(test_config)
     analysis = dehydrator._parse_analysis(
-        json.dumps({"domain": ["事务"], "todos": "not-a-list"}, ensure_ascii=False)
+        json.dumps({
+            "domain": ["事务"], "tags": [], "valence": 0.5,
+            "arousal": 0.3, "todos": "not-a-list",
+        }, ensure_ascii=False)
     )
     digest = dehydrator._parse_digest(
         json.dumps([{"content": "digest body", "todos": {"bad": "shape"}}])

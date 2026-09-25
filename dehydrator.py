@@ -26,8 +26,10 @@
 import os
 import re
 import json
-import hashlib
 import sqlite3
+from pathlib import Path
+
+from dehydration_cache_identity import DEHYDRATE_PROMPT_VERSION, dehydration_content_hash
 
 from maintenance_write_gate import (
     DEFAULT_WRITE_COORDINATOR,
@@ -49,16 +51,13 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 
 压缩规则：
 1. 提取所有核心事实，去除冗余修饰和重复
-2. 保留最新的情绪状态和态度
-3. 保留所有待办/未完成事项
-4. 关键数字、日期、名称必须保留
-5. 目标压缩率 > 70%
+2. 关键数字、日期、名称必须保留
+3. 只陈述正文直接支持的事实，不增加正文不存在的评价、态度或推断
+4. 不能创造任务或行动建议；目标压缩率 > 70%
 
 输出格式（纯 JSON，无其他内容）：
 {
   "core_facts": ["事实1", "事实2"],
-  "emotion_state": "当前情绪关键词",
-  "todos": ["待办1", "待办2"],
   "keywords": ["关键词1", "关键词2"],
   "summary": "50字以内的核心总结"
 }"""
@@ -158,6 +157,10 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
 }"""
 
 
+class AnalysisParseError(ValueError):
+    """A provider response could not be used as structured metadata."""
+
+
 class Dehydrator:
     """
     Data dehydrator + content analyzer.
@@ -191,6 +194,7 @@ class Dehydrator:
                 api_key=self.api_key,
                 base_url=self.base_url,
                 timeout=60.0,
+                max_retries=2,
             )
         else:
             self.client = None
@@ -213,28 +217,41 @@ class Dehydrator:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dehydration_cache_v2 (
+                content_hash TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (content_hash, model, prompt_version)
+            )
+        """)
         conn.commit()
         conn.close()
 
     def _get_cached_summary(self, content: str) -> str | None:
-        """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        row = conn.execute(
-            "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-            (content_hash,)
-        ).fetchone()
-        conn.close()
+        """Read only the current model and prompt version without mutating SQLite."""
+        content_hash = dehydration_content_hash(content)
+        db_uri = f"{Path(self.cache_db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(db_uri, uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute(
+                "SELECT summary FROM dehydration_cache_v2 "
+                "WHERE content_hash = ? AND model = ? AND prompt_version = ?",
+                (content_hash, self.model, DEHYDRATE_PROMPT_VERSION),
+            ).fetchone()
         return row[0] if row else None
 
     @guarded_optional_mutation("dehydration_cache_store")
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = dehydration_content_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
+            "INSERT OR REPLACE INTO dehydration_cache_v2 "
+            "(content_hash, summary, model, prompt_version) VALUES (?, ?, ?, ?)",
+            (content_hash, summary, self.model, DEHYDRATE_PROMPT_VERSION),
         )
         conn.commit()
         conn.close()
@@ -242,9 +259,12 @@ class Dehydrator:
     @guarded_mutation("dehydration_cache_delete")
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = dehydration_content_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.execute(
+            "DELETE FROM dehydration_cache_v2 WHERE content_hash = ?",
+            (content_hash,),
+        )
         conn.commit()
         conn.close()
 
@@ -260,7 +280,10 @@ class Dehydrator:
         metadata: dict = None,
         *,
         cache: bool = True,
-    ) -> str:
+        cache_read: bool | None = None,
+        cache_write: bool | None = None,
+        return_kind: bool = False,
+    ) -> str | tuple[str, str]:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
@@ -269,31 +292,69 @@ class Dehydrator:
         返回格式化的摘要字符串，可直接注入 Claude 上下文。
         使用 SQLite 缓存避免重复调用 API。
         """
+        if cache_read is None:
+            cache_read = cache
+        if cache_write is None:
+            cache_write = cache
+
+        def output(text: str, kind: str):
+            return (text, kind) if return_kind else text
+
         if not content or not content.strip():
-            return "（空记忆 / empty memory）"
+            return output("（空记忆 / empty memory）", "original")
 
         # --- Content is short enough, no compression needed ---
         # --- 内容已经很短，不需要压缩 ---
         if count_tokens_approx(content) < 100:
-            return self._format_output(content, metadata)
+            return output(self._format_output(content, metadata, strip_links=not return_kind), "original")
 
         # --- Check cache first ---
         # --- 先查缓存 ---
-        if cache:
+        if cache_read:
             cached = self._get_cached_summary(content)
             if cached:
-                return self._format_output(cached, metadata)
+                return output(self._format_output(cached, metadata), "summary")
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
 
-        result = await self._api_dehydrate(content)
+        result = self._parse_dehydration(await self._api_dehydrate(content))
         # --- Cache the result ---
-        if cache:
+        if cache_write:
             self._set_cached_summary(content, result)
-        return self._format_output(result, metadata)
+        return output(self._format_output(result, metadata), "summary")
+
+    @staticmethod
+    def _parse_dehydration(raw: str) -> str:
+        """Keep only validated summary fields; never echo model-created todos."""
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+            payload = json.loads(cleaned)
+        except (AttributeError, json.JSONDecodeError, ValueError) as exc:
+            raise AnalysisParseError("dehydration_parse_error") from exc
+        if not isinstance(payload, dict):
+            raise AnalysisParseError("dehydration_parse_error")
+        facts = payload.get("core_facts", [])
+        keywords = payload.get("keywords", [])
+        summary = payload.get("summary", "")
+        if (
+            not isinstance(facts, list)
+            or any(not isinstance(item, str) for item in facts)
+            or not isinstance(keywords, list)
+            or any(not isinstance(item, str) for item in keywords)
+            or not isinstance(summary, str)
+            or not (any(item.strip() for item in facts) or summary.strip())
+        ):
+            raise AnalysisParseError("dehydration_parse_error")
+        return json.dumps(
+            {"core_facts": facts, "keywords": keywords, "summary": summary},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     # ---------------------------------------------------------
     # Merge: blend new content into existing bucket
@@ -377,7 +438,7 @@ class Dehydrator:
     # Wraps dehydrated result with bucket name, tags, emotion coords
     # 把脱水结果包装成带桶名、标签、情感坐标的可读文本
     # ---------------------------------------------------------
-    def _format_output(self, content: str, metadata: dict = None) -> str:
+    def _format_output(self, content: str, metadata: dict = None, *, strip_links: bool = True) -> str:
         """
         Format dehydrated result into context-injectable text.
         将脱水结果格式化为可注入上下文的文本。
@@ -406,7 +467,8 @@ class Dehydrator:
                 header += " [已消化]"
             header += "\n"
         
-        content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+        if strip_links:
+            content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
 
     # ---------------------------------------------------------
@@ -457,10 +519,10 @@ class Dehydrator:
             temperature=0.1,
         )
         if not response.choices:
-            return self._default_analysis()
+            raise AnalysisParseError("analysis_empty_response")
         raw = response.choices[0].message.content or ""
         if not raw.strip():
-            return self._default_analysis()
+            raise AnalysisParseError("analysis_empty_response")
         return self._parse_analysis(raw)
 
     # ---------------------------------------------------------
@@ -481,18 +543,29 @@ class Dehydrator:
                 cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
             result = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning(f"API tagging JSON parse failed / JSON 解析失败: {raw[:200]}")
-            return self._default_analysis()
+            logger.warning("API tagging JSON parse failed")
+            raise AnalysisParseError("analysis_parse_error")
 
         if not isinstance(result, dict):
-            return self._default_analysis()
+            raise AnalysisParseError("analysis_parse_error")
+
+        if (
+            not isinstance(result.get("domain"), list)
+            or any(not isinstance(item, str) for item in result["domain"])
+            or not isinstance(result.get("tags"), list)
+            or any(not isinstance(item, str) for item in result["tags"])
+            or not isinstance(result.get("suggested_name", ""), str)
+            or "valence" not in result
+            or "arousal" not in result
+        ):
+            raise AnalysisParseError("analysis_parse_error")
 
         # --- Validate and clamp value ranges / 校验并钳制数值范围 ---
         try:
             valence = max(0.0, min(1.0, float(result.get("valence", 0.5))))
             arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
         except (ValueError, TypeError):
-            valence, arousal = 0.5, 0.3
+            raise AnalysisParseError("analysis_parse_error")
         raw_todos = result.get("todos", [])
         todos = (
             list(dict.fromkeys(
@@ -579,10 +652,10 @@ class Dehydrator:
             temperature=0.0,
         )
         if not response.choices:
-            return []
+            raise AnalysisParseError("digest_empty_response")
         raw = response.choices[0].message.content or ""
         if not raw.strip():
-            return []
+            raise AnalysisParseError("digest_empty_response")
         return self._parse_digest(raw)
 
     # ---------------------------------------------------------
@@ -600,16 +673,24 @@ class Dehydrator:
                 cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
             items = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:200]}")
-            return []
+            logger.warning("Diary digest JSON parse failed")
+            raise AnalysisParseError("digest_parse_error")
 
         if not isinstance(items, list):
-            return []
+            raise AnalysisParseError("digest_parse_error")
 
         validated = []
         for item in items:
-            if not isinstance(item, dict) or not item.get("content"):
-                continue
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str) or not item["content"].strip():
+                raise AnalysisParseError("digest_parse_error")
+            metadata_valid = (
+                isinstance(item.get("domain"), list)
+                and all(isinstance(value, str) for value in item["domain"])
+                and isinstance(item.get("tags"), list)
+                and all(isinstance(value, str) for value in item["tags"])
+                and "valence" in item
+                and "arousal" in item
+            )
             try:
                 importance = max(1, min(10, int(item.get("importance", 5))))
             except (ValueError, TypeError):
@@ -618,6 +699,9 @@ class Dehydrator:
                 valence = max(0.0, min(1.0, float(item.get("valence", 0.5))))
                 arousal = max(0.0, min(1.0, float(item.get("arousal", 0.3))))
             except (ValueError, TypeError):
+                valence, arousal = 0.5, 0.3
+                metadata_valid = False
+            if not metadata_valid:
                 valence, arousal = 0.5, 0.3
             raw_todos = item.get("todos", [])
             todos = (
@@ -631,13 +715,20 @@ class Dehydrator:
             )
 
             validated.append({
-                "name": str(item.get("name", ""))[:20],
+                "name": (
+                    item.get("name", "").strip()[:20]
+                    if metadata_valid and isinstance(item.get("name", ""), str)
+                    else ""
+                ),
                 "content": str(item.get("content", "")),
-                "domain": item.get("domain", ["未分类"])[:3],
+                "domain": item.get("domain", ["未分类"])[:3] if metadata_valid else ["未分类"],
                 "valence": valence,
                 "arousal": arousal,
-                "tags": item.get("tags", [])[:15],
-                "importance": importance,
-                "todos": todos,
+                "tags": item.get("tags", [])[:15] if metadata_valid else [],
+                "importance": importance if metadata_valid else 5,
+                "todos": todos if metadata_valid else [],
+                "_metadata_failure": "" if metadata_valid else "parse_error",
             })
+        if not validated:
+            raise AnalysisParseError("digest_parse_error")
         return validated

@@ -11,6 +11,7 @@ import frontmatter
 import yaml
 
 from utils import strip_wikilinks
+from dehydration_cache_identity import DEHYDRATE_PROMPT_VERSION
 
 
 def _read_frontmatter_fields(
@@ -72,10 +73,11 @@ def _read_unsealed_body(file_path: str) -> str | None:
 def _read_cached_summaries(
     cache_db_path: str,
     content_hashes: set[str],
+    dehydration_model: str,
 ) -> dict[str, str]:
     """Read cached dehydration summaries without creating or changing the DB."""
     database_path = Path(cache_db_path)
-    if not content_hashes or not database_path.is_file():
+    if not content_hashes or not dehydration_model or not database_path.is_file():
         return {}
     database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
     try:
@@ -87,9 +89,9 @@ def _read_cached_summaries(
                 chunk = hashes[start:start + 900]
                 placeholders = ", ".join("?" for _ in chunk)
                 rows = conn.execute(
-                    "SELECT content_hash, summary FROM dehydration_cache "
-                    f"WHERE content_hash IN ({placeholders})",
-                    chunk,
+                    "SELECT content_hash, summary FROM dehydration_cache_v2 "
+                    f"WHERE model = ? AND prompt_version = ? AND content_hash IN ({placeholders})",
+                    [dehydration_model, DEHYDRATE_PROMPT_VERSION, *chunk],
                 ).fetchall()
                 for content_hash, summary in rows:
                     if isinstance(summary, str) and summary.strip():
@@ -166,6 +168,7 @@ def _bucket_metadata_index(
 def _attach_summary_sources(
     bucket_records: dict[str, dict],
     cache_db_path: str,
+    dehydration_model: str,
 ) -> dict[str, int]:
     """Apply cache, body, then name fallback without calling any model or API."""
     cached_summaries = _read_cached_summaries(
@@ -175,6 +178,7 @@ def _attach_summary_sources(
             for record in bucket_records.values()
             if not record.get("sealed", True) and record.get("content_hash")
         },
+        dehydration_model,
     )
     counts = {"summary": 0, "body": 0, "name": 0}
     for record in bucket_records.values():
@@ -225,6 +229,7 @@ def run_dedupe_scan(
     excluded_archive_roots: tuple[str, ...] = (),
     db_path: str,
     model: str,
+    dehydration_model: str = "",
     limit: int = 30,
 ) -> str:
     """Return a local-only duplicate report. It performs no bucket or DB mutation."""
@@ -242,6 +247,7 @@ def run_dedupe_scan(
     summary_counts = _attach_summary_sources(
         bucket_records,
         str(Path(db_path).with_name("dehydration_cache.db")),
+        dehydration_model,
     )
 
     orphan_rows = 0

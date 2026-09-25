@@ -108,7 +108,8 @@ from asset_viewer import (
     ASSET_VIEWER_TOOL_META,
     ASSET_VIEWER_URI,
 )
-from dehydrator import Dehydrator
+from dehydrator import AnalysisParseError, Dehydrator
+from openai import APIConnectionError, APITimeoutError
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
@@ -1288,7 +1289,7 @@ async def _merge_or_create(
         domain=domain,
         valence=valence,
         arousal=arousal,
-        name=name or None,
+        name=(name.strip() if isinstance(name, str) else "") or _canonical_body_name(content),
         todos=incoming_todos,
         provenance_kind=provenance_kind,
     )
@@ -1298,6 +1299,27 @@ async def _merge_or_create(
     if source_id_out is not None:
         source_id_out.append(bucket_id)
     return bucket_id, False
+
+
+def _canonical_body_name(content: str) -> str:
+    """Use at most 20 Unicode characters from the stored body as a title."""
+    return " ".join(str(content).split())[:20]
+
+
+def _provider_failure_category(exc: BaseException) -> str:
+    """Map an exception chain to a small public reason without exposing details."""
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, AnalysisParseError):
+            return "parse_error"
+        if getattr(current, "status_code", None) == 429:
+            return "rate_limited"
+        if isinstance(current, (APIConnectionError, APITimeoutError)):
+            return "connection_error"
+        current = current.__cause__
+    if "API 不可用" in str(exc) or "OMBRE_API_KEY" in str(exc):
+        return "provider_unconfigured"
+    return "provider_error"
 
 
 def _bucket_date(meta: dict, *keys: str) -> str:
@@ -3230,6 +3252,7 @@ async def _run_dedupe_scan(limit: int = 30, include_archive: bool = False) -> st
         excluded_archive_roots=() if include_archive else (bucket_mgr.archive_dir,),
         db_path=embedding_engine.db_path,
         model=embedding_engine.model,
+        dehydration_model=dehydrator.model,
         limit=limit,
     )
 
@@ -3947,7 +3970,6 @@ async def _breath_filtered_impl(
     min_score: float,
 ) -> str:
     """Retrieve exact-filtered candidates without changing old breath paths."""
-    del mode
     domain_values = [part.strip() for part in (domain or "").split(",") if part.strip()]
     domain_set = {part.casefold() for part in domain_values}
     query_text = query.strip()
@@ -4001,6 +4023,7 @@ async def _breath_filtered_impl(
                     or q in bucket.get("content", "").lower()
                 ]
             sessions.sort(key=_breath_recency_key, reverse=True)
+            total_sessions = len(sessions)
             sessions = sessions[:max_results]
             if not sessions:
                 return empty_result("没有找到对话归档。")
@@ -4008,10 +4031,21 @@ async def _breath_filtered_impl(
             results = []
             for bucket in sessions:
                 metadata = bucket.get("metadata", {})
+                body = str(bucket.get("content", ""))
+                if query_text and mode == "full":
+                    available = max_tokens - count_tokens_approx("\n---\n".join(results))
+                    body = _prefix_within_token_budget(body, available)
+                    display = "原文·已截断" if body != str(bucket.get("content", "")) else "原文"
+                else:
+                    preview = body[:1200]
+                    body = strip_wikilinks(preview)
+                    display = "原文节选·已截断" if len(str(bucket.get("content", ""))) > 1200 else "原文"
+                    if body != preview:
+                        display += "·双链标记已省略"
                 text = (
                     f"[session] [bucket_id:{bucket['id']}] "
                     f"{metadata.get('name', bucket['id'])}\n"
-                    f"{strip_wikilinks(bucket.get('content', '')[:1200])}"
+                    f"{f'[显示={display}] ' if query_text else ''}{body}"
                 )
                 result = await _append_bucket_extras(text, bucket, emotion_trend)
                 if results and count_tokens_approx("\n---\n".join(results + [result])) > max_tokens:
@@ -4019,7 +4053,13 @@ async def _breath_filtered_impl(
                 results.append(result)
             if not results:
                 return empty_result("没有找到对话归档。")
-            return _with_emotion_timeline("\n---\n".join(results), emotion_trend)
+            text = "\n---\n".join(results)
+            if query_text:
+                text += (
+                    f"\n共匹配 {total_sessions} / 本次显示 {len(results)} / "
+                    f"后续剩余 {total_sessions - len(results)}"
+                )
+            return _with_emotion_timeline(text, emotion_trend)
         except Exception as exc:
             logger.error(f"Filtered session retrieval failed: {exc}")
             return "读取对话归档失败。"
@@ -4051,6 +4091,7 @@ async def _breath_filtered_impl(
                     )
                 ]
             feels.sort(key=_breath_recency_key, reverse=True)
+            total_feels = len(feels)
             feels = feels[:max_results]
             if not feels:
                 return empty_result("没有留下过 feel。")
@@ -4060,11 +4101,20 @@ async def _breath_filtered_impl(
                 metadata = bucket["metadata"]
                 created = _bucket_date(metadata, "created_at", "created")
                 updated = _bucket_date(metadata, "updated_at", "last_active", "created")
+                body = str(bucket['content'])
+                if query_text and mode == "full":
+                    available = max_tokens - count_tokens_approx("\n---\n".join(results))
+                    body = _prefix_within_token_budget(body, available)
+                    display = "原文·已截断" if body != str(bucket['content']) else "原文"
+                else:
+                    raw = body
+                    body = strip_wikilinks(raw)
+                    display = "原文·双链标记已省略" if body != raw else "原文"
                 entry = (
                     f"[{created}] [bucket_id:{bucket['id']}] "
                     f"name:{metadata.get('name', bucket['id'])} updated_at:{updated} "
                     f"tags:{','.join(_structured_metadata_values(metadata, 'tags'))}\n"
-                    f"{strip_wikilinks(bucket['content'])}"
+                    f"{f'[显示={display}] ' if query_text else ''}{body}"
                 )
                 entry = await _append_bucket_extras(entry, bucket, emotion_trend)
                 if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
@@ -4072,10 +4122,13 @@ async def _breath_filtered_impl(
                 results.append(entry)
             if not results:
                 return empty_result("没有留下过 feel。")
-            return _with_emotion_timeline(
-                "=== 你留下的 feel ===\n" + "\n---\n".join(results),
-                emotion_trend,
-            )
+            text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            if query_text:
+                text += (
+                    f"\n共匹配 {total_feels} / 本次显示 {len(results)} / "
+                    f"后续剩余 {total_feels - len(results)}"
+                )
+            return _with_emotion_timeline(text, emotion_trend)
         except Exception as exc:
             logger.error(f"Filtered feel retrieval failed: {exc}")
             return "读取 feel 失败。"
@@ -4132,7 +4185,8 @@ async def _breath_filtered_impl(
                     summary = await dehydrator.dehydrate(
                         content,
                         clean_meta,
-                        cache=False,
+                        cache_read=True,
+                        cache_write=False,
                     )
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
@@ -4159,7 +4213,8 @@ async def _breath_filtered_impl(
             for bucket in weak_matches
         ]
         if not results and not weak_lines:
-            await _fire_webhook("breath", {"mode": "empty", "matches": 0})
+            if touch:
+                await _fire_webhook("breath", {"mode": "empty", "matches": 0})
             return empty_result("未找到相关记忆。")
         final_text = "\n---\n".join(results)
         if weak_lines:
@@ -4176,14 +4231,15 @@ async def _breath_filtered_impl(
             f"因 token 预算省略 {token_budget_omitted} / "
             f"因低于阈值降级 {downgraded_count}"
         )
-        await _fire_webhook(
-            "breath",
-            {
-                "mode": "ok",
-                "matches": len(results) + len(weak_lines),
-                "chars": len(final_text),
-            },
-        )
+        if touch:
+            await _fire_webhook(
+                "breath",
+                {
+                    "mode": "ok",
+                    "matches": len(results) + len(weak_lines),
+                    "chars": len(final_text),
+                },
+            )
         return _with_emotion_timeline(final_text, emotion_trend)
 
     if not query_text:
@@ -4223,11 +4279,21 @@ async def _breath_filtered_impl(
     )
     ordered_matches = _order_breath_query_matches(matches)
     hidden_count = max(0, len(ordered_matches) - max_results)
-    return await format_active_matches(
-        ordered_matches[:max_results],
-        hidden_count,
-        sum(1 for bucket in ordered_matches if bucket.get("_breath_weak", False)),
+    selected = ordered_matches[:max_results]
+    final_text, _composition = await _compose_breath_query_matches(
+        selected,
+        max_tokens=max_tokens,
+        q_valence=q_valence,
+        emotion_trend=emotion_trend,
+        hidden_count=hidden_count,
+        total_matches=len(ordered_matches),
+        touch=touch,
+        wake_dormant=wake_dormant,
+        downgraded_count=sum(1 for bucket in ordered_matches if bucket.get("_breath_weak", False)),
+        mode=mode,
+        touch_ripple=True,
     )
+    return final_text or empty_result("未找到相关记忆。")
 
 
 def _filter_breath_query_matches(
@@ -4263,6 +4329,7 @@ def _breath_cursor_scope(
     min_score: float,
     as_of: str = "",
     touch: bool = True,
+    mode: str = "summary",
 ) -> str:
     payload = {
         "query": query,
@@ -4278,6 +4345,7 @@ def _breath_cursor_scope(
         "min_score": min_score,
         "as_of": as_of,
         "touch": touch,
+        "mode": mode,
     }
     encoded = _json_lib.dumps(
         payload,
@@ -4447,7 +4515,6 @@ async def _format_breath_query_summary(bucket: dict, summary: str) -> str:
     )
     return "[语义关联] " + header if bucket.get("vector_match") else header
 
-
 async def _compose_breath_query_matches(
     matches: list[dict],
     *,
@@ -4462,116 +4529,199 @@ async def _compose_breath_query_matches(
     cache: bool = True,
     next_cursor: str = "",
     downgraded_count: int = 0,
+    mode: str = "summary",
+    ordered_matches: list[dict] | None = None,
+    start_position: int = 0,
+    prior_consumed: int = 0,
+    cursor_scope: str = "",
+    touch_ripple: bool = False,
 ) -> tuple[str, dict]:
-    """Compose query results using the same path as normal Breath."""
-    results = []
-    shown_buckets = []
+    """Consume a prefix of the frozen page; budget omissions remain unconsumed."""
+    del cache  # Cache reads are always allowed; only touch controls cache writes.
+    results: list[str] = []
+    weak_lines: list[str] = []
+    shown_buckets: list[dict] = []
+    returned_ids: set[str] = set()
     token_used = 0
-    token_budget_omitted = 0
-    strong_matches = [
-        bucket for bucket in matches if not bucket.get("_breath_weak", False)
-    ]
-    weak_matches = [
-        bucket for bucket in matches if bucket.get("_breath_weak", False)
-    ]
-    for index, bucket in enumerate(strong_matches):
+    consumed = 0
+    failed_omitted = 0
+    matched_count = int(total_matches) if total_matches is not None else len(matches) + hidden_count
+    for bucket in matches:
         bid = str(bucket.get("id", ""))
         decision = trace_by_id.get(bid) if trace_by_id is not None else None
-        if token_used >= max_tokens:
-            token_budget_omitted += len(strong_matches) - index
-            if trace_by_id is not None:
-                for omitted_bucket in strong_matches[index:]:
-                    omitted_decision = trace_by_id.get(
-                        str(omitted_bucket.get("id", ""))
-                    )
-                    if omitted_decision is not None:
-                        omitted_decision["final_decision"] = "omitted_token_budget"
+        remaining_budget = max_tokens - token_used
+        if remaining_budget <= 0:
             break
-        try:
-            clean_meta = {
-                key: value
-                for key, value in bucket["metadata"].items()
-                if key != "tags"
-            }
-            if q_valence is not None and "valence" in clean_meta:
-                original_v = float(clean_meta.get("valence", 0.5))
-                shift = (q_valence - 0.5) * 0.2
-                clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            content = strip_wikilinks(bucket["content"])
-            if cache:
-                summary = await dehydrator.dehydrate(content, clean_meta)
-            else:
-                summary = await dehydrator.dehydrate(
-                    content,
-                    clean_meta,
-                    cache=False,
-                )
-            summary_tokens = count_tokens_approx(summary)
-            if token_used + summary_tokens > max_tokens:
-                token_budget_omitted += len(strong_matches) - index
-                if trace_by_id is not None:
-                    for omitted_bucket in strong_matches[index:]:
-                        omitted_decision = trace_by_id.get(
-                            str(omitted_bucket.get("id", ""))
-                        )
-                        if omitted_decision is not None:
-                            omitted_decision["final_decision"] = "omitted_token_budget"
+        if bucket.get("_breath_weak", False):
+            line = (
+                f"[bucket_id:{bid}] "
+                f"{bucket.get('metadata', {}).get('name', bid)} "
+                f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+            )
+            required = max(1, count_tokens_approx(line))
+            if required > remaining_budget:
                 break
+            weak_lines.append(line)
+            shown_buckets.append(bucket)
+            token_used += required
+            consumed += 1
+            if decision is not None:
+                decision["final_decision"] = "surfaced"
+                decision["surfaced_token_count"] = required
+            continue
+
+        try:
+            if mode == "full":
+                body = str(bucket["content"])
+                display = "原文"
+                summary = body
+            else:
+                clean_meta = {
+                    key: value for key, value in bucket["metadata"].items()
+                    if key != "tags"
+                }
+                if q_valence is not None and "valence" in clean_meta:
+                    original_v = float(clean_meta.get("valence", 0.5))
+                    shift = (q_valence - 0.5) * 0.2
+                    clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
+                rendered = await dehydrator.dehydrate(
+                    strip_wikilinks(bucket["content"]),
+                    clean_meta,
+                    cache_read=True,
+                    cache_write=touch,
+                    return_kind=True,
+                )
+                if isinstance(rendered, tuple):
+                    summary, kind = rendered
+                else:
+                    summary, kind = rendered, "summary"
+                if kind == "original":
+                    summary = str(bucket["content"])
+                display = "原文" if kind == "original" else "压缩摘要·非原文"
+            required = count_tokens_approx(summary)
+            if required > remaining_budget:
+                if mode == "full" or display == "原文":
+                    summary = _prefix_within_token_budget(summary, remaining_budget)
+                    if not summary:
+                        break
+                    display = (
+                        "原文·已截断" if display == "原文"
+                        else "压缩摘要·已截断·非原文"
+                    )
+                    required = count_tokens_approx(summary)
+                else:
+                    break
             if touch:
+                if touch_ripple:
+                    returned_ids.add(bucket["id"])
                 await bucket_mgr.touch(
                     bucket["id"],
                     wake_dormant=wake_dormant,
+                    **({"ripple_ids": returned_ids} if touch_ripple else {}),
                 )
-            summary = await _format_breath_query_summary(bucket, summary)
-            results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
+            formatted = await _format_breath_query_summary(
+                bucket, f"[显示={display}] {summary}"
+            )
+            entry = await _append_bucket_extras(formatted, bucket, emotion_trend)
+            results.append(entry)
             shown_buckets.append(bucket)
-            token_used += summary_tokens
+            token_used += required
+            consumed += 1
             if decision is not None:
                 decision["final_decision"] = "surfaced"
-                decision["surfaced_token_count"] = summary_tokens
-        except Exception:
-            if decision is not None:
-                decision["final_decision"] = "omitted_composition_error"
-            continue
+                decision["surfaced_token_count"] = required
+        except Exception as exc:
+            logger.warning(
+                "Breath composition failed for bucket %s (%s); using canonical body",
+                bid, type(exc).__name__,
+            )
+            try:
+                body = str(bucket["content"])
+                prefix = _prefix_within_token_budget(body, remaining_budget)
+                if not prefix:
+                    if not body:
+                        failed_omitted += 1
+                        consumed += 1
+                        if decision is not None:
+                            decision["final_decision"] = "omitted_composition_error"
+                    break
+                display = (
+                    "原文·已截断；摘要服务暂不可用"
+                    if prefix != body else "原文；摘要服务暂不可用"
+                )
+                formatted = await _format_breath_query_summary(
+                    bucket, f"[显示={display}] {prefix}"
+                )
+                entry = await _append_bucket_extras(formatted, bucket, emotion_trend)
+                results.append(entry)
+                shown_buckets.append(bucket)
+                token_used += count_tokens_approx(prefix)
+                consumed += 1
+                if decision is not None:
+                    decision["final_decision"] = "surfaced_fallback"
+            except Exception as fallback_exc:
+                logger.warning(
+                    "Breath canonical fallback failed for bucket %s (%s)",
+                    bid, type(fallback_exc).__name__,
+                )
+                failed_omitted += 1
+                consumed += 1
+                if decision is not None:
+                    decision["final_decision"] = "omitted_composition_error"
 
-    matched_count = (
-        max(0, int(total_matches))
-        if total_matches is not None
-        else len(matches) + hidden_count
-    )
-    weak_lines = [
-        f"[bucket_id:{bucket['id']}] "
-        f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
-        f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
-        for bucket in weak_matches
-    ]
+    if trace_by_id is not None:
+        for omitted_bucket in matches[consumed:]:
+            omitted_decision = trace_by_id.get(str(omitted_bucket.get("id", "")))
+            if omitted_decision is not None:
+                omitted_decision["final_decision"] = "omitted_token_budget"
     displayed_count = len(results) + len(weak_lines)
-    omitted_count = hidden_count + token_budget_omitted
+    remaining = max(0, matched_count - prior_consumed - consumed)
+    selected_limit = min(len(matches), max(0, matched_count - prior_consumed))
+    result_limit_omitted = max(0, matched_count - prior_consumed - selected_limit)
+    token_budget_omitted = max(0, selected_limit - consumed)
+    if ordered_matches is not None:
+        if consumed:
+            next_position = int(matches[consumed - 1].get("_breath_index", start_position + consumed - 1)) + 1
+        elif matches:
+            next_position = int(matches[0].get("_breath_index", start_position))
+        else:
+            next_position = len(ordered_matches)
+        next_cursor = (
+            _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
+            if remaining and cursor_scope else ""
+        )
     composition = {
         "surfaced_count": displayed_count,
         "token_used": token_used,
         "token_budget": max_tokens,
         "matched_count": matched_count,
-        "result_limit_omitted": hidden_count,
+        "prior_consumed": prior_consumed,
+        "composition_failed_omitted": failed_omitted,
+        "result_limit_omitted": result_limit_omitted,
         "token_budget_omitted": token_budget_omitted,
-        "hidden_count": omitted_count,
+        "hidden_count": remaining,
+        "remaining_count": remaining,
+        "consumed_count": consumed,
         "downgraded_count": downgraded_count,
+        "next_cursor": next_cursor,
     }
     if matched_count == 0:
         return "", composition
-
     summary_lines = []
-    if omitted_count:
-        summary_lines.append(f"还有{omitted_count}个相关记忆未显示")
+    if not consumed and matches:
+        summary_lines.append("max_tokens 过小，无法显示当前匹配项；请增大预算后重试。")
+    if remaining:
+        summary_lines.append(f"还有{remaining}个相关记忆未显示")
     summary_lines.extend(
         await _current_successor_lines(
-            shown_buckets + weak_matches,
+            shown_buckets,
             {str(bucket.get("id", "")) for bucket in matches},
         )
     )
     summary_lines.append(
-        f"共匹配 {matched_count} / 本次显示 {displayed_count} / "
-        f"因结果上限省略 {hidden_count} / "
+        f"共匹配 {matched_count} / 前页已消费 {prior_consumed} / "
+        f"本次显示 {displayed_count} / 因组装失败省略 {failed_omitted} / "
+        f"后续剩余 {remaining} / 因结果上限省略 {result_limit_omitted} / "
         f"因 token 预算省略 {token_budget_omitted} / "
         f"因低于阈值降级 {downgraded_count}"
     )
@@ -4581,10 +4731,7 @@ async def _compose_breath_query_matches(
     if weak_lines:
         weak_section = "--- 弱匹配（仅列名） ---\n" + "\n".join(weak_lines)
         final_text = "\n\n".join(part for part in (final_text, weak_section) if part)
-    if final_text:
-        final_text += "\n\n" + "\n".join(summary_lines)
-    else:
-        final_text = "\n".join(summary_lines)
+    final_text = "\n\n".join(part for part in (final_text, "\n".join(summary_lines)) if part)
     return _with_emotion_timeline(final_text, emotion_trend), composition
 
 
@@ -4718,6 +4865,7 @@ async def _format_historical_breath_summary(
     body: str,
     *,
     requested_as_of: str,
+    truncated: bool = False,
 ) -> str:
     """Render raw historical content without current-summary cache side effects."""
     metadata = bucket.get("metadata", {})
@@ -4735,7 +4883,7 @@ async def _format_historical_breath_summary(
         f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
         f"[通道:{channel}]{superseded_marker}\n"
         f"[正文版本有效: {version_start} — {version_range}]\n"
-        f"{body}"
+        f"[显示={'历史原文·已截断' if truncated else '历史原文'}] {body}"
     )
 
 
@@ -4748,48 +4896,76 @@ async def _compose_historical_breath_matches(
     downgraded_count: int,
     next_cursor: str,
     requested_as_of: str,
+    ordered_matches: list[dict] | None = None,
+    start_position: int = 0,
+    prior_consumed: int = 0,
+    cursor_scope: str = "",
 ) -> str:
-    """Render historical bodies directly; history reads never touch or cache."""
+    """Render only a consumed prefix of the historical frozen query page."""
     results: list[str] = []
+    weak_lines: list[str] = []
     token_used = 0
-    token_budget_omitted = 0
-    strong_matches = [bucket for bucket in matches if not bucket.get("_breath_weak", False)]
-    weak_matches = [bucket for bucket in matches if bucket.get("_breath_weak", False)]
-    for index, bucket in enumerate(strong_matches):
-        body = strip_wikilinks(str(bucket.get("content", "")))
-        body_tokens = count_tokens_approx(body)
-        if token_used + body_tokens > max_tokens:
-            token_budget_omitted += len(strong_matches) - index
+    consumed = 0
+    for bucket in matches:
+        remaining_budget = max_tokens - token_used
+        if remaining_budget <= 0:
             break
-        results.append(
-            await _format_historical_breath_summary(
-                bucket,
-                body,
-                requested_as_of=requested_as_of,
+        if bucket.get("_breath_weak", False):
+            line = (
+                f"[历史版本 · as_of={requested_as_of}] [bucket_id:{bucket['id']}] "
+                f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
+                f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
             )
+            required = max(1, count_tokens_approx(line))
+            if required > remaining_budget:
+                break
+            weak_lines.append(line)
+            token_used += required
+            consumed += 1
+            continue
+        body = str(bucket.get("content", ""))
+        required = count_tokens_approx(body)
+        if required > remaining_budget:
+            body = _prefix_within_token_budget(body, remaining_budget)
+            if not body:
+                break
+        rendered = await _format_historical_breath_summary(
+            bucket, body, requested_as_of=requested_as_of,
+            truncated=body != str(bucket.get("content", "")),
         )
-        token_used += body_tokens
-
-    weak_lines = [
-        f"[历史版本 · as_of={requested_as_of}] [bucket_id:{bucket['id']}] "
-        f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
-        f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
-        for bucket in weak_matches
-    ]
+        results.append(rendered)
+        token_used += count_tokens_approx(body)
+        consumed += 1
     displayed_count = len(results) + len(weak_lines)
-    if not displayed_count:
+    remaining = max(0, total_matches - prior_consumed - consumed)
+    selected_limit = min(len(matches), total_matches - prior_consumed)
+    result_limit_omitted = max(0, total_matches - prior_consumed - selected_limit)
+    token_budget_omitted = max(0, selected_limit - consumed)
+    if ordered_matches is not None:
+        if consumed:
+            next_position = int(matches[consumed - 1].get("_breath_index", start_position + consumed - 1)) + 1
+        elif matches:
+            next_position = int(matches[0].get("_breath_index", start_position))
+        else:
+            next_position = len(ordered_matches)
+        next_cursor = (
+            _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
+            if remaining and cursor_scope else ""
+        )
+    if total_matches == 0:
         return "未找到在该时点存在的相关历史记忆。"
-
     parts = ["\n---\n".join(results)] if results else []
     if weak_lines:
         parts.append("--- 历史弱匹配（仅列名） ---\n" + "\n".join(weak_lines))
-    omitted_count = hidden_count + token_budget_omitted
     summary_lines = []
-    if omitted_count:
-        summary_lines.append(f"还有{omitted_count}个相关历史记忆未显示")
+    if not displayed_count and matches:
+        summary_lines.append("max_tokens 过小，无法显示当前历史匹配项；请增大预算后重试。")
+    if remaining:
+        summary_lines.append(f"还有{remaining}个相关历史记忆未显示")
     summary_lines.append(
-        f"共匹配 {total_matches} / 本次显示 {displayed_count} / "
-        f"因结果上限省略 {hidden_count} / "
+        f"共匹配 {total_matches} / 前页已消费 {prior_consumed} / "
+        f"本次显示 {displayed_count} / 因组装失败省略 0 / "
+        f"后续剩余 {remaining} / 因结果上限省略 {result_limit_omitted} / "
         f"因 token 预算省略 {token_budget_omitted} / "
         f"因低于阈值降级 {downgraded_count}"
     )
@@ -4875,8 +5051,8 @@ async def _breath_as_of_impl(
         except ValueError:
             return "cursor 无效、已过期或与当前检索条件不匹配。"
         by_id = {str(bucket.get("id", "")): bucket for bucket in corpus}
-        matches = []
-        for record in frozen_matches[position:position + max_results]:
+        eligible = []
+        for index, record in enumerate(frozen_matches):
             bucket = by_id.get(record["id"])
             if bucket is None:
                 continue
@@ -4884,9 +5060,13 @@ async def _breath_as_of_impl(
             rendered["_breath_score"] = float(record["score"])
             rendered["_breath_channel"] = record["channel"]
             rendered["_breath_weak"] = bool(record["weak"])
-            matches.append(rendered)
+            rendered["_breath_index"] = index
+            eligible.append(rendered)
         ordered_matches = frozen_matches
-        next_position = min(position + max_results, len(ordered_matches))
+        prior_consumed = sum(1 for match in eligible if match["_breath_index"] < position)
+        matches = [match for match in eligible if match["_breath_index"] >= position][:max_results]
+        total_matches = len(eligible)
+        downgraded_count = sum(1 for match in eligible if match.get("_breath_weak", False))
     else:
         try:
             matches = await bucket_mgr.search(
@@ -4914,27 +5094,26 @@ async def _breath_as_of_impl(
             min_score=resolved_min_score,
         )
         ordered_matches = _order_breath_query_matches(matches)
+        for index, match in enumerate(ordered_matches):
+            match["_breath_index"] = index
         matches = ordered_matches[:max_results]
-        next_position = len(matches)
-
-    total_matches = len(ordered_matches)
-    hidden_count = max(0, total_matches - len(matches))
-    downgraded_count = sum(
-        1 for match in ordered_matches if match.get("_breath_weak", False)
-    )
-    next_cursor = (
-        _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
-        if next_position < total_matches
-        else ""
-    )
+        position = 0
+        prior_consumed = 0
+        total_matches = len(ordered_matches)
+        downgraded_count = sum(1 for match in ordered_matches if match.get("_breath_weak", False))
+    hidden_count = max(0, total_matches - prior_consumed - len(matches))
     return await _compose_historical_breath_matches(
         matches,
         max_tokens=max_tokens,
         hidden_count=hidden_count,
         total_matches=total_matches,
         downgraded_count=downgraded_count,
-        next_cursor=next_cursor,
+        next_cursor="",
         requested_as_of=requested_as_of,
+        ordered_matches=ordered_matches,
+        start_position=position,
+        prior_consumed=prior_consumed,
+        cursor_scope=cursor_scope,
     )
 
 
@@ -5063,18 +5242,39 @@ async def _breath_impl(
                     or q in b.get("content", "").lower()
                 ]
             sessions.sort(key=lambda b: _bucket_date(b["metadata"], "updated_at", "created_at", "created"), reverse=True)
+            total_sessions = len(sessions)
             sessions = sessions[:max_results]
             if not sessions:
                 return _with_emotion_timeline("没有找到对话归档。", emotion_trend)
             results = []
             for b in sessions:
                 meta = b.get("metadata", {})
+                body = str(b.get("content", ""))
+                if query.strip() and mode == "full":
+                    available = max_tokens - count_tokens_approx("\n---\n".join(results))
+                    body = _prefix_within_token_budget(body, available)
+                    display = "原文·已截断" if body != str(b.get("content", "")) else "原文"
+                    body = f"[显示={display}] {body}"
+                else:
+                    preview = body[:1200]
+                    body = strip_wikilinks(preview)
+                    if query.strip():
+                        display = "原文节选·已截断" if len(str(b.get("content", ""))) > 1200 else "原文"
+                        if body != preview:
+                            display += "·双链标记已省略"
+                        body = f"[显示={display}] {body}"
                 text = (
                     f"[session] [bucket_id:{b['id']}] {meta.get('name', b['id'])}\n"
-                    f"{strip_wikilinks(b.get('content', '')[:1200])}"
+                    f"{body}"
                 )
                 results.append(await _append_bucket_extras(text, b, emotion_trend))
-            return _with_emotion_timeline("\n---\n".join(results), emotion_trend)
+            text = "\n---\n".join(results)
+            if query.strip():
+                text += (
+                    f"\n共匹配 {total_sessions} / 本次显示 {len(results)} / "
+                    f"后续剩余 {total_sessions - len(results)}"
+                )
+            return _with_emotion_timeline(text, emotion_trend)
         except Exception as e:
             logger.error(f"Session archive retrieval failed: {e}")
             return "读取对话归档失败。"
@@ -5288,7 +5488,7 @@ async def _breath_impl(
                         summary = await dehydrator.dehydrate(content, clean_meta)
                     else:
                         summary = await dehydrator.dehydrate(
-                            content, clean_meta, cache=False
+                            content, clean_meta, cache_read=True, cache_write=False
                         )
                     marker = "📌 " if b["metadata"].get("pinned", False) else ""
                     line = f"{marker}[核心准则] [bucket_id:{b['id']}] {summary}"
@@ -5309,7 +5509,7 @@ async def _breath_impl(
                         summary = await dehydrator.dehydrate(content, clean_meta)
                     else:
                         summary = await dehydrator.dehydrate(
-                            content, clean_meta, cache=False
+                            content, clean_meta, cache_read=True, cache_write=False
                         )
                     summary_tokens = count_tokens_approx(summary)
                     if summary_tokens > token_budget:
@@ -5392,6 +5592,7 @@ async def _breath_impl(
         resonance=resonance,
         min_score=resolved_min_score,
         touch=touch,
+        mode=mode,
     )
     search_trace = {}
     if cursor:
@@ -5399,38 +5600,34 @@ async def _breath_impl(
             frozen_matches, position = _decode_breath_cursor(cursor, cursor_scope)
         except ValueError:
             return "cursor 无效、已过期或与当前检索条件不匹配。"
-        page_records = frozen_matches[position:position + max_results]
-        loaded_by_id = {}
-        for record in page_records:
-            bucket_id = record["id"]
-            bucket = await bucket_mgr.get(bucket_id)
-            if bucket is not None:
-                loaded_by_id[bucket_id] = bucket
-        loaded = []
-        for record in page_records:
-            bucket = loaded_by_id.get(record["id"])
+        # Revalidate the whole frozen order so sealed/deleted/dormant entries
+        # cannot leak into the public total or leave holes in a resumed page.
+        eligible = []
+        for index, record in enumerate(frozen_matches):
+            bucket = await bucket_mgr.get(record["id"])
             if bucket is None:
                 continue
             rendered = dict(bucket)
             rendered["_breath_score"] = float(record["score"])
             rendered["_breath_channel"] = record["channel"]
             rendered["_breath_weak"] = bool(record["weak"])
-            loaded.append(rendered)
-        matches = _filter_breath_query_matches(
-            loaded,
-            recent_cutoff=recent_cutoff,
-            date_from=date_from,
-            date_to=date_to,
-            include_sealed=include_sealed,
-        )
-        if not include_dormant:
-            matches = [
-                bucket
-                for bucket in matches
-                if not bucket.get("metadata", {}).get("dormant", False)
-            ]
+            rendered["_breath_index"] = index
+            if not _filter_breath_query_matches(
+                [rendered],
+                recent_cutoff=recent_cutoff,
+                date_from=date_from,
+                date_to=date_to,
+                include_sealed=include_sealed,
+            ):
+                continue
+            if not include_dormant and rendered.get("metadata", {}).get("dormant", False):
+                continue
+            eligible.append(rendered)
+        prior_consumed = sum(1 for bucket in eligible if bucket["_breath_index"] < position)
+        matches = [bucket for bucket in eligible if bucket["_breath_index"] >= position][:max_results]
         ordered_matches = frozen_matches
-        next_position = min(position + max_results, len(ordered_matches))
+        total_matches = len(eligible)
+        downgraded_count = sum(1 for bucket in eligible if bucket["_breath_weak"])
     else:
         try:
             matches = await bucket_mgr.search(
@@ -5467,18 +5664,14 @@ async def _breath_impl(
             min_score=resolved_min_score,
         )
         ordered_matches = _order_breath_query_matches(matches)
+        for index, bucket in enumerate(ordered_matches):
+            bucket["_breath_index"] = index
+        position = 0
+        prior_consumed = 0
+        total_matches = len(ordered_matches)
+        downgraded_count = sum(1 for bucket in ordered_matches if bucket["_breath_weak"])
         matches = ordered_matches[:max_results]
-        next_position = len(matches)
-    total_matches = len(ordered_matches)
-    hidden_count = max(0, total_matches - len(matches))
-    downgraded_count = sum(
-        1 for match in ordered_matches if match.get("_breath_weak", False)
-    )
-    next_cursor = (
-        _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
-        if next_position < total_matches
-        else ""
-    )
+    hidden_count = max(0, total_matches - prior_consumed - len(matches))
 
     final_text, composition = await _compose_breath_query_matches(
         matches,
@@ -5493,22 +5686,27 @@ async def _breath_impl(
         },
         touch=touch,
         wake_dormant=wake_dormant,
-        cache=touch,
-        next_cursor=next_cursor,
         downgraded_count=downgraded_count,
+        mode=mode,
+        ordered_matches=ordered_matches,
+        start_position=position,
+        prior_consumed=prior_consumed,
+        cursor_scope=cursor_scope,
     )
     if not final_text:
-        await _fire_webhook("breath", {"mode": "empty", "matches": 0})
+        if touch:
+            await _fire_webhook("breath", {"mode": "empty", "matches": 0})
         return _with_emotion_timeline("未找到相关记忆。", emotion_trend)
 
-    await _fire_webhook(
-        "breath",
-        {
-            "mode": "ok",
-            "matches": len(matches),
-            "chars": len(final_text),
-        },
-    )
+    if touch:
+        await _fire_webhook(
+            "breath",
+            {
+                "mode": "ok",
+                "matches": len(matches),
+                "chars": len(final_text),
+            },
+        )
     return final_text
 
 
@@ -8553,12 +8751,14 @@ async def hold(
         # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        feel_failure = ""
         try:
             feel_analysis = await dehydrator.analyze(content)
         except Exception as e:
             logger.warning(f"Feel auto-tagging failed, using defaults: {e}")
+            feel_failure = _provider_failure_category(e)
             feel_analysis = {"tags": []}
-        feel_name = strip_wikilinks(content).strip().replace("\n", " ")[:20] or None
+        feel_name = _canonical_body_name(content.strip().replace("\n", " ")) or None
         bucket_id = await bucket_mgr.create(
             content=content,
             tags=feel_analysis.get("tags", []),
@@ -8591,13 +8791,17 @@ async def hold(
             response += f"\nsimilarity: {similarity_notice}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
+        if feel_failure:
+            response += f"\n自动打标失败；原因={feel_failure}；已使用默认 metadata"
         return response
 
     # --- Step 1: auto-tagging / 自动打标 ---
+    analysis_failure = ""
     try:
         analysis = await dehydrator.analyze(content)
     except Exception as e:
         logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
+        analysis_failure = _provider_failure_category(e)
         analysis = {
             "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
             "tags": [], "suggested_name": "", "todos": [],
@@ -8627,7 +8831,7 @@ async def hold(
             domain=domain,
             valence=final_valence,
             arousal=final_arousal,
-            name=suggested_name or None,
+            name=suggested_name or _canonical_body_name(content),
             bucket_type="permanent",
             pinned=True,
             todos=analysis_todos,
@@ -8643,6 +8847,8 @@ async def hold(
             response += f"\nsimilarity: {similarity_notice}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
+        if analysis_failure:
+            response += f"\n自动打标失败；原因={analysis_failure}；已使用默认 metadata"
         return response
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -8671,6 +8877,8 @@ async def hold(
             response += f"\nsimilarity: {similarity_notice}"
     if conflict_warning:
         response += f"\nconflict: {conflict_warning}"
+    if analysis_failure:
+        response += f"\n自动打标失败；原因={analysis_failure}；已使用默认 metadata"
     return response
 
 
@@ -8695,39 +8903,47 @@ async def grow(content: str) -> str:
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         conflict_warning = await _detect_conflict_warning(content)
+        metadata_failure = ""
         try:
             analysis = await dehydrator.analyze(content)
         except Exception as e:
             logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
+            metadata_failure = _provider_failure_category(e)
             analysis = {
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
-            content=content.strip(),
-            tags=analysis.get("tags", []),
-            importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
-            domain=analysis.get("domain", ["未分类"]),
-            valence=analysis.get("valence", 0.5),
-            arousal=analysis.get("arousal", 0.3),
-            name=analysis.get("suggested_name", ""),
-            todos=_canonical_todos(analysis.get("todos")),
-        )
+        try:
+            result_name, is_merged = await _merge_or_create(
+                content=content.strip(),
+                tags=analysis.get("tags", []),
+                importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
+                domain=analysis.get("domain", ["未分类"]),
+                valence=analysis.get("valence", 0.5),
+                arousal=analysis.get("arousal", 0.3),
+                name=analysis.get("suggested_name", ""),
+                todos=_canonical_todos(analysis.get("todos")),
+            )
+        except Exception as exc:
+            logger.exception("Fast-path grow persistence failed")
+            return "记忆写入失败。 reason=persistence_error"
         action = "合并" if is_merged else "新建"
         response = f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
+        if metadata_failure:
+            response += f"\n自动打标失败；原因={metadata_failure}；已使用默认 metadata"
         return response
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
         items = await dehydrator.digest(content)
     except Exception as e:
-        logger.error(f"Diary digest failed / 日记整理失败: {e}")
-        return "日记整理失败。"
+        logger.error("Diary digest failed (%s)", type(e).__name__, exc_info=True)
+        return f"日记整理失败。 reason={_provider_failure_category(e)}"
 
     if not items:
-        return "内容为空或整理失败。"
+        return "日记整理失败。 reason=parse_error"
 
     results = []
     conflicts = []
@@ -8746,7 +8962,7 @@ async def grow(content: str) -> str:
                 domain=item.get("domain", ["未分类"]),
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
-                name=item.get("name", ""),
+                name=item.get("name") or _canonical_body_name(item["content"]),
                 todos=_canonical_todos(item.get("todos")),
                 provenance_kind="summary",
             )
@@ -8755,8 +8971,10 @@ async def grow(content: str) -> str:
                 results.append(f"📎{result_name}")
                 merged += 1
             else:
-                results.append(f"📝{item.get('name', result_name)}")
+                results.append(f"📝{item.get('name') or _canonical_body_name(item['content'])}")
                 created += 1
+            if item.get("_metadata_failure"):
+                results.append("自动打标失败；原因=parse_error；已使用默认 metadata")
             if conflict_warning:
                 conflicts.append(f"{item.get('name', result_name)}: {conflict_warning}")
         except Exception as e:
@@ -8764,7 +8982,7 @@ async def grow(content: str) -> str:
                 f"Failed to process diary item / 日记条目处理失败: "
                 f"{item.get('name', '?')}: {e}"
             )
-            results.append(f"⚠️{item.get('name', '?')}")
+            results.append(f"⚠️{item.get('name', '?')} reason=persistence_error")
 
     response = f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
     if conflicts:
@@ -11258,6 +11476,8 @@ async def api_config_update(request):
             dehydrator.client = AsyncOpenAI(
                 api_key=dehydrator.api_key,
                 base_url=dehydrator.base_url,
+                timeout=60.0,
+                max_retries=2,
             )
 
     # --- Embedding config ---

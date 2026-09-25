@@ -324,6 +324,6 @@ def test_mcp_maintenance_and_memory_errors_are_bounded(tmp_path, monkeypatch):
         assert INJECTED not in result
     assert digest_result == "自动消化失败。"
     assert related_result == "自动 related 回填失败。"
-    assert grow_result == "日记整理失败。"
+    assert grow_result == "日记整理失败。 reason=provider_error"
     assert pulse_result == "获取系统状态失败。"
     assert breath_result == "记忆系统暂时无法访问。"

@@ -15,7 +15,7 @@ def _load_server(tmp_path, monkeypatch):
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
     server.dehydrator.dehydrate = AsyncMock(
-        side_effect=lambda content, metadata=None: content[:120]
+        side_effect=lambda content, metadata=None, **kwargs: content[:120]
     )
     return server
 
@@ -94,6 +94,25 @@ async def test_topic_filter_routes_archived_sessions_and_old_archives_are_safe(
     assert matching_id in result
     assert other_id not in result
     assert "legacy-session" not in result
+
+
+@pytest.mark.asyncio
+async def test_filtered_session_query_full_and_hidden_count(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first_id = _bucket_id(await server.archive_session("query body [[first]]", topics=["phase-r123"]))
+    second_id = _bucket_id(await server.archive_session("query body [[second]]", topics=["phase-r123"]))
+    server.dehydrator.dehydrate = AsyncMock(side_effect=AssertionError("full must use body"))
+
+    result = await server.breath(
+        query="query body", topic_filter=["phase-r123"],
+        mode="full", max_results=1, touch=False,
+    )
+
+    assert "[显示=原文]" in result
+    assert "[[" in result
+    assert (first_id in result) != (second_id in result)
+    assert "共匹配 2 / 本次显示 1 / 后续剩余 1" in result
+    server.dehydrator.dehydrate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

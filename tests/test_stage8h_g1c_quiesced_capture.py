@@ -211,7 +211,7 @@ async def test_frozen_reads_skip_touch_ripple_and_dehydration_cache(tmp_path, mo
 
     async def synthetic_dehydrate(content):
         assert content == uncached_content
-        return "uncached result"
+        return '{"core_facts":["uncached result"],"keywords":[],"summary":"uncached result"}'
 
     monkeypatch.setattr(dehydrator, "_api_dehydrate", synthetic_dehydrate)
     bucket_before = (first_path.read_bytes(), second_path.read_bytes())
@@ -243,7 +243,7 @@ async def test_frozen_reads_skip_touch_ripple_and_dehydration_cache(tmp_path, mo
     await manager.touch(first_id)
     assert first_path.read_bytes() != bucket_before[0]
     await dehydrator.dehydrate(uncached_content)
-    assert dehydrator._get_cached_summary(uncached_content) == "uncached result"
+    assert "uncached result" in dehydrator._get_cached_summary(uncached_content)
 
 
 @pytest.mark.asyncio

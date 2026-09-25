@@ -56,14 +56,15 @@ async def test_breath_31_matches_displays_8_and_reports_23(tmp_path, monkeypatch
         return_value=[_bucket(index) for index in range(31)]
     )
     server.dehydrator.dehydrate = AsyncMock(
-        side_effect=lambda content, metadata=None: content
+        side_effect=lambda content, metadata=None, **kwargs: content
     )
 
     result = await server.breath(query="accounting anchor", max_results=8)
 
     assert "还有23个相关记忆未显示" in result
     assert (
-        "共匹配 31 / 本次显示 8 / 因结果上限省略 23 / "
+        "共匹配 31 / 前页已消费 0 / 本次显示 8 / 因组装失败省略 0 / "
+        "后续剩余 23 / 因结果上限省略 23 / "
         "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in result
     assert "杩樻湁" not in result
@@ -80,7 +81,7 @@ async def test_breath_counts_selected_items_omitted_by_token_budget(
     )
     summaries = iter(["short", "长" * 100, "unused third summary"])
     server.dehydrator.dehydrate = AsyncMock(
-        side_effect=lambda content, metadata=None: next(summaries)
+        side_effect=lambda content, metadata=None, **kwargs: next(summaries)
     )
 
     result = await server.breath(
@@ -91,7 +92,8 @@ async def test_breath_counts_selected_items_omitted_by_token_budget(
 
     assert "还有3个相关记忆未显示" in result
     assert (
-        "共匹配 4 / 本次显示 1 / 因结果上限省略 1 / "
+        "共匹配 4 / 前页已消费 0 / 本次显示 1 / 因组装失败省略 0 / "
+        "后续剩余 3 / 因结果上限省略 1 / "
         "因 token 预算省略 2 / 因低于阈值降级 0"
     ) in result
     assert server.dehydrator.dehydrate.await_count == 2
@@ -108,7 +110,7 @@ async def test_breath_cursor_pages_are_stable_without_duplicates_or_gaps(
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
     server.bucket_mgr.get = AsyncMock(side_effect=lambda bucket_id: by_id.get(bucket_id))
     server.dehydrator.dehydrate = AsyncMock(
-        side_effect=lambda content, metadata=None: content
+        side_effect=lambda content, metadata=None, **kwargs: content
     )
 
     first = await server.breath(query="paged anchor", max_results=5)
@@ -135,18 +137,20 @@ async def test_breath_cursor_pages_are_stable_without_duplicates_or_gaps(
         )
 
     assert (
-        "共匹配 12 / 本次显示 5 / 因结果上限省略 7 / "
+        "共匹配 12 / 前页已消费 5 / 本次显示 5 / 因组装失败省略 0 / "
+        "后续剩余 2 / 因结果上限省略 2 / "
         "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in second
     assert (
-        "共匹配 12 / 本次显示 2 / 因结果上限省略 10 / "
+        "共匹配 12 / 前页已消费 10 / 本次显示 2 / 因组装失败省略 0 / "
+        "后续剩余 0 / 因结果上限省略 0 / "
         "因 token 预算省略 0 / 因低于阈值降级 0"
     ) in third
     assert _next_cursor(first)
     assert _next_cursor(second)
     assert not _next_cursor(third)
     assert server.bucket_mgr.search.await_count == 1
-    assert server.bucket_mgr.get.await_count == 7
+    assert server.bucket_mgr.get.await_count == 24
 
 
 @pytest.mark.asyncio
