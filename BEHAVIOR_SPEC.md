@@ -199,11 +199,12 @@ pulse(include_archive=False)
 
 **系统内部发生什么**：
 
-1. `bucket_mgr.get_stats()` — 遍历三个目录，统计文件数量和 KB 大小
+1. `bucket_mgr.get_stats()` — 遍历 permanent、dynamic、archive、feel 四类目录，按目录统计文件数量和 KB 大小；状态栏沿用现有的前三类全局计数
 2. `bucket_mgr.list_all(include_archive=False)` — 加载全部桶
-3. 对每个桶：`decay_engine.calculate_score(metadata)` 计算当前权重分
+3. 默认列表先列 pinned/protected，再列非 dormant 的 dynamic 桶 Top15（缺失 `type` 按 dynamic）；两组各按 `(score, updated_at)` 降序，日期沿用既有回退，最后应用 `limit`/`offset`
 4. 按类型/状态分配图标：📌钉选 / 📦permanent / 🫧feel / 🗄️archived / ✅resolved / 💭普通
 5. 拼接每桶摘要行：`名称 bucket_id 主题 情感坐标 重要度 权重 标签`
+6. 默认列表末尾统计当前可见范围中实际未显示的 permanent / feel 桶；`还有更多:是` 时可用 `show_all=True` 查看未进入默认候选的桶
 
 **返回结果**：
 ```
@@ -217,6 +218,8 @@ pulse(include_archive=False)
 === 记忆列表 ===
 📌 [核心原则] bucket_id:abc123 主题:内心 情感:V0.8/A0.5 ...
 💭 [实习offer获得] bucket_id:def456 主题:成长 情感:V0.8/A0.7 ...
+...
+总数:17个可见桶，当前显示:16个（钉选1个 + 动态Top15，limit=50, offset=0），固化 1 / feel 0 个未列入当前输出，还有更多:是（用 show_all=True 查看当前可见范围内未显示的桶）
 ```
 
 ---

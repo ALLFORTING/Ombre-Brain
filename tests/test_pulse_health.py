@@ -41,6 +41,78 @@ def _health_section(result):
     return result.split("=== maintenance health ===\n", 1)[1]
 
 
+def _listed_ids(result):
+    return [
+        line.split("bucket_id:", 1)[1].split()[0]
+        for line in result.splitlines()
+        if "bucket_id:" in line
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pulse_default_top15_only_dynamic_and_counts_actual_unlisted(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    pinned_permanent = await server.bucket_mgr.create(
+        content="pinned permanent", bucket_type="permanent", pinned=True
+    )
+    plain_permanent = await server.bucket_mgr.create(
+        content="plain permanent", bucket_type="permanent"
+    )
+    protected_feel = await server.bucket_mgr.create(
+        content="protected feel", bucket_type="feel", protected=True
+    )
+    plain_feel = await server.bucket_mgr.create(content="plain feel", bucket_type="feel")
+    sealed_feel = await server.bucket_mgr.create(
+        content="sealed feel", bucket_type="feel", sealed=True
+    )
+    dynamic_ids = [
+        await server.bucket_mgr.create(content=f"dynamic {index}")
+        for index in range(16)
+    ]
+
+    default = await server.pulse(touch=False)
+    displayed = _listed_ids(default)
+    assert len(displayed) == 17
+    assert pinned_permanent in displayed and protected_feel in displayed
+    assert len(set(displayed) & set(dynamic_ids)) == 15
+    assert plain_permanent not in displayed and plain_feel not in displayed
+    assert sealed_feel not in default
+    assert "固化 1 / feel 1 个未列入当前输出" in default
+    assert "还有更多:是" in default
+    assert "show_all=True" in default
+
+    page = await server.pulse(touch=False, limit=1)
+    page_ids = set(_listed_ids(page))
+    assert len(page_ids) == 1
+    assert (
+        f"固化 {2 - int(pinned_permanent in page_ids)} / "
+        f"feel {2 - int(protected_feel in page_ids)} 个未列入当前输出"
+    ) in page
+
+    all_buckets = await server.pulse(show_all=True, touch=False)
+    assert "总数:20个可见桶" in all_buckets
+    assert "还有更多:否" in all_buckets
+    assert sealed_feel not in all_buckets
+
+
+@pytest.mark.asyncio
+async def test_pulse_default_score_then_updated_at_with_missing_type(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    pinned = await server.bucket_mgr.create(content="pinned", pinned=True)
+    older = await server.bucket_mgr.create(content="older")
+    legacy = await server.bucket_mgr.create(content="legacy")
+    newer = await server.bucket_mgr.create(content="newer")
+    _set_metadata(server, pinned, updated_at="2020-01-01")
+    _set_metadata(server, older, updated_at="2026-01-01")
+    _set_metadata(server, legacy, type=_MISSING, updated_at="2026-01-02")
+    _set_metadata(server, newer, updated_at="2026-01-03")
+    monkeypatch.setattr(server.decay_engine, "calculate_score", lambda meta: 1.0)
+
+    result = await server.pulse(touch=False)
+    assert _listed_ids(result) == [pinned, newer, legacy, older]
+    assert "还有更多:否" in result
+
+
 @pytest.mark.asyncio
 async def test_pulse_default_behavior_has_no_health_section(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)

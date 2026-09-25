@@ -483,7 +483,7 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 #### `pulse`
 
-`pulse(show_all=False)` 先组合 pinned/protected 与非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；`pulse(show_all=True, limit=50, offset=0)` 返回 bounded page。`limit` 最大 50，`offset` 从 0 开始。superseded 桶的列表行以 `⊘` 前缀标记。返回末尾给出可见总数、当前显示数量和 `还有更多:是/否`，据此继续下一页；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。维护、验收或探针列表使用 `touch=False`，它不启动衰减引擎，也不标记 dormant。
+`pulse(show_all=False)` 先组合 pinned/protected 与非 dormant 的 dynamic 桶 Top15（缺失 `type` 按 dynamic），再对最终列表应用 `limit`/`offset`。默认模式两组各按 `(score, updated_at)` 降序排列：高分优先，同分时较新的日期优先；日期缺失时沿用 `last_active`、`created` 回退。末尾的 `固化 N / feel M 个未列入当前输出` 统计当前可见范围内、实际未显示在本次输出中的桶，已显示的 pinned/protected 桶不重复计入。默认模式 `还有更多:是` 表示当前可见范围仍有未显示桶，使用 `show_all=True` 查看完整范围；不能仅靠增加默认模式的 `offset` 枚举 Top15 以外的桶。`pulse(show_all=True, limit=50, offset=0)` 保持原有排序并返回 bounded page，可按 `还有更多` 继续翻页。`limit` 最大 50，`offset` 从 0 开始。superseded 桶的列表行以 `⊘` 前缀标记；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。维护、验收或探针列表使用 `touch=False`，它不启动衰减引擎，也不标记 dormant。
 
 #### `archive_session`
 

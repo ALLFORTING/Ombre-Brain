@@ -18,6 +18,32 @@ def _load_server(tmp_path, monkeypatch):
     return server
 
 
+def test_resonance_distance_preserves_zero_and_defaults_only_none_or_missing(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    assert server._resonance_distance(
+        {"metadata": {"valence": 0, "arousal": 0}}, (0, 0)
+    ) == 0.0
+    assert server._resonance_distance(
+        {"metadata": {"valence": None, "arousal": None}}, (0.5, 0.3)
+    ) == 0.0
+    assert server._resonance_distance({"metadata": {}}, (0.5, 0.3)) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_breath_resonance_zero_coordinates_rank_first(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    zero_id = await server.bucket_mgr.create(
+        content="zero mood", valence=0, arousal=0
+    )
+    default_id = await server.bucket_mgr.create(
+        content="default mood", valence=0.5, arousal=0.3
+    )
+
+    result = await server.breath(resonance="0,0", max_results=2)
+    assert zero_id in result and default_id in result
+    assert result.index(zero_id) < result.index(default_id)
+
+
 @pytest.mark.asyncio
 async def test_breath_resonance_sorts_by_emotion_distance(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)

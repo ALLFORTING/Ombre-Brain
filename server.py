@@ -1539,8 +1539,10 @@ def _parse_resonance(value: str) -> tuple[float, float] | None:
 
 def _resonance_distance(bucket: dict, target: tuple[float, float]) -> float:
     meta = bucket.get("metadata", {})
-    valence = float(meta.get("valence", 0.5) or 0.5)
-    arousal = float(meta.get("arousal", 0.3) or 0.3)
+    raw_valence = meta.get("valence")
+    raw_arousal = meta.get("arousal")
+    valence = float(0.5 if raw_valence is None else raw_valence)
+    arousal = float(0.3 if raw_arousal is None else raw_arousal)
     return ((valence - target[0]) ** 2 + (arousal - target[1]) ** 2) ** 0.5
 
 
@@ -10493,10 +10495,17 @@ async def pulse(
         dynamic_buckets = [
             b for b in listable_buckets
             if b["id"] not in pinned_ids
+            and b["metadata"].get("type", "dynamic") == "dynamic"
             and not b["metadata"].get("dormant", False)
         ]
-        pinned_buckets.sort(key=pulse_score, reverse=True)
-        dynamic_buckets.sort(key=pulse_score, reverse=True)
+        def default_order_key(bucket: dict) -> tuple[float, str]:
+            meta = bucket["metadata"]
+            return pulse_score(bucket), _bucket_date(
+                meta, "updated_at", "last_active", "created"
+            )
+
+        pinned_buckets.sort(key=default_order_key, reverse=True)
+        dynamic_buckets.sort(key=default_order_key, reverse=True)
         dynamic_buckets = dynamic_buckets[:15]
         dynamic_count = len(dynamic_buckets)
         ordered_buckets = pinned_buckets + dynamic_buckets
@@ -10547,7 +10556,7 @@ async def pulse(
     has_more = (
         offset + len(visible_buckets) < total_buckets
         if show_all
-        else offset + len(visible_buckets) < len(ordered_buckets)
+        else len(visible_buckets) < total_buckets
     )
     if show_all:
         breakdown = f"有界全部列表，limit={limit}, offset={offset}"
@@ -10556,10 +10565,21 @@ async def pulse(
             f"（{breakdown}），还有更多:{'是' if has_more else '否'}\n"
         )
     else:
+        displayed_ids = {b["id"] for b in visible_buckets}
+        unlisted_permanent = sum(
+            b["metadata"].get("type") == "permanent" and b["id"] not in displayed_ids
+            for b in listable_buckets
+        )
+        unlisted_feel = sum(
+            b["metadata"].get("type") == "feel" and b["id"] not in displayed_ids
+            for b in listable_buckets
+        )
         display_stats = (
             f"\n总数:{total_buckets}个可见桶，当前显示:{len(visible_buckets)}个"
             f"（钉选{len(pinned_buckets)}个 + 动态Top15，limit={limit}, offset={offset}），"
-            f"还有更多:{'是' if has_more else '否'}\n"
+            f"固化 {unlisted_permanent} / feel {unlisted_feel} 个未列入当前输出，"
+            f"还有更多:{'是' if has_more else '否'}"
+            f"{'（用 show_all=True 查看当前可见范围内未显示的桶）' if has_more else ''}\n"
         )
     return (
         status

@@ -52,8 +52,8 @@
 
 ## `pulse` 的有界列表
 
-- `pulse(show_all=False)` 先组合所有 pinned/protected 桶和非 dormant 动态桶 Top15，再对最终列表应用 `limit`/`offset`；不要把 limit 当作改变候选排序的参数。
-- `pulse(show_all=True, limit=50, offset=0)` 按稳定顺序返回可见桶的一个 bounded page。`limit` 最大为 50，`offset` 从 0 开始；根据返回中的总数、当前显示数量和 `还有更多` 判断是否继续下一页。
+- `pulse(show_all=False)` 先组合所有 pinned/protected 桶和非 dormant 的 dynamic 桶 Top15（缺失 `type` 按 dynamic），两组各按 `(score, updated_at)` 降序排列，同分日期沿用现有回退；最后对组合列表应用 `limit`/`offset`。末尾的 `固化 N / feel M 个未列入当前输出` 只计当前可见范围内本次未显示的桶，包括分页未显示的桶，不重复计已显示的 pinned/protected 桶。
+- 默认模式的 `还有更多:是` 表示当前可见范围仍有桶未显示；要查看 Top15 以外的桶，改用 `show_all=True`，不要仅递增默认模式的 `offset`。`pulse(show_all=True, limit=50, offset=0)` 保持原有排序，返回可见桶的 bounded page；`limit` 最大为 50，`offset` 从 0 开始，可按该模式的 `还有更多` 继续翻页。
 - `include_archive` 和 `include_sealed` 仍分别控制归档桶和 sealed 桶可见性；分页不会改变 pinned/protected/dormant/sealed 的原有语义。
 - 维护、验收或探针列表使用 `pulse(..., touch=False)`；它不启动衰减引擎，也不标记 dormant。
 
