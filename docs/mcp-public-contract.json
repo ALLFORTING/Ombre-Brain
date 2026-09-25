@@ -962,6 +962,38 @@
       }
     },
     {
+      "name": "dismiss_note",
+      "primitive": "tool",
+      "category": "ting_notes",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "write",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "confirm_token": {
+            "default": "",
+            "type": "string"
+          },
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "note_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "note_id"
+        ]
+      }
+    },
+    {
       "name": "get_note",
       "primitive": "tool",
       "category": "ting_notes",

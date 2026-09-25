@@ -583,7 +583,7 @@ asyncio.run(main())
         capture_output=True,
         text=True,
     )
-    assert len(json.loads(completed.stdout)) == 26
+    assert len(json.loads(completed.stdout)) == 27
     env["OMBRE_DIAG_TOOLS"] = "true"
     completed = __import__("subprocess").run(
         [sys.executable, "-c", script],
@@ -593,4 +593,4 @@ asyncio.run(main())
         capture_output=True,
         text=True,
     )
-    assert len(json.loads(completed.stdout)) == 41
+    assert len(json.loads(completed.stdout)) == 42

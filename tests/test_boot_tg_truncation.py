@@ -161,7 +161,7 @@ async def test_tg_trigger_preview_marks_truncated_body(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_talk_and_code_keep_existing_preview_behavior(tmp_path, monkeypatch):
+async def test_talk_and_code_mark_truncated_pinned_previews(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     tail = "PROFILE_PREVIEW_HIDDEN_TAIL"
     bucket_id = await server.bucket_mgr.create(
@@ -170,6 +170,11 @@ async def test_talk_and_code_keep_existing_preview_behavior(tmp_path, monkeypatc
         pinned=True,
         domain=["项目/OB"],
     )
+    talk_long_id = await server.bucket_mgr.create(
+        ("T" * 5000) + "TALK_PREVIEW_HIDDEN_TAIL",
+        name="talk preview control",
+        pinned=True,
+    )
 
     talk = await server.boot(profile="talk")
     code = await server.boot(profile="code")
@@ -177,4 +182,7 @@ async def test_talk_and_code_keep_existing_preview_behavior(tmp_path, monkeypatc
     assert tail in talk
     assert tail not in code
     assert f"…已截断：bucket {bucket_id}" not in talk
-    assert f"…已截断：bucket {bucket_id}" not in code
+    assert f"…已截断：bucket {bucket_id}" in code
+    assert f'dream(detail_ids="{bucket_id}")' in code
+    assert f"…已截断：bucket {talk_long_id}" in talk
+    assert "TALK_PREVIEW_HIDDEN_TAIL" not in talk

@@ -2568,6 +2568,8 @@ def _parse_note_open_at(value: str) -> str:
 
 
 def _note_delivery_state(note: dict) -> str:
+    if note.get("dismissed_at"):
+        return "dismissed"
     if note.get("skipped_at"):
         return "skipped_for_delivery"
     if note.get("boot_delivered_at"):
@@ -2666,7 +2668,7 @@ async def _format_due_triggers(
     max_items: int = 10,
     *,
     show_preview_truncation: bool = False,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[tuple[str, int]]]:
     today = datetime.now().date().isoformat()
     due = []
     for bucket in active_buckets:
@@ -2693,8 +2695,15 @@ async def _format_due_triggers(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
             f"trigger_date:{meta.get('trigger_date')}\n{preview}"
         )
-    text = "=== boot: 今日浮现 ===\n" + ("\n---\n".join(lines) if lines else "（今日无到期提醒）")
-    return text, [bucket["id"] for bucket in shown]
+    header = "=== boot: 今日浮现 ===\n"
+    text = header + ("\n---\n".join(lines) if lines else "（今日无到期提醒）")
+    end = len(header)
+    complete_items = []
+    for bucket, line in zip(shown, lines):
+        end += len(line)
+        complete_items.append((bucket["id"], end))
+        end += len("\n---\n")
+    return text, complete_items
 
 
 def _format_feel_echo(active_buckets: list[dict]) -> str:
@@ -2848,16 +2857,18 @@ def _fit_sections_to_budget(
     atomic_sections: set[str] | None = None,
     omission_item_refs: dict[str, list[str]] | None = None,
     truncation_notice_tokens: int = BOOT_TRUNCATION_NOTICE_TOKENS,
-) -> str:
+    return_sections: bool = False,
+) -> str | tuple[str, dict[str, str]]:
     """Fit named sections in priority order and report every omitted block."""
     if not sections:
-        return ""
+        return ("", {}) if return_sections else ""
     minimum_chars = minimum_chars or {}
     atomic_sections = atomic_sections or set()
     omission_item_refs = omission_item_refs or {}
     total_tokens = sum(count_tokens_approx(text) for _, _, text in sections)
     if total_tokens <= max_tokens:
-        return "\n\n".join(text for _, _, text in sections)
+        body = "\n\n".join(text for _, _, text in sections)
+        return (body, {key: text for key, _, text in sections}) if return_sections else body
 
     content_budget = max(0, max_tokens - truncation_notice_tokens)
     requested_tokens = {}
@@ -2879,6 +2890,7 @@ def _fit_sections_to_budget(
             reserved_tokens[key] = reserved
         remaining_reserve -= reserved
     output = []
+    emitted_sections: dict[str, str] = {}
     complete = []
     partial = []
     omitted = []
@@ -2942,6 +2954,7 @@ def _fit_sections_to_budget(
         section_tokens = count_tokens_approx(text)
         if section_tokens <= available:
             output.append(text)
+            emitted_sections[key] = text
             complete.append(display_name)
             used += section_tokens
             continue
@@ -2956,6 +2969,7 @@ def _fit_sections_to_budget(
         prefix = _prefix_within_token_budget(text, available)
         if prefix:
             output.append(prefix)
+            emitted_sections[key] = prefix
             partial.append(
                 _omission_detail(key, display_name, prefix, partial_output=True)
             )
@@ -2991,7 +3005,8 @@ def _fit_sections_to_budget(
                 truncation_notice_tokens,
             )
     output.append(notice)
-    return "\n\n".join(output)
+    body = "\n\n".join(output)
+    return (body, emitted_sections) if return_sections else body
 
 
 def _boot_delta_locator(bucket: dict) -> str:
@@ -3010,11 +3025,13 @@ def _format_boot_delta(
     visible_buckets: list[dict],
     max_tokens: int = BOOT_DELTA_MAX_TOKENS,
     include_omitted_ids: bool = False,
-) -> str:
+    return_progress: bool = False,
+) -> str | tuple[str, int]:
     """Format complete, bounded boot-delta records from the durable event log."""
     header = "=== boot: 增量摘要 ==="
     if checkpoint is None:
-        return f"{header}\n（暂无上次 boot 基线）"
+        text = f"{header}\n（暂无上次 boot 基线）"
+        return (text, high_water) if return_progress else text
 
     visible_by_id = {
         str(bucket.get("id", "")): bucket
@@ -3065,11 +3082,17 @@ def _format_boot_delta(
         )
 
     if not records:
-        return f"{header}\n（无新增变化）"
+        text = f"{header}\n（无新增变化）"
+        return (text, high_water) if return_progress else text
 
-    records.sort(key=lambda item: item[:3], reverse=True)
-    selected: list[str] = []
+    # A scalar checkpoint can only cross a contiguous prefix of eligible events.
+    # Keep the existing display priority within the selected prefix.
+    records.sort(key=lambda item: item[2])
+    selected: list[tuple[str, int, int, str, str]] = []
     omitted_ids: list[str] = []
+
+    def _display(items: list[tuple[str, int, int, str, str]]) -> list[str]:
+        return [item[4] for item in sorted(items, key=lambda item: item[:3], reverse=True)]
 
     def _omitted_suffix(bucket_ids: list[str]) -> str:
         suffix = f"（还有 {len(bucket_ids)} 项未展开"
@@ -3089,9 +3112,9 @@ def _format_boot_delta(
             shown_ids.append(bucket_id)
         return prefix + "、".join(shown_ids) + overflow
 
-    for index, (_, _, _, _, record) in enumerate(records):
+    for index, record in enumerate(records):
         remaining = len(records) - index - 1
-        candidate = [header, *selected, record]
+        candidate = [header, *_display([*selected, record])]
         if remaining:
             remaining_ids = [item[3] for item in records[index + 1 :]]
             candidate.append(_omitted_suffix(remaining_ids))
@@ -3101,10 +3124,14 @@ def _format_boot_delta(
         omitted_ids = [item[3] for item in records[index:]]
         break
 
-    lines = [header, *selected]
+    lines = [header, *_display(selected)]
     if omitted_ids:
         lines.append(_omitted_suffix(omitted_ids))
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    safe_event_id = selected[-1][2] if omitted_ids and selected else (
+        int(checkpoint["last_event_id"]) if omitted_ids else high_water
+    )
+    return (text, safe_event_id) if return_progress else text
 
 
 def _digest_api_config() -> tuple[str, str, str]:
@@ -9091,6 +9118,40 @@ async def leave_note(
     )
 
 
+@mcp.tool()
+async def dismiss_note(
+    note_id: int,
+    include_sealed: bool = False,
+    confirm_token: str = "",
+) -> str:
+    """Preview, then confirm dismissal of one note without deleting its history."""
+    try:
+        note_id = int(note_id)
+    except (TypeError, ValueError):
+        return "Please provide a valid note_id."
+    if note_id < 1:
+        return "Please provide a valid note_id."
+    note = bucket_mgr.get_note(note_id, include_sealed=include_sealed)
+    if note is None:
+        return _with_response_seal(f"note_id not found: {note_id}")
+    if note.get("dismissed_at"):
+        return _with_response_seal(f"婷留言 note_id:{note_id} 已 dismiss；历史仍保留。")
+    if not (confirm_token or "").strip():
+        token = _issue_mutation_confirmation("note.dismiss", note)
+        return _with_response_seal(
+            f"待确认 dismiss_note：note_id:{note_id} "
+            f"preview:{_format_note_preview(note['text'])}\n"
+            "确认后停止自动 boot 投递；正文和历史保留，且不标记 delivered/read。\n"
+            f"请用相同 note_id、include_sealed 和 confirm_token={token} 再次调用；"
+            f"有效期 {_MUTATION_CONFIRM_TTL_SECONDS} 秒。"
+        )
+    if not _consume_mutation_confirmation("note.dismiss", note, confirm_token):
+        return _with_response_seal("dismiss_note 确认无效、已过期或留言状态已变化；请重新预览。")
+    if not bucket_mgr.dismiss_note(note_id, expected_note=note):
+        return _with_response_seal("dismiss_note 未执行：留言状态已变化；请重新预览。")
+    return _with_response_seal(f"已 dismiss 婷留言 note_id:{note_id}；正文和历史保留。")
+
+
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
@@ -9638,18 +9699,22 @@ async def boot(
     visible_buckets = list({
         bucket["id"]: bucket for bucket in [*active_buckets, *archive_buckets]
     }.values())
-    delta_text = _format_boot_delta(
-        checkpoint=checkpoint,
-        high_water=high_water,
-        visible_buckets=[
-            bucket for bucket in visible_buckets
-            if _profile_allows_bucket(bucket, profile)
-        ],
-        max_tokens=int(profile_config["delta_tokens"]),
-        include_omitted_ids=profile == "tg",
-    )
+    profile_buckets = [
+        bucket for bucket in visible_buckets
+        if _profile_allows_bucket(bucket, profile)
+    ]
 
-    trigger_text, trigger_ids = await _format_due_triggers(
+    def _delta_candidate() -> tuple[str, int]:
+        return _format_boot_delta(
+            checkpoint=checkpoint,
+            high_water=high_water,
+            visible_buckets=profile_buckets,
+            max_tokens=int(profile_config["delta_tokens"]),
+            include_omitted_ids=profile == "tg",
+            return_progress=True,
+        )
+
+    trigger_text, trigger_items = await _format_due_triggers(
         active_buckets,
         max_items=int(profile_config["trigger_items"]),
         show_preview_truncation=profile == "tg",
@@ -9681,7 +9746,7 @@ async def boot(
                     str(bucket["id"]), summary_state, source_hash
                 )
         else:
-            preview = _format_boot_preview(bucket, pinned_chars)
+            preview = _format_boot_preview(bucket, pinned_chars, show_truncation=True)
         pinned_lines.append(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
         )
@@ -9718,13 +9783,8 @@ async def boot(
 
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
-    if deliver_note_id is not None and not bucket_mgr.mark_note_boot_delivered(
-        deliver_note_id,
-        delivered_at=note_now,
-    ):
-        ting_note_text, _ = _format_ting_note_for_boot(note_now, max_tokens)
 
-    def _compose_boot_body(current_delta_text: str) -> str:
+    def _compose_boot_body(current_delta_text: str) -> tuple[str, dict[str, str]]:
         sections = [
             ("ting_note", "婷留言", ting_note_text),
             ("delta", "增量摘要", current_delta_text),
@@ -9750,7 +9810,7 @@ async def boot(
             omission_item_refs = {
                 "ting_note": _stable_refs(ting_note_text),
                 "delta": _stable_refs(current_delta_text),
-                "triggers": [f"bucket_id:{bucket_id}" for bucket_id in trigger_ids],
+                "triggers": [f"bucket_id:{bucket_id}" for bucket_id, _ in trigger_items],
                 "mailbox": _stable_refs(mailbox_text),
                 "todos": _stable_refs(todos_text),
                 "pinned": [f"bucket_id:{bucket['id']}" for bucket in pinned],
@@ -9764,64 +9824,56 @@ async def boot(
                 "ting_note": len(ting_note_text),
                 "delta": len(current_delta_text),
             },
-            atomic_sections={"delta"},
+            atomic_sections={"ting_note", "delta"},
             omission_item_refs=omission_item_refs,
             truncation_notice_tokens=truncation_notice_tokens,
+            return_sections=True,
         )
 
-    body = _compose_boot_body(delta_text)
-    today = datetime.now().date().isoformat()
-    for bucket_id in trigger_ids:
-        await bucket_mgr.update(bucket_id, trigger_last_seen=today)
-
-    expected_event_id = (
-        int(checkpoint["last_event_id"]) if checkpoint is not None else None
-    )
-    if not bucket_mgr.advance_boot_delta_checkpoint(
-        expected_event_id,
-        high_water,
-        profile=profile,
-    ):
-        # Another boot completed first. Rebuild against its checkpoint so this
-        # response cannot replay that already-delivered delta batch.
-        checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
-        high_water = bucket_mgr.get_boot_delta_high_water()
-        delta_text = _format_boot_delta(
-            checkpoint=checkpoint,
-            high_water=high_water,
-            visible_buckets=[
-                bucket for bucket in visible_buckets
-                if _profile_allows_bucket(bucket, profile)
-            ],
-            max_tokens=int(profile_config["delta_tokens"]),
-            include_omitted_ids=profile == "tg",
-        )
-        body = _compose_boot_body(delta_text)
+    for _ in range(3):
+        delta_text, safe_event_id = _delta_candidate()
+        body, emitted_sections = _compose_boot_body(delta_text)
         expected_event_id = (
             int(checkpoint["last_event_id"]) if checkpoint is not None else None
         )
-        if not bucket_mgr.advance_boot_delta_checkpoint(
+        # An omitted delta has no consumed range. A partial delta only crosses
+        # the contiguous eligible prefix selected by _format_boot_delta.
+        next_event_id = (
+            safe_event_id if emitted_sections.get("delta") == delta_text
+            else expected_event_id
+        )
+        if next_event_id == expected_event_id or bucket_mgr.advance_boot_delta_checkpoint(
             expected_event_id,
-            high_water,
+            next_event_id,
             profile=profile,
         ):
-            # A later concurrent boot owns the checkpoint; its successful
-            # advance remains authoritative and no event is discarded here.
-            checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
-            high_water = bucket_mgr.get_boot_delta_high_water()
-            body = _compose_boot_body(
-                _format_boot_delta(
-                    checkpoint=checkpoint,
-                    high_water=high_water,
-                    visible_buckets=[
-                        bucket for bucket in visible_buckets
-                        if _profile_allows_bucket(bucket, profile)
-                    ],
-                    max_tokens=int(profile_config["delta_tokens"]),
-                    include_omitted_ids=profile == "tg",
-                )
-            )
-    return _with_response_seal(f"boot profile: {profile}\n\n{body}")
+            break
+        # A concurrent boot advanced this profile. Recalculate both the body
+        # and every consumption decision against the new checkpoint.
+        checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
+        high_water = bucket_mgr.get_boot_delta_high_water()
+    else:
+        # Do not advance after repeated CAS conflicts. The final body still
+        # determines note and trigger consumption.
+        delta_text, _ = _delta_candidate()
+        body, emitted_sections = _compose_boot_body(delta_text)
+
+    response = _with_response_seal(f"boot profile: {profile}\n\n{body}")
+    if deliver_note_id is not None and emitted_sections.get("ting_note") == ting_note_text:
+        try:
+            bucket_mgr.mark_note_boot_delivered(deliver_note_id, delivered_at=note_now)
+        except Exception:
+            logger.exception("Boot note delivery state update failed")
+    emitted_triggers = emitted_sections.get("triggers", "")
+    if trigger_text.startswith(emitted_triggers):
+        today = datetime.now().date().isoformat()
+        for bucket_id, end_offset in trigger_items:
+            if end_offset <= len(emitted_triggers):
+                try:
+                    await bucket_mgr.update(bucket_id, trigger_last_seen=today)
+                except Exception:
+                    logger.exception("Boot trigger delivery state update failed")
+    return response
 
 
 @mcp.tool(description=TG_SUMMARY_TOOL_DESCRIPTION)

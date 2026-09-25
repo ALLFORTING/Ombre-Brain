@@ -70,3 +70,74 @@ async def test_invalid_trigger_date_is_rejected(tmp_path, monkeypatch):
 
     assert "trigger_date must use YYYY-MM-DD format" in hold_result
     assert "trigger_date must use YYYY-MM-DD format" in trace_result
+
+
+@pytest.mark.asyncio
+async def test_boot_only_marks_fully_emitted_trigger_items_seen(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    today = datetime.now().date().isoformat()
+    ids = []
+    for index in range(8):
+        bucket_id = await server.bucket_mgr.create(
+            ("触" * 280) + f"END_TRIGGER_{index}",
+            name=f"due trigger {index}",
+        )
+        assert await server.bucket_mgr.update(bucket_id, trigger_date=today)
+        ids.append(bucket_id)
+
+    first = await server.boot(max_tokens=1000)
+    seen = []
+    for index, bucket_id in enumerate(ids):
+        bucket = await server.bucket_mgr.get(bucket_id)
+        complete = f"END_TRIGGER_{index}" in first
+        assert (bucket["metadata"]["trigger_last_seen"] == today) is complete
+        seen.append(complete)
+    assert any(seen) and not all(seen)
+
+    second = await server.boot(max_tokens=16000)
+    for index, bucket_id in enumerate(ids):
+        if not seen[index]:
+            assert f"END_TRIGGER_{index}" in second
+            bucket = await server.bucket_mgr.get(bucket_id)
+            assert bucket["metadata"]["trigger_last_seen"] == today
+
+
+@pytest.mark.asyncio
+async def test_cas_recomposition_recomputes_trigger_consumption(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.boot()
+    today = datetime.now().date().isoformat()
+    ids = []
+    for index in range(8):
+        bucket_id = await server.bucket_mgr.create(
+            ("触" * 280) + f"END_CAS_{index}",
+            name=f"CAS event {index} " + "变" * 70,
+        )
+        assert await server.bucket_mgr.update(bucket_id, trigger_date=today)
+        ids.append(bucket_id)
+
+    original = server.bucket_mgr.advance_boot_delta_checkpoint
+    calls = 0
+
+    def concurrent_advance(expected_event_id, next_event_id, profile="talk"):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert original(
+                expected_event_id,
+                server.bucket_mgr.get_boot_delta_high_water(),
+                profile=profile,
+            )
+            return False
+        return original(expected_event_id, next_event_id, profile=profile)
+
+    monkeypatch.setattr(server.bucket_mgr, "advance_boot_delta_checkpoint", concurrent_advance)
+    result = await server.boot(max_tokens=1000)
+
+    assert calls == 1
+    assert "（无新增变化）" in result
+    for index, bucket_id in enumerate(ids):
+        bucket = await server.bucket_mgr.get(bucket_id)
+        assert (bucket["metadata"]["trigger_last_seen"] == today) is (
+            f"END_CAS_{index}" in result
+        )

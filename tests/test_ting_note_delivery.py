@@ -187,6 +187,79 @@ async def test_budget_fallback_never_truncates_or_consumes_note_before_full_get(
 
 
 @pytest.mark.asyncio
+async def test_global_boot_budget_keeps_ting_note_atomic_and_pending(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    body = "长" * 525
+    await server.leave_note(body)
+    await server.bucket_mgr.create("钉" * 2000, name="budget pressure", pinned=True)
+    candidate, candidate_id = server._format_ting_note_for_boot(
+        datetime.now().isoformat(timespec="seconds"), 1000
+    )
+    assert candidate_id == 1 and body in candidate
+
+    result = await server.boot(max_tokens=1000)
+    row = _note_rows(server)[0]
+
+    assert body not in result
+    assert "部分截断：婷留言" not in result
+    assert row["boot_delivered_at"] is None
+    assert row["skipped_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_final_boot_composition_does_not_deliver_note(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.leave_note("must survive failed boot")
+
+    def fail_fit(*args, **kwargs):
+        raise RuntimeError("final composition failed")
+
+    monkeypatch.setattr(server, "_fit_sections_to_budget", fail_fit)
+    with pytest.raises(RuntimeError, match="final composition failed"):
+        await server.boot()
+    assert _note_rows(server)[0]["boot_delivered_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_note_requires_exact_one_shot_confirmation(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.leave_note("retain this exact note")
+
+    preview = await server.dismiss_note(1)
+    token = preview.split("confirm_token=", 1)[1].split()[0].rstrip("；")
+    assert "待确认 dismiss_note" in preview
+    assert _note_rows(server)[0]["dismissed_at"] is None
+    assert "确认无效" in await server.dismiss_note(1, confirm_token="wrong")
+
+    confirmed = await server.dismiss_note(1, confirm_token=token)
+    row = _note_rows(server)[0]
+    assert "已 dismiss" in confirmed
+    assert row["text"] == "retain this exact note"
+    assert row["dismissed_at"] is not None
+    assert row["boot_delivered_at"] is None
+    assert row["read_at"] is None
+    assert "已 dismiss" in await server.dismiss_note(1, confirm_token=token)
+    assert "retain this exact note" not in await server.boot()
+    assert "delivery:dismissed" in await server.list_notes()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_note_rejects_changed_plan_and_hidden_note(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.leave_note("visible")
+    await server.leave_note("sealed", sealed=True)
+    await server.leave_note("future", open_at="2099-01-01T00:00:00")
+
+    assert "not found" in await server.dismiss_note(2)
+    assert "not found" in await server.dismiss_note(3, include_sealed=True)
+    preview = await server.dismiss_note(1)
+    token = preview.split("confirm_token=", 1)[1].split()[0].rstrip("；")
+    await server.get_note(1)
+    assert "确认无效" in await server.dismiss_note(1, confirm_token=token)
+    assert _note_rows(server)[0]["dismissed_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_notes_do_not_create_or_enter_memory_buckets(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     await server.leave_note("not a memory retrieval corpus")

@@ -153,6 +153,72 @@ async def test_boot_delta_budget_keeps_complete_records_and_names_omissions(
     assert all("：" in line for line in delta.splitlines() if line.startswith("- "))
 
 
+@pytest.mark.asyncio
+async def test_delta_checkpoint_only_crosses_fully_emitted_eligible_prefix(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.boot(profile="tg")
+    bucket_ids = []
+    for index in range(12):
+        bucket_ids.append(await server.bucket_mgr.create(
+            f"delta payload {index}",
+            name=f"event {index:02d} " + "变" * 70,
+            importance=9,
+        ))
+    events = server.bucket_mgr.get_boot_delta_events(
+        0, server.bucket_mgr.get_boot_delta_high_water()
+    )
+    event_ids = {event["bucket_id"]: event["id"] for event in events}
+    high_water = max(event_ids.values())
+    delivered = set()
+    checkpoints = []
+
+    for _ in range(12):
+        body = await server.boot(profile="tg")
+        delivered.update(
+            bucket_id for bucket_id in bucket_ids
+            if f"- [bucket_id:{bucket_id}]" in body
+        )
+        checkpoint = server.bucket_mgr.get_boot_delta_checkpoint("tg")["last_event_id"]
+        checkpoints.append(checkpoint)
+        assert all(
+            event_ids[bucket_id] > checkpoint or bucket_id in delivered
+            for bucket_id in bucket_ids
+        )
+        if checkpoint == high_water:
+            break
+
+    assert checkpoints[0] < high_water
+    assert checkpoints == sorted(checkpoints)
+    assert checkpoints[-1] == high_water
+    assert delivered == set(bucket_ids)
+
+
+@pytest.mark.asyncio
+async def test_globally_omitted_delta_does_not_advance_checkpoint(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.boot()
+    before = _checkpoint(server)["last_event_id"]
+    bucket_id = await server.bucket_mgr.create(
+        "delta after baseline", name="deferred delta event " + "变" * 70
+    )
+    for index in range(5):
+        await server.bucket_mgr.create(
+            f"other event {index}", name=f"other event {index} " + "变" * 70
+        )
+    await server.leave_note("长" * 450)
+    await server.bucket_mgr.create("钉" * 2000, name="budget pressure", pinned=True)
+
+    limited = await server.boot(max_tokens=1000)
+    assert "=== boot: 增量摘要 ===" not in limited
+    assert _checkpoint(server)["last_event_id"] == before
+
+    resumed = await server.boot()
+    assert f"[bucket_id:{bucket_id}] deferred delta event" in resumed
+    assert _checkpoint(server)["last_event_id"] > before
+
+
 def test_boot_delta_schema_has_event_log_and_success_checkpoint(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
 

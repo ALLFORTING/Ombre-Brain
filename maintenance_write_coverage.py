@@ -89,6 +89,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "record_note": "guarded_mutation",
         "mark_note_boot_delivered": "guarded_mutation",
         "mark_note_read": "guarded_mutation",
+        "dismiss_note": "guarded_mutation",
         "create": "guarded_async_mutation",
         "_move_bucket": "guarded_mutation",
         "update": "guarded_async_mutation",

@@ -1375,6 +1375,38 @@ class BucketManager:
             )
             return cur.rowcount > 0
 
+    @guarded_mutation("bucket_note_dismiss")
+    def dismiss_note(
+        self,
+        note_id: int,
+        *,
+        expected_note: dict,
+        dismissed_at: str | None = None,
+    ) -> bool:
+        """Dismiss one unchanged note without deleting it or claiming delivery."""
+        dismissed_at = dismissed_at or now_iso()
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT note_id, created_at, author, via, text, sealed, open_at,
+                       boot_delivered_at, read_at, skipped_at, skipped_reason,
+                       dismissed_at
+                FROM notes WHERE note_id = ?
+                """,
+                (int(note_id),),
+            ).fetchone()
+            if row is None or dict(row) != expected_note or row["dismissed_at"] is not None:
+                conn.rollback()
+                return False
+            conn.execute(
+                "UPDATE notes SET dismissed_at = ? WHERE note_id = ?",
+                (dismissed_at, int(note_id)),
+            )
+            conn.commit()
+        return True
+
     # ---------------------------------------------------------
     # Create a new bucket
     # 创建新桶
