@@ -115,19 +115,20 @@ async def test_pinned_trace_unpin_requires_current_confirmation_token(
     bucket_id = await server.bucket_mgr.create(content="pinned body", pinned=True)
 
     blocked = await server.trace(bucket_id, pinned=0)
-    token = blocked.split("confirm_token:", 1)[1].split(".", 1)[0].strip()
+    token = blocked.split("confirm_token:", 1)[1].strip()
     before = await server.bucket_mgr.get(bucket_id)
 
     assert "confirmation required" in blocked
-    assert token == server._pinned_unpin_confirm_token(before)
+    assert token in server._mutation_confirm_tokens
     assert before["metadata"]["pinned"] is True
 
     wrong = await server.trace(bucket_id, pinned=0, confirm_token="wrong-token")
-    assert "confirmation required" in wrong
+    assert "confirmation invalid" in wrong
     assert (await server.bucket_mgr.get(bucket_id))["metadata"]["pinned"] is True
 
     unpinned = await server.trace(bucket_id, pinned=0, confirm_token=token)
     assert "pinned=False" in unpinned
+    assert "type=permanent" in unpinned
     assert (await server.bucket_mgr.get(bucket_id))["metadata"]["pinned"] is False
 
 

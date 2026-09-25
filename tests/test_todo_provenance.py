@@ -179,7 +179,9 @@ async def test_merge_supersession_and_delete_preserve_or_remove_sidecar(tmp_path
     source_id = await server.bucket_mgr.create(
         content="source", todos=["source task"], todo_provenance=[_record("source task", "system")]
     )
-    await server.trace(target_id, merge=source_id)
+    preview = await server.trace(target_id, merge=source_id)
+    await server.trace(target_id, merge=source_id,
+                       confirm_token=preview.split("confirm_token:", 1)[1].strip())
     merged = await server.bucket_mgr.get(target_id)
     assert merged["metadata"]["todo_provenance"] == [
         _record("target task", "ting"), _record("source task", "system")

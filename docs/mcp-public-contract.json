@@ -1525,6 +1525,10 @@
             "default": -1,
             "type": "integer"
           },
+          "permanent": {
+            "default": -1,
+            "type": "integer"
+          },
           "provenance_kind": {
             "default": "",
             "type": "string"

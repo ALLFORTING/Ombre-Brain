@@ -75,6 +75,7 @@ _MUTATION_CONFIRM_TTL_SECONDS = 5 * 60
 _MUTATION_CONFIRM_MAX_TOKENS = 256
 _mutation_confirm_tokens: dict[str, dict] = {}
 _mutation_confirm_lock = threading.Lock()
+_merge_running_operations: set[str] = set()
 _digest_running_operations: set[str] = set()
 
 
@@ -1236,6 +1237,7 @@ async def _merge_or_create(
     todos: list | None = None,
     provenance_kind: str | None = None,
     source_id_out: list[str] | None = None,
+    outcome_out: dict | None = None,
 ) -> tuple[str, bool]:
     """
     Reuse a deterministic duplicate if found; otherwise create a new bucket.
@@ -1263,6 +1265,16 @@ async def _merge_or_create(
         ):
             # Deterministic duplicate only: reuse the existing record without
             # invoking the lossy LLM merge path.
+            writes = {}
+            if trigger_date:
+                old_date = str(metadata.get("trigger_date", "") or "").strip()
+                if old_date and old_date != trigger_date:
+                    raise ValueError(
+                        f"duplicate bucket {bucket['id']} has trigger_date={old_date}; "
+                        f"requested {trigger_date} was rejected without writing"
+                    )
+                if old_date != trigger_date:
+                    writes.update(trigger_date=trigger_date, trigger_last_seen="")
             if incoming_todos:
                 existing_todos = _canonical_todos(metadata.get("todos"))
                 merged_todos = list(dict.fromkeys(existing_todos + incoming_todos))
@@ -1270,14 +1282,15 @@ async def _merge_or_create(
                     merged_todos != existing_todos
                     or not isinstance(metadata.get("todos"), list)
                 ):
-                    updated = await bucket_mgr.update(
-                        bucket["id"],
-                        todos=merged_todos,
-                    )
-                    if not updated:
-                        raise RuntimeError(
-                            f"failed to preserve todos for duplicate bucket {bucket['id']}"
-                        )
+                    writes["todos"] = merged_todos
+            if writes and not await bucket_mgr.update(bucket["id"], **writes):
+                raise RuntimeError(f"failed to update duplicate bucket {bucket['id']}")
+            if outcome_out is not None:
+                outcome_out.update(bucket_id=bucket["id"], reused=True,
+                                   written_fields=sorted(writes),
+                                   ignored_fields=["tags", "importance", "domain",
+                                                   "valence", "arousal", "name",
+                                                   "provenance_kind"])
             if source_id_out is not None:
                 source_id_out.append(bucket["id"])
             return metadata.get("name", bucket["id"]), True
@@ -1295,9 +1308,17 @@ async def _merge_or_create(
     )
     await _auto_link_related(bucket_id)
     if trigger_date:
-        await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
+        if not await bucket_mgr.update(bucket_id, trigger_date=trigger_date,
+                                       trigger_last_seen=""):
+            raise RuntimeError(f"trigger_date was not written to new bucket {bucket_id}")
     if source_id_out is not None:
         source_id_out.append(bucket_id)
+    if outcome_out is not None:
+        outcome_out.update(bucket_id=bucket_id, reused=False,
+                           written_fields=["content", "tags", "importance", "domain",
+                                           "valence", "arousal", "name", "todos",
+                                           *(["trigger_date"] if trigger_date else [])],
+                           ignored_fields=[])
     return bucket_id, False
 
 
@@ -2082,9 +2103,17 @@ async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = F
     return "\n".join(lines)
 
 
-async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
+async def _merge_bucket_into_target(
+    target_id: str, source_id: str, confirm_token: str = "",
+) -> str:
     if not source_id or source_id == target_id:
         return "merge 必须指定另一个有效的 bucket_id。"
+    for pending in bucket_mgr.read_merge_operations(open_only=True):
+        if (pending["target_id"], pending["source_id"]) == (target_id, source_id):
+            return await _execute_merge_operation(pending)
+        if {target_id, source_id} & {pending["target_id"], pending["source_id"]}:
+            return ("merge blocked by unfinished operation_id: "
+                    f"{pending['operation_id']}; resume its original target/source pair first.")
     target = await bucket_mgr.get(target_id)
     source = await bucket_mgr.get(source_id)
     if not target:
@@ -2144,20 +2173,6 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
         + float(source_meta.get("arousal", 0.3))
     ) / 2
 
-    updated = await bucket_mgr.update(
-        target_id,
-        content=merged_content,
-        tags=merged_tags,
-        importance=merged_importance,
-        valence=merged_valence,
-        arousal=merged_arousal,
-        todos=merged_todos,
-        todo_provenance=merged_todo_provenance,
-        provenance_kind="unknown",
-    )
-    if not updated:
-        return f"合并失败，无法更新目标桶: {target_id}"
-
     relation_operations: list[tuple[str, dict, dict]] = []
     inbound_ids = [
         str(bucket.get("id", "")) for bucket in inbound
@@ -2214,25 +2229,184 @@ async def _merge_bucket_into_target(target_id: str, source_id: str) -> str:
             )
         )
 
-    applied_relations: list[tuple[str, dict]] = []
-    for relation_id, relation_update, relation_restore in relation_operations:
-        if not await bucket_mgr.update(relation_id, **relation_update):
-            for rollback_id, rollback_update in reversed(applied_relations):
-                await bucket_mgr.update(rollback_id, **rollback_update)
-            return "合并失败：superseded_by 关系重连未完成。"
-        applied_relations.append((relation_id, relation_restore))
-
-    deleted = await bucket_mgr.delete(source_id, _allow_sealed=source_sealed)
-    if not deleted:
-        for rollback_id, rollback_update in reversed(applied_relations):
-            await bucket_mgr.update(rollback_id, **rollback_update)
-        return f"目标桶已更新，但源桶删除失败: {source_id}"
-    return (
-        f"已合并 {source_id} → {target_id}: "
-        f"importance={merged_importance}, "
-        f"valence={merged_valence:.3f}, arousal={merged_arousal:.3f}, "
-        f"tags={','.join(str(tag) for tag in merged_tags)}"
+    target_update = {
+        "content": merged_content, "tags": merged_tags,
+        "importance": merged_importance, "valence": merged_valence,
+        "arousal": merged_arousal, "todos": merged_todos,
+        "todo_provenance": merged_todo_provenance,
+        "provenance_kind": "unknown",
+    }
+    plan = {
+        "target_id": target_id, "source_id": source_id,
+        "source_sealed": source_sealed,
+        "target_content_sha256": hashlib.sha256(
+            str(target.get("content", "")).encode("utf-8")
+        ).hexdigest(),
+        "source_content_sha256": hashlib.sha256(
+            str(source.get("content", "")).encode("utf-8")
+        ).hexdigest(),
+        "target_metadata_sha256": _merge_metadata_digest(target_meta),
+        "source_metadata_sha256": _merge_metadata_digest(source_meta),
+        "target_update": target_update,
+        "relations": [
+            {"bucket_id": bucket_id, "updates": update,
+             "before_sha256": _merge_metadata_digest(next(
+                 bucket["metadata"] for bucket in all_buckets
+                 if bucket["id"] == bucket_id
+             ))}
+            for bucket_id, update, _ in relation_operations
+        ],
+    }
+    payload = {
+        "target_id": target_id, "source_id": source_id,
+        "target_content_sha256": plan["target_content_sha256"],
+        "source_content_sha256": plan["source_content_sha256"],
+        "target_metadata_sha256": plan["target_metadata_sha256"],
+        "source_metadata_sha256": plan["source_metadata_sha256"],
+        "plan_sha256": _confirmation_payload_digest(plan),
+    }
+    token = (confirm_token or "").strip()
+    if not token:
+        issued = _issue_mutation_confirmation("trace.merge", payload)
+        return (
+            "merge preview: no changes made. "
+            f"trace(bucket_id={target_id}, merge={source_id}) appends source into target, "
+            f"rewires {len(relation_operations)} relation steps, then deletes source. "
+            f"target_sha256={payload['target_content_sha256']} "
+            f"source_sha256={payload['source_content_sha256']}\n"
+            f"confirm_token: {issued}"
+        )
+    with _mutation_confirm_lock:
+        entry = _mutation_confirm_tokens.get(token)
+        if (not entry or float(entry.get("expires_at", 0)) <= time.monotonic()
+                or entry.get("operation") != "trace.merge"
+                or entry.get("payload_digest") != _confirmation_payload_digest(payload)):
+            return "merge confirmation invalid, expired, used, or stale; preview again."
+        operation_id = secrets.token_hex(12)
+        try:
+            bucket_mgr.write_merge_operation(
+                operation_id, plan, status="running", completed=[], create=True,
+            )
+        except ValueError as exc:
+            return f"merge blocked: {exc}"
+        _mutation_confirm_tokens.pop(token, None)
+    operation = next(
+        record for record in bucket_mgr.read_merge_operations()
+        if record["operation_id"] == operation_id
     )
+    return await _execute_merge_operation(operation)
+
+
+def _merge_metadata_digest(metadata: dict) -> str:
+    encoded = _json_lib.dumps(metadata, ensure_ascii=False, sort_keys=True,
+                              default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _execute_merge_operation(operation: dict) -> str:
+    """Resume a confirmed merge from durable steps without rebuilding its body."""
+    operation_id = operation["operation_id"]
+    plan = operation["plan"]
+    target_id, source_id = plan["target_id"], plan["source_id"]
+    with _mutation_confirm_lock:
+        if operation_id in _merge_running_operations:
+            return f"merge operation already running: operation_id: {operation_id}"
+        _merge_running_operations.add(operation_id)
+    completed = list(operation["completed"])
+    steps = ["target", *[f"relation:{index}" for index in range(len(plan["relations"]))],
+             "delete_started", "delete_source"]
+
+    def persist(status: str) -> None:
+        bucket_mgr.write_merge_operation(operation_id, plan, status=status,
+                                         completed=completed)
+
+    async def update_step(step: str, bucket_id: str, changes: dict) -> None:
+        key = f"merge:{operation_id}:{step}"
+        if step not in completed:
+            await bucket_mgr.apply_import_operation(
+                key, operation_kind="update", target_bucket_id=bucket_id,
+                payload={"kwargs": changes},
+            )
+        inspected = bucket_mgr.inspect_import_operation(key)
+        if not inspected or not inspected["marker"] or not inspected["memory_exists"]:
+            raise RuntimeError(f"merge step {step} has no durable write marker")
+        written = await bucket_mgr.get(bucket_id)
+        if not written:
+            raise RuntimeError(f"merge step {step} target missing")
+        for field, expected in changes.items():
+            if field == "content":
+                actual = written["content"]
+            elif field == "todo_provenance" and not expected:
+                continue
+            else:
+                actual = written["metadata"].get(field)
+            if actual != expected:
+                raise RuntimeError(f"merge step {step} changed after write: {field}")
+        if step not in completed:
+            completed.append(step)
+            persist("running")
+
+    try:
+        persist("running")
+        target_step = bucket_mgr.inspect_import_operation(f"merge:{operation_id}:target")
+        if "target" not in completed and not (target_step and target_step["marker"]):
+            original_target = await bucket_mgr.get(target_id)
+            if (not original_target or
+                hashlib.sha256(str(original_target["content"]).encode("utf-8")).hexdigest()
+                    != plan["target_content_sha256"] or
+                _merge_metadata_digest(original_target["metadata"])
+                    != plan["target_metadata_sha256"]):
+                raise RuntimeError("target changed after confirmation")
+        await update_step("target", target_id, plan["target_update"])
+        for index, relation in enumerate(plan["relations"]):
+            step = f"relation:{index}"
+            marker = bucket_mgr.inspect_import_operation(f"merge:{operation_id}:{step}")
+            if (step not in completed and not (marker and marker["marker"])
+                    and relation["bucket_id"] != target_id):
+                current = await bucket_mgr.get(relation["bucket_id"])
+                if (not current or _merge_metadata_digest(current["metadata"])
+                        != relation["before_sha256"]):
+                    raise RuntimeError(f"relation target changed: {relation['bucket_id']}")
+            await update_step(f"relation:{index}", relation["bucket_id"],
+                              relation["updates"])
+        if "delete_source" not in completed:
+            source = await bucket_mgr.get(source_id)
+            if source is not None:
+                if (hashlib.sha256(str(source.get("content", "")).encode("utf-8")).hexdigest()
+                        != plan["source_content_sha256"]):
+                    raise RuntimeError("source changed after confirmation")
+                if _merge_metadata_digest(source["metadata"]) != plan["source_metadata_sha256"]:
+                    raise RuntimeError("source metadata changed after confirmation")
+                if "delete_started" not in completed:
+                    completed.append("delete_started")
+                    persist("running")
+                if not await bucket_mgr.delete(source_id,
+                                               _allow_sealed=plan["source_sealed"]):
+                    raise RuntimeError("source deletion failed")
+            elif "delete_started" not in completed:
+                raise RuntimeError("source disappeared before the delete step")
+            completed.append("delete_source")
+            persist("running")
+        persist("complete")
+        return (f"operation_id: {operation_id}\n已合并 {source_id} → {target_id}: "
+                f"importance={plan['target_update']['importance']}, "
+                f"valence={plan['target_update']['valence']:.3f}, "
+                f"arousal={plan['target_update']['arousal']:.3f}, "
+                f"tags={','.join(str(tag) for tag in plan['target_update']['tags'])}")
+    except Exception as exc:
+        try:
+            persist("failed")
+        except Exception:
+            logger.exception("Could not persist merge failure state for %s", operation_id)
+        logger.error("Merge operation %s failed: %s", operation_id, exc)
+        remaining = [step for step in steps if step not in completed]
+        return (f"operation_id: {operation_id}\nmerge partial failure: {exc}\n"
+                f"completed: {', '.join(completed) or '(none)'}\n"
+                f"remaining: {', '.join(remaining) or '(none)'}\n"
+                f"Retry trace(bucket_id={target_id}, merge={source_id}) to resume this operation.")
+    finally:
+        with _mutation_confirm_lock:
+            _merge_running_operations.discard(operation_id)
 
 
 def _split_search_results(matches: list[dict], max_results: int) -> tuple[list[dict], list[dict], int]:
@@ -2255,20 +2429,6 @@ def _split_search_results(matches: list[dict], max_results: int) -> tuple[list[d
 def _is_sealed(bucket: dict) -> bool:
     """Return True when a bucket is manually sealed."""
     return int(bucket.get("metadata", {}).get("sealed", 0) or 0) == 1
-
-
-def _pinned_unpin_confirm_token(bucket: dict) -> str:
-    """Return a deterministic confirmation token for unpinning this bucket."""
-    metadata = bucket.get("metadata", {})
-    payload = "|".join(
-        (
-            str(bucket.get("id", "")),
-            str(int(bool(metadata.get("pinned")))),
-            str(metadata.get("updated_at", "")),
-            str(metadata.get("last_active", "")),
-        )
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _confirmation_payload_digest(payload: dict) -> str:
@@ -8644,6 +8804,13 @@ async def breath(
     ] = "",
 ) -> str:
     """Retrieval-oriented memory search; touch=False keeps maintenance retrieval read-only."""
+    for field_name, value in (("valence", valence), ("arousal", arousal)):
+        if value != -1 and not 0 <= value <= 1:
+            return f"{field_name} must be -1 or within 0.0-1.0."
+    if importance_min != -1 and not 1 <= importance_min <= 10:
+        return "importance_min must be -1 or within 1-10."
+    if (mode or "").strip().lower() not in ("summary", "full"):
+        return "mode must be summary or full."
     if (as_of or "").strip() and mailbox:
         return _with_response_seal("as_of 历史检索不支持 mailbox。")
     if mailbox:
@@ -8731,6 +8898,11 @@ async def hold(
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+    if not 1 <= importance <= 10:
+        return "importance must be within 1-10."
+    for field_name, value in (("valence", valence), ("arousal", arousal)):
+        if value != -1 and not 0 <= value <= 1:
+            return f"{field_name} must be -1 or within 0.0-1.0."
     try:
         explicit_provenance_kind = _parse_explicit_provenance_kind(provenance_kind)
     except ValueError as exc:
@@ -8769,7 +8941,6 @@ async def hold(
         return str(exc)
     should_record_emotion = 0 <= valence <= 1 and 0 <= arousal <= 1
 
-    importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
     # --- Feel mode: store as feel type, minimal metadata ---
@@ -8880,26 +9051,37 @@ async def hold(
 
     # --- Step 2: merge or create / 合并或新建 ---
     source_ids: list[str] = []
-    result_name, is_merged = await _merge_or_create(
-        content=content,
-        tags=all_tags,
-        importance=importance,
-        domain=domain,
-        valence=final_valence,
-        arousal=final_arousal,
-        name=suggested_name,
-        trigger_date=trigger_date,
-        todos=analysis_todos,
-        provenance_kind=explicit_provenance_kind,
-        source_id_out=source_ids,
-    )
+    outcome: dict = {}
+    try:
+        result_name, is_merged = await _merge_or_create(
+            content=content,
+            tags=all_tags,
+            importance=importance,
+            domain=domain,
+            valence=final_valence,
+            arousal=final_arousal,
+            name=suggested_name,
+            trigger_date=trigger_date,
+            todos=analysis_todos,
+            provenance_kind=explicit_provenance_kind,
+            source_id_out=source_ids,
+            outcome_out=outcome,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)
     if should_record_emotion:
         _record_emotion_snapshot(valence, arousal, "hold", source_ids[0])
 
     if is_merged:
-        response = f"合并→{result_name} {','.join(domain)}"
+        ignored = [*outcome["ignored_fields"], *(["source_bucket"] if source_bucket else [])]
+        response = (
+            f"合并→{result_name} {','.join(domain)}\n"
+            f"bucket_id={outcome['bucket_id']} reused=true "
+            f"written_fields={outcome['written_fields']} ignored_fields={ignored}"
+        )
     else:
         response = await _format_hold_created(result_name)
+        response += f"\nbucket_id={outcome['bucket_id']} reused=false written_fields={outcome['written_fields']} ignored_fields={outcome['ignored_fields']}"
         if similarity_notice:
             response += f"\nsimilarity: {similarity_notice}"
     if conflict_warning:
@@ -9179,6 +9361,7 @@ async def trace(
     ] = None,
     resolved: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
     pinned: Annotated[int, Field(description="-1 means unchanged; 0 means False (unpinning a pinned bucket requires confirm_token); 1 means True.")] = -1,
+    permanent: Annotated[int, Field(description="-1 leaves lifecycle type unchanged; 0 changes an unpinned permanent bucket to dynamic with confirmation; 1 changes it to permanent. pinned always implies permanent.")] = -1,
     digested: Annotated[int, Field(description="-1 means unchanged; 0 means False; 1 means True.")] = -1,
     dormant: Annotated[int, Field(description="-1 means unchanged; 0 means False and explicitly wakes; 1 means True and marks dormant.")] = -1,
     sealed: Annotated[int, Field(description="-1 means unchanged; 0 means unsealed; 1 means sealed.")] = -1,
@@ -9198,6 +9381,17 @@ async def trace(
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    if importance != -1 and not 1 <= importance <= 10:
+        return "importance must be -1 or within 1-10."
+    for field_name, value in (("valence", valence), ("arousal", arousal)):
+        if value != -1 and not 0 <= value <= 1:
+            return f"{field_name} must be -1 or within 0.0-1.0."
+    for field_name, value in (("resolved", resolved), ("pinned", pinned),
+                              ("permanent", permanent), ("digested", digested),
+                              ("dormant", dormant), ("sealed", sealed)):
+        if value not in (-1, 0, 1):
+            return f"{field_name} must be -1, 0, or 1."
 
     if todos is not None and todo_items is not None:
         return "todos 与 todo_items 不能同时使用。"
@@ -9241,6 +9435,7 @@ async def trace(
                 todo_items=todo_items,
                 resolved=resolved,
                 pinned=pinned,
+                permanent=permanent,
                 digested=digested,
                 dormant=dormant,
                 sealed=sealed,
@@ -9260,9 +9455,18 @@ async def trace(
     if merge and delete:
         return "merge 不能与 delete 同时使用。"
     if merge:
-        return await _merge_bucket_into_target(bucket_id, merge.strip())
+        if (name or domain or valence != -1 or arousal != -1 or
+                importance != -1 or tags or todos is not None or
+                todo_items is not None or resolved != -1 or pinned != -1 or
+                permanent != -1 or digested != -1 or dormant != -1 or
+                sealed != -1 or content or explicit_provenance_kind is not None or
+                related or unrelate or superseded_by is not None or append or
+                trigger_date):
+            return "merge must be called alone with bucket_id, merge, and optional confirm_token."
+        return await _merge_bucket_into_target(bucket_id, merge.strip(), confirm_token)
     try:
-        trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
+        trigger_date = ("none" if trigger_date.strip().lower() == "none" else
+                        (_parse_optional_date(trigger_date, "trigger_date") or ""))
     except ValueError as exc:
         return str(exc)
 
@@ -9277,6 +9481,9 @@ async def trace(
     previous_provenance_kind = normalize_provenance_kind(
         metadata.get("provenance_kind")
     )
+    if permanent in (0, 1) and metadata.get("type") not in ("dynamic", "permanent"):
+        return (f"permanent cannot change bucket type {metadata.get('type')}; "
+                "only dynamic and permanent buckets are supported.")
     requested_superseded_by = None
     if superseded_by is not None:
         if not isinstance(superseded_by, str):
@@ -9298,13 +9505,10 @@ async def trace(
         metadata.get("pinned") or metadata.get("protected")
     )
     protection_label = "pinned/protected"
-    if pinned == 0 and metadata.get("pinned"):
-        unpin_token = _pinned_unpin_confirm_token(bucket)
-        if not hmac.compare_digest((confirm_token or "").strip(), unpin_token):
-            return (
-                "confirmation required: rerun trace with pinned=0 and "
-                f"confirm_token: {unpin_token}."
-            )
+    if permanent == 0 and (pinned == 1 or (metadata.get("pinned") and pinned != 0)):
+        return "permanent=0 rejected: cancel pinned first with pinned=0; permanent=0 never unpins implicitly."
+    if permanent == 0 and metadata.get("protected"):
+        return "permanent=0 rejected: protected bucket cannot be downgraded."
     if content and (_is_sealed(bucket) or metadata.get("protected")):
         return f"内容修改失败：记忆桶 {bucket_id} 受到保护。"
 
@@ -9333,6 +9537,11 @@ async def trace(
         updates["pinned"] = bool(pinned)
         if pinned == 1:
             updates["importance"] = 10  # pinned → lock importance
+    if permanent in (0, 1):
+        updates["permanent"] = permanent
+    elif pinned == 0 and metadata.get("pinned") and metadata.get("type") != "permanent":
+        # Normalize only the bucket being explicitly unpinned; do not bulk-repair data.
+        updates["permanent"] = 1
     if digested in (0, 1):
         updates["digested"] = bool(digested)
     if dormant in (0, 1):
@@ -9340,7 +9549,7 @@ async def trace(
     if sealed in (0, 1):
         updates["sealed"] = sealed
     if trigger_date:
-        updates["trigger_date"] = trigger_date
+        updates["trigger_date"] = "" if trigger_date == "none" else trigger_date
         updates["trigger_last_seen"] = ""
     if content:
         if append:
@@ -9375,6 +9584,32 @@ async def trace(
                 f"importance 未修改：记忆桶 {bucket_id} 受到 {protection_label} protection，"
                 "importance 锁定为 10。"
             )
+
+    lowering = ((pinned == 0 and bool(metadata.get("pinned"))) or
+                (permanent == 0 and metadata.get("type") == "permanent"))
+    if lowering:
+        payload = {
+            "bucket_id": bucket_id,
+            "content_sha256": hashlib.sha256(str(bucket.get("content", "")).encode("utf-8")).hexdigest(),
+            "metadata_sha256": hashlib.sha256(
+                _json_lib.dumps(metadata, ensure_ascii=False, sort_keys=True,
+                                default=str).encode("utf-8")
+            ).hexdigest(),
+            "updates": updates,
+        }
+        if not (confirm_token or "").strip():
+            token = _issue_mutation_confirmation("trace.lifecycle", payload)
+            planned_type = (
+                "dynamic" if updates.get("permanent") == 0 else
+                "permanent" if updates.get("permanent") == 1 else
+                metadata.get("type")
+            )
+            return (f"confirmation required: bucket_id={bucket_id} "
+                    f"pinned={metadata.get('pinned', False)}->{updates.get('pinned', metadata.get('pinned', False))} "
+                    f"type={metadata.get('type')}->{planned_type}; "
+                    f"confirm_token: {token}")
+        if not _consume_mutation_confirmation("trace.lifecycle", payload, confirm_token):
+            return "lifecycle confirmation invalid, expired, used, or stale; preview again."
 
     if not updates and requested_superseded_by is None and not unrelated_ids:
         return "没有任何字段需要修改。"
@@ -9451,6 +9686,11 @@ async def trace(
     if unrelated_ids:
         unrelate_change = f"unrelate={','.join(unrelated_ids)}"
         changed += f", {unrelate_change}" if changed else unrelate_change
+    if pinned == 0 or permanent in (0, 1):
+        current = await bucket_mgr.get(bucket_id)
+        if current:
+            state = current["metadata"]
+            changed += f"; pinned={bool(state.get('pinned'))}, type={state.get('type')}"
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 @mcp.tool()

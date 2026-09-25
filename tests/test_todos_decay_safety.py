@@ -156,7 +156,9 @@ async def test_todos_tri_state_resolved_filter_and_merge_preserve(tmp_path, monk
         content="source todo content",
         todos=["source task", "new target task"],
     )
-    await server.trace(target_id, merge=source_id)
+    preview = await server.trace(target_id, merge=source_id)
+    await server.trace(target_id, merge=source_id,
+                       confirm_token=preview.split("confirm_token:", 1)[1].strip())
     merged = await server.bucket_mgr.get(target_id)
     assert merged["metadata"]["todos"] == [
         "new target task",

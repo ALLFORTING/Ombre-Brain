@@ -827,6 +827,12 @@ class BucketManager:
     def inspect_import_operation(self, operation_key: str) -> dict[str, Any] | None:
         """Inspect an O5B operation and its hidden atomic marker read-only."""
 
+        with sqlite3.connect(self.history_db_path) as conn:
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'ob_import_operations'"
+            ).fetchone():
+                return None
         operation = self._get_import_operation(operation_key)
         if operation is None:
             return None
@@ -910,6 +916,72 @@ class BucketManager:
         return [
             {**dict(row), "plan": json.loads(row["plan_json"]),
              "outputs": json.loads(row["outputs_json"]),
+             "completed": json.loads(row["completed_json"])}
+            for row in rows
+        ]
+
+    @guarded_mutation("bucket_merge_operation_write")
+    def write_merge_operation(
+        self, operation_id: str, plan: dict, *, status: str,
+        completed: list[str], create: bool = False,
+    ) -> None:
+        """Persist a merge plan and step progress before or after file mutations."""
+        if status not in {"running", "failed", "complete"}:
+            raise ValueError("invalid merge operation status")
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS merge_operations (
+                    operation_id TEXT PRIMARY KEY, target_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL, plan_json TEXT NOT NULL,
+                    status TEXT NOT NULL, completed_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("BEGIN IMMEDIATE")
+            encoded = json.dumps(plan, ensure_ascii=False, sort_keys=True)
+            row = conn.execute(
+                "SELECT plan_json FROM merge_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if create:
+                if row is not None:
+                    raise ValueError("merge operation already exists")
+                pending = conn.execute(
+                    "SELECT operation_id FROM merge_operations WHERE status != 'complete' "
+                    "AND (target_id IN (?, ?) OR source_id IN (?, ?)) LIMIT 1",
+                    (plan["target_id"], plan["source_id"],
+                     plan["target_id"], plan["source_id"]),
+                ).fetchone()
+                if pending:
+                    raise ValueError(f"unfinished merge operation: {pending[0]}")
+                conn.execute(
+                    "INSERT INTO merge_operations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (operation_id, plan["target_id"], plan["source_id"], encoded,
+                     status, json.dumps(completed), now_iso()),
+                )
+            else:
+                if row is None or row[0] != encoded:
+                    raise ValueError("merge operation plan changed or missing")
+                conn.execute(
+                    "UPDATE merge_operations SET status = ?, completed_json = ?, "
+                    "updated_at = ? WHERE operation_id = ?",
+                    (status, json.dumps(completed), now_iso(), operation_id),
+                )
+
+    def read_merge_operations(self, *, open_only: bool = False) -> list[dict]:
+        with sqlite3.connect(self.history_db_path) as conn:
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'merge_operations'"
+            ).fetchone():
+                return []
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM merge_operations"
+            if open_only:
+                query += " WHERE status != 'complete'"
+            rows = conn.execute(query + " ORDER BY updated_at").fetchall()
+        return [
+            {**dict(row), "plan": json.loads(row["plan_json"]),
              "completed": json.loads(row["completed_json"])}
             for row in rows
         ]
@@ -1546,6 +1618,8 @@ class BucketManager:
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
+        if pinned:
+            metadata["type"] = "permanent"
         post = frontmatter.Post(linked_content, **metadata)
         if operation is not None:
             existing_path = self._find_bucket_file(bucket_id)
@@ -1581,8 +1655,6 @@ class BucketManager:
         # --- 按类型 + 主题域选择存储目录 ---
         if bucket_type == "permanent" or pinned:
             type_dir = self.permanent_dir
-            if pinned and bucket_type != "permanent":
-                metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
         else:
@@ -1713,6 +1785,20 @@ class BucketManager:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
 
+        requested_permanent = kwargs.pop("permanent", None)
+        if requested_permanent is not None:
+            if requested_permanent not in (0, 1):
+                return False
+            if post.get("type") not in ("dynamic", "permanent"):
+                return False
+            next_pinned = bool(kwargs.get("pinned", post.get("pinned", False)))
+            if requested_permanent == 0 and (next_pinned or post.get("protected")):
+                return False
+        original_file_bytes = None
+        if requested_permanent is not None or kwargs.get("pinned"):
+            with open(file_path, "rb") as original_file:
+                original_file_bytes = original_file.read()
+
         previous_content = str(post.content or "")
         previous_todos = canonicalize_todos(post.get("todos"))
         previous_todo_provenance = reconcile_todo_provenance(
@@ -1839,6 +1925,9 @@ class BucketManager:
             post["pinned"] = bool(kwargs["pinned"])
             if kwargs["pinned"]:
                 post["importance"] = 10  # pinned → lock importance to 10
+                post["type"] = "permanent"
+        if requested_permanent is not None:
+            post["type"] = "permanent" if requested_permanent else "dynamic"
         if "digested" in kwargs:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
@@ -1884,7 +1973,7 @@ class BucketManager:
         post["updated_at"] = _date_only()
 
         try:
-            if operation is not None or content_changed:
+            if operation is not None or content_changed or requested_permanent is not None or kwargs.get("pinned"):
                 self._write_post_atomic(file_path, post)
                 if operation is not None:
                     self._mark_import_operation_applied(o5b_operation_key)
@@ -1895,17 +1984,21 @@ class BucketManager:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
 
-        # --- Auto-move: pinned → permanent/ ---
-        # --- 自动移动：钉选 → permanent/ ---
+        # --- Keep lifecycle metadata and directory together. ---
         # NOTE: resolved buckets are NOT auto-archived here.
         # They stay in dynamic/ and decay naturally until score < threshold.
         # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
         domain = post.get("domain", ["未分类"])
-        if kwargs.get("pinned") and post.get("type") != "permanent":
-            post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
+        type_dir = (self.permanent_dir if post.get("type") == "permanent" else
+                    self.dynamic_dir if post.get("type") == "dynamic" else None)
+        if type_dir and original_file_bytes is not None:
+            try:
+                self._move_bucket(file_path, type_dir, domain)
+            except OSError as exc:
+                with open(file_path, "wb") as restore_file:
+                    restore_file.write(original_file_bytes)
+                logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
+                return False
 
         if (
             not next_sealed

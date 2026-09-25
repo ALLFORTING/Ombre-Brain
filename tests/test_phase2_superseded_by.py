@@ -109,7 +109,11 @@ async def test_merge_rewires_inbound_and_cleans_outgoing_reverse_without_waking_
     await server.trace(inbound_two, superseded_by=source_id)
     await server.trace(target_id, dormant=1)
 
-    result = await server.trace(target_id, merge=source_id)
+    preview = await server.trace(target_id, merge=source_id)
+    result = await server.trace(
+        target_id, merge=source_id,
+        confirm_token=preview.split("confirm_token:", 1)[1].strip(),
+    )
 
     assert "已合并" in result
     assert await server.bucket_mgr.get(source_id) is None
@@ -131,7 +135,11 @@ async def test_merge_into_active_target_keeps_active_behavior(tmp_path, monkeypa
     source_id = await _bucket(server, "source", name="Source")
     target_id = await _bucket(server, "target", name="Target")
 
-    result = await server.trace(target_id, merge=source_id)
+    preview = await server.trace(target_id, merge=source_id)
+    result = await server.trace(
+        target_id, merge=source_id,
+        confirm_token=preview.split("confirm_token:", 1)[1].strip(),
+    )
 
     assert "已合并" in result
     assert (await server.bucket_mgr.get(target_id))["metadata"]["dormant"] is False

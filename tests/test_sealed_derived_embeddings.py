@@ -377,7 +377,11 @@ async def test_merge_rejects_cross_boundary_and_allows_sealed_to_sealed(tmp_path
 
     sealed_target = await server.bucket_mgr.create("sealed target", sealed=True)
     sealed_source_2 = await server.bucket_mgr.create("sealed source 2", sealed=True)
-    merged = await server._merge_bucket_into_target(sealed_target, sealed_source_2)
+    preview = await server._merge_bucket_into_target(sealed_target, sealed_source_2)
+    merged = await server._merge_bucket_into_target(
+        sealed_target, sealed_source_2,
+        preview.split("confirm_token:", 1)[1].strip(),
+    )
 
     assert "已合并" in merged
     assert (await server.bucket_mgr.get(sealed_source_2)) is None
@@ -392,13 +396,22 @@ async def test_merge_keeps_source_when_target_update_succeeds_but_delete_fails(t
 
     target = await server.bucket_mgr.create("merge target")
     source = await server.bucket_mgr.create("merge source")
+    original_delete = server.bucket_mgr.delete
     server.bucket_mgr.delete = AsyncMock(return_value=False)
 
-    result = await server._merge_bucket_into_target(target, source)
+    preview = await server._merge_bucket_into_target(target, source)
+    result = await server._merge_bucket_into_target(
+        target, source, preview.split("confirm_token:", 1)[1].strip(),
+    )
 
-    assert "源桶删除失败" in result
+    assert "source deletion failed" in result
     assert "merge source" in (await server.bucket_mgr.get(target))["content"]
     assert (await server.bucket_mgr.get(source)) is not None
+    server.bucket_mgr.delete = original_delete
+    resumed = await server._merge_bucket_into_target(target, source)
+    assert "已合并" in resumed
+    assert (await server.bucket_mgr.get(target))["content"].count("merge source") == 1
+    assert await server.bucket_mgr.get(source) is None
 
 
 @pytest.mark.asyncio

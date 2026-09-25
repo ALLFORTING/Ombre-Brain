@@ -138,7 +138,9 @@ async def test_merge_duplicate_and_lifecycle_preserve_or_clear_provenance(tmp_pa
     server = _load_server(tmp_path, monkeypatch)
     target_id = await server.bucket_mgr.create("target", provenance_kind="summary")
     source_id = await server.bucket_mgr.create("source", provenance_kind="summary")
-    assert "已合并" in await server.trace(target_id, merge=source_id)
+    preview = await server.trace(target_id, merge=source_id)
+    token = preview.split("confirm_token:", 1)[1].strip()
+    assert "已合并" in await server.trace(target_id, merge=source_id, confirm_token=token)
     assert _metadata(await server.bucket_mgr.get(target_id)) == "unknown"
 
     duplicate_id = await server.bucket_mgr.create("duplicate", provenance_kind="inference")

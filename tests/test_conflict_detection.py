@@ -110,7 +110,15 @@ async def test_hold_invalid_supersession_target_does_not_create_bucket(tmp_path,
 async def test_hold_without_supersedes_uses_normal_merge_path(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server._detect_conflict_warning = AsyncMock(return_value="")
-    server._merge_or_create = AsyncMock(return_value=("normal-path-id", False))
+    async def mock_merge(**kwargs):
+        kwargs["source_id_out"].append("normal-path-id")
+        kwargs["outcome_out"].update(
+            bucket_id="normal-path-id", reused=False,
+            written_fields=["content"], ignored_fields=[],
+        )
+        return "normal-path-id", False
+
+    server._merge_or_create = AsyncMock(side_effect=mock_merge)
 
     result = await server.hold("fact_evolution_normal_path")
 
