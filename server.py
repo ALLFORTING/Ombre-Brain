@@ -8894,7 +8894,7 @@ async def hold(
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
+    """存储单条记忆并自动打标；匹配到规范化正文相同的可复用桶时复用，未新建，不做语义合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -9077,7 +9077,7 @@ async def hold(
     if is_merged:
         ignored = [*outcome["ignored_fields"], *(["source_bucket"] if source_bucket else [])]
         response = (
-            f"合并→{result_name} {','.join(domain)}\n"
+            f"复用了已匹配到的相同内容桶，未新建：{result_name} {','.join(domain)}\n"
             f"bucket_id={outcome['bucket_id']} reused=true "
             f"written_fields={outcome['written_fields']} ignored_fields={ignored}"
         )
@@ -9124,6 +9124,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
+        outcome: dict = {}
         try:
             result_name, is_merged = await _merge_or_create(
                 content=content.strip(),
@@ -9134,12 +9135,18 @@ async def grow(content: str) -> str:
                 arousal=analysis.get("arousal", 0.3),
                 name=analysis.get("suggested_name", ""),
                 todos=_canonical_todos(analysis.get("todos")),
+                outcome_out=outcome,
             )
         except Exception as exc:
             logger.exception("Fast-path grow persistence failed")
             return "记忆写入失败。 reason=persistence_error"
-        action = "合并" if is_merged else "新建"
-        response = f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        action = "复用了已匹配到的相同内容桶，未新建" if is_merged else "新建"
+        reused = "true" if is_merged else "false"
+        response = (
+            f"{action} → {result_name} | bucket_id={outcome['bucket_id']} "
+            f"reused={reused} | {','.join(analysis.get('domain', []))} "
+            f"V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        )
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         if metadata_failure:
@@ -9159,13 +9166,14 @@ async def grow(content: str) -> str:
     results = []
     conflicts = []
     created = 0
-    merged = 0
+    reused = 0
 
     # --- Step 2: merge or create each item (with per-item error handling) ---
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
             conflict_warning = await _detect_conflict_warning(item["content"])
+            outcome: dict = {}
             result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
@@ -9176,13 +9184,20 @@ async def grow(content: str) -> str:
                 name=item.get("name") or _canonical_body_name(item["content"]),
                 todos=_canonical_todos(item.get("todos")),
                 provenance_kind="summary",
+                outcome_out=outcome,
             )
 
             if is_merged:
-                results.append(f"📎{result_name}")
-                merged += 1
+                results.append(
+                    f"📎复用了已匹配到的相同内容桶，未新建：{result_name} | "
+                    f"bucket_id={outcome['bucket_id']} reused=true"
+                )
+                reused += 1
             else:
-                results.append(f"📝{item.get('name') or _canonical_body_name(item['content'])}")
+                results.append(
+                    f"📝新建：{item.get('name') or _canonical_body_name(item['content'])} | "
+                    f"bucket_id={outcome['bucket_id']} reused=false"
+                )
                 created += 1
             if item.get("_metadata_failure"):
                 results.append("自动打标失败；原因=parse_error；已使用默认 metadata")
@@ -9195,7 +9210,7 @@ async def grow(content: str) -> str:
             )
             results.append(f"⚠️{item.get('name', '?')} reason=persistence_error")
 
-    response = f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+    response = f"{len(items)}条|新建{created}/复用{reused}\n" + "\n".join(results)
     if conflicts:
         response += "\nconflict: " + "；".join(conflicts)
     return response

@@ -147,6 +147,61 @@ async def test_grow_digest_path_appends_conflict_warning(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_grow_fast_path_reports_actual_id_for_created_and_reused(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._detect_conflict_warning = AsyncMock(return_value="")
+    server._auto_link_related = AsyncMock(return_value=None)
+    server.bucket_mgr.search = AsyncMock(return_value=[])
+
+    created = await server.grow("fresh short item")
+    created_bucket = (await server.bucket_mgr.list_all())[0]
+    assert f"bucket_id={created_bucket['id']} reused=false" in created
+    assert "新建" in created and "合并" not in created
+
+    existing_id = await server.bucket_mgr.create(
+        "same short item", name="existing display name"
+    )
+    server.bucket_mgr.search = AsyncMock(
+        return_value=[await server.bucket_mgr.get(existing_id)]
+    )
+    reused = await server.grow("same short item")
+    assert "复用了已匹配到的相同内容桶，未新建" in reused
+    assert "existing display name" in reused
+    assert f"bucket_id={existing_id} reused=true" in reused
+    assert "合并" not in reused
+
+
+@pytest.mark.asyncio
+async def test_grow_digest_path_reports_each_created_and_reused_id(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._detect_conflict_warning = AsyncMock(return_value="")
+    server._auto_link_related = AsyncMock(return_value=None)
+    existing_id = await server.bucket_mgr.create(
+        "same diary item", name="existing display name"
+    )
+    existing = await server.bucket_mgr.get(existing_id)
+
+    async def search(content, **kwargs):
+        return [existing] if content == "same diary item" else []
+
+    server.bucket_mgr.search = AsyncMock(side_effect=search)
+    server.dehydrator.digest = AsyncMock(return_value=[
+        {"name": "reused item", "content": "same diary item"},
+        {"name": "created item", "content": "new diary item"},
+    ])
+    result = await server.grow("A diary entry long enough to use the digest path")
+    buckets = await server.bucket_mgr.list_all()
+    created_id = next(bucket["id"] for bucket in buckets
+                      if bucket["content"] == "new diary item")
+
+    assert "2条|新建1/复用1" in result
+    assert f"bucket_id={existing_id} reused=true" in result
+    assert f"bucket_id={created_id} reused=false" in result
+    assert "复用了已匹配到的相同内容桶，未新建" in result
+    assert "合并" not in result
+
+
+@pytest.mark.asyncio
 async def test_conflict_detection_uses_lexical_fallback_candidates(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     old_id = await server.bucket_mgr.create(

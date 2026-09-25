@@ -44,7 +44,7 @@
 - 对用户应表述为：“当前无法读取该 letter；它可能不存在，也可能处于 sealed 状态。”
 - boot 只自动递送最新的可见 pending 婷留言一次。两封留言之间没有 boot 时，旧的可见 pending note 会被较新的递送覆盖，但始终可用 `get_note` 查询；不能把“没有留言”编造成一封 note。若 boot 预算不足，提示 `get_note(note_id=...)` 不算递送，直到模型实际获得全文。
 - 闲聊、短期信息和已经准确记住的内容不必重复写入。
-- 确有值得保留的单条信息用 `hold`；较长日记/总结用 `grow`。
+- 确有值得保留的单条信息用 `hold`；较长日记/总结用 `grow`。普通写入仅可能复用已匹配到的规范化正文相同且可复用的桶，不做语义合并；返回的 `bucket_id` 是实际新建或复用的桶 ID。
 - `hold` 创建新桶前会做只读相似提醒：仅比较当前可检索、非 sealed、非 dormant 的记忆；semantic similarity 达到 0.80 时才提示。提示不阻止写入，不自动 merge、related 或 supersede。embedding 不可用时，返回会明确说明相似检查未执行。
 - 冲突检查只用于提示。候选召回可以宽松，但只有检测器确认 `same_fact=true` 且 `conflict=true`，并给出新旧 evidence 时才显示冲突提醒；共同年份、人名、主题或少量关键词不够。`OMBRE_CONFLICT_DETECTION_ENABLED` 独立控制是否尝试检测；缺少 `OMBRE_DIGEST_API_KEY` 时显示检测未执行，不影响 `hold` 写入。
 - `feel=True` 记录的是模型带走的感受、问题或观察，不是事件本身的情绪。只有真的有沉淀时才写；不要为了完成流程强行产出。

@@ -42,7 +42,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 |---|---|---|---|---|---|---|
 | `breath` | Memory retrieval | Surface or search memories, including semantic and exact tag/topic filtered retrieval | User/model | Yes | Large parameter surface blurs search, surfacing, mailbox, and emotion modes | Keep; later put specialist modes behind workflows |
 | `get_letter` | Memory read | Read one handoff letter by exact `letter_id`, with sealed visibility opt-in | User/model | Yes | Narrow lookup should not be used as mailbox enumeration | Keep; use when the letter ID is already known |
-| `hold` | Memory write | Store one memory with tagging, merge, emotion, and trigger metadata | User/model | Yes | Can be confused with `grow` for long input | Keep; sharpen routing guidance |
+| `hold` | Memory write | Store one memory with tagging, identical-content reuse, emotion, and trigger metadata | User/model | Yes | Can be confused with `grow` for long input | Keep; sharpen routing guidance |
 | `grow` | Memory write | Split and archive journal-style content into multiple memories | User/model | Yes | Overlaps `hold` at the content-length boundary | Keep; add a write workflow that chooses `hold` or `grow` |
 | `trace` | Memory mutation | Update, append, replace, relate, merge, seal, or delete buckets | User/model power operation | Yes | Highly overloaded and includes destructive actions | Keep; later introduce narrower action groups and confirmations |
 | `archive_session` | Session memory | Save a conversation summary, mood, highlights, and handoff letter | Model workflow | Yes | Usually belongs to an end-of-session sequence | Keep; add a prompt/workflow wrapper |

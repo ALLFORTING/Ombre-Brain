@@ -179,6 +179,8 @@ async def test_hold_reuse_reports_fields_and_preserves_trigger(tmp_path, monkeyp
     result = await server.hold("same body", tags="manual", importance=9,
                                trigger_date="2026-10-01")
     assert f"bucket_id={bucket_id} reused=true" in result
+    assert "复用了已匹配到的相同内容桶，未新建" in result
+    assert "合并" not in result
     assert "trigger_date" in result and "ignored_fields" in result
     bucket = await server.bucket_mgr.get(bucket_id)
     assert bucket["metadata"]["trigger_date"] == "2026-10-01"
