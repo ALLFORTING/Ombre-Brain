@@ -34,6 +34,7 @@ import hashlib
 import json
 import tempfile
 import inspect
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from uuid import UUID, uuid4
 from datetime import datetime
 from pathlib import Path
@@ -145,7 +146,7 @@ def _todo_provenance_record(
         if strict:
             raise ValueError("todo provenance entries must be objects.")
         return None
-    allowed = {"id", "text", "said_by", "said_at", "source_bucket"}
+    allowed = {"id", "text", "said_by", "said_at", "source_bucket", "done_at"}
     unexpected = set(raw) - allowed
     if unexpected:
         if strict:
@@ -188,7 +189,18 @@ def _todo_provenance_record(
                 raise ValueError("todo provenance source_bucket must be a string or null.")
             return None
         source_bucket = source_bucket.strip() or None
+    done_at = raw.get("done_at")
+    if done_at is not None:
+        try:
+            if not valid_todo_id(todo_id) or not isinstance(done_at, str) or not done_at.strip():
+                raise ValueError
+            datetime.fromisoformat(done_at)
+        except (TypeError, ValueError):
+            if strict:
+                raise ValueError("todo done_at requires an id and an ISO-8601 string or null.")
+            return None
     return {
+        **({"done_at": done_at} if "done_at" in raw else {}),
         **({"id": todo_id} if todo_id is not None else {}),
         "text": text.strip(),
         "said_by": said_by,
@@ -215,32 +227,34 @@ def _todo_provenance_is_known(record: dict[str, Any] | None) -> bool:
     )
 
 
+def _merge_todo_completion(target: dict, source: dict) -> dict:
+    first, incoming = target.get("done_at"), source.get("done_at")
+    if first and incoming and first != incoming:
+        raise ValueError("todo completion conflict: one id has different done_at values.")
+    done_at = first or incoming
+    return {"done_at": done_at} if done_at or "done_at" in target or "done_at" in source else {}
+
+
 def _merge_todo_attribution(target: dict, source: dict) -> dict:
-    """Resolve attribution only. Identity never participates in attribution."""
+    """Attribution choices must never erase or arbitrate completion."""
+    completion = _merge_todo_completion(target, source)
     identity = target.get("id") or source.get("id")
     target = {**target, **({"id": identity} if identity else {})}
     source = {**source, **({"id": identity} if identity else {})}
     fields = ("said_by", "said_at", "source_bucket")
     if all(target.get(key) == source.get(key) for key in fields):
-        return dict(target)
-    if _todo_provenance_is_known(target) and not _todo_provenance_is_known(source):
-        return dict(target)
-    if _todo_provenance_is_known(source) and not _todo_provenance_is_known(target):
-        return {**source, **({"id": target["id"]} if "id" in target else {})}
-    return {**target, "said_by": "unknown", "said_at": None, "source_bucket": None}
+        result = target
+    elif _todo_provenance_is_known(target) and not _todo_provenance_is_known(source):
+        result = target
+    elif _todo_provenance_is_known(source) and not _todo_provenance_is_known(target):
+        result = source
+    else:
+        result = {**target, "said_by": "unknown", "said_at": None, "source_bucket": None}
+    return {**result, **completion}
 
 
-def reconcile_todo_provenance(
-    todos: Any,
-    raw_provenance: Any,
-    *,
-    strict: bool = False,
-) -> list[dict[str, Any]]:
-    """Read sidecars without assigning IDs or writing legacy data.
-
-    Distinct identities can share text. Repeated IDs fold attribution, while
-    legacy records retain their first-valid-record-per-text compatibility.
-    """
+def reconcile_todo_provenance(todos: Any, raw_provenance: Any, *, strict: bool = False) -> list[dict[str, Any]]:
+    """Canonical identities plus completed history; never assign legacy IDs."""
     texts = canonicalize_todos(todos)
     if raw_provenance is None:
         return []
@@ -248,7 +262,7 @@ def reconcile_todo_provenance(
         if strict:
             raise ValueError("todo_provenance must be a list.")
         return []
-    records: dict[tuple[str, str], dict] = {}
+    records = {}
     for raw in raw_provenance:
         record = _todo_provenance_record(raw, strict=strict)
         if record is None:
@@ -259,7 +273,7 @@ def reconcile_todo_provenance(
             if strict:
                 raise ValueError("todo identity conflict: one id has different texts.")
             continue
-        if record["text"] not in texts:
+        if record["text"] not in texts and not record.get("done_at"):
             if strict:
                 raise ValueError("todo provenance text must appear in todos.")
             continue
@@ -267,75 +281,87 @@ def reconcile_todo_provenance(
             records[key] = record
         elif "id" in record:
             records[key] = _merge_todo_attribution(previous, record)
-    return [record for text in texts for record in records.values() if record["text"] == text]
+    return ([record for text in texts for record in records.values() if record["text"] == text]
+            + [record for record in records.values() if record["text"] not in texts])
 
 
-def prepare_todo_provenance(
-    todos: Any,
-    raw_provenance: Any = None,
-    *,
-    previous_todos: Any = None,
-    previous_provenance: Any = None,
-    references_only: bool = False,
-    assign_ids: bool = True,
-) -> list[dict[str, Any]]:
-    """Assign server identities only for an explicit todo write.
-
-    Internal import/merge records may carry persisted identities. MCP callers
-    use references_only and may reference only identities already in this bucket.
-    """
+def prepare_todo_provenance(todos: Any, raw_provenance: Any = None, *,
+                            previous_todos: Any = None, previous_provenance: Any = None,
+                            references_only: bool = False, assign_ids: bool = True) -> list[dict[str, Any]]:
+    """Prepare explicit writes, retaining sticky completion and completed history."""
     texts = canonicalize_todos(todos)
     incoming = reconcile_todo_provenance(texts, raw_provenance, strict=True)
     previous = reconcile_todo_provenance(previous_todos, previous_provenance, strict=True)
-    by_id = {record["id"]: record for record in previous if "id" in record}
+    by_id = {r["id"]: r for r in previous if "id" in r}
     output = []
     for text in texts:
-        candidates = [record for record in previous if record["text"] == text]
-        submitted = [record for record in incoming if record["text"] == text]
-        if not submitted:
+        candidates = [r for r in previous if r["text"] == text]
+        submitted = [r for r in incoming if r["text"] == text]
+        inherited = not submitted
+        if inherited:
             submitted = candidates or automatic_todo_provenance([text])
         for record in submitted:
             record = dict(record)
-            todo_id = record.get("id")
-            if todo_id is not None:
-                if references_only and todo_id not in by_id:
+            identity = record.get("id")
+            if identity is not None:
+                if references_only and identity not in by_id:
                     raise ValueError("todo id is not an existing identity in this bucket.")
-                if not references_only and todo_id in by_id and by_id[todo_id]["text"] != text:
+                if not references_only and identity in by_id and by_id[identity]["text"] != text:
                     raise ValueError("todo identity conflict: one id has different texts.")
             else:
-                matches = [item for item in candidates if "id" in item]
-                if len(matches) > 1:
-                    raise ValueError("ambiguous todo identity: specify an existing id.")
-                if matches:
-                    record["id"] = matches[0]["id"]
-                elif assign_ids:
-                    record["id"] = "todo_" + str(uuid4())
+                matches = [r for r in candidates if "id" in r]
+                # A persisted legacy member alongside completion must not vanish
+                # through text matching or implicit ID assignment.
+                legacy_mixed = any(r.get("done_at") for r in submitted) or (
+                    any(r.get("done_at") for r in candidates) and (inherited or record in candidates))
+                if not legacy_mixed:
+                    if len(matches) > 1:
+                        raise ValueError("ambiguous todo identity: specify an existing id.")
+                    if matches:
+                        record["id"] = matches[0]["id"]
+                    elif assign_ids:
+                        record["id"] = "todo_" + str(uuid4())
+            if record.get("id") in by_id:
+                record.update(_merge_todo_completion(by_id[record["id"]], record))
             output.append(record)
+    # Orphaned incoming completed records are valid history too.
+    for record in incoming:
+        if record["text"] not in texts and record.get("done_at"):
+            record = dict(record)
+            if record["id"] in by_id:
+                if by_id[record["id"]]["text"] != record["text"]:
+                    raise ValueError("todo identity conflict: one id has different texts.")
+                record.update(_merge_todo_completion(by_id[record["id"]], record))
+            output.append(record)
+    submitted_ids = {r.get("id") for r in output if "id" in r}
+    output.extend(r for r in previous if r.get("done_at") and r["id"] not in submitted_ids)
     return reconcile_todo_provenance(texts, output, strict=True)
 
 
-def merge_todo_provenance(
-    target_todos: Any,
-    target_provenance: Any,
-    source_todos: Any,
-    source_provenance: Any,
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """Union identities; attach id-less contributions only on a unique match."""
-    target = canonicalize_todos(target_todos)
-    source = canonicalize_todos(source_todos)
+def merge_todo_provenance(target_todos: Any, target_provenance: Any,
+                          source_todos: Any, source_provenance: Any, *,
+                          source_is_persisted: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
+    """Union identities; distinguish persisted legacy members from proposals."""
+    target, source = canonicalize_todos(target_todos), canonicalize_todos(source_todos)
     texts = list(dict.fromkeys(target + source))
     records = reconcile_todo_provenance(target, target_provenance, strict=True)
     incoming = reconcile_todo_provenance(source, source_provenance, strict=True)
+    if source_is_persisted:
+        records += automatic_todo_provenance([text for text in target
+                   if not any(r["text"] == text for r in records)])
+        incoming += automatic_todo_provenance([text for text in source
+                    if not any(r["text"] == text for r in incoming)])
     for record in incoming:
         record = dict(record)
         if "id" in record:
-            matches = [item for item in records if item.get("id") == record["id"]]
+            matches = [r for r in records if r.get("id") == record["id"]]
         else:
-            matches = [item for item in records if item["text"] == record["text"]]
+            matches = [r for r in records if r["text"] == record["text"]]
+            if source_is_persisted and any(r.get("done_at") for r in matches):
+                matches = [r for r in matches if "id" not in r]
             if len(matches) > 1:
                 if _todo_provenance_is_known(record):
                     raise ValueError("ambiguous todo identity: specify an existing id.")
-                # An unknown extraction adds no attribution or identity to choose.
                 continue
         if matches:
             previous = matches[0]
@@ -348,6 +374,42 @@ def merge_todo_provenance(
             records.append(record)
     return texts, reconcile_todo_provenance(texts, records, strict=True)
 
+
+def active_todo_projection(todos: Any, raw_provenance: Any) -> tuple[list[str], list[dict]]:
+    """Derive activity without modifying persistence or inventing IDs."""
+    texts = canonicalize_todos(todos)
+    records = reconcile_todo_provenance(texts, raw_provenance)
+    active_texts, active_records = [], []
+    for text in texts:
+        matches = [r for r in records if r["text"] == text]
+        # Malformed same-text sidecars remain a conservative legacy contribution.
+        invalid_legacy = isinstance(raw_provenance, list) and any(
+            isinstance(raw, dict) and raw.get("text") == text
+            and _todo_provenance_record(raw, strict=False) is None for raw in raw_provenance)
+        active = [r for r in matches if not r.get("done_at")]
+        if not matches or invalid_legacy:
+            active += automatic_todo_provenance([text])
+        if active:
+            active_texts.append(text)
+            active_records.extend(active)
+    return active_texts, active_records
+
+
+def todo_completion_plan(bucket_id: str, post: Any, todo_id: str) -> dict:
+    """Bind confirmation only to canonical todo state, never unrelated metadata."""
+    if not valid_todo_id(todo_id):
+        raise ValueError("todo_done requires a stable todo_<uuid> ID; legacy todo without an ID cannot be completed.")
+    todos = canonicalize_todos(post.get("todos"))
+    records = reconcile_todo_provenance(todos, post.get("todo_provenance"), strict=True)
+    target = next((r for r in records if r.get("id") == todo_id), None)
+    if target is None:
+        raise ValueError("unknown todo ID; legacy todo without a stable ID cannot be located or completed.")
+    state = {"todos": todos, "todo_provenance": [
+        {**r, "done_at": r.get("done_at")} for r in records]}
+    digest = hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"bucket_id": bucket_id, "todo_id": todo_id, "target": target,
+            "todo_state_sha256": digest}
 
 class BucketIdempotencyError(RuntimeError):
     """Content-free failure for the O5B memory idempotency seam."""
@@ -434,6 +496,7 @@ class BucketManager:
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
         self._init_history_db()
+        initialize_bucket_write_lock(self.base_dir)
 
     async def _delete_ordinary_embedding(self, bucket_id: str) -> None:
         """Delete the local ordinary vector, regardless of provider enablement."""
@@ -890,13 +953,14 @@ class BucketManager:
     ) -> dict[str, Any]:
         """Durably plan an O5B operation before any memory file mutation."""
 
-        return self._ensure_import_operation(
-            operation_key,
-            operation_kind=operation_kind,
-            target_bucket_id=target_bucket_id,
-            payload=payload,
-            memory_mutation_id=memory_mutation_id,
-        )
+        with bucket_write_scope(self.base_dir):
+            return self._ensure_import_operation(
+                operation_key,
+                operation_kind=operation_kind,
+                target_bucket_id=target_bucket_id,
+                payload=payload,
+                memory_mutation_id=memory_mutation_id,
+            )
 
     @guarded_async_mutation("bucket_import_idempotency_apply")
     async def apply_import_operation(
@@ -1680,28 +1744,29 @@ class BucketManager:
             )
         else:
             bucket_id = generate_bucket_id()
-        if operation is not None:
-            existing_path = self._find_bucket_file(bucket_id)
-            if existing_path:
-                try:
-                    existing_post = frontmatter.load(existing_path)
-                except Exception as exc:
-                    raise BucketIdempotencyError("operation_marker_invalid") from exc
-                marker = self._operation_marker(existing_post, _o5b_operation_key)
-                if (
-                    marker is None
-                    or marker.get("payload_digest") != operation["payload_digest"]
-                    or (
-                        operation.get("memory_mutation_id") is not None
-                        and marker.get("memory_mutation_id")
-                        != operation["memory_mutation_id"]
-                    )
-                ):
-                    raise BucketIdempotencyError("idempotency_conflict")
-                self._mark_import_operation_applied(_o5b_operation_key)
-                return bucket_id
-            if operation["status"] == "applied":
-                raise BucketIdempotencyError("target_bucket_missing")
+        with bucket_write_scope(self.base_dir):
+            if operation is not None:
+                existing_path = self._find_bucket_file(bucket_id)
+                if existing_path:
+                    try:
+                        existing_post = frontmatter.load(existing_path)
+                    except Exception as exc:
+                        raise BucketIdempotencyError("operation_marker_invalid") from exc
+                    marker = self._operation_marker(existing_post, _o5b_operation_key)
+                    if (
+                        marker is None
+                        or marker.get("payload_digest") != operation["payload_digest"]
+                        or (
+                            operation.get("memory_mutation_id") is not None
+                            and marker.get("memory_mutation_id")
+                            != operation["memory_mutation_id"]
+                        )
+                    ):
+                        raise BucketIdempotencyError("idempotency_conflict")
+                    self._mark_import_operation_applied(_o5b_operation_key)
+                    return bucket_id
+                if operation["status"] == "applied":
+                    raise BucketIdempotencyError("target_bucket_missing")
 
         content = apply_display_aliases(content)
         name = apply_display_aliases(name) if name else name
@@ -1814,16 +1879,29 @@ class BucketManager:
                 )
                 raise RuntimeError("sealed_embedding_cleanup_failed") from exc
 
-        try:
-            if operation is not None:
-                self._write_post_atomic(file_path, post)
+        with bucket_write_scope(self.base_dir):
+            existing_path = self._find_bucket_file(bucket_id)
+            if existing_path:
+                if operation is None:
+                    raise BucketIdempotencyError("idempotency_conflict")
+                marker = self._operation_marker(frontmatter.load(existing_path), _o5b_operation_key)
+                if not marker or marker.get("payload_digest") != operation["payload_digest"]:
+                    raise BucketIdempotencyError("idempotency_conflict")
+                if (operation.get("memory_mutation_id") is not None
+                        and marker.get("memory_mutation_id") != operation["memory_mutation_id"]):
+                    raise BucketIdempotencyError("memory_mutation_conflict")
                 self._mark_import_operation_applied(_o5b_operation_key)
-            else:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
-            raise
+                return bucket_id
+            try:
+                if operation is not None:
+                    self._write_post_atomic(file_path, post)
+                    self._mark_import_operation_applied(_o5b_operation_key)
+                else:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(frontmatter.dumps(post))
+            except OSError as e:
+                logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
+                raise
 
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
@@ -1851,6 +1929,39 @@ class BucketManager:
             return None
         return self._load_bucket(file_path)
 
+    def preview_todo_completion(self, bucket_id: str, todo_id: str) -> dict:
+        with bucket_write_scope(self.base_dir):
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                raise ValueError("bucket not found")
+            post = frontmatter.load(path)
+            return {**todo_completion_plan(bucket_id, post, todo_id),
+                    "bucket_name": post.get("name", bucket_id)}
+
+    @guarded_mutation("bucket_todo_complete")
+    def complete_todo(self, bucket_id: str, todo_id: str, authorize) -> dict:
+        with bucket_write_scope(self.base_dir):
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                raise ValueError("bucket not found")
+            post = frontmatter.load(path)
+            plan = todo_completion_plan(bucket_id, post, todo_id)
+            if plan["target"].get("done_at"):
+                return {"status": "already_completed", "done_at": plan["target"]["done_at"]}
+            if not authorize(plan):
+                return {"status": "confirmation_invalid"}
+            records = reconcile_todo_provenance(post.get("todos"), post.get("todo_provenance"), strict=True)
+            done_at = now_iso()
+            for record in records:
+                if record.get("id") == todo_id:
+                    record["done_at"] = done_at
+            post["todo_provenance"] = records
+            try:
+                self._write_post_atomic(path, post)
+            except OSError:
+                return {"status": "write_failed"}
+            return {"status": "completed", "done_at": done_at}
+
     # ---------------------------------------------------------
     # Move bucket between directories
     # 在目录间移动桶文件
@@ -1861,15 +1972,16 @@ class BucketManager:
         Move a bucket file to a new type directory, preserving domain subfolder.
         Returns new file path.
         """
-        primary_domain = sanitize_name(domain[0]) if domain else "未分类"
-        target_dir = os.path.join(target_type_dir, primary_domain)
-        os.makedirs(target_dir, exist_ok=True)
-        filename = os.path.basename(file_path)
-        new_path = safe_path(target_dir, filename)
-        if os.path.normpath(file_path) != os.path.normpath(new_path):
-            os.rename(file_path, new_path)
-            logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
-        return new_path
+        with bucket_write_scope(self.base_dir):
+            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+            target_dir = os.path.join(target_type_dir, primary_domain)
+            os.makedirs(target_dir, exist_ok=True)
+            filename = os.path.basename(file_path)
+            new_path = safe_path(target_dir, filename)
+            if os.path.normpath(file_path) != os.path.normpath(new_path):
+                os.rename(file_path, new_path)
+                logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
+            return new_path
 
     # ---------------------------------------------------------
     # Update bucket
@@ -1882,274 +1994,297 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
-        history_change_type = kwargs.pop("_history_change_type", "replace")
-        o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
-        o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
-        o5c_memory_mutation_id = kwargs.pop("_o5c_memory_mutation_id", None)
-        operation = None
-        if o5b_operation_key is not None:
-            operation = self._ensure_import_operation(
-                o5b_operation_key,
-                operation_kind="update",
-                target_bucket_id=bucket_id,
-                payload={"kwargs": dict(kwargs)},
-                payload_digest=o5b_payload_digest,
-                memory_mutation_id=o5c_memory_mutation_id,
-            )
-            if operation["operation_kind"] != "update":
-                raise BucketIdempotencyError("operation_kind_conflict")
-            bucket_id = operation["target_bucket_id"]
-            stored_kwargs = operation["payload"].get("kwargs")
-            if not isinstance(stored_kwargs, dict):
-                raise BucketIdempotencyError("operation_payload_invalid")
-            kwargs = stored_kwargs
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
-
-        try:
-            post = frontmatter.load(file_path)
-        except Exception as e:
-            logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
-            return False
-
-        if operation is not None:
-            marker = self._operation_marker(post, o5b_operation_key)
-            if marker is not None:
-                if marker.get("payload_digest") != operation["payload_digest"]:
-                    raise BucketIdempotencyError("operation_payload_conflict")
-                if (
-                    operation.get("memory_mutation_id") is not None
-                    and marker.get("memory_mutation_id")
-                    != operation["memory_mutation_id"]
-                ):
-                    raise BucketIdempotencyError("memory_mutation_conflict")
-                self._mark_import_operation_applied(o5b_operation_key)
-                return True
-            if operation["status"] == "applied":
-                raise BucketIdempotencyError("operation_marker_missing")
-
-        requested_permanent = kwargs.pop("permanent", None)
-        if requested_permanent is not None:
-            if requested_permanent not in (0, 1):
-                return False
-            if post.get("type") not in ("dynamic", "permanent"):
-                return False
-            next_pinned = bool(kwargs.get("pinned", post.get("pinned", False)))
-            if requested_permanent == 0 and (next_pinned or post.get("protected")):
-                return False
-        original_file_bytes = None
-        if requested_permanent is not None or kwargs.get("pinned"):
-            with open(file_path, "rb") as original_file:
-                original_file_bytes = original_file.read()
-
-        previous_content = str(post.content or "")
-        previous_todos = canonicalize_todos(post.get("todos"))
-        previous_todo_provenance = reconcile_todo_provenance(
-            previous_todos,
-            post.get("todo_provenance"),
-        )
-        prepared_todos = None
-        prepared_provenance = None
-        if "todos" in kwargs or "todo_provenance" in kwargs:
-            prepared_todos = (
-                apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
-                if "todos" in kwargs else previous_todos
-            )
-            try:
-                incoming_provenance = kwargs.get("todo_provenance")
-                if operation is not None and o5b_operation_key.startswith("o5b:"):
-                    incoming_provenance = reconcile_todo_provenance(
-                        prepared_todos, incoming_provenance, strict=True,
-                    )
-                    current_ids = {r["id"] for r in previous_todo_provenance if "id" in r}
-                    for record in incoming_provenance:
-                        matches = [r for r in previous_todo_provenance
-                                   if r["text"] == record["text"] and "id" in r]
-                        if record.get("id") not in current_ids and len(matches) == 1:
-                            record["id"] = matches[0]["id"]
-                prepared_provenance = prepare_todo_provenance(
-                    prepared_todos,
-                    incoming_provenance,
-                    previous_todos=previous_todos,
-                    previous_provenance=post.get("todo_provenance"),
-                    references_only=kwargs.pop("_todo_references_only", False),
+        with bucket_write_scope(self.base_dir):
+            history_change_type = kwargs.pop("_history_change_type", "replace")
+            o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
+            o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
+            o5c_memory_mutation_id = kwargs.pop("_o5c_memory_mutation_id", None)
+            operation = None
+            if o5b_operation_key is not None:
+                operation = self._ensure_import_operation(
+                    o5b_operation_key,
+                    operation_kind="update",
+                    target_bucket_id=bucket_id,
+                    payload={"kwargs": dict(kwargs)},
+                    payload_digest=o5b_payload_digest,
+                    memory_mutation_id=o5c_memory_mutation_id,
                 )
-                if operation is not None and o5b_operation_key.startswith("o5b:"):
-                    # Attribution edits made after an extraction plan must survive.
-                    # A confirmed bucket merge instead writes its planned conflict result.
-                    current_by_id = {r["id"]: r for r in previous_todo_provenance if "id" in r}
-                    prepared_provenance = [
-                        {**r, **{k: current_by_id[r["id"]][k]
-                                 for k in ("said_by", "said_at", "source_bucket")}}
-                        if r["id"] in current_by_id and _todo_provenance_is_known(current_by_id[r["id"]])
-                        else r for r in prepared_provenance
-                    ]
-            except ValueError as exc:
-                logger.warning("Refusing invalid todo update for %s: %s", bucket_id, exc)
+                if operation["operation_kind"] != "update":
+                    raise BucketIdempotencyError("operation_kind_conflict")
+                bucket_id = operation["target_bucket_id"]
+                stored_kwargs = operation["payload"].get("kwargs")
+                if not isinstance(stored_kwargs, dict):
+                    raise BucketIdempotencyError("operation_payload_invalid")
+                kwargs = stored_kwargs
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
                 return False
-        previous_superseded_by = post.get("superseded_by")
-        explicit_provenance_kind = (
-            normalize_provenance_kind(kwargs["provenance_kind"], strict=True)
-            if "provenance_kind" in kwargs
-            else None
-        )
 
-        if operation is not None:
-            self._append_operation_marker(
-                post,
-                operation_key=o5b_operation_key,
-                payload_digest=operation["payload_digest"],
-                operation_kind="update",
-                memory_mutation_id=operation.get("memory_mutation_id"),
-            )
+            try:
+                post = frontmatter.load(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
+                return False
 
+            if operation is not None:
+                marker = self._operation_marker(post, o5b_operation_key)
+                if marker is not None:
+                    if marker.get("payload_digest") != operation["payload_digest"]:
+                        raise BucketIdempotencyError("operation_payload_conflict")
+                    if (
+                        operation.get("memory_mutation_id") is not None
+                        and marker.get("memory_mutation_id")
+                        != operation["memory_mutation_id"]
+                    ):
+                        raise BucketIdempotencyError("memory_mutation_conflict")
+                    self._mark_import_operation_applied(o5b_operation_key)
+                    return True
+                if operation["status"] == "applied":
+                    raise BucketIdempotencyError("operation_marker_missing")
 
-        previous_sealed = _is_sealed_bucket(post)
-        next_sealed = (
-            int(kwargs["sealed"]) == 1
-            if "sealed" in kwargs
-            else previous_sealed
-        )
-        content_changed = "content" in kwargs
-        cleanup_before_write = next_sealed and (not previous_sealed or content_changed)
-        if cleanup_before_write:
+        embedding_cleanup_done = False
+        preliminary_sealed = int(kwargs.get("sealed", post.get("sealed", 0)) or 0) == 1
+        if preliminary_sealed and (not _is_sealed_bucket(post) or "content" in kwargs):
             try:
                 await self._delete_ordinary_embedding(bucket_id)
+                embedding_cleanup_done = True
             except Exception as exc:
-                logger.error(
-                    "Refusing sealed bucket update because ordinary-vector cleanup "
-                    "failed for %s: %s",
-                    bucket_id,
-                    exc,
-                )
+                logger.error("Refusing sealed update: cleanup failed for %s: %s", bucket_id, exc)
                 return False
 
-        # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
-        # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
-        is_pinned = post.get("pinned", False) or post.get("protected", False)
-        if is_pinned:
-            kwargs.pop("importance", None)  # silently ignore importance update
-
-        # --- Update only fields that were passed in / 只改传入的字段 ---
-        if "content" in kwargs:
-            try:
-                self.record_history(bucket_id, post.content, history_change_type)
-            except Exception as e:
-                logger.error(
-                    f"Refusing content update because history capture failed "
-                    f"for {bucket_id}: {e}"
-                )
+        with bucket_write_scope(self.base_dir):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
                 return False
-            kwargs["content"] = apply_display_aliases(kwargs["content"])
-            post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
-        # A body rewrite invalidates any previous provenance claim unless the
-        # caller deliberately provides a replacement classification.
-        if explicit_provenance_kind is not None:
-            post["provenance_kind"] = explicit_provenance_kind
-        elif content_changed:
-            post["provenance_kind"] = "unknown"
-        if "tags" in kwargs:
-            kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
-            post["tags"] = kwargs["tags"]
-        if prepared_todos is not None:
-            post["todos"] = prepared_todos
-            if prepared_provenance:
-                post["todo_provenance"] = prepared_provenance
-            else:
-                post.metadata.pop("todo_provenance", None)
-        if "importance" in kwargs:
-            post["importance"] = max(1, min(10, int(kwargs["importance"])))
-        if "domain" in kwargs:
-            kwargs["domain"] = apply_display_aliases_to_value(kwargs["domain"])
-            post["domain"] = kwargs["domain"]
-        if "valence" in kwargs:
-            post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
-        if "arousal" in kwargs:
-            post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
-        if "name" in kwargs:
-            kwargs["name"] = apply_display_aliases(kwargs["name"])
-            post["name"] = sanitize_name(kwargs["name"])
-        if "resolved" in kwargs:
-            post["resolved"] = bool(kwargs["resolved"])
-        if "pinned" in kwargs:
-            post["pinned"] = bool(kwargs["pinned"])
-            if kwargs["pinned"]:
-                post["importance"] = 10  # pinned → lock importance to 10
-                post["type"] = "permanent"
-        if requested_permanent is not None:
-            post["type"] = "permanent" if requested_permanent else "dynamic"
-        if "digested" in kwargs:
-            post["digested"] = bool(kwargs["digested"])
-        if "model_valence" in kwargs:
-            post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
-        if "emotion_history" in kwargs:
-            post["emotion_history"] = kwargs["emotion_history"]
-        if "related_buckets" in kwargs:
-            post["related_buckets"] = kwargs["related_buckets"]
-        if "source_bucket" in kwargs:
-            post["source_bucket"] = kwargs["source_bucket"]
-        if "trigger_date" in kwargs:
-            post["trigger_date"] = kwargs["trigger_date"]
-        if "trigger_last_seen" in kwargs:
-            post["trigger_last_seen"] = kwargs["trigger_last_seen"]
-        if "superseded_by" in kwargs:
-            if kwargs["superseded_by"] is None:
-                post.metadata.pop("superseded_by", None)
-            else:
-                post["superseded_by"] = str(kwargs["superseded_by"])
-        if "superseded_at" in kwargs:
-            if kwargs["superseded_at"] is None:
-                post.metadata.pop("superseded_at", None)
-            else:
-                post["superseded_at"] = str(kwargs["superseded_at"])
-        if "supersedes" in kwargs:
-            if kwargs["supersedes"] is None:
-                post.metadata.pop("supersedes", None)
-            else:
-                post["supersedes"] = list(
-                    dict.fromkeys(
-                        str(value).strip()
-                        for value in kwargs["supersedes"]
-                        if str(value).strip()
-                    )
-                )
-        if "dormant" in kwargs:
-            post["dormant"] = bool(kwargs["dormant"])
-        if "sealed" in kwargs:
-            post["sealed"] = 1 if int(kwargs["sealed"]) == 1 else 0
-
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
-        post["last_active"] = now_iso()
-        post["updated_at"] = _date_only()
-
-        try:
-            if operation is not None or content_changed or requested_permanent is not None or kwargs.get("pinned"):
-                self._write_post_atomic(file_path, post)
-                if operation is not None:
+            post = frontmatter.load(file_path)
+            if operation is not None:
+                marker = self._operation_marker(post, o5b_operation_key)
+                if marker is not None:
+                    if marker.get("payload_digest") != operation["payload_digest"]:
+                        raise BucketIdempotencyError("operation_payload_conflict")
+                    if (
+                        operation.get("memory_mutation_id") is not None
+                        and marker.get("memory_mutation_id")
+                        != operation["memory_mutation_id"]
+                    ):
+                        raise BucketIdempotencyError("memory_mutation_conflict")
                     self._mark_import_operation_applied(o5b_operation_key)
-            else:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
-            return False
+                    return True
+                if operation["status"] == "applied":
+                    raise BucketIdempotencyError("operation_marker_missing")
 
-        # --- Keep lifecycle metadata and directory together. ---
-        # NOTE: resolved buckets are NOT auto-archived here.
-        # They stay in dynamic/ and decay naturally until score < threshold.
-        # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
-        domain = post.get("domain", ["未分类"])
-        type_dir = (self.permanent_dir if post.get("type") == "permanent" else
-                    self.dynamic_dir if post.get("type") == "dynamic" else None)
-        if type_dir and original_file_bytes is not None:
-            try:
-                self._move_bucket(file_path, type_dir, domain)
-            except OSError as exc:
-                with open(file_path, "wb") as restore_file:
-                    restore_file.write(original_file_bytes)
-                logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
+            requested_permanent = kwargs.pop("permanent", None)
+            if requested_permanent is not None:
+                if requested_permanent not in (0, 1):
+                    return False
+                if post.get("type") not in ("dynamic", "permanent"):
+                    return False
+                next_pinned = bool(kwargs.get("pinned", post.get("pinned", False)))
+                if requested_permanent == 0 and (next_pinned or post.get("protected")):
+                    return False
+            original_file_bytes = None
+            if requested_permanent is not None or kwargs.get("pinned"):
+                with open(file_path, "rb") as original_file:
+                    original_file_bytes = original_file.read()
+
+            previous_content = str(post.content or "")
+            previous_todos = canonicalize_todos(post.get("todos"))
+            previous_todo_provenance = reconcile_todo_provenance(
+                previous_todos,
+                post.get("todo_provenance"),
+            )
+            prepared_todos = None
+            prepared_provenance = None
+            if "todos" in kwargs or "todo_provenance" in kwargs:
+                prepared_todos = (
+                    apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
+                    if "todos" in kwargs else previous_todos
+                )
+                try:
+                    incoming_provenance = kwargs.get("todo_provenance")
+                    if operation is not None and o5b_operation_key.startswith("o5b:"):
+                        incoming_provenance = reconcile_todo_provenance(
+                            prepared_todos, incoming_provenance, strict=True,
+                        )
+                        current_ids = {r["id"] for r in previous_todo_provenance if "id" in r}
+                        for record in incoming_provenance:
+                            matches = [r for r in previous_todo_provenance
+                                       if r["text"] == record["text"] and "id" in r]
+                            if record.get("id") not in current_ids and len(matches) == 1:
+                                record["id"] = matches[0]["id"]
+                    prepared_provenance = prepare_todo_provenance(
+                        prepared_todos,
+                        incoming_provenance,
+                        previous_todos=previous_todos,
+                        previous_provenance=post.get("todo_provenance"),
+                        references_only=kwargs.pop("_todo_references_only", False),
+                    )
+                    if operation is not None and o5b_operation_key.startswith("o5b:"):
+                        # Attribution edits made after an extraction plan must survive.
+                        # A confirmed bucket merge instead writes its planned conflict result.
+                        current_by_id = {r["id"]: r for r in previous_todo_provenance if "id" in r}
+                        prepared_provenance = [
+                            {**r, **{k: current_by_id[r["id"]][k]
+                                     for k in ("said_by", "said_at", "source_bucket")}}
+                            if r["id"] in current_by_id and _todo_provenance_is_known(current_by_id[r["id"]])
+                            else r for r in prepared_provenance
+                        ]
+                except ValueError as exc:
+                    logger.warning("Refusing invalid todo update for %s: %s", bucket_id, exc)
+                    return False
+            previous_superseded_by = post.get("superseded_by")
+            explicit_provenance_kind = (
+                normalize_provenance_kind(kwargs["provenance_kind"], strict=True)
+                if "provenance_kind" in kwargs
+                else None
+            )
+
+            if operation is not None:
+                self._append_operation_marker(
+                    post,
+                    operation_key=o5b_operation_key,
+                    payload_digest=operation["payload_digest"],
+                    operation_kind="update",
+                    memory_mutation_id=operation.get("memory_mutation_id"),
+                )
+
+
+            previous_sealed = _is_sealed_bucket(post)
+            next_sealed = (
+                int(kwargs["sealed"]) == 1
+                if "sealed" in kwargs
+                else previous_sealed
+            )
+            content_changed = "content" in kwargs
+            cleanup_before_write = next_sealed and (not previous_sealed or content_changed)
+            if cleanup_before_write and not embedding_cleanup_done:
                 return False
+
+            # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
+            # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
+            is_pinned = post.get("pinned", False) or post.get("protected", False)
+            if is_pinned:
+                kwargs.pop("importance", None)  # silently ignore importance update
+
+            # --- Update only fields that were passed in / 只改传入的字段 ---
+            if "content" in kwargs:
+                try:
+                    self.record_history(bucket_id, post.content, history_change_type)
+                except Exception as e:
+                    logger.error(
+                        f"Refusing content update because history capture failed "
+                        f"for {bucket_id}: {e}"
+                    )
+                    return False
+                kwargs["content"] = apply_display_aliases(kwargs["content"])
+                post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
+            # A body rewrite invalidates any previous provenance claim unless the
+            # caller deliberately provides a replacement classification.
+            if explicit_provenance_kind is not None:
+                post["provenance_kind"] = explicit_provenance_kind
+            elif content_changed:
+                post["provenance_kind"] = "unknown"
+            if "tags" in kwargs:
+                kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
+                post["tags"] = kwargs["tags"]
+            if prepared_todos is not None:
+                post["todos"] = prepared_todos
+                if prepared_provenance:
+                    post["todo_provenance"] = prepared_provenance
+                else:
+                    post.metadata.pop("todo_provenance", None)
+            if "importance" in kwargs:
+                post["importance"] = max(1, min(10, int(kwargs["importance"])))
+            if "domain" in kwargs:
+                kwargs["domain"] = apply_display_aliases_to_value(kwargs["domain"])
+                post["domain"] = kwargs["domain"]
+            if "valence" in kwargs:
+                post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
+            if "arousal" in kwargs:
+                post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
+            if "name" in kwargs:
+                kwargs["name"] = apply_display_aliases(kwargs["name"])
+                post["name"] = sanitize_name(kwargs["name"])
+            if "resolved" in kwargs:
+                post["resolved"] = bool(kwargs["resolved"])
+            if "pinned" in kwargs:
+                post["pinned"] = bool(kwargs["pinned"])
+                if kwargs["pinned"]:
+                    post["importance"] = 10  # pinned → lock importance to 10
+                    post["type"] = "permanent"
+            if requested_permanent is not None:
+                post["type"] = "permanent" if requested_permanent else "dynamic"
+            if "digested" in kwargs:
+                post["digested"] = bool(kwargs["digested"])
+            if "model_valence" in kwargs:
+                post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+            if "emotion_history" in kwargs:
+                post["emotion_history"] = kwargs["emotion_history"]
+            if "related_buckets" in kwargs:
+                post["related_buckets"] = kwargs["related_buckets"]
+            if "source_bucket" in kwargs:
+                post["source_bucket"] = kwargs["source_bucket"]
+            if "trigger_date" in kwargs:
+                post["trigger_date"] = kwargs["trigger_date"]
+            if "trigger_last_seen" in kwargs:
+                post["trigger_last_seen"] = kwargs["trigger_last_seen"]
+            if "superseded_by" in kwargs:
+                if kwargs["superseded_by"] is None:
+                    post.metadata.pop("superseded_by", None)
+                else:
+                    post["superseded_by"] = str(kwargs["superseded_by"])
+            if "superseded_at" in kwargs:
+                if kwargs["superseded_at"] is None:
+                    post.metadata.pop("superseded_at", None)
+                else:
+                    post["superseded_at"] = str(kwargs["superseded_at"])
+            if "supersedes" in kwargs:
+                if kwargs["supersedes"] is None:
+                    post.metadata.pop("supersedes", None)
+                else:
+                    post["supersedes"] = list(
+                        dict.fromkeys(
+                            str(value).strip()
+                            for value in kwargs["supersedes"]
+                            if str(value).strip()
+                        )
+                    )
+            if "dormant" in kwargs:
+                post["dormant"] = bool(kwargs["dormant"])
+            if "sealed" in kwargs:
+                post["sealed"] = 1 if int(kwargs["sealed"]) == 1 else 0
+
+            # --- Auto-refresh activation time / 自动刷新激活时间 ---
+            post["last_active"] = now_iso()
+            post["updated_at"] = _date_only()
+
+            try:
+                if operation is not None or content_changed or prepared_todos is not None or requested_permanent is not None or kwargs.get("pinned"):
+                    self._write_post_atomic(file_path, post)
+                    if operation is not None:
+                        self._mark_import_operation_applied(o5b_operation_key)
+                else:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(frontmatter.dumps(post))
+            except OSError as e:
+                logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
+                return False
+
+            # --- Keep lifecycle metadata and directory together. ---
+            # NOTE: resolved buckets are NOT auto-archived here.
+            # They stay in dynamic/ and decay naturally until score < threshold.
+            # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
+            domain = post.get("domain", ["未分类"])
+            type_dir = (self.permanent_dir if post.get("type") == "permanent" else
+                        self.dynamic_dir if post.get("type") == "dynamic" else None)
+            if type_dir and original_file_bytes is not None:
+                try:
+                    self._move_bucket(file_path, type_dir, domain)
+                except OSError as exc:
+                    with open(file_path, "wb") as restore_file:
+                        restore_file.write(original_file_bytes)
+                    logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
+                    return False
 
         if (
             not next_sealed
@@ -2197,41 +2332,42 @@ class BucketManager:
         source_sha256: str,
     ) -> tuple[str, str]:
         """Store a TG summary only when the source body still has the expected hash."""
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return "missing", ""
-        try:
-            post = frontmatter.load(file_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to load bucket for TG summary refresh %s: %s",
-                bucket_id,
-                exc,
-            )
-            return "invalid", ""
-        if _is_sealed_bucket(post):
-            return "sealed", ""
+        with bucket_write_scope(self.base_dir):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return "missing", ""
+            try:
+                post = frontmatter.load(file_path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load bucket for TG summary refresh %s: %s",
+                    bucket_id,
+                    exc,
+                )
+                return "invalid", ""
+            if _is_sealed_bucket(post):
+                return "sealed", ""
 
-        current_source_sha256 = hashlib.sha256(
-            str(post.content or "").encode("utf-8")
-        ).hexdigest()
-        if current_source_sha256 != source_sha256:
-            return "source_hash_mismatch", current_source_sha256
+            current_source_sha256 = hashlib.sha256(
+                str(post.content or "").encode("utf-8")
+            ).hexdigest()
+            if current_source_sha256 != source_sha256:
+                return "source_hash_mismatch", current_source_sha256
 
-        post["tg_summary"] = summary
-        post["tg_summary_source_hash"] = current_source_sha256
-        post["tg_summary_updated_at"] = now_iso()
-        post["last_active"] = now_iso()
-        post["updated_at"] = _date_only()
-        try:
-            self._write_post_atomic(file_path, post)
-        except OSError as exc:
-            logger.error(
-                "Failed to write TG summary refresh for %s: %s", bucket_id, exc
-            )
-            return "write_failed", current_source_sha256
-        logger.info("Refreshed TG summary for bucket %s", bucket_id)
-        return "updated", current_source_sha256
+            post["tg_summary"] = summary
+            post["tg_summary_source_hash"] = current_source_sha256
+            post["tg_summary_updated_at"] = now_iso()
+            post["last_active"] = now_iso()
+            post["updated_at"] = _date_only()
+            try:
+                self._write_post_atomic(file_path, post)
+            except OSError as exc:
+                logger.error(
+                    "Failed to write TG summary refresh for %s: %s", bucket_id, exc
+                )
+                return "write_failed", current_source_sha256
+            logger.info("Refreshed TG summary for bucket %s", bucket_id)
+            return "updated", current_source_sha256
 
     # ---------------------------------------------------------
     # Wikilink injection — DISABLED
@@ -2254,6 +2390,7 @@ class BucketManager:
         bucket_id: str,
         *,
         _allow_sealed: bool = False,
+        _expected_todo_state: tuple[Any, Any] | None = None,
     ) -> bool:
         """
         Delete a memory bucket file.
@@ -2271,22 +2408,29 @@ class BucketManager:
                 )
             return False
 
-        try:
-            post = frontmatter.load(file_path)
-            if (
-                (not _allow_sealed and _is_sealed_bucket(post))
-                or post.get("pinned")
-                or post.get("protected")
-            ):
-                logger.warning(
-                    "Refusing destructive delete of protected bucket %s",
-                    bucket_id,
-                )
+        with bucket_write_scope(self.base_dir):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
                 return False
-            self.record_history(bucket_id, post.content, "delete")
-        except Exception as exc:
-            logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")
-            return False
+            try:
+                post = frontmatter.load(file_path)
+                if (_expected_todo_state is not None and
+                        (post.get("todos"), post.get("todo_provenance")) != _expected_todo_state):
+                    return False
+                if (
+                    (not _allow_sealed and _is_sealed_bucket(post))
+                    or post.get("pinned")
+                    or post.get("protected")
+                ):
+                    logger.warning(
+                        "Refusing destructive delete of protected bucket %s",
+                        bucket_id,
+                    )
+                    return False
+                self.record_history(bucket_id, post.content, "delete")
+            except Exception as exc:
+                logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")
+                return False
 
         try:
             await self._delete_ordinary_embedding(bucket_id)
@@ -2298,15 +2442,20 @@ class BucketManager:
             )
             return False
 
-        try:
-            os.remove(file_path)
-        except OSError as exc:
-            logger.error(
-                "Bucket file removal failed after vector cleanup / 删除桶文件失败: %s: %s",
-                file_path,
-                exc,
-            )
-            return False
+        with bucket_write_scope(self.base_dir):
+            current_path = self._find_bucket_file(bucket_id)
+            if not current_path or frontmatter.dumps(frontmatter.load(current_path)) != frontmatter.dumps(post):
+                return False
+            file_path = current_path
+            try:
+                os.remove(file_path)
+            except OSError as exc:
+                logger.error(
+                    "Bucket file removal failed after vector cleanup / 删除桶文件失败: %s: %s",
+                    file_path,
+                    exc,
+                )
+                return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True
@@ -2330,19 +2479,20 @@ class BucketManager:
         更新桶的最后激活时间和激活次数；仅在显式请求时解除休眠。
         同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
         """
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return
-
         try:
-            post = frontmatter.load(file_path)
-            post["last_active"] = now_iso()
-            post["activation_count"] = post.get("activation_count", 0) + 1
-            if wake_dormant:
-                post["dormant"] = False
+            with bucket_write_scope(self.base_dir):
+                file_path = self._find_bucket_file(bucket_id)
+                if not file_path:
+                    return
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+                post = frontmatter.load(file_path)
+                post["last_active"] = now_iso()
+                post["activation_count"] = post.get("activation_count", 0) + 1
+                if wake_dormant:
+                    post["dormant"] = False
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -2359,18 +2509,19 @@ class BucketManager:
     @guarded_async_mutation("bucket_dormant")
     async def set_dormant(self, bucket_id: str, dormant: bool = True) -> bool:
         """Set dormant without refreshing last_active or updated_at."""
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
-        try:
-            post = frontmatter.load(file_path)
-            post["dormant"] = bool(dormant)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
-            return False
+        with bucket_write_scope(self.base_dir):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+            try:
+                post = frontmatter.load(file_path)
+                post["dormant"] = bool(dormant)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
+                return False
 
     @guarded_optional_async_mutation("bucket_time_ripple")
     async def _time_ripple(
@@ -2410,20 +2561,21 @@ class BucketManager:
 
             if delta_hours <= hours:
                 # Boost activation_count by 0.3 (fractional), don't change last_active
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
-                try:
-                    post = frontmatter.load(file_path)
-                    current_count = post.get("activation_count", 1)
-                    # Store as float for fractional increments; calculate_score handles it
-                    post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
-                    rippled += 1
-                except Exception:
-                    logger.warning("Failed to persist time ripple for %s", bucket["id"])
-                    raise
+                with bucket_write_scope(self.base_dir):
+                    file_path = self._find_bucket_file(bucket["id"])
+                    if not file_path:
+                        continue
+                    try:
+                        post = frontmatter.load(file_path)
+                        current_count = post.get("activation_count", 1)
+                        # Store as float for fractional increments; calculate_score handles it
+                        post["activation_count"] = round(current_count + 0.3, 1)
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(frontmatter.dumps(post))
+                        rippled += 1
+                    except Exception:
+                        logger.warning("Failed to persist time ripple for %s", bucket["id"])
+                        raise
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
@@ -2991,36 +3143,37 @@ class BucketManager:
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
         """
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
+        with bucket_write_scope(self.base_dir):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
 
-        try:
-            # Read once, get domain info and update type / 一次性读取
-            post = frontmatter.load(file_path)
-            domain = post.get("domain", ["未分类"])
-            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
-            archive_subdir = os.path.join(self.archive_dir, primary_domain)
-            os.makedirs(archive_subdir, exist_ok=True)
+            try:
+                # Read once, get domain info and update type / 一次性读取
+                post = frontmatter.load(file_path)
+                domain = post.get("domain", ["未分类"])
+                primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+                archive_subdir = os.path.join(self.archive_dir, primary_domain)
+                os.makedirs(archive_subdir, exist_ok=True)
 
-            dest = safe_path(archive_subdir, os.path.basename(file_path))
+                dest = safe_path(archive_subdir, os.path.basename(file_path))
 
-            # Update type marker then move file / 更新类型标记后移动文件
-            post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+                # Update type marker then move file / 更新类型标记后移动文件
+                post["type"] = "archived"
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
 
-            # Use shutil.move for cross-filesystem safety
-            # 使用 shutil.move 保证跨文件系统安全
-            shutil.move(file_path, str(dest))
-        except Exception as e:
-            logger.error(
-                f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
-            )
-            return False
+                # Use shutil.move for cross-filesystem safety
+                # 使用 shutil.move 保证跨文件系统安全
+                shutil.move(file_path, str(dest))
+            except Exception as e:
+                logger.error(
+                    f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
+                )
+                return False
 
-        logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
-        return True
+            logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+            return True
 
     # ---------------------------------------------------------
     # Internal: find bucket file across all three directories
@@ -3116,66 +3269,67 @@ class BucketManager:
                     if not filename.endswith(".md"):
                         continue
                     scanned += 1
-                    path = os.path.join(root, filename)
-                    try:
-                        post = frontmatter.load(path)
-                    except Exception as exc:
-                        logger.warning("Alias cleanup could not read %s: %s", path, exc)
-                        continue
-
-                    if _is_sealed_bucket(post):
-                        continue
-
-                    original_content = post.content
-                    original_name = post.get("name")
-                    original_tags = post.get("tags")
-                    post.content = apply_display_aliases(post.content)
-                    # Alias cleanup can rewrite the body. It is not a
-                    # provenance-preserving metadata operation.
-                    if str(post.content) != str(original_content):
-                        post["provenance_kind"] = "unknown"
-                    if original_name is not None:
-                        post["name"] = apply_display_aliases(original_name)
-                    if original_tags is not None:
-                        post["tags"] = apply_display_aliases_to_value(original_tags)
-
-                    before = (
-                        str(original_content)
-                        + str(original_name or "")
-                        + str(original_tags or "")
-                    )
-                    after = (
-                        str(post.content)
-                        + str(post.get("name", ""))
-                        + str(post.get("tags", ""))
-                    )
-                    file_replacements = sum(
-                        before.count(source) for source in DISPLAY_ALIASES
-                    )
-                    if before == after:
-                        continue
-
-                    temp_path = f"{path}.alias-clean.tmp"
-                    try:
-                        with open(temp_path, "w", encoding="utf-8") as handle:
-                            handle.write(frontmatter.dumps(post))
-                        os.replace(temp_path, path)
-                    except OSError as exc:
-                        logger.error("Alias cleanup could not write %s: %s", path, exc)
+                    with bucket_write_scope(self.base_dir):
+                        path = os.path.join(root, filename)
                         try:
-                            if os.path.exists(temp_path):
-                                os.remove(temp_path)
-                        except OSError:
-                            pass
-                        continue
+                            post = frontmatter.load(path)
+                        except Exception as exc:
+                            logger.warning("Alias cleanup could not read %s: %s", path, exc)
+                            continue
 
-                    bucket_id = str(post.get("id", Path(path).stem))
-                    replacements += file_replacements
-                    changed.append({
-                        "id": bucket_id,
-                        "name": str(post.get("name", bucket_id)),
-                        "replacements": file_replacements,
-                    })
+                        if _is_sealed_bucket(post):
+                            continue
+
+                        original_content = post.content
+                        original_name = post.get("name")
+                        original_tags = post.get("tags")
+                        post.content = apply_display_aliases(post.content)
+                        # Alias cleanup can rewrite the body. It is not a
+                        # provenance-preserving metadata operation.
+                        if str(post.content) != str(original_content):
+                            post["provenance_kind"] = "unknown"
+                        if original_name is not None:
+                            post["name"] = apply_display_aliases(original_name)
+                        if original_tags is not None:
+                            post["tags"] = apply_display_aliases_to_value(original_tags)
+
+                        before = (
+                            str(original_content)
+                            + str(original_name or "")
+                            + str(original_tags or "")
+                        )
+                        after = (
+                            str(post.content)
+                            + str(post.get("name", ""))
+                            + str(post.get("tags", ""))
+                        )
+                        file_replacements = sum(
+                            before.count(source) for source in DISPLAY_ALIASES
+                        )
+                        if before == after:
+                            continue
+
+                        temp_path = f"{path}.alias-clean.tmp"
+                        try:
+                            with open(temp_path, "w", encoding="utf-8") as handle:
+                                handle.write(frontmatter.dumps(post))
+                            os.replace(temp_path, path)
+                        except OSError as exc:
+                            logger.error("Alias cleanup could not write %s: %s", path, exc)
+                            try:
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            except OSError:
+                                pass
+                            continue
+
+                        bucket_id = str(post.get("id", Path(path).stem))
+                        replacements += file_replacements
+                        changed.append({
+                            "id": bucket_id,
+                            "name": str(post.get("name", bucket_id)),
+                            "replacements": file_replacements,
+                        })
                     if original_content != post.content:
                         await self._refresh_ordinary_embedding_best_effort(
                             bucket_id,

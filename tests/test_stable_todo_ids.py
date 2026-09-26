@@ -252,7 +252,8 @@ async def test_runtime_schema_exposes_optional_id_and_no_other_phase_fields(tmp_
         schema = tools["trace"].inputSchema
         item = schema["properties"]["todo_items"]["anyOf"][0]["items"]
         assert "id" in item["properties"] and "id" not in item["required"]
-        assert "todo_done" not in schema["properties"]
+        assert "todo_done" in schema["properties"]
+        assert "todo_done" not in schema["required"]
         assert "done_at" not in item["properties"]
         bucket = await server.bucket_mgr.create("MCP", todos=["old"])
         identity = (await _records(server.bucket_mgr, bucket))[0]["id"]

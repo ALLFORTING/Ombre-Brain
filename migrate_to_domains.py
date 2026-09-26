@@ -9,6 +9,7 @@
 """
 
 import os
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import re
 import shutil
 
@@ -82,40 +83,42 @@ def migrate():
         print("没有需要迁移的文件。")
         return
 
+    initialize_bucket_write_lock(os.path.dirname(DYNAMIC_DIR))
     print(f"发现 {len(files)} 个待迁移文件\n")
 
     for filename in sorted(files):
-        old_path = os.path.join(DYNAMIC_DIR, filename)
-        try:
-            meta = parse_frontmatter(old_path)
-        except Exception as e:
-            print(f"  ✗ 无法解析 {filename}: {e}")
-            continue
+        with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
+            old_path = os.path.join(DYNAMIC_DIR, filename)
+            try:
+                meta = parse_frontmatter(old_path)
+            except Exception as e:
+                print(f"  ✗ 无法解析 {filename}: {e}")
+                continue
 
-        if not meta:
-            print(f"  ✗ 无 frontmatter: {filename}")
-            continue
+            if not meta:
+                print(f"  ✗ 无 frontmatter: {filename}")
+                continue
 
-        bucket_id = meta.get("id", filename.replace(".md", ""))
-        name = meta.get("name", "")
-        domain = meta.get("domain", ["未分类"])
-        primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+            bucket_id = meta.get("id", filename.replace(".md", ""))
+            name = meta.get("name", "")
+            domain = meta.get("domain", ["未分类"])
+            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
 
-        # 构造新路径
-        domain_dir = os.path.join(DYNAMIC_DIR, primary_domain)
-        os.makedirs(domain_dir, exist_ok=True)
+            # 构造新路径
+            domain_dir = os.path.join(DYNAMIC_DIR, primary_domain)
+            os.makedirs(domain_dir, exist_ok=True)
 
-        if name and name != bucket_id:
-            new_filename = f"{sanitize_name(name)}_{bucket_id}.md"
-        else:
-            new_filename = f"{bucket_id}.md"
+            if name and name != bucket_id:
+                new_filename = f"{sanitize_name(name)}_{bucket_id}.md"
+            else:
+                new_filename = f"{bucket_id}.md"
 
-        new_path = os.path.join(domain_dir, new_filename)
+            new_path = os.path.join(domain_dir, new_filename)
 
-        # 移动
-        shutil.move(old_path, new_path)
-        print(f"  ✓ {filename}")
-        print(f"    → {primary_domain}/{new_filename}")
+            # 移动
+            shutil.move(old_path, new_path)
+            print(f"  ✓ {filename}")
+            print(f"    → {primary_domain}/{new_filename}")
 
     print("\n迁移完成。")
 

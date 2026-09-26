@@ -5,6 +5,7 @@
 """
 
 import os
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import re
 import shutil
 
@@ -120,19 +121,21 @@ def classify(body, old_domains):
 
 def update_domain_in_file(filepath, new_domains):
     """更新文件中 frontmatter 的 domain 字段。"""
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
+    initialize_bucket_write_lock(os.path.dirname(DYNAMIC_DIR))
+    with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
 
-    # 替换 domain 块
-    domain_yaml = "domain:\n" + "".join(f"- {d}\n" for d in new_domains)
-    content = re.sub(
-        r"domain:\s*\n(?:\s*-\s*.+\n?)+",
-        domain_yaml,
-        content,
-        count=1
-    )
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
+        # 替换 domain 块
+        domain_yaml = "domain:\n" + "".join(f"- {d}\n" for d in new_domains)
+        content = re.sub(
+            r"domain:\s*\n(?:\s*-\s*.+\n?)+",
+            domain_yaml,
+            content,
+            count=1
+        )
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
 
 
 def reclassify():
@@ -153,41 +156,43 @@ def reclassify():
 
     print(f"扫描到 {len(all_files)} 个桶文件\n")
 
+    initialize_bucket_write_lock(os.path.dirname(DYNAMIC_DIR))
     for filepath in sorted(all_files):
-        meta, yaml_text, body = parse_md(filepath)
-        if not meta:
-            print(f"  ✗ 无法解析: {os.path.basename(filepath)}")
-            continue
+        with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
+            meta, yaml_text, body = parse_md(filepath)
+            if not meta:
+                print(f"  ✗ 无法解析: {os.path.basename(filepath)}")
+                continue
 
-        bucket_id = meta.get("id", "unknown")
-        name = meta.get("name", bucket_id)
-        old_domains = meta.get("domain", ["未分类"])
-        new_domains = classify(body, old_domains)
+            bucket_id = meta.get("id", "unknown")
+            name = meta.get("name", bucket_id)
+            old_domains = meta.get("domain", ["未分类"])
+            new_domains = classify(body, old_domains)
 
-        primary = sanitize_name(new_domains[0])
+            primary = sanitize_name(new_domains[0])
 
-        if name and name != bucket_id:
-            new_filename = f"{sanitize_name(name)}_{bucket_id}.md"
-        else:
-            new_filename = f"{bucket_id}.md"
+            if name and name != bucket_id:
+                new_filename = f"{sanitize_name(name)}_{bucket_id}.md"
+            else:
+                new_filename = f"{bucket_id}.md"
 
-        new_dir = os.path.join(DYNAMIC_DIR, primary)
-        os.makedirs(new_dir, exist_ok=True)
-        new_path = os.path.join(new_dir, new_filename)
+            new_dir = os.path.join(DYNAMIC_DIR, primary)
+            os.makedirs(new_dir, exist_ok=True)
+            new_path = os.path.join(new_dir, new_filename)
 
-        changed = (new_domains != old_domains) or (filepath != new_path)
+            changed = (new_domains != old_domains) or (filepath != new_path)
 
-        if changed:
-            # 更新 frontmatter
-            update_domain_in_file(filepath, new_domains)
-            # 移动文件
-            if filepath != new_path:
-                shutil.move(filepath, new_path)
-            print(f"  ✓ {name}")
-            print(f"    {','.join(old_domains)} → {','.join(new_domains)}")
-            print(f"    → {primary}/{new_filename}")
-        else:
-            print(f"  · {name} (不变)")
+            if changed:
+                # 更新 frontmatter
+                update_domain_in_file(filepath, new_domains)
+                # 移动文件
+                if filepath != new_path:
+                    shutil.move(filepath, new_path)
+                print(f"  ✓ {name}")
+                print(f"    {','.join(old_domains)} → {','.join(new_domains)}")
+                print(f"    → {primary}/{new_filename}")
+            else:
+                print(f"  · {name} (不变)")
 
     # 清理空目录
     for d in os.listdir(DYNAMIC_DIR):

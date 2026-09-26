@@ -55,6 +55,7 @@ import re
 import json as _json_lib
 import httpx
 import frontmatter
+from bucket_write_lock import BucketWriteLockError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -105,6 +106,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from bucket_manager import (
     BucketManager,
     automatic_todo_provenance,
+    active_todo_projection,
     canonicalize_todos,
     merge_todo_provenance,
     normalize_provenance_kind,
@@ -1923,6 +1925,8 @@ def _structured_todo_items(todo_items) -> tuple[list[str], list[dict]]:
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("todo_items.text 必须是非空字符串。")
+        if "done_at" in item:
+            raise ValueError("todo_items.done_at is server-generated and cannot be supplied.")
         raw_todos.append(text.strip())
     todos = _canonical_todos(raw_todos)
     try:
@@ -2320,6 +2324,7 @@ async def _merge_bucket_into_target(
             target_meta.get("todo_provenance"),
             _canonical_todos(source_meta.get("todos")),
             source_meta.get("todo_provenance"),
+            source_is_persisted=True,
         )
     except ValueError as exc:
         return f"merge todo identity conflict: {exc}"
@@ -2469,6 +2474,21 @@ def _merge_metadata_digest(metadata: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _todo_resume_matches(expected: list, actual: list | None) -> bool:
+    remaining = list(actual or [])
+    for planned in expected:
+        found = next((r for r in remaining if
+                      (r.get("id") == planned["id"] if "id" in planned else r.get("text") == planned.get("text"))), None)
+        if found is None:
+            return False
+        if planned.get("done_at") and found.get("done_at") != planned["done_at"]:
+            return False
+        if {k: v for k, v in found.items() if k != "done_at"} != {k: v for k, v in planned.items() if k != "done_at"}:
+            return False
+        remaining.remove(found)
+    return all(r.get("done_at") for r in remaining)
+
+
 async def _execute_merge_operation(operation: dict) -> str:
     """Resume a confirmed merge from durable steps without rebuilding its body."""
     operation_id = operation["operation_id"]
@@ -2512,6 +2532,8 @@ async def _execute_merge_operation(operation: dict) -> str:
                 # may establish IDs; compare their original attribution fields.
                 actual = [{key: value for key, value in record.items() if key != "id"}
                           for record in actual or []]
+            if field == "todo_provenance" and _todo_resume_matches(expected, actual):
+                continue
             if actual != expected:
                 raise RuntimeError(f"merge step {step} changed after write: {field}")
         if step not in completed:
@@ -2553,7 +2575,9 @@ async def _execute_merge_operation(operation: dict) -> str:
                     completed.append("delete_started")
                     persist("running")
                 if not await bucket_mgr.delete(source_id,
-                                               _allow_sealed=plan["source_sealed"]):
+                        _allow_sealed=plan["source_sealed"],
+                        _expected_todo_state=(source["metadata"].get("todos"),
+                                              source["metadata"].get("todo_provenance"))):
                     raise RuntimeError("source deletion failed")
             elif "delete_started" not in completed:
                 raise RuntimeError("source disappeared before the delete step")
@@ -9601,6 +9625,41 @@ async def dismiss_note(
 # Also handles deletion (delete=True)
 # 同时承接删除功能
 # =============================================================
+def _todo_done_confirmation_payload(plan: dict) -> dict:
+    target = plan["target"]
+    return {"bucket_id": plan["bucket_id"], "todo_id": plan["todo_id"],
+            "target_identity": target.get("id"), "target_text": target["text"],
+            "done_at": target.get("done_at"), "todo_state_sha256": plan["todo_state_sha256"]}
+
+
+def _trace_todo_done(bucket_id: str, todo_id: str, confirm_token: str) -> str:
+    try:
+        if not (confirm_token or "").strip():
+            plan = bucket_mgr.preview_todo_completion(bucket_id, todo_id)
+            if plan["target"].get("done_at"):
+                outcome = {"status": "already_completed", "done_at": plan["target"]["done_at"]}
+            else:
+                token = _issue_mutation_confirmation("trace.todo_done", _todo_done_confirmation_payload(plan))
+                return (f"todo completion preview: no changes made; bucket_id={bucket_id} "
+                        f"name={plan['bucket_name']}; todo_id={todo_id}; text={plan['target']['text']}; "
+                        "current=pending; action=mark completed; bucket resolved will not change.\n"
+                        f"confirm_token: {token}")
+        else:
+            outcome = bucket_mgr.complete_todo(bucket_id, todo_id,
+                lambda plan: _consume_mutation_confirmation("trace.todo_done",
+                    _todo_done_confirmation_payload(plan), confirm_token))
+    except (ValueError, BucketWriteLockError, OSError) as exc:
+        return f"todo completion rejected: {exc}"
+    status = outcome["status"]
+    if status == "confirmation_invalid":
+        return "todo completion confirmation invalid, expired, used, or stale; preview again."
+    if status == "write_failed":
+        return "todo completion write failed; no completion committed; token consumed; preview again."
+    label = "already completed" if status == "already_completed" else "todo completed"
+    return (f"{label}: bucket_id={bucket_id}; todo_id={todo_id}; "
+            f"done_at={outcome['done_at']}; bucket resolved unchanged.")
+
+
 @mcp.tool()
 async def trace(
     bucket_id: str,
@@ -9638,12 +9697,25 @@ async def trace(
     trigger_date: str = "",
     delete: bool = False,
     confirm_token: str = "",
+    todo_done: Annotated[str | None, Field(description="Complete one stable todo ID using preview then confirm_token. Must be called alone with bucket_id; completion never resolves the bucket.")] = None,
 ) -> str:
     # MCP schema note: related and superseded_by stay in the signature for relations.
     """Mixed memory operation: metadata/content, relations, merge, seal, and destructive delete; no MCP undo command."""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    if todo_done is not None:
+        if (name or domain or valence != -1 or arousal != -1 or importance != -1 or
+                tags or todos is not None or todo_items is not None or resolved != -1 or
+                pinned != -1 or permanent != -1 or digested != -1 or dormant != -1 or
+                sealed != -1 or content or provenance_kind or related or unrelate or
+                superseded_by is not None or merge or append or trigger_date or delete):
+            return "todo_done must be called alone with bucket_id, todo_done, and optional confirm_token."
+        targets = list(dict.fromkeys(_parse_csv_ids(bucket_id)))
+        if len(targets) != 1:
+            return "todo_done requires exactly one bucket; batch completion is not supported."
+        return _trace_todo_done(targets[0], todo_done, confirm_token)
 
     if importance != -1 and not 1 <= importance <= 10:
         return "importance must be -1 or within 1-10."
@@ -10109,15 +10181,16 @@ async def todos(
             continue
         if meta.get("resolved", False):
             continue
-        items = _normalize_todos(meta.get("todos"))
+        try:
+            active_texts, records = active_todo_projection(meta.get("todos"), meta.get("todo_provenance"))
+        except ValueError as exc:
+            return f"todo provenance conflict: {exc}"
+        items = [text for text in _normalize_todos(meta.get("todos")) if text in active_texts or text not in _canonical_todos(meta.get("todos"))]
         if not items:
             continue
         name = meta.get("name", bucket["id"])
         importance = meta.get("importance", "?")
         if include_provenance:
-            records = reconcile_todo_provenance(
-                _canonical_todos(meta.get("todos")), meta.get("todo_provenance"),
-            )
             for item in items:
                 matches = [record for record in records if record["text"] == item] or [{}]
                 for record in matches:

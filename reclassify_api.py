@@ -5,6 +5,7 @@
 """
 import asyncio
 import os
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import json
 import glob
 import re
@@ -65,6 +66,7 @@ async def reclassify():
     files = sorted(glob.glob(os.path.join(UNCLASS_DIR, "*.md")))
     print(f"找到 {len(files)} 个未分类文件\n")
 
+    initialize_bucket_write_lock(os.path.dirname(DATA_DIR))
     for fpath in files:
         basename = os.path.basename(fpath)
         post = frontmatter.load(fpath)
@@ -96,28 +98,33 @@ async def reclassify():
         new_valence = max(0.0, min(1.0, float(result.get("valence", 0.5))))
         new_arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
 
-        post.metadata["domain"] = new_domain
-        post.metadata["tags"] = new_tags
-        post.metadata["valence"] = new_valence
-        post.metadata["arousal"] = new_arousal
-        if new_name:
-            post.metadata["name"] = new_name
+        with bucket_write_scope(os.path.dirname(DATA_DIR)):
+            # Re-read after the API await, retaining current todos/provenance.
+            if not os.path.isfile(fpath):
+                continue
+            post = frontmatter.load(fpath)
+            post.metadata["domain"] = new_domain
+            post.metadata["tags"] = new_tags
+            post.metadata["valence"] = new_valence
+            post.metadata["arousal"] = new_arousal
+            if new_name:
+                post.metadata["name"] = new_name
 
-        # 写回文件
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(frontmatter.dumps(post))
+            # 写回文件
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
 
-        # 移动到正确目录
-        primary = sanitize(new_domain[0]) if new_domain else "未分类"
-        target_dir = os.path.join(DATA_DIR, primary)
-        os.makedirs(target_dir, exist_ok=True)
+            # 移动到正确目录
+            primary = sanitize(new_domain[0]) if new_domain else "未分类"
+            target_dir = os.path.join(DATA_DIR, primary)
+            os.makedirs(target_dir, exist_ok=True)
 
-        bid = post.metadata.get("id", "")
-        new_filename = f"{new_name}_{bid}.md" if new_name and new_name != bid else basename
-        dest = os.path.join(target_dir, new_filename)
+            bid = post.metadata.get("id", "")
+            new_filename = f"{new_name}_{bid}.md" if new_name and new_name != bid else basename
+            dest = os.path.join(target_dir, new_filename)
 
-        if dest != fpath:
-            os.rename(fpath, dest)
+            if dest != fpath:
+                os.rename(fpath, dest)
 
         print(f"  OK {basename}")
         print(f"     -> {primary}/{new_filename}")

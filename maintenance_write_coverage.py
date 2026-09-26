@@ -16,6 +16,7 @@ COVERAGE_SCHEMA_VERSION = 3
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
+    "bucket_write_lock.py": {"initialize_bucket_write_lock": "guarded_mutation"},
     "add_timestamps.py": {"main": "standalone_maintenance_script"},
     "migrate_to_domains.py": {"migrate": "standalone_maintenance_script"},
     "reclassify_api.py": {"reclassify": "standalone_maintenance_script"},
@@ -95,6 +96,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "create": "guarded_async_mutation",
         "_move_bucket": "guarded_mutation",
         "update": "guarded_async_mutation",
+        "complete_todo": "guarded_mutation",
         "delete": "guarded_async_mutation",
         "touch": "guarded_optional_async_mutation",
         "set_dormant": "guarded_async_mutation",

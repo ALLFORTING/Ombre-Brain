@@ -1,4 +1,5 @@
 import os
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from datetime import datetime
 
 import frontmatter
@@ -20,22 +21,24 @@ def _iter_markdown_files(base_dir: str):
 
 
 def main() -> int:
+    initialize_bucket_write_lock(BUCKETS_DIR)
     updated = 0
     scanned = 0
     for path in _iter_markdown_files(BUCKETS_DIR):
         scanned += 1
-        post = frontmatter.load(path)
-        changed = False
-        if not post.get("created_at"):
-            post["created_at"] = _date_from_epoch(os.path.getctime(path))
-            changed = True
-        if not post.get("updated_at"):
-            post["updated_at"] = _date_from_epoch(os.path.getmtime(path))
-            changed = True
-        if changed:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            updated += 1
+        with bucket_write_scope(BUCKETS_DIR):
+            post = frontmatter.load(path)
+            changed = False
+            if not post.get("created_at"):
+                post["created_at"] = _date_from_epoch(os.path.getctime(path))
+                changed = True
+            if not post.get("updated_at"):
+                post["updated_at"] = _date_from_epoch(os.path.getmtime(path))
+                changed = True
+            if changed:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(frontmatter.dumps(post))
+                updated += 1
     print(f"scanned={scanned} updated={updated} buckets_dir={BUCKETS_DIR}")
     return 0
 

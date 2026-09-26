@@ -1633,6 +1633,17 @@
             ],
             "default": null
           },
+          "todo_done": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "trigger_date": {
             "default": "",
             "type": "string"
