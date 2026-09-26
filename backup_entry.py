@@ -150,6 +150,7 @@ def run() -> None:
         app = server.mcp.sse_app()
     server.add_mcp_auth_middleware(app)
     server.add_http_cors_middleware(app)
+    server.add_mcp_diagnostic_middleware(app)
     server.install_uvicorn_access_log_redaction()
     uvicorn.run(app, host="0.0.0.0", port=server.OMBRE_PORT)
 

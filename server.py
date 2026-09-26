@@ -223,6 +223,98 @@ def install_uvicorn_access_log_redaction() -> None:
         access_logger.addFilter(_UvicornAccessTokenRedactionFilter())
 
 
+def _mcp_session_hash(session_id: bytes | str) -> str:
+    raw = session_id if isinstance(session_id, bytes) else session_id.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+class _MCPRequestDiagnosticMiddleware:
+    """Log response headers immediately, without consuming or altering streams."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not (path == "/mcp" or path.startswith("/mcp/")):
+            await self.app(scope, receive, send)
+            return
+
+        session_id = next(
+            (value for name, value in scope.get("headers", [])
+             if name.lower() == b"mcp-session-id"),
+            None,
+        )
+        has_session = "true" if session_id is not None else "false"
+        session_field = (
+            f" session_hash={_mcp_session_hash(session_id)}"
+            if session_id is not None else ""
+        )
+
+        async def diagnostic_send(message):
+            if message["type"] == "http.response.start":
+                logging.getLogger("ombre_brain.mcp").info(
+                    "mcp_request method=%s status=%s has_session=%s%s",
+                    scope["method"], message["status"], has_session, session_field,
+                )
+            await send(message)
+
+        await self.app(scope, receive, diagnostic_send)
+
+
+class _MCPSDKSessionRedactionFilter(logging.Filter):
+    """Sanitize only known MCP 1.29.1 session messages; keep errors intact."""
+
+    _FULL_ID_MESSAGES = {
+        "mcp.server.streamable_http_manager": (
+            ("Created new transport with session ID: ", ""),
+            ("Session ", " idle timeout"),
+            ("Session ", " crashed"),
+            ("Cleaning up crashed session ", " from active instances."),
+        ),
+        "mcp.server.streamable_http": (("Terminating session: ", ""),),
+        "mcp.server.sse": (
+            ("Received invalid session ID: ", ""),
+            ("Could not find session for ID: ", ""),
+        ),
+    }
+    _REDACTED_MESSAGES = {
+        "mcp.server.streamable_http_manager": (
+            "Rejecting request for session %s: credential does not match the one that created the session",
+        ),
+        "mcp.server.sse": (
+            "Rejecting message for session %s: credential does not match",
+        ),
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg in self._REDACTED_MESSAGES.get(record.name, ()):
+            # The HTTP manager passes only [:64], so a full-ID hash is impossible.
+            prefix, _, suffix = record.msg.partition("%s")
+            record.msg = f"{prefix}[redacted]{suffix}"
+            record.args = ()
+        elif isinstance(record.msg, str) and not record.args:
+            for prefix, suffix in self._FULL_ID_MESSAGES.get(record.name, ()):
+                if record.msg.startswith(prefix) and record.msg.endswith(suffix):
+                    end = len(record.msg) - len(suffix) if suffix else len(record.msg)
+                    session_id = record.msg[len(prefix):end]
+                    record.msg = f"{prefix}session_hash={_mcp_session_hash(session_id)}{suffix}"
+                    break
+        return True
+
+
+def add_mcp_diagnostic_middleware(app):
+    """Shared HTTP-entrypoint installation; auth and transport stay unchanged."""
+    for name in _MCPSDKSessionRedactionFilter._FULL_ID_MESSAGES:
+        sdk_logger = logging.getLogger(name)
+        if not any(isinstance(item, _MCPSDKSessionRedactionFilter)
+                   for item in sdk_logger.filters):
+            sdk_logger.addFilter(_MCPSDKSessionRedactionFilter())
+    if not any(item.cls is _MCPRequestDiagnosticMiddleware for item in app.user_middleware):
+        app.add_middleware(_MCPRequestDiagnosticMiddleware)
+    return app
+
+
 _HOOK_OBVIOUS_TOKENS = frozenset({
     "changeme",
     "password",
@@ -12486,6 +12578,7 @@ if __name__ == "__main__":
             _app = mcp.sse_app()
         add_mcp_auth_middleware(_app)
         add_http_cors_middleware(_app)
+        add_mcp_diagnostic_middleware(_app)
         install_uvicorn_access_log_redaction()
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
