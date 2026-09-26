@@ -146,7 +146,9 @@ def _todo_provenance_record(
         if strict:
             raise ValueError("todo provenance entries must be objects.")
         return None
-    allowed = {"id", "text", "said_by", "said_at", "source_bucket", "done_at"}
+    # State conflicts must escape even permissive legacy/malformed fallback.
+    terminal = _merge_todo_terminal_state({}, raw)
+    allowed = {"id", "text", "said_by", "said_at", "source_bucket", "done_at", "dropped_at"}
     unexpected = set(raw) - allowed
     if unexpected:
         if strict:
@@ -189,18 +191,18 @@ def _todo_provenance_record(
                 raise ValueError("todo provenance source_bucket must be a string or null.")
             return None
         source_bucket = source_bucket.strip() or None
-    done_at = raw.get("done_at")
-    if done_at is not None:
-        try:
-            if not valid_todo_id(todo_id) or not isinstance(done_at, str) or not done_at.strip():
-                raise ValueError
-            datetime.fromisoformat(done_at)
-        except (TypeError, ValueError):
-            if strict:
-                raise ValueError("todo done_at requires an id and an ISO-8601 string or null.")
-            return None
+    for field, timestamp in terminal.items():
+        if timestamp is not None:
+            try:
+                if not valid_todo_id(todo_id) or not isinstance(timestamp, str) or not timestamp.strip():
+                    raise ValueError
+                datetime.fromisoformat(timestamp)
+            except (TypeError, ValueError):
+                if strict:
+                    raise ValueError(f"todo {field} requires an id and an ISO-8601 string or null.")
+                return None
     return {
-        **({"done_at": done_at} if "done_at" in raw else {}),
+        **terminal,
         **({"id": todo_id} if todo_id is not None else {}),
         "text": text.strip(),
         "said_by": said_by,
@@ -227,17 +229,33 @@ def _todo_provenance_is_known(record: dict[str, Any] | None) -> bool:
     )
 
 
-def _merge_todo_completion(target: dict, source: dict) -> dict:
-    first, incoming = target.get("done_at"), source.get("done_at")
-    if first and incoming and first != incoming:
-        raise ValueError("todo completion conflict: one id has different done_at values.")
-    done_at = first or incoming
-    return {"done_at": done_at} if done_at or "done_at" in target or "done_at" in source else {}
+def _merge_todo_terminal_state(target: dict, source: dict) -> dict:
+    """Sticky, mutually exclusive completion/drop; never arbitrate conflicts."""
+    fields = ("done_at", "dropped_at")
+    result = {}
+    for record in (target, source):
+        if all(record.get(field) is not None for field in fields):
+            raise ValueError("todo terminal conflict: done_at and dropped_at are mutually exclusive.")
+    for field in fields:
+        first, incoming = target.get(field), source.get(field)
+        if first is not None and incoming is not None and first != incoming:
+            label = "completion" if field == "done_at" else "drop"
+            raise ValueError(f"todo {label} conflict: one id has different {field} values.")
+        if field in target or field in source:
+            result[field] = first if first is not None else incoming
+    if all(result.get(field) is not None for field in fields):
+        raise ValueError("todo terminal conflict: done_at and dropped_at are mutually exclusive.")
+    return result
+
+
+def _todo_is_terminal(record: dict) -> bool:
+    """Only for validated records; conflict validation precedes projection."""
+    return bool(record.get("done_at") or record.get("dropped_at"))
 
 
 def _merge_todo_attribution(target: dict, source: dict) -> dict:
-    """Attribution choices must never erase or arbitrate completion."""
-    completion = _merge_todo_completion(target, source)
+    """Attribution choices must never erase or arbitrate terminal state."""
+    terminal = _merge_todo_terminal_state(target, source)
     identity = target.get("id") or source.get("id")
     target = {**target, **({"id": identity} if identity else {})}
     source = {**source, **({"id": identity} if identity else {})}
@@ -250,11 +268,11 @@ def _merge_todo_attribution(target: dict, source: dict) -> dict:
         result = source
     else:
         result = {**target, "said_by": "unknown", "said_at": None, "source_bucket": None}
-    return {**result, **completion}
+    return {**result, **terminal}
 
 
 def reconcile_todo_provenance(todos: Any, raw_provenance: Any, *, strict: bool = False) -> list[dict[str, Any]]:
-    """Canonical identities plus completed history; never assign legacy IDs."""
+    """Canonical identities plus terminal history; never assign legacy IDs."""
     texts = canonicalize_todos(todos)
     if raw_provenance is None:
         return []
@@ -263,6 +281,16 @@ def reconcile_todo_provenance(todos: Any, raw_provenance: Any, *, strict: bool =
             raise ValueError("todo_provenance must be a list.")
         return []
     records = {}
+    # Inspect raw state claims before any unsupported-field/text fallback can
+    # hide a conflict for one stable identity.
+    terminal_claims = {}
+    for raw in raw_provenance:
+        if isinstance(raw, dict):
+            state = _merge_todo_terminal_state({}, raw)
+            if valid_todo_id(raw.get("id")):
+                identity = raw["id"]
+                terminal_claims[identity] = _merge_todo_terminal_state(
+                    terminal_claims.get(identity, {}), state)
     for raw in raw_provenance:
         record = _todo_provenance_record(raw, strict=strict)
         if record is None:
@@ -273,7 +301,7 @@ def reconcile_todo_provenance(todos: Any, raw_provenance: Any, *, strict: bool =
             if strict:
                 raise ValueError("todo identity conflict: one id has different texts.")
             continue
-        if record["text"] not in texts and not record.get("done_at"):
+        if record["text"] not in texts and not _todo_is_terminal(record):
             if strict:
                 raise ValueError("todo provenance text must appear in todos.")
             continue
@@ -288,7 +316,7 @@ def reconcile_todo_provenance(todos: Any, raw_provenance: Any, *, strict: bool =
 def prepare_todo_provenance(todos: Any, raw_provenance: Any = None, *,
                             previous_todos: Any = None, previous_provenance: Any = None,
                             references_only: bool = False, assign_ids: bool = True) -> list[dict[str, Any]]:
-    """Prepare explicit writes, retaining sticky completion and completed history."""
+    """Prepare explicit writes, retaining sticky terminal state and history."""
     texts = canonicalize_todos(todos)
     incoming = reconcile_todo_provenance(texts, raw_provenance, strict=True)
     previous = reconcile_todo_provenance(previous_todos, previous_provenance, strict=True)
@@ -310,10 +338,10 @@ def prepare_todo_provenance(todos: Any, raw_provenance: Any = None, *,
                     raise ValueError("todo identity conflict: one id has different texts.")
             else:
                 matches = [r for r in candidates if "id" in r]
-                # A persisted legacy member alongside completion must not vanish
+                # A persisted legacy member alongside terminal history must not vanish
                 # through text matching or implicit ID assignment.
-                legacy_mixed = any(r.get("done_at") for r in submitted) or (
-                    any(r.get("done_at") for r in candidates) and (inherited or record in candidates))
+                legacy_mixed = any(_todo_is_terminal(r) for r in submitted) or (
+                    any(_todo_is_terminal(r) for r in candidates) and (inherited or record in candidates))
                 if not legacy_mixed:
                     if len(matches) > 1:
                         raise ValueError("ambiguous todo identity: specify an existing id.")
@@ -322,19 +350,19 @@ def prepare_todo_provenance(todos: Any, raw_provenance: Any = None, *,
                     elif assign_ids:
                         record["id"] = "todo_" + str(uuid4())
             if record.get("id") in by_id:
-                record.update(_merge_todo_completion(by_id[record["id"]], record))
+                record.update(_merge_todo_terminal_state(by_id[record["id"]], record))
             output.append(record)
-    # Orphaned incoming completed records are valid history too.
+    # Orphaned incoming terminal records are valid history too.
     for record in incoming:
-        if record["text"] not in texts and record.get("done_at"):
+        if record["text"] not in texts and _todo_is_terminal(record):
             record = dict(record)
             if record["id"] in by_id:
                 if by_id[record["id"]]["text"] != record["text"]:
                     raise ValueError("todo identity conflict: one id has different texts.")
-                record.update(_merge_todo_completion(by_id[record["id"]], record))
+                record.update(_merge_todo_terminal_state(by_id[record["id"]], record))
             output.append(record)
     submitted_ids = {r.get("id") for r in output if "id" in r}
-    output.extend(r for r in previous if r.get("done_at") and r["id"] not in submitted_ids)
+    output.extend(r for r in previous if _todo_is_terminal(r) and r["id"] not in submitted_ids)
     return reconcile_todo_provenance(texts, output, strict=True)
 
 
@@ -357,7 +385,7 @@ def merge_todo_provenance(target_todos: Any, target_provenance: Any,
             matches = [r for r in records if r.get("id") == record["id"]]
         else:
             matches = [r for r in records if r["text"] == record["text"]]
-            if source_is_persisted and any(r.get("done_at") for r in matches):
+            if source_is_persisted and any(_todo_is_terminal(r) for r in matches):
                 matches = [r for r in matches if "id" not in r]
             if len(matches) > 1:
                 if _todo_provenance_is_known(record):
@@ -386,7 +414,7 @@ def active_todo_projection(todos: Any, raw_provenance: Any) -> tuple[list[str], 
         invalid_legacy = isinstance(raw_provenance, list) and any(
             isinstance(raw, dict) and raw.get("text") == text
             and _todo_provenance_record(raw, strict=False) is None for raw in raw_provenance)
-        active = [r for r in matches if not r.get("done_at")]
+        active = [r for r in matches if not _todo_is_terminal(r)]
         if not matches or invalid_legacy:
             active += automatic_todo_provenance([text])
         if active:
@@ -395,17 +423,21 @@ def active_todo_projection(todos: Any, raw_provenance: Any) -> tuple[list[str], 
     return active_texts, active_records
 
 
-def todo_completion_plan(bucket_id: str, post: Any, todo_id: str) -> dict:
+def todo_completion_plan(bucket_id: str, post: Any, todo_id: str, *, operation: str = "todo_done") -> dict:
     """Bind confirmation only to canonical todo state, never unrelated metadata."""
     if not valid_todo_id(todo_id):
+        if operation == "todo_drop":
+            raise ValueError("todo_drop requires a stable todo_<uuid> ID. 该 todo 为旧格式，无稳定 ID，当前不能单条放弃。")
         raise ValueError("todo_done requires a stable todo_<uuid> ID; legacy todo without an ID cannot be completed.")
     todos = canonicalize_todos(post.get("todos"))
     records = reconcile_todo_provenance(todos, post.get("todo_provenance"), strict=True)
     target = next((r for r in records if r.get("id") == todo_id), None)
     if target is None:
+        if operation == "todo_drop":
+            raise ValueError("unknown todo ID. 该 todo 为旧格式，无稳定 ID，当前不能单条放弃。")
         raise ValueError("unknown todo ID; legacy todo without a stable ID cannot be located or completed.")
     state = {"todos": todos, "todo_provenance": [
-        {**r, "done_at": r.get("done_at")} for r in records]}
+        {**r, "done_at": r.get("done_at"), "dropped_at": r.get("dropped_at")} for r in records]}
     digest = hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True,
                             separators=(",", ":")).encode("utf-8")).hexdigest()
     return {"bucket_id": bucket_id, "todo_id": todo_id, "target": target,
@@ -1946,6 +1978,8 @@ class BucketManager:
                 raise ValueError("bucket not found")
             post = frontmatter.load(path)
             plan = todo_completion_plan(bucket_id, post, todo_id)
+            if plan["target"].get("dropped_at"):
+                raise ValueError("该 todo 已放弃，不能标记为完成")
             if plan["target"].get("done_at"):
                 return {"status": "already_completed", "done_at": plan["target"]["done_at"]}
             if not authorize(plan):
@@ -1954,13 +1988,48 @@ class BucketManager:
             done_at = now_iso()
             for record in records:
                 if record.get("id") == todo_id:
-                    record["done_at"] = done_at
+                    record.update(_merge_todo_terminal_state(record, {"done_at": done_at}))
             post["todo_provenance"] = records
             try:
                 self._write_post_atomic(path, post)
             except OSError:
                 return {"status": "write_failed"}
             return {"status": "completed", "done_at": done_at}
+
+    def preview_todo_drop(self, bucket_id: str, todo_id: str) -> dict:
+        with bucket_write_scope(self.base_dir):
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                raise ValueError("bucket not found")
+            post = frontmatter.load(path)
+            return {**todo_completion_plan(bucket_id, post, todo_id, operation="todo_drop"),
+                    "bucket_name": post.get("name", bucket_id)}
+
+    @guarded_mutation("bucket_todo_drop")
+    def drop_todo(self, bucket_id: str, todo_id: str, authorize) -> dict:
+        with bucket_write_scope(self.base_dir):
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                raise ValueError("bucket not found")
+            post = frontmatter.load(path)
+            plan = todo_completion_plan(bucket_id, post, todo_id, operation="todo_drop")
+            if plan["target"].get("done_at"):
+                raise ValueError("该 todo 已完成，不能标记为放弃")
+            if plan["target"].get("dropped_at"):
+                return {"status": "already_dropped", "dropped_at": plan["target"]["dropped_at"]}
+            if not authorize(plan):
+                return {"status": "confirmation_invalid"}
+            records = reconcile_todo_provenance(post.get("todos"), post.get("todo_provenance"), strict=True)
+            dropped_at = now_iso()
+            for record in records:
+                if record.get("id") == todo_id:
+                    record.update(_merge_todo_terminal_state(record, {"dropped_at": dropped_at}))
+            post["todo_provenance"] = records
+            try:
+                self._write_post_atomic(path, post)
+            except OSError:
+                return {"status": "write_failed"}
+            return {"status": "dropped", "dropped_at": dropped_at}
 
     # ---------------------------------------------------------
     # Move bucket between directories

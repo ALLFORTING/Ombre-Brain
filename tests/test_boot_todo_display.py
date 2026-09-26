@@ -278,6 +278,54 @@ async def test_three_profiles_share_projection_archive_and_legacy_without_writes
 
 
 @pytest.mark.asyncio
+async def test_dropped_identity_excluded_from_three_profiles_and_counts(server):
+    identity = await server.bucket_mgr.create("carrier", todos=["abandoned", "active", "finished"])
+    records = (await server.bucket_mgr.get(identity))["metadata"]["todo_provenance"]
+    server.bucket_mgr.drop_todo(identity, records[0]["id"], lambda _: True)
+    server.bucket_mgr.complete_todo(identity, records[2]["id"], lambda _: True)
+    path = server.bucket_mgr._find_bucket_file(identity)
+    before = open(path, "rb").read()
+    for profile in PROFILE_TODOS:
+        output = await server.boot(profile=profile)
+        section = output.split("=== boot: 未完结 todos ===\n", 1)[1].split("\n\n", 1)[0]
+        assert "共 1 项未完成 | 本次显示 1 | 未显示 0" in section
+        assert records[1]["id"] in section
+        assert records[0]["id"] not in section and records[2]["id"] not in section
+        assert "abandoned" not in section and "finished" not in section
+    assert open(path, "rb").read() == before
+
+
+@pytest.mark.parametrize("profile", list(PROFILE_TODOS))
+def test_drop_updates_tail_hidden_and_remaining_without_rotation_changes(profile):
+    buckets = [bucket(i) for i in range(40)]
+    before = todo_page(active_display_candidates(buckets), profile, DAY)
+    dropped = before.rotation[0]
+    for entry in buckets:
+        if entry["id"] == dropped.bucket_id:
+            entry["metadata"]["todo_provenance"][0]["dropped_at"] = "2026-09-26T12:00:00"
+    after = todo_page(active_display_candidates(buckets), profile, DAY)
+    assert len(after.candidates) == len(before.candidates) - 1
+    assert dropped not in after.candidates and dropped not in after.rotation
+    assert after.priority == before.priority
+    fitted = fit_todos(after, 220)
+    assert_counts(fitted, 39)
+    assert fitted.hidden == 39 - fitted.shown
+    assert dropped.todo_id not in fitted.text
+
+
+@pytest.mark.asyncio
+async def test_dual_terminal_boot_reports_conflict_and_keeps_checkpoint(server):
+    checkpoint = server.bucket_mgr.get_boot_delta_checkpoint()
+    bad = bucket(1)
+    bad["metadata"]["todo_provenance"][0].update(done_at="2026-09-20", dropped_at="2026-09-21")
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bad])
+    for profile in PROFILE_TODOS:
+        result = await server.boot(profile=profile)
+        assert "活动总数无法确认" in result and "共 0" not in result
+    assert server.bucket_mgr.get_boot_delta_checkpoint() == checkpoint
+
+
+@pytest.mark.asyncio
 async def test_projection_error_does_not_claim_zero_or_consume_delta(server):
     checkpoint = server.bucket_mgr.get_boot_delta_checkpoint()
     bad = bucket(1)

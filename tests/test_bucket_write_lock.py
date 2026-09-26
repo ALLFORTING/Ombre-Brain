@@ -91,7 +91,8 @@ def _acquire(root):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("writer", ["update", "touch", "set_dormant", "refresh_tg_summary", "archive"])
-async def test_all_full_frontmatter_writers_wait_for_completion(test_config, writer):
+@pytest.mark.parametrize("terminal", ["done_at", "dropped_at"])
+async def test_all_full_frontmatter_writers_wait_for_completion(test_config, writer, terminal):
     manager = BucketManager(test_config)
     bucket = await manager.create("body", todos=["task"])
     identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
@@ -110,7 +111,8 @@ async def test_all_full_frontmatter_writers_wait_for_completion(test_config, wri
         import hashlib
         return asyncio.run(other.refresh_tg_summary(bucket, "summary", hashlib.sha256(b"body").hexdigest()))
     with ThreadPoolExecutor(max_workers=2) as pool:
-        completion = pool.submit(manager.complete_todo, bucket, identity, authorize)
+        action = manager.complete_todo if terminal == "done_at" else manager.drop_todo
+        completion = pool.submit(action, bucket, identity, authorize)
         assert entered.wait(5)
         mutation = pool.submit(rewrite)
         assert attempting.wait(5)
@@ -118,11 +120,12 @@ async def test_all_full_frontmatter_writers_wait_for_completion(test_config, wri
         release.set()
         result = completion.result(timeout=5)
         mutation.result(timeout=5)
-    assert other.preview_todo_completion(bucket, identity)["target"]["done_at"] == result["done_at"]
+    assert other.preview_todo_completion(bucket, identity)["target"][terminal] == result[terminal]
 
 
 @pytest.mark.asyncio
-async def test_process_writer_cannot_enter_between_revalidation_and_commit(test_config):
+@pytest.mark.parametrize("terminal", ["done_at", "dropped_at"])
+async def test_process_writer_cannot_enter_between_revalidation_and_commit(test_config, terminal):
     manager = BucketManager(test_config)
     bucket = await manager.create("body", todos=["task"])
     identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
@@ -136,23 +139,24 @@ print('ready', flush=True)
 sys.stdin.readline()
 print('attempting', flush=True)
 asyncio.run(m.update(bucket, todos=['task'], todo_provenance=old))
-print(m.preview_todo_completion(bucket, old[0]['id'])['target']['done_at'], flush=True)
+print(m.preview_todo_completion(bucket, old[0]['id'])['target'][sys.argv[3]], flush=True)
 """
-    child = subprocess.Popen([sys.executable, "-u", "-c", script, test_config["buckets_dir"], bucket],
+    child = subprocess.Popen([sys.executable, "-u", "-c", script, test_config["buckets_dir"], bucket, terminal],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     entered, release = threading.Event(), threading.Event()
     try:
         assert child.stdout.readline().strip() == "ready"
         def authorize(_): entered.set(); return release.wait(5)
         with ThreadPoolExecutor() as pool:
-            completion = pool.submit(manager.complete_todo, bucket, identity, authorize)
+            action = manager.complete_todo if terminal == "done_at" else manager.drop_todo
+            completion = pool.submit(action, bucket, identity, authorize)
             assert entered.wait(5)
             child.stdin.write("go\n"); child.stdin.flush()
             assert child.stdout.readline().strip() == "attempting"
             assert not select.select([child.stdout], [], [], 0.1)[0]
             release.set()
             result = completion.result(timeout=5)
-        assert child.stdout.readline().strip() == result["done_at"]
+        assert child.stdout.readline().strip() == result[terminal]
         assert child.wait(timeout=5) == 0, child.stderr.read()
     finally:
         release.set()
@@ -230,6 +234,103 @@ async def test_concurrent_completions_commit_only_once(test_config):
     assert sorted(r["status"] for r in results) == ["already_completed", "completed"]
     assert results[0]["done_at"] == results[1]["done_at"]
     assert consumed == [True]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_drops_commit_only_once(test_config):
+    manager = BucketManager(test_config)
+    bucket = await manager.create("body", todos=["task"])
+    identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
+    other = BucketManager(test_config)
+    consumed = []
+    def authorize(_):
+        consumed.append(True)
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(m.drop_todo, bucket, identity, authorize) for m in (manager, other)]
+        results = [f.result(timeout=5) for f in futures]
+    assert sorted(r["status"] for r in results) == ["already_dropped", "dropped"]
+    assert results[0]["dropped_at"] == results[1]["dropped_at"]
+    assert consumed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["done_at", "dropped_at"])
+async def test_concurrent_done_drop_has_only_one_terminal_and_consumption(test_config, winner):
+    manager = BucketManager(test_config)
+    bucket = await manager.create("body", todos=["task"])
+    identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
+    other = BucketManager(test_config)
+    entered, release, attempting = threading.Event(), threading.Event(), threading.Event()
+    consumed = []
+    first = manager.complete_todo if winner == "done_at" else manager.drop_todo
+    second = other.drop_todo if winner == "done_at" else other.complete_todo
+    def authorize(_):
+        consumed.append("winner")
+        entered.set()
+        assert release.wait(5)
+        return True
+    def lose():
+        attempting.set()
+        return second(bucket, identity, lambda _: consumed.append("loser") or True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        success = pool.submit(first, bucket, identity, authorize)
+        assert entered.wait(5)
+        rejected = pool.submit(lose)
+        try:
+            assert attempting.wait(5)
+            with pytest.raises(TimeoutError): rejected.result(timeout=0.05)
+        finally:
+            release.set()
+        result = success.result(timeout=5)
+        with pytest.raises(ValueError, match="不能标记"):
+            rejected.result(timeout=5)
+    state = other.preview_todo_completion(bucket, identity)["target"]
+    assert state[winner] == result[winner]
+    assert bool(state.get("done_at")) != bool(state.get("dropped_at"))
+    assert consumed == ["winner"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_first", ["done_at", "dropped_at"])
+async def test_failed_publish_leaves_active_for_competing_terminal(test_config, monkeypatch, failed_first):
+    manager = BucketManager(test_config)
+    bucket = await manager.create("body", todos=["task"])
+    identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
+    other = BucketManager(test_config)
+    path = manager._find_bucket_file(bucket)
+    original = Path(path).read_bytes()
+    entered, release, attempting = threading.Event(), threading.Event(), threading.Event()
+    consumed = []
+    first = manager.complete_todo if failed_first == "done_at" else manager.drop_todo
+    second = other.drop_todo if failed_first == "done_at" else other.complete_todo
+    def fail_publish(*_):
+        assert Path(path).read_bytes() == original
+        raise OSError("injected publish failure")
+    monkeypatch.setattr(manager, "_write_post_atomic", fail_publish)
+    def authorize(_):
+        consumed.append("failed")
+        entered.set()
+        assert release.wait(5)
+        return True
+    def compete():
+        attempting.set()
+        return second(bucket, identity, lambda _: consumed.append("success") or True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        failed = pool.submit(first, bucket, identity, authorize)
+        assert entered.wait(5)
+        succeeded = pool.submit(compete)
+        try:
+            assert attempting.wait(5)
+            with pytest.raises(TimeoutError): succeeded.result(timeout=0.05)
+        finally:
+            release.set()
+        assert failed.result(timeout=5)["status"] == "write_failed"
+        result = succeeded.result(timeout=5)
+    state = other.preview_todo_completion(bucket, identity)["target"]
+    opposite = "dropped_at" if failed_first == "done_at" else "done_at"
+    assert state[opposite] == result[opposite] and not state.get(failed_first)
+    assert consumed == ["failed", "success"]
 
 
 @pytest.mark.asyncio

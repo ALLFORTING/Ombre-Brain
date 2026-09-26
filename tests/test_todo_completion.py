@@ -223,7 +223,8 @@ async def test_pending_durable_apply_and_restart_preserve_completion(server, tmp
 
 
 @pytest.mark.asyncio
-async def test_sealed_async_update_reloads_after_completion(server):
+@pytest.mark.parametrize("action,field", [("todo_done", "done_at"), ("todo_drop", "dropped_at")])
+async def test_sealed_async_update_reloads_after_completion(server, action, field):
     bucket, records = await setup(server)
     entered, release = asyncio.Event(), asyncio.Event()
     async def cleanup(_):
@@ -232,11 +233,12 @@ async def test_sealed_async_update_reloads_after_completion(server):
     server.bucket_mgr._delete_ordinary_embedding = cleanup
     task = asyncio.create_task(server.bucket_mgr.update(bucket, sealed=1, content="changed"))
     await entered.wait()
-    await finish(server, bucket, records[0]["id"])
-    done_at = server.bucket_mgr.preview_todo_completion(bucket, records[0]["id"])["target"]["done_at"]
+    preview = await server.trace(bucket, **{action: records[0]["id"]})
+    await server.trace(bucket, **{action: records[0]["id"]}, confirm_token=token(preview))
+    terminal_at = server.bucket_mgr.preview_todo_completion(bucket, records[0]["id"])["target"][field]
     release.set()
     assert await task
-    assert server.bucket_mgr.preview_todo_completion(bucket, records[0]["id"])["target"]["done_at"] == done_at
+    assert server.bucket_mgr.preview_todo_completion(bucket, records[0]["id"])["target"][field] == terminal_at
 
 
 @pytest.mark.asyncio
@@ -341,3 +343,37 @@ async def test_mcp_client_completion_and_injected_done_at_contract(server, tmp_p
         invalid = await client.call_tool("trace", {"bucket_id": bucket, "todo_items": [{**records[0], "done_at": LATER}]})
         assert "server-generated" in "\n".join(item.text for item in invalid.content if hasattr(item, "text"))
         assert snapshot(tmp_path) == committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["todo_done", "todo_drop"])
+async def test_cross_terminal_rejects_without_consuming_old_token(server, tmp_path, winner):
+    bucket, records = await setup(server)
+    identity = records[0]["id"]
+    done_token = token(await server.trace(bucket, todo_done=identity))
+    drop_token = token(await server.trace(bucket, todo_drop=identity))
+    tokens = {"todo_done": done_token, "todo_drop": drop_token}
+    await server.trace(bucket, **{winner: identity}, confirm_token=tokens[winner])
+    loser = "todo_drop" if winner == "todo_done" else "todo_done"
+    error = "该 todo 已完成，不能标记为放弃" if winner == "todo_done" else "该 todo 已放弃，不能标记为完成"
+    before = snapshot(tmp_path)
+    token_count = len(server._mutation_confirm_tokens)
+    for supplied in (None, tokens[loser]):
+        result = await server.trace(bucket, **{loser: identity}, **({"confirm_token": supplied} if supplied else {}))
+        assert error in result
+        assert snapshot(tmp_path) == before
+        assert tokens[loser] in server._mutation_confirm_tokens
+        assert len(server._mutation_confirm_tokens) == token_count
+    current = server.bucket_mgr.preview_todo_completion(bucket, identity)["target"]
+    assert bool(current.get("done_at")) != bool(current.get("dropped_at"))
+
+
+@pytest.mark.asyncio
+async def test_completion_fingerprint_includes_other_todo_drop(server, tmp_path):
+    bucket, records = await setup(server)
+    pending = token(await server.trace(bucket, todo_done=records[0]["id"]))
+    preview = await server.trace(bucket, todo_drop=records[1]["id"])
+    await server.trace(bucket, todo_drop=records[1]["id"], confirm_token=token(preview))
+    before = snapshot(tmp_path)
+    assert "stale" in await server.trace(bucket, todo_done=records[0]["id"], confirm_token=pending)
+    assert snapshot(tmp_path) == before

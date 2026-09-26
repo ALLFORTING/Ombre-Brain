@@ -62,6 +62,8 @@ from boot_todos import active_display_candidates, todo_page, fit_todos, shanghai
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
+from functools import wraps
+import inspect
 from typing_extensions import Annotated, Literal
 from pydantic import Field
 from PIL import Image, UnidentifiedImageError
@@ -114,6 +116,8 @@ from bucket_manager import (
     normalize_provenance_kind,
     prepare_todo_provenance,
     reconcile_todo_provenance,
+    _merge_todo_terminal_state,
+    _todo_is_terminal,
 )
 from asset_store import (
     MAX_IMAGE_PIXELS as RM_ASSET_MAX_IMAGE_PIXELS,
@@ -447,7 +451,40 @@ async def _fire_webhook(event: str, payload: dict) -> None:
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
-mcp = FastMCP(
+def _todo_drop_argument_error(arguments: dict) -> str | None:
+    """Check explicit drop arguments before SDK defaults are expanded."""
+    if "todo_drop" not in arguments:
+        return None
+    if set(arguments) - {"bucket_id", "todo_drop", "confirm_token"}:
+        return "todo_drop must be called alone with bucket_id, todo_drop, and optional confirm_token."
+    if arguments["todo_drop"] is None:
+        return "todo_drop requires a stable todo_<uuid> ID. 该 todo 为旧格式，无稳定 ID，当前不能单条放弃。"
+    return None
+
+
+class _TodoDropGuardFastMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict):
+        if name == "trace":
+            error = _todo_drop_argument_error(arguments)
+            if error:
+                return CallToolResult(isError=True, content=[TextContent(type="text", text=error)])
+        return await super().call_tool(name, arguments)
+
+
+def _guard_todo_drop_presence(fn):
+    """Direct Python calls retain presence; MCP registers the original fn."""
+    signature = inspect.signature(fn)
+    @wraps(fn)
+    async def guarded(*args, **kwargs):
+        supplied = signature.bind_partial(*args, **kwargs).arguments
+        error = _todo_drop_argument_error(supplied)
+        if error:
+            return error
+        return await fn(*args, **kwargs)
+    return guarded
+
+
+mcp = _TodoDropGuardFastMCP(
     "Ombre Brain",
     host="0.0.0.0",
     port=OMBRE_PORT,
@@ -1927,8 +1964,9 @@ def _structured_todo_items(todo_items) -> tuple[list[str], list[dict]]:
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("todo_items.text 必须是非空字符串。")
-        if "done_at" in item:
-            raise ValueError("todo_items.done_at is server-generated and cannot be supplied.")
+        for field in ("done_at", "dropped_at"):
+            if field in item:
+                raise ValueError(f"todo_items.{field} is server-generated and cannot be supplied.")
         raw_todos.append(text.strip())
     todos = _canonical_todos(raw_todos)
     try:
@@ -2476,19 +2514,28 @@ def _merge_metadata_digest(metadata: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _todo_resume_matches(expected: list, actual: list | None) -> bool:
+def _todo_resume_matches(expected: list, actual: list | None, *, allow_legacy_assigned_ids: bool = False) -> bool:
+    # Validate intact records before the existing legacy journal ID exception.
+    for records in (expected, actual or []):
+        reconcile_todo_provenance(
+            [r.get("text") for r in records if isinstance(r, dict)], records, strict=True)
     remaining = list(actual or [])
     for planned in expected:
         found = next((r for r in remaining if
                       (r.get("id") == planned["id"] if "id" in planned else r.get("text") == planned.get("text"))), None)
         if found is None:
             return False
-        if planned.get("done_at") and found.get("done_at") != planned["done_at"]:
+        merged = _merge_todo_terminal_state(planned, found)
+        if any(merged.get(k) != found.get(k) for k in ("done_at", "dropped_at")):
             return False
-        if {k: v for k, v in found.items() if k != "done_at"} != {k: v for k, v in planned.items() if k != "done_at"}:
+        ignored = {"done_at", "dropped_at"}
+        actual_fields = {k: v for k, v in found.items() if k not in ignored}
+        if allow_legacy_assigned_ids and "id" not in planned:
+            actual_fields.pop("id", None)
+        if actual_fields != {k: v for k, v in planned.items() if k not in ignored}:
             return False
         remaining.remove(found)
-    return all(r.get("done_at") for r in remaining)
+    return all(_todo_is_terminal(r) for r in remaining)
 
 
 async def _execute_merge_operation(operation: dict) -> str:
@@ -2524,18 +2571,12 @@ async def _execute_merge_operation(operation: dict) -> str:
         for field, expected in changes.items():
             if field == "content":
                 actual = written["content"]
-            elif field == "todo_provenance" and not expected:
-                continue
             else:
                 actual = written["metadata"].get(field)
-            if (field == "todo_provenance" and expected
-                    and all("id" not in record for record in expected)):
-                # Legacy journals keep their original plan/digest. First apply
-                # may establish IDs; compare their original attribution fields.
-                actual = [{key: value for key, value in record.items() if key != "id"}
-                          for record in actual or []]
-            if field == "todo_provenance" and _todo_resume_matches(expected, actual):
-                continue
+            if field == "todo_provenance":
+                legacy = bool(expected) and all("id" not in r for r in expected)
+                if _todo_resume_matches(expected, actual, allow_legacy_assigned_ids=legacy):
+                    continue
             if actual != expected:
                 raise RuntimeError(f"merge step {step} changed after write: {field}")
         if step not in completed:
@@ -9662,21 +9703,24 @@ async def dismiss_note(
 # Also handles deletion (delete=True)
 # 同时承接删除功能
 # =============================================================
-def _todo_done_confirmation_payload(plan: dict) -> dict:
+def _todo_terminal_confirmation_payload(plan: dict) -> dict:
     target = plan["target"]
     return {"bucket_id": plan["bucket_id"], "todo_id": plan["todo_id"],
             "target_identity": target.get("id"), "target_text": target["text"],
-            "done_at": target.get("done_at"), "todo_state_sha256": plan["todo_state_sha256"]}
+            "done_at": target.get("done_at"), "dropped_at": target.get("dropped_at"),
+            "todo_state_sha256": plan["todo_state_sha256"]}
 
 
 def _trace_todo_done(bucket_id: str, todo_id: str, confirm_token: str) -> str:
     try:
         if not (confirm_token or "").strip():
             plan = bucket_mgr.preview_todo_completion(bucket_id, todo_id)
+            if plan["target"].get("dropped_at"):
+                raise ValueError("该 todo 已放弃，不能标记为完成")
             if plan["target"].get("done_at"):
                 outcome = {"status": "already_completed", "done_at": plan["target"]["done_at"]}
             else:
-                token = _issue_mutation_confirmation("trace.todo_done", _todo_done_confirmation_payload(plan))
+                token = _issue_mutation_confirmation("trace.todo_done", _todo_terminal_confirmation_payload(plan))
                 return (f"todo completion preview: no changes made; bucket_id={bucket_id} "
                         f"name={plan['bucket_name']}; todo_id={todo_id}; text={plan['target']['text']}; "
                         "current=pending; action=mark completed; bucket resolved will not change.\n"
@@ -9684,7 +9728,7 @@ def _trace_todo_done(bucket_id: str, todo_id: str, confirm_token: str) -> str:
         else:
             outcome = bucket_mgr.complete_todo(bucket_id, todo_id,
                 lambda plan: _consume_mutation_confirmation("trace.todo_done",
-                    _todo_done_confirmation_payload(plan), confirm_token))
+                    _todo_terminal_confirmation_payload(plan), confirm_token))
     except (ValueError, BucketWriteLockError, OSError) as exc:
         return f"todo completion rejected: {exc}"
     status = outcome["status"]
@@ -9697,6 +9741,36 @@ def _trace_todo_done(bucket_id: str, todo_id: str, confirm_token: str) -> str:
             f"done_at={outcome['done_at']}; bucket resolved unchanged.")
 
 
+def _trace_todo_drop(bucket_id: str, todo_id: str, confirm_token: str) -> str:
+    try:
+        if not (confirm_token or "").strip():
+            plan = bucket_mgr.preview_todo_drop(bucket_id, todo_id)
+            if plan["target"].get("done_at"):
+                raise ValueError("该 todo 已完成，不能标记为放弃")
+            if plan["target"].get("dropped_at"):
+                outcome = {"status": "already_dropped", "dropped_at": plan["target"]["dropped_at"]}
+            else:
+                token = _issue_mutation_confirmation("trace.todo_drop", _todo_terminal_confirmation_payload(plan))
+                return (f"todo drop preview: no changes made; bucket_id={bucket_id} "
+                        f"name={plan['bucket_name']}; todo_id={todo_id}; text={plan['target']['text']}; "
+                        "current=active; action=放弃该 todo; 不等于已完成；不删除历史；不自动 resolved bucket。\n"
+                        f"confirm_token: {token}")
+        else:
+            outcome = bucket_mgr.drop_todo(bucket_id, todo_id,
+                lambda plan: _consume_mutation_confirmation("trace.todo_drop",
+                    _todo_terminal_confirmation_payload(plan), confirm_token))
+    except (ValueError, BucketWriteLockError, OSError) as exc:
+        return f"todo drop rejected: {exc}"
+    if outcome["status"] == "confirmation_invalid":
+        return "todo drop confirmation invalid, expired, used, or stale; preview again."
+    if outcome["status"] == "write_failed":
+        return "todo drop write failed; no drop committed; token consumed; preview again."
+    label = "already dropped (已放弃)" if outcome["status"] == "already_dropped" else "todo dropped (已放弃)"
+    return (f"{label}: bucket_id={bucket_id}; todo_id={todo_id}; "
+            f"dropped_at={outcome['dropped_at']}; history preserved; bucket resolved unchanged.")
+
+
+@_guard_todo_drop_presence
 @mcp.tool()
 async def trace(
     bucket_id: str,
@@ -9734,24 +9808,29 @@ async def trace(
     trigger_date: str = "",
     delete: bool = False,
     confirm_token: str = "",
-    todo_done: Annotated[str | None, Field(description="Complete one stable todo ID using preview then confirm_token. Must be called alone with bucket_id; completion never resolves the bucket.")] = None,
+    todo_done: Annotated[str | None, Field(description="Use only when Ting explicitly says the task is completed. Complete one stable todo ID using preview then confirm_token. Call alone with bucket_id; never resolves the bucket; dropped todos cannot be completed.")] = None,
+    todo_drop: Annotated[str | None, Field(description="Use only when Ting explicitly cancels, abandons, or says the task will not be done; never infer abandonment from age, importance, or inactivity. Drop one stable todo ID using preview then confirm_token. Only bucket_id, todo_drop, confirm_token may be supplied. Preserves history, is not completion, never resolves the bucket; completed todos cannot be dropped.")] = None,
 ) -> str:
     # MCP schema note: related and superseded_by stay in the signature for relations.
-    """Mixed memory operation: metadata/content, relations, merge, seal, and destructive delete; no MCP undo command."""
+    """Mixed memory operation: metadata/content, relations, merge, seal, delete, and confirmed todo completion/abandonment driven by Ting's explicit intent; no MCP undo command."""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
-    if todo_done is not None:
+    if todo_done is not None or todo_drop is not None:
+        action = "todo_drop" if todo_drop is not None else "todo_done"
         if (name or domain or valence != -1 or arousal != -1 or importance != -1 or
                 tags or todos is not None or todo_items is not None or resolved != -1 or
                 pinned != -1 or permanent != -1 or digested != -1 or dormant != -1 or
                 sealed != -1 or content or provenance_kind or related or unrelate or
-                superseded_by is not None or merge or append or trigger_date or delete):
-            return "todo_done must be called alone with bucket_id, todo_done, and optional confirm_token."
+                superseded_by is not None or merge or append or trigger_date or delete or
+                (todo_done is not None and todo_drop is not None)):
+            return f"{action} must be called alone with bucket_id, {action}, and optional confirm_token."
         targets = list(dict.fromkeys(_parse_csv_ids(bucket_id)))
         if len(targets) != 1:
-            return "todo_done requires exactly one bucket; batch completion is not supported."
+            return f"{action} requires exactly one bucket; batch mutation is not supported."
+        if todo_drop is not None:
+            return _trace_todo_drop(targets[0], todo_drop, confirm_token)
         return _trace_todo_done(targets[0], todo_done, confirm_token)
 
     if importance != -1 and not 1 <= importance <= 10:
