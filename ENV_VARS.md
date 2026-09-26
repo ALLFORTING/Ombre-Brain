@@ -5,6 +5,7 @@
 | `OMBRE_API_KEY` | 是 | — | Gemini / OpenAI-compatible API Key，用于脱水(dehydration)和向量嵌入 |
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
+| `OMBRE_MCP_STATELESS_HTTP` | 否 | `false` | 仅影响 `streamable-http`；`true` 会禁用 transport session tracking。候选开关，断连会取消当前工具；不提供 exactly-once 或幂等保障。SSE / stdio 不受影响。 |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
 | `OMBRE_AUTH_TOKEN` | 否 | 无 | HTTP MCP（`/mcp`、`/mcp/*`、SSE 的 `/sse` 与 `/messages`）的首选认证；只接受 `Authorization: Bearer <token>`，Bearer 未设置或不匹配时拒绝访问 |
 | `OMBRE_MCP_ALLOW_QUERY_TOKEN` | 否 | 关闭 | URL-only MCP 客户端的显式 query-token 兼容开关；默认关闭。启用后 URL 凭据可能被客户端、代理、历史记录或访问日志保留 |
@@ -34,6 +35,16 @@
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
 | `OMBRE_EMBEDDING_API_KEY` | 否 | — | 独立的向量 API key；设置后不会复用主 LLM key |
 | `OMBRE_CONFLICT_DETECTION_ENABLED` | 否 | `true` | 独立控制 `hold`/`grow` 矛盾检测；关闭时跳过候选选择和模型调用。开启时仍需可用的 digest API 配置才能实际调用模型 |
+
+## Stateless HTTP candidate (S-2)
+
+`OMBRE_MCP_STATELESS_HTTP` 默认 `false`；未设置、空值、无效值和 false-like 值保持现有 stateful 行为。与其他 OB 开关一致，仅 `1`、`true`、`yes`、`on`（忽略大小写和首尾空白）开启。
+
+示例：`OMBRE_TRANSPORT=streamable-http`、`OMBRE_MCP_STATELESS_HTTP=false`。设为 `true` 会禁用 transport session tracking，不返回 `Mcp-Session-Id`，但不会把 confirmation、cursor 或磁盘 operation state 移入 transport。进程内 token/cursor 仍不能跨进程、重启或任意多副本共享。
+
+MCP 1.29.1 的 `streamable_http_app()` 无此关键字参数；共享 builder 在首次构造前设置 `mcp.settings.stateless_http`。开关仅在启动构造时生效，修改后需重启。`json_response` 继续 false，认证、CORS 和 session diagnostics 保持原样。
+
+这是默认关闭的候选实现，尚不建议线上启用。stateless 客户端断连会取消工具任务，现有多步骤写可能只完成部分步骤；此开关不提供 exactly-once、请求幂等或重试去重保障。详见 [S-2 验证报告](docs/S2_STATELESS_HTTP_VALIDATION.md)。
 
 ## HTTP MCP authentication
 

@@ -565,6 +565,18 @@ DIAGNOSTIC_TOOL_NAMES = frozenset({
 })
 
 
+def build_streamable_http_app():
+    """Build once at startup; MCP 1.29.1 reads this setting, not a method kwarg.
+
+    The OB flag controls only this HTTP builder. SSE and stdio do not use it.
+    Authentication, CORS and diagnostics are installed by the entrypoints.
+    """
+    mcp.settings.stateless_http = _env_flag_enabled(
+        os.getenv("OMBRE_MCP_STATELESS_HTTP", "false")
+    )
+    return mcp.streamable_http_app()
+
+
 def _env_flag_enabled(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -12573,7 +12585,7 @@ if __name__ == "__main__":
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
         if transport == "streamable-http":
-            _app = mcp.streamable_http_app()
+            _app = build_streamable_http_app()
         else:
             _app = mcp.sse_app()
         add_mcp_auth_middleware(_app)

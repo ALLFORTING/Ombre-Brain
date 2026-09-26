@@ -145,7 +145,7 @@ def run() -> None:
     threading.Thread(target=start_keepalive, daemon=True).start()
 
     if transport == "streamable-http":
-        app = server.mcp.streamable_http_app()
+        app = server.build_streamable_http_app()
     else:
         app = server.mcp.sse_app()
     server.add_mcp_auth_middleware(app)
