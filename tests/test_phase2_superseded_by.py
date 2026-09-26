@@ -233,3 +233,32 @@ async def test_breath_does_not_repeat_successor_when_it_is_already_returned(tmp_
 
     assert f"⊘已作废→{target_id}(Current)" in result
     assert "当前有效：" not in result
+
+
+@pytest.mark.asyncio
+async def test_real_breath_exact_superseded_name_survives_small_limit_without_touch(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server.bucket_mgr.embedding_engine = None
+    monkeypatch.setattr(server.bucket_mgr, "_calc_time_score", lambda metadata: 1.0)
+    name = "完整作废桶名"
+    old_id = await _bucket(server, "old canonical body", name=name)
+    successor_id = await _bucket(server, "successor canonical body", name="当前有效桶")
+    for index in range(5):
+        await _bucket(server, f"正文提到{name}的竞争者{index}", name=f"竞争者{index}")
+    await server.trace(old_id, superseded_by=successor_id)
+    before = await server.bucket_mgr.get(old_id)
+    server.bucket_mgr.touch.reset_mock()
+    server.decay_engine.ensure_started.reset_mock()
+
+    result = await server.breath(query=name, max_results=1, touch=False)
+
+    assert f"[bucket_id:{old_id}]" in result
+    assert "[通道:精确]" in result
+    assert "[检索分=7.53]" in result
+    assert f"⊘已作废→{successor_id}(当前有效桶)" in result
+    assert "old canonical body" in result
+    assert "successor canonical body" not in result
+    assert "exact_name_match" not in result
+    server.bucket_mgr.touch.assert_not_awaited()
+    server.decay_engine.ensure_started.assert_not_awaited()
+    assert (await server.bucket_mgr.get(old_id))["metadata"] == before["metadata"]

@@ -2494,6 +2494,7 @@ class BucketManager:
                 # Dim 1: topic relevance (fuzzy text, 0~1)
                 topic_score = self._calc_topic_score(query, bucket)
                 exact_score = self._calc_exact_match_score(query, bucket)
+                exact_name_match = self._is_exact_name_match(query, bucket)
                 semantic_score = max(
                     0.0,
                     min(1.0, float(vector_scores.get(bucket["id"], 0.0))),
@@ -2535,6 +2536,7 @@ class BucketManager:
                         "importance": round(importance_score, 4),
                         "semantic": round(semantic_score, 4),
                     }
+                    trace_entry["exact_name_match"] = exact_name_match
                     trace_entry["pre_penalty_score"] = round(normalized, 2)
                     trace_entry["semantic_threshold"] = semantic_score >= 0.42
                     trace_entry["threshold"] = self.fuzzy_threshold
@@ -2569,6 +2571,7 @@ class BucketManager:
                             else 2 if exact_score > 0
                             else 1
                         )
+                    bucket["exact_name_match"] = exact_name_match
                     bucket["score"] = round(hybrid_score, 2)
                     bucket["semantic_score"] = round(semantic_score, 4)
                     bucket["vector_match"] = semantic_score >= 0.42 and not exact_score
@@ -2589,7 +2592,9 @@ class BucketManager:
                 continue
 
         scored.sort(
-            key=lambda x: (x.get("match_tier", 0), x["score"]),
+            key=lambda x: (
+                x["exact_name_match"], x.get("match_tier", 0), x["score"]
+            ),
             reverse=True,
         )
         if trace is not None:
@@ -2662,6 +2667,14 @@ class BucketManager:
     def _normalize_search_text(value) -> str:
         """Normalize without tokenizing, preserving one-character Chinese names."""
         return "".join(str(value or "").casefold().split())
+
+    def _is_exact_name_match(self, query: str, bucket: dict) -> bool:
+        """Prioritize whole normalized names without changing retrieval scores."""
+        query_text = self._normalize_search_text(apply_display_aliases(query))
+        name = bucket.get("metadata", {}).get("name", "")
+        return bool(query_text) and query_text == self._normalize_search_text(
+            apply_display_aliases(name or "")
+        )
 
     def _metadata_keywords(self, meta: dict) -> list[str]:
         keywords = meta.get("keywords", [])
