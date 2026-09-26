@@ -116,6 +116,28 @@ async def test_filtered_session_query_full_and_hidden_count(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_session_preview_marks_1200_char_cut_only_without_query(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    short_id = await server.bucket_mgr.create(
+        "A" * 1200, name="short session", domain=["session"], topics=["W2"]
+    )
+    long_id = await server.bucket_mgr.create(
+        "A" * 1201, name="long session", domain=["session"], topics=["W2"]
+    )
+    await server.bucket_mgr.archive(short_id)
+    await server.bucket_mgr.archive(long_id)
+
+    for kwargs in ({"domain": "session"}, {"topic_filter": ["W2"]}):
+        plain = await server.breath(max_results=2, touch=False, **kwargs)
+        queried = await server.breath(query="A", max_results=2, touch=False, **kwargs)
+        assert f"…已截断：bucket {short_id}" not in plain
+        assert f"…已截断：bucket {long_id}" in plain
+        assert "显示 1200 / 1201 字符" in plain
+        assert "[显示=原文节选·已截断]" in queried
+        assert f"…已截断：bucket {long_id}" not in queried
+
+
+@pytest.mark.asyncio
 async def test_topic_and_tag_filters_are_conjunctive(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     matching_id = _bucket_id(

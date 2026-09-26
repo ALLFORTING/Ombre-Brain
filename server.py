@@ -1447,18 +1447,42 @@ async def _dream_superseded_notice(bucket: dict) -> str:
     return f"此桶已被 {successor_id}({successor_name}) 取代于 {timestamp}"
 
 
-async def _bucket_summary_line(bucket: dict, score: float | None = None, pinned: bool = False) -> str:
+def _bucket_display_icon(meta: dict, *, protected_as_pinned: bool = False) -> str:
+    """Share the pulse type/status icons while keeping query pins literal."""
+    if int(meta.get("sealed", 0) or 0) == 1:
+        return "🔒"
+    if meta.get("pinned") or (protected_as_pinned and meta.get("protected")):
+        return "📌"
+    if meta.get("type") == "permanent":
+        return "📦"
+    if meta.get("type") == "feel":
+        return "🫧"
+    if meta.get("type") == "archived":
+        return "🗄️"
+    if meta.get("resolved", False):
+        return "✅"
+    return "💭"
+
+
+async def _bucket_summary_line(
+    bucket: dict, score: float | None = None, pinned: bool = False,
+    *, importance_only: bool = False,
+) -> str:
     meta = bucket.get("metadata", {})
     label = meta.get("name", bucket["id"])
     superseded_marker = await _superseded_marker(bucket)
     topic = _bucket_topic(meta)
     emotion = _bucket_emotion(meta)
     updated = _bucket_date(meta, "updated_at", "last_active", "created")
+    icon = _bucket_display_icon(meta)
+    if importance_only:
+        importance = meta.get("importance", "?")
+        return f"{icon} [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
     if pinned:
         importance = meta.get("importance", "?")
-        return f"📌 [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
+        return f"{icon} [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 重要:{importance} | 更新:{updated}"
     weight = f"{score:.2f}" if score is not None else "0.00"
-    return f"💭 [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 权重:{weight} | 更新:{updated}"
+    return f"{icon} [bucket_id:{bucket['id']}] {label}{superseded_marker} | 主题:{topic} | {emotion} | 权重:{weight} | 更新:{updated}"
 
 
 async def _dream_summary_line(bucket: dict) -> str:
@@ -2683,7 +2707,7 @@ def _dashboard_delete_response(bucket_id: str, outcome: dict, *, review: bool = 
     return JSONResponse(body, status_code=200 if status == "preview" else 500 if status == "failed" else 409)
 
 
-def _extract_session_summary(content: str, max_chars: int = 700) -> str:
+def _extract_session_summary(content: str, max_chars: int | None = 700) -> str:
     """Extract the Summary section from an archived session bucket."""
     text = strip_wikilinks(content or "").strip()
     marker = "## Summary"
@@ -2691,7 +2715,7 @@ def _extract_session_summary(content: str, max_chars: int = 700) -> str:
         text = text.split(marker, 1)[1].strip()
         if "\n## " in text:
             text = text.split("\n## ", 1)[0].strip()
-    return text[:max_chars].strip()
+    return text[:max_chars].strip() if max_chars is not None else text
 
 
 def _format_mailbox(limit: int = 1, include_sealed: bool = False) -> str:
@@ -2767,6 +2791,13 @@ def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | No
     )
 
 
+def _format_bucket_truncation_notice(bucket_id: str, shown: int, total: int) -> str:
+    return (
+        f"[…已截断：bucket {bucket_id}，显示 {shown} / {total} 字符；"
+        f"完整内容可用 dream(detail_ids=\"{bucket_id}\") 读取]"
+    )
+
+
 def _format_boot_preview(
     bucket: dict,
     max_chars: int,
@@ -2778,11 +2809,7 @@ def _format_boot_preview(
     preview = content[:max_chars]
     if show_truncation and len(content) > len(preview):
         bucket_id = str(bucket.get("id", ""))
-        return (
-            f"{preview}\n"
-            f"[…已截断：bucket {bucket_id}，显示 {len(preview)} / {len(content)} 字符；"
-            f"完整内容可用 dream(detail_ids=\"{bucket_id}\") 读取]"
-        )
+        return f"{preview}\n{_format_bucket_truncation_notice(bucket_id, len(preview), len(content))}"
     return preview
 
 
@@ -4231,6 +4258,10 @@ async def _breath_filtered_impl(
                     display = "原文节选·已截断" if len(str(bucket.get("content", ""))) > 1200 else "原文"
                     if body != preview:
                         display += "·双链标记已省略"
+                    if not query_text and len(str(bucket.get("content", ""))) > 1200:
+                        body += "\n" + _format_bucket_truncation_notice(
+                            str(bucket["id"]), len(body), len(str(bucket.get("content", "")))
+                        )
                 text = (
                     f"[session] [bucket_id:{bucket['id']}] "
                     f"{metadata.get('name', bucket['id'])}\n"
@@ -4397,8 +4428,10 @@ async def _breath_filtered_impl(
 
         weak_lines = [
             f"[bucket_id:{bucket['id']}] "
+            f"{_bucket_display_icon(bucket.get('metadata', {}))} "
             f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
-            f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+            f"{_breath_retrieval_score_label(bucket)}"
+            f"{' [休眠]' if bucket.get('metadata', {}).get('dormant', False) else ''}"
             for bucket in weak_matches
         ]
         if not results and not weak_lines:
@@ -4561,9 +4594,14 @@ def _encode_breath_cursor(matches: list[dict], position: int, scope: str) -> str
         "matches": [
             {
                 "id": str(bucket.get("id", "")),
-                "score": float(bucket.get("_breath_score", 0.0)),
-                "channel": str(bucket.get("_breath_channel", "关键词")),
-                "weak": bool(bucket.get("_breath_weak", False)),
+                "score": float(bucket.get("_breath_score", bucket.get("score", 0.0))),
+                "retrieval_score": (
+                    bucket.get("score") if "_breath_score" in bucket
+                    else bucket.get("retrieval_score")
+                ),
+                "channel": str(bucket.get("_breath_channel", bucket.get("channel", "关键词"))),
+                "weak": bool(bucket.get("_breath_weak", bucket.get("weak", False))),
+                "vector_match": bool(bucket.get("vector_match", False)),
             }
             for bucket in matches
         ],
@@ -4598,6 +4636,16 @@ def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[dict],
             or not isinstance(match.get("channel"), str)
             or not match["channel"]
             or not isinstance(match.get("weak"), bool)
+            or (
+                "retrieval_score" in match
+                and match["retrieval_score"] is not None
+                and (
+                    not isinstance(match["retrieval_score"], (int, float))
+                    or isinstance(match["retrieval_score"], bool)
+                    or not 0.0 <= float(match["retrieval_score"]) <= 100.0
+                )
+            )
+            or ("vector_match" in match and not isinstance(match["vector_match"], bool))
             for match in frozen_matches
         )
         or len({match["id"] for match in frozen_matches}) != len(frozen_matches)
@@ -4629,7 +4677,8 @@ def _resolve_breath_min_score(min_score: float) -> float:
     return resolved
 
 
-def _breath_exact_anchor_match(query: str, bucket: dict) -> bool:
+def _breath_weak_score_anchor_match(query: str, bucket: dict) -> bool:
+    """Preserve the existing weak-match grouping independently of labels."""
     query_text = "".join(str(query or "").casefold().split())
     if not query_text:
         return False
@@ -4639,6 +4688,27 @@ def _breath_exact_anchor_match(query: str, bucket: dict) -> bool:
         str(bucket.get("content", "")),
     ))
     return query_text in "".join(searchable.casefold().split())
+
+
+def _breath_exact_anchor_match(query: str, bucket: dict) -> bool:
+    query_text = "".join(str(query or "").casefold().split())
+    if not query_text:
+        return False
+    meta = bucket.get("metadata", {})
+    normalize = lambda value: "".join(str(value or "").casefold().split())
+    tags = meta.get("tags", [])
+    if isinstance(tags, str):
+        tags = [part.strip() for part in tags.split(",")]
+    return query_text == normalize(meta.get("name", "")) or any(
+        query_text == normalize(tag) for tag in (tags or [])
+    )
+
+
+def _breath_retrieval_score_label(bucket: dict) -> str:
+    score = bucket.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        return f"检索分={score:.2f}"
+    return "检索分=未记录"
 
 
 def _annotate_breath_query_matches(
@@ -4666,10 +4736,13 @@ def _annotate_breath_query_matches(
         except (TypeError, ValueError):
             semantic_score = 0.0
 
+        score = (
+            1.0 if _breath_weak_score_anchor_match(query, rendered)
+            else max(fuzzy_score, semantic_score)
+        )
         if _breath_exact_anchor_match(query, rendered):
-            score, channel = 1.0, "精确"
+            channel = "精确"
         else:
-            score = max(fuzzy_score, semantic_score)
             if fuzzy_score > 0.0 and semantic_score > 0.0:
                 channel = "双"
             elif semantic_score > 0.0:
@@ -4693,14 +4766,14 @@ def _order_breath_query_matches(matches: list[dict]) -> list[dict]:
 
 async def _format_breath_query_summary(bucket: dict, summary: str) -> str:
     """Add the stable query-result header used by both Breath query paths."""
-    pinned = bool(bucket.get("metadata", {}).get("pinned", False))
-    score = float(bucket.get("_breath_score", 0.0))
+    meta = bucket.get("metadata", {})
+    icon = _bucket_display_icon(meta)
+    dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
     channel = str(bucket.get("_breath_channel", "关键词"))
-    marker = " 📌" if pinned else ""
     superseded_marker = await _superseded_marker(bucket)
     header = (
-        f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
-        f"[通道:{channel}]{superseded_marker} {summary}"
+        f"[bucket_id:{bucket['id']}] {icon} [{_breath_retrieval_score_label(bucket)}] "
+        f"[通道:{channel}]{superseded_marker}{dormant_tag} {summary}"
     )
     return "[语义关联] " + header if bucket.get("vector_match") else header
 
@@ -4742,10 +4815,11 @@ async def _compose_breath_query_matches(
         if remaining_budget <= 0:
             break
         if bucket.get("_breath_weak", False):
+            meta = bucket.get("metadata", {})
+            dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
             line = (
-                f"[bucket_id:{bid}] "
-                f"{bucket.get('metadata', {}).get('name', bid)} "
-                f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+                f"[bucket_id:{bid}] {_bucket_display_icon(meta)} "
+                f"{meta.get('name', bid)} {_breath_retrieval_score_label(bucket)}{dormant_tag}"
             )
             required = max(1, count_tokens_approx(line))
             if required > remaining_budget:
@@ -5058,8 +5132,8 @@ async def _format_historical_breath_summary(
 ) -> str:
     """Render raw historical content without current-summary cache side effects."""
     metadata = bucket.get("metadata", {})
-    marker = " 📌" if metadata.get("pinned", False) else ""
-    score = float(bucket.get("_breath_score", 0.0))
+    icon = _bucket_display_icon(metadata)
+    dormant_tag = " [休眠]" if metadata.get("dormant", False) else ""
     channel = str(bucket.get("_breath_channel", "关键词"))
     superseded_marker = await _superseded_marker(bucket)
     version_start = str(bucket.get("_as_of_version_start", ""))
@@ -5069,8 +5143,8 @@ async def _format_historical_breath_summary(
     )
     return (
         f"[历史版本 · as_of={requested_as_of} · metadata=当前] "
-        f"[bucket_id:{bucket['id']}]{marker} [sim={score:.2f}] "
-        f"[通道:{channel}]{superseded_marker}\n"
+        f"[bucket_id:{bucket['id']}] {icon} [{_breath_retrieval_score_label(bucket)}] "
+        f"[通道:{channel}]{superseded_marker}{dormant_tag}\n"
         f"[正文版本有效: {version_start} — {version_range}]\n"
         f"[显示={'历史原文·已截断' if truncated else '历史原文'}] {body}"
     )
@@ -5100,10 +5174,12 @@ async def _compose_historical_breath_matches(
         if remaining_budget <= 0:
             break
         if bucket.get("_breath_weak", False):
+            meta = bucket.get("metadata", {})
+            dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
             line = (
                 f"[历史版本 · as_of={requested_as_of}] [bucket_id:{bucket['id']}] "
-                f"{bucket.get('metadata', {}).get('name', bucket['id'])} "
-                f"sim={float(bucket.get('_breath_score', 0.0)):.2f}"
+                f"{_bucket_display_icon(meta)} {meta.get('name', bucket['id'])} "
+                f"{_breath_retrieval_score_label(bucket)}{dormant_tag}"
             )
             required = max(1, count_tokens_approx(line))
             if required > remaining_budget:
@@ -5247,8 +5323,17 @@ async def _breath_as_of_impl(
                 continue
             rendered = dict(bucket)
             rendered["_breath_score"] = float(record["score"])
+            rendered.pop("score", None)
+            if record.get("retrieval_score") is not None:
+                rendered["score"] = float(record["retrieval_score"])
+            if (
+                record.get("retrieval_score") is None and record["channel"] == "精确"
+                and not _breath_exact_anchor_match(query, rendered)
+            ):
+                record["channel"] = "关键词"
             rendered["_breath_channel"] = record["channel"]
             rendered["_breath_weak"] = bool(record["weak"])
+            rendered["vector_match"] = bool(record.get("vector_match", False))
             rendered["_breath_index"] = index
             eligible.append(rendered)
         ordered_matches = frozen_matches
@@ -5452,6 +5537,10 @@ async def _breath_impl(
                         if body != preview:
                             display += "·双链标记已省略"
                         body = f"[显示={display}] {body}"
+                    elif len(str(b.get("content", ""))) > 1200:
+                        body += "\n" + _format_bucket_truncation_notice(
+                            str(b["id"]), len(body), len(str(b.get("content", "")))
+                        )
                 text = (
                     f"[session] [bucket_id:{b['id']}] {meta.get('name', b['id'])}\n"
                     f"{body}"
@@ -5545,7 +5634,7 @@ async def _breath_impl(
                 )
         results = [
             await _append_bucket_extras(
-                await _bucket_summary_line(b, pinned=bool(b["metadata"].get("pinned"))),
+                await _bucket_summary_line(b, importance_only=True),
                 b,
                 emotion_trend,
             )
@@ -5798,8 +5887,17 @@ async def _breath_impl(
                 continue
             rendered = dict(bucket)
             rendered["_breath_score"] = float(record["score"])
+            rendered.pop("score", None)
+            if record.get("retrieval_score") is not None:
+                rendered["score"] = float(record["retrieval_score"])
+            if (
+                record.get("retrieval_score") is None and record["channel"] == "精确"
+                and not _breath_exact_anchor_match(query, rendered)
+            ):
+                record["channel"] = "关键词"
             rendered["_breath_channel"] = record["channel"]
             rendered["_breath_weak"] = bool(record["weak"])
+            rendered["vector_match"] = bool(record.get("vector_match", False))
             rendered["_breath_index"] = index
             if not _filter_breath_query_matches(
                 [rendered],
@@ -10026,7 +10124,12 @@ async def boot(
     session_lines = []
     for bucket in sessions[:3]:
         meta = bucket.get("metadata", {})
-        summary = _extract_session_summary(bucket.get("content", ""))
+        full_summary = _extract_session_summary(bucket.get("content", ""), max_chars=None)
+        summary = full_summary[:700].strip()
+        if len(full_summary) > 700:
+            summary += "\n" + _format_bucket_truncation_notice(
+                str(bucket["id"]), len(summary), len(full_summary)
+            )
         session_lines.append(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{summary}"
         )
@@ -10529,20 +10632,7 @@ async def pulse(
     lines = []
     for b in visible_buckets:
         meta = b.get("metadata", {})
-        if int(meta.get("sealed", 0) or 0) == 1:
-            icon = "🔒"
-        elif meta.get("pinned") or meta.get("protected"):
-            icon = "📌"
-        elif meta.get("type") == "permanent":
-            icon = "📦"
-        elif meta.get("type") == "feel":
-            icon = "🫧"
-        elif meta.get("type") == "archived":
-            icon = "🗄️"
-        elif meta.get("resolved", False):
-            icon = "✅"
-        else:
-            icon = "💭"
+        icon = _bucket_display_icon(meta, protected_as_pinned=True)
         try:
             score = decay_engine.calculate_score(meta)
         except Exception:

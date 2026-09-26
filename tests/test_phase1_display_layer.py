@@ -21,10 +21,11 @@ def _load_server(tmp_path, monkeypatch):
     return server
 
 
-def _bucket(bucket_id, content, *, name=None, pinned=False, protected=False):
+def _bucket(bucket_id, content, *, name=None, pinned=False, protected=False, score=42.0):
     return {
         "id": bucket_id,
         "content": content,
+        "score": score,
         "metadata": {
             "name": name or bucket_id,
             "pinned": pinned,
@@ -54,26 +55,63 @@ def _next_cursor(result):
 
 
 @pytest.mark.asyncio
-async def test_breath_exact_anchor_has_normalized_score_and_exact_channel(tmp_path, monkeypatch):
+async def test_breath_body_substring_is_not_exact_and_shows_retrieval_score(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    bucket = _bucket("anchor", "only 琥珀风筝2309 appears here", name="anchor memory")
+    bucket = _bucket("anchor", "only 琥珀风筝2309 appears here", name="anchor memory", score=37.25)
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [bucket], {"anchor": {"fuzzy_lexical": 0.31, "semantic": 0.72}}
         )
     )
 
-    result = await server.breath(query=" 琥珀 风筝2309 ")
+    result = await server.breath(query=" 琥珀 风筝2309 ", min_score=0.90)
 
-    assert "[sim=1.00]" in result
-    assert "[通道:精确]" in result
+    assert "[检索分=37.25]" in result
+    assert "[通道:双]" in result
+    assert "[通道:精确]" not in result
+    assert "--- 弱匹配（仅列名） ---" not in result
+
+
+@pytest.mark.asyncio
+async def test_breath_shows_the_search_result_score(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("unique retrieval score marker")
+    matches = await server.bucket_mgr.search("unique retrieval score marker")
+    expected = next(bucket["score"] for bucket in matches if bucket["id"] == bucket_id)
+
+    result = await server.breath(query="unique retrieval score marker", touch=False)
+
+    assert f"[检索分={expected:.2f}]" in result
+
+
+@pytest.mark.asyncio
+async def test_breath_exact_channel_requires_whole_name_or_tag(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    name = _bucket("name", "unrelated body", name="琥珀 风筝", score=34.5)
+    tag = _bucket("tag", "unrelated body", score=29.25)
+    tag["metadata"]["tags"] = ["琥珀风筝"]
+    server.bucket_mgr.search = AsyncMock(
+        side_effect=_search_with_scores(
+            [name, tag],
+            {
+                "name": {"fuzzy_lexical": 0.31, "semantic": 0.0},
+                "tag": {"fuzzy_lexical": 0.31, "semantic": 0.0},
+            },
+        )
+    )
+
+    result = await server.breath(query=" 琥珀 风筝 ")
+
+    assert result.count("[通道:精确]") == 2
+    assert "[检索分=34.50]" in result
+    assert "[检索分=29.25]" in result
 
 
 @pytest.mark.asyncio
 async def test_breath_weak_matches_have_no_body_and_do_not_consume_budget(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     strong = _bucket("strong", "strong body", name="Strong")
-    weak = _bucket("weak", "weak body must stay hidden", name="Weak")
+    weak = _bucket("weak", "weak body must stay hidden", name="Weak", score=17.25)
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [strong, weak],
@@ -88,7 +126,7 @@ async def test_breath_weak_matches_have_no_body_and_do_not_consume_budget(tmp_pa
 
     assert "strong body" in result
     assert "--- 弱匹配（仅列名） ---" in result
-    assert "[bucket_id:weak] Weak sim=0.30" in result
+    assert "[bucket_id:weak] 💭 Weak 检索分=17.25" in result
     assert "weak body must stay hidden" not in result
     assert "因低于阈值降级 1" in result
     assert server.dehydrator.dehydrate.await_count == 1
@@ -98,7 +136,7 @@ async def test_breath_weak_matches_have_no_body_and_do_not_consume_budget(tmp_pa
 async def test_breath_cursor_freezes_scores_and_weak_group(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     strong = _bucket("strong", "strong body", name="Strong")
-    weak = _bucket("weak", "weak body", name="Weak")
+    weak = _bucket("weak", "weak body", name="Weak", score=17.25)
     by_id = {"strong": strong, "weak": weak}
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
@@ -113,19 +151,85 @@ async def test_breath_cursor_freezes_scores_and_weak_group(tmp_path, monkeypatch
 
     first = await server.breath(query="not an exact anchor", max_results=1, min_score=0.45)
     cursor = _next_cursor(first)
-    by_id["weak"] = _bucket("weak", "not an exact anchor now appears here", name="Weak")
+    by_id["weak"] = _bucket("weak", "not an exact anchor now appears here", name="Weak", score=90.0)
     second = await server.breath(
         query="not an exact anchor", max_results=1, min_score=0.45, cursor=cursor
     )
 
     assert cursor
-    assert "[bucket_id:weak] Weak sim=0.20" in second
+    assert "[bucket_id:weak] 💭 Weak 检索分=17.25" in second
     assert "not an exact anchor now appears here" not in second
     assert server.bucket_mgr.search.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_breath_dual_channel_uses_max_score(tmp_path, monkeypatch):
+async def test_legacy_cursor_keeps_page_but_does_not_relabel_old_sim(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    first_bucket = _bucket("first", "first body", score=40.0)
+    second_bucket = _bucket("second", "anchor in second body", score=19.5)
+    by_id = {"first": first_bucket, "second": second_bucket}
+    server.bucket_mgr.search = AsyncMock(
+        side_effect=_search_with_scores(
+            [first_bucket, second_bucket],
+            {
+                "first": {"fuzzy_lexical": 0.7, "semantic": 0.0},
+                "second": {"fuzzy_lexical": 0.6, "semantic": 0.0},
+            },
+        )
+    )
+    server.bucket_mgr.get = AsyncMock(side_effect=lambda bucket_id: by_id.get(bucket_id))
+
+    first = await server.breath(query="anchor", max_results=1)
+    cursor = _next_cursor(first)
+    for record in server._BREATH_CURSOR_STATES[cursor]["matches"]:
+        record.pop("retrieval_score")
+        record.pop("vector_match")
+        if record["id"] == "second":
+            record["channel"] = "精确"  # legacy body-substring label
+    second = await server.breath(query="anchor", max_results=1, cursor=cursor)
+
+    assert "[bucket_id:second]" in second
+    assert "[检索分=未记录]" in second
+    assert "[检索分=0.60]" not in second
+    assert "[通道:精确]" not in second
+    assert "[通道:关键词]" in second
+    assert server.bucket_mgr.search.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cursor_reencoding_preserves_retrieval_display_and_weak_group(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    buckets = [_bucket(str(index), f"body {index}", score=40.0 - index) for index in range(4)]
+    buckets[2]["vector_match"] = True
+    by_id = {bucket["id"]: bucket for bucket in buckets}
+    server.bucket_mgr.search = AsyncMock(
+        side_effect=_search_with_scores(
+            buckets,
+            {
+                "0": {"fuzzy_lexical": 0.9, "semantic": 0.0},
+                "1": {"fuzzy_lexical": 0.8, "semantic": 0.0},
+                "2": {"fuzzy_lexical": 0.7, "semantic": 0.8},
+                "3": {"fuzzy_lexical": 0.2, "semantic": 0.0},
+            },
+        )
+    )
+    server.bucket_mgr.get = AsyncMock(side_effect=lambda bucket_id: by_id.get(bucket_id))
+
+    first = await server.breath(query="anchor", max_results=1, min_score=0.45)
+    second = await server.breath(query="anchor", max_results=1, min_score=0.45, cursor=_next_cursor(first))
+    by_id["2"] = _bucket("2", "changed body", score=99.0)
+    third = await server.breath(query="anchor", max_results=1, min_score=0.45, cursor=_next_cursor(second))
+    fourth = await server.breath(query="anchor", max_results=1, min_score=0.45, cursor=_next_cursor(third))
+
+    assert "[检索分=38.00]" in third
+    assert "[通道:双]" in third and "[语义关联]" in third
+    assert "弱匹配（仅列名）" in fourth
+    assert "检索分=37.00" in fourth and "body 3" not in fourth
+    assert server.bucket_mgr.search.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_breath_dual_channel_keeps_channel_but_shows_retrieval_score(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket = _bucket("dual", "ordinary body")
     server.bucket_mgr.search = AsyncMock(
@@ -136,7 +240,7 @@ async def test_breath_dual_channel_uses_max_score(tmp_path, monkeypatch):
 
     result = await server.breath(query="not an exact anchor")
 
-    assert "[sim=0.83]" in result
+    assert "[检索分=42.00]" in result
     assert "[通道:双]" in result
 
 
@@ -185,6 +289,50 @@ async def test_breath_pin_marker_requires_pinned_true(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_icons_and_dormant_marker_reuse_pulse_types(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    cases = [
+        ({"type": "permanent"}, "📦"),
+        ({"type": "archived"}, "🗄️"),
+        ({"type": "feel"}, "🫧"),
+        ({"resolved": True}, "✅"),
+        ({"sealed": 1}, "🔒"),
+        ({"dormant": True}, "💭"),
+    ]
+    for meta, icon in cases:
+        bucket = _bucket("icon", "body")
+        bucket["metadata"].update(meta)
+        bucket["_breath_channel"] = "关键词"
+        line = await server._format_breath_query_summary(bucket, "summary")
+        assert f"[bucket_id:icon] {icon}" in line
+        assert ("[休眠]" in line) == bool(meta.get("dormant"))
+
+
+@pytest.mark.asyncio
+async def test_importance_mode_shows_type_and_real_importance(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    permanent_id = await server.bucket_mgr.create(
+        "permanent importance body", importance=9, bucket_type="permanent"
+    )
+    dynamic_id = await server.bucket_mgr.create(
+        "dynamic importance body", importance=8, bucket_type="dynamic"
+    )
+    pinned_id = await server.bucket_mgr.create(
+        "pinned importance body", importance=8, pinned=True
+    )
+
+    result = await server.breath(importance_min=8, touch=False)
+
+    assert f"📦 [bucket_id:{permanent_id}]" in result
+    assert f"💭 [bucket_id:{dynamic_id}]" in result
+    assert f"📌 [bucket_id:{pinned_id}]" in result
+    assert result.count("重要:9") == 1
+    assert result.count("重要:8") == 1
+    assert result.count("重要:10") == 1  # create() promotes pinned importance
+    assert "权重:0.00" not in result
+
+
+@pytest.mark.asyncio
 async def test_filtered_breath_uses_same_score_and_weak_match_presentation(
     tmp_path, monkeypatch
 ):
@@ -206,8 +354,8 @@ async def test_filtered_breath_uses_same_score_and_weak_match_presentation(
         query="not an exact anchor", tags_filter=["tag"], min_score=0.45
     )
 
-    assert "[sim=0.80]" in result
-    assert "[bucket_id:weak] Weak sim=0.20" in result
+    assert "[检索分=42.00]" in result
+    assert "[bucket_id:weak] 📌 Weak 检索分=42.00" in result
     assert "weak filtered body" not in result
 
 

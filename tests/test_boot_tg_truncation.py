@@ -47,6 +47,21 @@ async def test_tg_pinned_preview_marks_only_content_that_is_truncated(
 
 
 @pytest.mark.asyncio
+async def test_talk_boot_session_summary_marks_only_over_700_chars(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    short_id = (await server.archive_session("S" * 700)).split("bucket_id:", 1)[1].split()[0]
+    long_id = (await server.archive_session("L" * 701)).split("bucket_id:", 1)[1].split()[0]
+
+    result = await server.boot(profile="talk")
+
+    assert "S" * 700 in result
+    assert "L" * 700 in result
+    assert f"…已截断：bucket {short_id}" not in result
+    assert f"…已截断：bucket {long_id}，显示 700 / 701 字符" in result
+    assert f'dream(detail_ids="{long_id}")' in result
+
+
+@pytest.mark.asyncio
 async def test_tg_global_budget_reports_omitted_pinned_bucket_ids(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket_ids = []

@@ -182,6 +182,8 @@ async def test_superseded_readouts_and_ranking_keep_phase1_presentation(tmp_path
 
     old = await server.bucket_mgr.get(old_id)
     none_bucket = await server.bucket_mgr.get(none_id)
+    old["score"] = 31.25
+    none_bucket["score"] = 18.0
 
     async def search(*args, trace=None, **kwargs):
         if trace is not None:
@@ -193,7 +195,7 @@ async def test_superseded_readouts_and_ranking_keep_phase1_presentation(tmp_path
 
     server.bucket_mgr.search = AsyncMock(side_effect=search)
     breath = await server.breath(query="not an exact anchor")
-    assert "[sim=0.80]" in breath
+    assert "[检索分=31.25]" in breath
     assert f"⊘已作废→{target_id}(Current)" in breath
     assert "⊘已作废" in breath
     assert f"当前有效：[{target_id}] Current（取代了 {old_id}）" in breath

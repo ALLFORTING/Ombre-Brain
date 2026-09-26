@@ -165,6 +165,10 @@ grow(content="今天去医院体检，结果还好；晚上和朋友吃饭聊了
 
 **R-1/R-2 当前契约**：普通及结构化过滤的 query 检索中，`mode="full"` 展示 canonical body，预算不足时确定性截断并标记 `[显示=原文·已截断]`；默认 `summary` 展示 `[显示=压缩摘要·非原文]`，短正文直接展示时标记 `[显示=原文]`。摘要组装失败优先回退到 canonical body，标记“摘要服务暂不可用”，并记录 WARNING；`[prov]` 仍只表示 canonical body 来源。无 query 浮现路径的既有 `full` 语义未在本 Phase 修改。`touch=False` 可以读取当前 model/prompt_version 的缓存，但不写缓存或更新 activation。query cursor 指向下一条尚未消费的冻结匹配项；计数行区分前页已消费、本次显示、组装失败省略、后续剩余和本页预算/结果上限未显示项。sealed 不参与公开计数。
 
+**W-5 展示补充**：`[通道:精确]` 仅用于规范化后的完整桶名或完整 tag 等于 query；正文子串不能标为精确。`[检索分=...]` 展示 `bucket["score"]`，不是纯语义相似度；常规检索先按 `match_tier`，同 tier 内再按该 score 排序，`resonance` 可再次重排。📌 仅表示 pinned，dormant 命中显示 `[休眠]`；旧 cursor 若未冻结检索分则显示“未记录”。这不改变召回、排序、弱匹配、touch 或 cursor 消费语义。
+
+**W-2 session 节选**：boot 最近归档 Summary 仍截 700 字符，确实截断时提示全文读取；breath session 默认节选仍取正文前 1200 字符，无 query 截断时提示全文读取，带 query 的默认节选沿用现有 `[显示=原文节选·已截断]`，不重复提示。`mode="full"` 的 query 路径保持原有预算截断行为。
+
 **用户操作**：例如"还记得我之前说过关于实习的事吗"
 
 **Claude 行为**：
@@ -352,6 +356,8 @@ hold(content="她问起了警校的事，我感觉她在用问题保护自己，
 ---
 
 ### 场景 11：用户带 importance_min 参数批量拉取重要记忆
+
+此路径仍按真实 `importance` 降序；输出使用桶类型图标并逐项显示 `重要:n`，不显示占位 `权重:0.00`。
 
 **Claude 行为**：
 ```python
