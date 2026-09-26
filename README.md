@@ -428,6 +428,14 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 The recent session Summary preview remains limited to 700 characters. When that Summary is longer, boot marks the cut and points to `dream(detail_ids="...")` for the full bucket.
 
+boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未 resolved、非 sealed 桶中的活动待办（含 archive），不按年龄、importance 门槛或项目标签过滤。T 按展示 identity 计数：每个活动 `(bucket_id, todo_id)` 一项；同文本的不同活动 ID 分别计数；legacy 无 ID 按 `(bucket_id, canonical todo text)` 去重。completed identity 不展示，专用 `todos()` 的既有输出格式保持不变。
+
+候选按桶 importance 降序、稳定展示键升序排列。talk/code/tg 分别用前 3/2/1 项定义 priority anchor；其余候选按稳定键建 tail。每天固定使用 `Asia/Shanghai`，从与 tail 长度互质、最接近 profile 目标 3/3/2 的步长计算起点（同距离取较小步长）。同一日期/profile/候选快照下，tail 起点与顺序不受实际预算影响。稳定 tail 的起点最迟 M 日遍历全部 M 个位置；实际是否显示取决于预算，不承诺固定等待天数。
+
+预算足够时显示全部；不足时保留 priority 与 rotation 的机会，能容纳一条时可优先展示当天 rotation 项，再沿当天顺序使用剩余预算。anchor 数量不是展示上限。每个 todo 一行，完整保留 bucket_id、todo_id（legacy 为 null）和 importance；正文上限分别为 120/100/40 字符，截断标注 `…[正文已截]`。legacy 标记“旧格式；不能单条 todo_done”，读取不补 ID。
+
+段头按最终完整条目报告“共 T 项未完成 | 本次显示 S | 未显示 T-S”，并说明“未显示 ≠ 已完成”。条目不会被截成半条或丢失 ID；预算只能容纳摘要时 S=0。todo 展示不新增持久化投递状态，既有 note/trigger/delta 的完整输出与投递判断保持不变。跨平台时区数据由显式 `tzdata` 依赖提供。
+
 #### `breath`
 
 - `query: str = ""` — 关键词/语义检索；为空时进入浮现模式 / Keyword or semantic query; empty means surfacing mode.
@@ -471,7 +479,7 @@ The recent session Summary preview remains limited to 700 characters. When that 
 - `trace(bucket_id=..., todo_done="todo_<uuid>")` — 单条待办完成，必须独立调用，只允许同时传 `bucket_id`、`todo_done` 和确认时的 `confirm_token`；不支持文本、数组下标、批量完成、reopen/undo，也不为 legacy 项补 ID。首次调用仅预览 bucket、todo ID、文本、pending 状态和完成动作，返回 5 分钟一次性 token，不写状态。使用同一目标和 token 才完成；bucket 不会自动 resolved。
 - completion 保存在 `todo_provenance.done_at`，由服务端第一次成功提交时生成，使用项目 ISO 时间格式。缺失/null 为未完成；非空时间为已完成。同 ID 的旧 payload、attribution 更新、import/merge 和 durable retry 不能清空时间或重新激活；两个不同非空时间是冲突，拒绝执行。已完成项保留文本、身份及 sidecar 历史，重复调用直接返回原 `done_at`，不需再次确认；成功后响应丢失也可安全重试。
 - confirmation 绑定 bucket ID、todo ID、目标文本和 canonical todo/provenance 状态，不绑定无关正文、tags、importance 或 activation metadata。todo 状态变化使旧 token stale，要求重新预览；提交前消费 token，落盘失败后需要重新预览，不能产生虚假完成。
-- `todos()` 的活动投影与持久化分离：同文本只要有任一未完成 ID 或无 ID legacy 身份就继续活动；只有全部可识别身份完成且没有 legacy active 身份时才隐藏。provenance 模式只列活动身份。完成不会删除 `todos: list[str]` 中的文本；本阶段不改变 boot / talk / code / TG 的读取、排序、数量或展示。
+- `todos()` 的活动投影与持久化分离：同文本只要有任一未完成 ID 或无 ID legacy 身份就继续活动；只有全部可识别身份完成且没有 legacy active 身份时才隐藏。provenance 模式只列活动身份。完成不会删除 `todos: list[str]` 中的文本；boot 的活动待办展示复用同一 active projection。
 - bucket 文件 writer 共用 storage-root mutex；`.bucket-write.lock` 是仅用于互斥的 SQLite 文件，没有 todo、token 或 operation 状态。锁内无异步等待，最终读取、确认校验和 atomic replace 之间不能插入其他参与 writer。timeout/异常拒绝写入，事务 rollback/close 后释放锁。原子提交沿用同目录临时文件、flush/fsync 和 replace；旧版本进程、外部编辑器和第三方直接文件写入不受该锁协调。四个维护脚本仅接入锁，本阶段不执行真实修复。merge source 的 todo 状态在验证后变化时，删除会拒绝并保留 source，沿用既有 partial failure/resume 行为。
 - todo reconciliation — 同 ID 合并为一个身份，不同 ID 即使文本相同也分别保留。重排、重复复用、update 和 merge 保留现有 ID，merge 后 source 删除不影响迁入的身份；不做全库文本 identity dedupe。明确按 ID 改写文本保留身份；未指明身份的文本改写按替换语义创建新项，移除文本裁掉未完成 sidecar，已完成身份及首次 `done_at` 继续保留为历史。attribution 相同则保留、known 胜过 unknown、同身份的 known 冲突降为 unknown，但不会因此改写或删除 ID。
 - 普通/pinned `hold`、`grow` 和 import（含 capture/durable 路径）的自动 todo 使用现有 sidecar，`said_by="unknown"`。当前提取链路没有可靠的逐条来源时间，因此 `said_at=None`，不使用执行、capture 或重试时间冒充原话时间；重复复用不会覆盖同文本的已知 provenance。`hold(feel=True)` 仍可自动打标，但不会持久化 analyzer 提取的 todos 或其 provenance。读取和无关更新不会回填旧桶 / Automatic todos use the existing unknown-provenance sidecar without inventing source timestamps or downgrading known provenance. Feel auto-tagging does not persist extracted todos or their provenance; reads and unrelated updates do not backfill legacy buckets.

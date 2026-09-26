@@ -160,5 +160,7 @@ typing-inspection==0.4.4
     #   mcp
     #   pydantic
     #   pydantic-settings
+tzdata==2026.4
+    # via -r requirements.txt
 uvicorn==0.52.4
     # via mcp

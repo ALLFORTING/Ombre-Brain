@@ -173,7 +173,7 @@ async def test_tg_is_compact_and_keeps_global_constraint_and_high_todo(
 
     assert constraint_id in tg
     assert high_todo_id in tg
-    assert low_todo_id not in tg
+    assert low_todo_id in tg
     assert "=== boot: 最新信箱 ===" in tg
     assert "=== boot: 最近 3 次归档 ===" not in tg
     assert "=== boot: 回声 ===" not in tg

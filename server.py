@@ -57,6 +57,8 @@ import httpx
 import frontmatter
 from bucket_write_lock import BucketWriteLockError
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfoNotFoundError
+from boot_todos import active_display_candidates, todo_page, fit_todos, shanghai_date, TodoPage
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
@@ -3148,7 +3150,7 @@ BOOT_PROFILE_CONFIG = {
     },
 }
 BOOT_PROFILE_CODE_ROOTS = frozenset({"项目", "工程", "工具", "环境", "部署"})
-BOOT_PROFILE_TG_TODO_MIN_IMPORTANCE = 8
+BOOT_PROFILE_TG_MIN_IMPORTANCE = 8
 BOOT_PROFILE_NAMES = frozenset(BOOT_PROFILE_CONFIG)
 
 
@@ -3188,7 +3190,7 @@ def _profile_allows_bucket(bucket: dict, profile: str) -> bool:
         return _profile_is_global_constraint(bucket) or _profile_is_code_context(bucket)
     return _profile_is_global_constraint(bucket) or (
         int(bucket.get("metadata", {}).get("importance", 0) or 0)
-        >= BOOT_PROFILE_TG_TODO_MIN_IMPORTANCE
+        >= BOOT_PROFILE_TG_MIN_IMPORTANCE
     )
 
 
@@ -3217,6 +3219,7 @@ def _fit_sections_to_budget(
     omission_item_refs: dict[str, list[str]] | None = None,
     truncation_notice_tokens: int = BOOT_TRUNCATION_NOTICE_TOKENS,
     return_sections: bool = False,
+    todo_display: TodoPage | None = None,
 ) -> str | tuple[str, dict[str, str]]:
     """Fit named sections in priority order and report every omitted block."""
     if not sections:
@@ -3224,12 +3227,20 @@ def _fit_sections_to_budget(
     minimum_chars = minimum_chars or {}
     atomic_sections = atomic_sections or set()
     omission_item_refs = omission_item_refs or {}
-    total_tokens = sum(count_tokens_approx(text) for _, _, text in sections)
+    total_tokens = (
+        count_tokens_approx("\n\n".join(text for _, _, text in sections))
+        if todo_display is not None
+        else sum(count_tokens_approx(text) for _, _, text in sections)
+    )
     if total_tokens <= max_tokens:
         body = "\n\n".join(text for _, _, text in sections)
         return (body, {key: text for key, _, text in sections}) if return_sections else body
 
-    content_budget = max(0, max_tokens - truncation_notice_tokens)
+    # Per-section rounding and separators must fit too. The existing notice
+    # reserve also protects a complete todo summary if no content slot survives.
+    content_budget = max(0, max_tokens - truncation_notice_tokens - (
+        len(sections) if todo_display is not None else 0
+    ))
     requested_tokens = {}
     for key, _, text in sections:
         minimum = max(0, minimum_chars.get(key, 0))
@@ -3296,6 +3307,8 @@ def _fit_sections_to_budget(
 
     used = 0
     priority_exhausted = False
+    todo_index = None
+    todo_summary_tokens = 0
 
     for index, (key, display_name, text) in enumerate(sections):
         later_reserve = sum(
@@ -3310,6 +3323,18 @@ def _fit_sections_to_budget(
             continue
 
         available = max(0, content_budget - used - later_reserve)
+        if key == "todos" and todo_display is not None:
+            fitted = fit_todos(todo_display, available)
+            todo_index = len(output)
+            output.append(fitted.text)
+            emitted_sections[key] = fitted.text
+            if count_tokens_approx(fitted.text) <= available:
+                used += count_tokens_approx(fitted.text)
+            else:
+                todo_summary_tokens = count_tokens_approx(fitted.text) + 1
+            if fitted.hidden:
+                priority_exhausted = True
+            continue
         section_tokens = count_tokens_approx(text)
         if section_tokens <= available:
             output.append(text)
@@ -3345,8 +3370,9 @@ def _fit_sections_to_budget(
     if omitted:
         notice_lines.append("- 未输出：" + "、".join(omitted))
     notice = "\n".join(notice_lines)
-    if count_tokens_approx(notice) > truncation_notice_tokens:
-        if omission_item_refs:
+    notice_budget = max(0, truncation_notice_tokens - todo_summary_tokens)
+    if count_tokens_approx(notice) > notice_budget:
+        if omission_item_refs and (todo_display is None or notice_budget >= 100):
             overflow = (
                 "\n- 省略 ID 清单超出本次 TG 预算；仅列出前缀，"
                 "未列出的稳定 ID 无法在当前紧凑输出中完整列出。"
@@ -3354,16 +3380,27 @@ def _fit_sections_to_budget(
             notice = (
                 _prefix_within_token_budget(
                     notice,
-                    max(0, truncation_notice_tokens - count_tokens_approx(overflow)),
+                    max(0, notice_budget - count_tokens_approx(overflow)),
                 )
                 + overflow
             )
         else:
             notice = _prefix_within_token_budget(
                 notice,
-                truncation_notice_tokens,
+                notice_budget,
             )
     output.append(notice)
+    if todo_index is not None:
+        def _measure_final_todos(text: str) -> int:
+            candidate_output = list(output)
+            candidate_output[todo_index] = text
+            return count_tokens_approx("\n\n".join(candidate_output))
+
+        # Reclaim unused lower-section/notice budget without changing any other
+        # emitted text. The page was captured before fitting and CAS retries.
+        fitted = fit_todos(todo_display, max_tokens, measure=_measure_final_todos)
+        output[todo_index] = fitted.text
+        emitted_sections["todos"] = fitted.text
     body = "\n\n".join(output)
     return (body, emitted_sections) if return_sections else body
 
@@ -10233,33 +10270,6 @@ async def todos(
     return "\n---\n".join(text for _, text in groups)
 
 
-def _format_tg_todos(all_buckets: list[dict]) -> str:
-    """Return TG's bounded high-priority todo view without any write path."""
-    groups = []
-    for bucket in all_buckets:
-        meta = bucket.get("metadata", {})
-        if _is_sealed(bucket) or meta.get("resolved", False):
-            continue
-        if not _profile_allows_bucket(bucket, "tg"):
-            continue
-        items = _normalize_todos(meta.get("todos"))
-        if not items:
-            continue
-        importance = int(meta.get("importance", 0) or 0)
-        groups.append(
-            (
-                importance,
-                f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
-                f"| 重要度:{importance}\n"
-                + "\n".join(f"- {item}" for item in items),
-            )
-        )
-    groups.sort(key=lambda item: item[0], reverse=True)
-    if not groups:
-        return "当前没有高优先级未完成待办。"
-    return "\n---\n".join(text for _, text in groups[:5])
-
-
 @mcp.tool()
 async def boot(
     pinned_chars: int = 5000,
@@ -10286,6 +10296,13 @@ async def boot(
     except Exception as exc:
         logger.error("Boot failed to list buckets: %s", exc)
         return _with_response_seal("boot 暂时无法读取记忆库。")
+
+    try:
+        todo_display = todo_page(active_display_candidates(archive_buckets), profile, shanghai_date())
+    except ZoneInfoNotFoundError:
+        return _with_response_seal("boot 无法计算每日待办轮转：缺少 Asia/Shanghai 时区数据，请安装 tzdata。")
+    except (ValueError, TypeError, KeyError):
+        return _with_response_seal("boot 待办活动总数无法确认：todo provenance conflict 或损坏的展示 identity。")
 
     checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
     high_water = bucket_mgr.get_boot_delta_high_water()
@@ -10375,9 +10392,7 @@ async def boot(
         "\n---\n".join(session_lines) if session_lines else "（暂无 session 归档）"
     )
 
-    todos_text = "=== boot: 未完结 todos ===\n" + (
-        _format_tg_todos(visible_buckets) if profile == "tg" else await todos()
-    )
+    todos_text = fit_todos(todo_display, max_tokens).text
 
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
@@ -10410,7 +10425,6 @@ async def boot(
                 "delta": _stable_refs(current_delta_text),
                 "triggers": [f"bucket_id:{bucket_id}" for bucket_id, _ in trigger_items],
                 "mailbox": _stable_refs(mailbox_text),
-                "todos": _stable_refs(todos_text),
                 "pinned": [f"bucket_id:{bucket['id']}" for bucket in pinned],
             }
             truncation_notice_tokens = BOOT_TG_TRUNCATION_NOTICE_TOKENS
@@ -10426,6 +10440,7 @@ async def boot(
             omission_item_refs=omission_item_refs,
             truncation_notice_tokens=truncation_notice_tokens,
             return_sections=True,
+            todo_display=todo_display,
         )
 
     for _ in range(3):

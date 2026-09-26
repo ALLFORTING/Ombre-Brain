@@ -19,6 +19,9 @@ pyyaml>=6.0
 # Markdown frontmatter 解析（桶文件读写）
 python-frontmatter>=1.1.0
 
+# IANA timezone data for Asia/Shanghai todo rotation (including minimal images).
+tzdata==2026.4
+
 # Remember-Me image decoding and metadata stripping
 Pillow>=11,<13
 
