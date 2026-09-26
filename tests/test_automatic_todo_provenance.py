@@ -14,6 +14,12 @@ from raw_evidence_import import RawEvidenceImportCoordinator
 from utils import apply_display_aliases
 
 
+def _attributes(records):
+    from bucket_manager import valid_todo_id
+    assert all(valid_todo_id(record.get("id")) for record in records)
+    return [{key: value for key, value in record.items() if key != "id"} for record in records]
+
+
 def _record(text, said_by="unknown", said_at=None, source_bucket=None):
     return dict(text=text, said_by=said_by, said_at=said_at, source_bucket=source_bucket)
 
@@ -46,7 +52,7 @@ async def test_hold_extraction_cannot_assert_speaker_or_source_time(tmp_path, mo
     buckets = await server.bucket_mgr.list_all()
     assert len(buckets) == 1
     assert buckets[0]["metadata"]["todos"] == ["send file"]
-    assert buckets[0]["metadata"]["todo_provenance"] == [_record("send file")]
+    assert _attributes(buckets[0]["metadata"]["todo_provenance"]) == [_record("send file")]
 
 
 @pytest.mark.asyncio
@@ -98,7 +104,7 @@ async def test_automatic_reuse_preserves_known_and_only_attributes_incoming_todo
     buckets = await server.bucket_mgr.list_all()
     assert len(buckets) == 1
     assert buckets[0]["metadata"]["todos"] == [stored_task, "legacy untouched", "next"]
-    assert buckets[0]["metadata"]["todo_provenance"] == [known, _record("next")]
+    assert _attributes(buckets[0]["metadata"]["todo_provenance"]) == [known, _record("legacy untouched"), _record("next")]
 
 
 @pytest.mark.asyncio
@@ -115,7 +121,7 @@ async def test_plain_import_persists_unknown_without_using_conversation_range(
     assert (await engine.start(source, filename="source.json", preserve_raw=preserve_raw))["status"] == "completed"
     bucket = (await manager.list_all())[0]
     assert bucket["metadata"]["todos"] == ["send file"]
-    assert bucket["metadata"]["todo_provenance"] == [_record("send file")]
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record("send file")]
 
 
 @pytest.mark.asyncio
@@ -158,7 +164,7 @@ async def test_capture_restarts_after_applied_write_without_todo_or_provenance_d
     bucket_before = await manager.get(operation_before["result_id"])
     expected = [known if route == "merge" else _record("send file"), _record("next")]
     assert bucket_before["metadata"]["todos"] == ["send file", "next"]
-    assert bucket_before["metadata"]["todo_provenance"] == expected
+    assert _attributes(bucket_before["metadata"]["todo_provenance"]) == expected
 
     restarted_manager = BucketManager(config)
     restarted = ImportEngine(config, restarted_manager, dehydrator)
@@ -203,7 +209,7 @@ async def test_durable_update_preserves_known_provenance_added_after_planning(te
         await manager.apply_import_operation(record["operation_key"])
     bucket = await manager.get(target_id)
     assert bucket["metadata"]["todos"] == ["send file", "legacy task", "next"]
-    assert bucket["metadata"]["todo_provenance"] == [known, legacy_known, _record("next")]
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [known, legacy_known, _record("next")]
     assert manager.inspect_import_operation(record["operation_key"])["payload_digest"] == planned["payload_digest"]
 
 
@@ -211,6 +217,11 @@ async def test_durable_update_preserves_known_provenance_added_after_planning(te
 async def test_legacy_read_does_not_add_sidecar(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket_id = await server.bucket_mgr.create("legacy", todos=["legacy task"])
+    import frontmatter
+    path = Path((await server.bucket_mgr.get(bucket_id))["path"])
+    post = frontmatter.load(path)
+    post.metadata.pop("todo_provenance")
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
     bucket = await server.bucket_mgr.get(bucket_id)
     original_bytes = Path(bucket["path"]).read_bytes()
     assert "todo_provenance" not in bucket["metadata"]

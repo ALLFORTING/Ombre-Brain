@@ -66,7 +66,7 @@ def test_export_preserves_visible_ordinary_data_and_hides_sealed(tmp_path):
     hidden = "sealed-1"
     _bucket(root, "dynamic", "visible.md", {
         "id": visible, "sealed": 0, "todos": ["keep"],
-        "todo_provenance": [{"text": "keep", "said_by": "ting", "source_bucket": hidden}],
+        "todo_provenance": [{"id": "todo_11111111-1111-4111-8111-111111111111", "text": "keep", "said_by": "ting", "source_bucket": hidden}],
         "provenance_kind": "summary", "related_buckets": f"{visible},{hidden},missing",
         "source_bucket": hidden, "superseded_by": hidden, "supersedes": [visible, hidden],
         "extension": {"future": ["value"]},
@@ -102,6 +102,7 @@ def test_export_preserves_visible_ordinary_data_and_hides_sealed(tmp_path):
     assert bucket["frontmatter"]["superseded_by"] == ""
     assert bucket["frontmatter"]["supersedes"] == [visible]
     assert bucket["frontmatter"]["todo_provenance"][0]["source_bucket"] is None
+    assert bucket["frontmatter"]["todo_provenance"][0]["id"] == "todo_11111111-1111-4111-8111-111111111111"
     assert [row["old_content"] for row in _records(destination, "bucket_history.jsonl")] == ["older", "newer"]
     assert _records(destination, "letters.jsonl")[0]["content"] == "visible letter"
     assert _records(destination, "notes.jsonl")[0]["text"] == "visible note"

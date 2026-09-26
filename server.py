@@ -64,6 +64,22 @@ from pydantic import Field
 from PIL import Image, UnidentifiedImageError
 
 
+TodoItem = Annotated[
+    dict,
+    Field(json_schema_extra={
+        "properties": {
+            "id": {"type": "string", "pattern": "^todo_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+            "text": {"type": "string"},
+            "said_by": {"type": "string", "enum": ["ting", "model", "system", "unknown"]},
+            "said_at": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "source_bucket": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "required": ["text"],
+        "additionalProperties": False,
+    }),
+]
+
+
 # This identity is process-local evidence only.  It is never used for
 # authentication, capability lookup, or durable state.
 _RM_PROCESS_BOOT_ID = secrets.token_hex(16)
@@ -92,6 +108,7 @@ from bucket_manager import (
     canonicalize_todos,
     merge_todo_provenance,
     normalize_provenance_kind,
+    prepare_todo_provenance,
     reconcile_todo_provenance,
 )
 from asset_store import (
@@ -2193,12 +2210,15 @@ async def _merge_bucket_into_target(
     if isinstance(source_tags, str):
         source_tags = _parse_csv_ids(source_tags)
     merged_tags = list(dict.fromkeys([*target_tags, *source_tags]))
-    merged_todos, merged_todo_provenance = merge_todo_provenance(
-        _canonical_todos(target_meta.get("todos")),
-        target_meta.get("todo_provenance"),
-        _canonical_todos(source_meta.get("todos")),
-        source_meta.get("todo_provenance"),
-    )
+    try:
+        merged_todos, merged_todo_provenance = merge_todo_provenance(
+            _canonical_todos(target_meta.get("todos")),
+            target_meta.get("todo_provenance"),
+            _canonical_todos(source_meta.get("todos")),
+            source_meta.get("todo_provenance"),
+        )
+    except ValueError as exc:
+        return f"merge todo identity conflict: {exc}"
     merged_importance = max(
         int(target_meta.get("importance", 5)),
         int(source_meta.get("importance", 5)),
@@ -2323,6 +2343,9 @@ async def _merge_bucket_into_target(
             return "merge confirmation invalid, expired, used, or stale; preview again."
         operation_id = secrets.token_hex(12)
         try:
+            plan["target_update"]["todo_provenance"] = prepare_todo_provenance(
+                merged_todos, merged_todo_provenance,
+            )
             bucket_mgr.write_merge_operation(
                 operation_id, plan, status="running", completed=[], create=True,
             )
@@ -2379,6 +2402,12 @@ async def _execute_merge_operation(operation: dict) -> str:
                 continue
             else:
                 actual = written["metadata"].get(field)
+            if (field == "todo_provenance" and expected
+                    and all("id" not in record for record in expected)):
+                # Legacy journals keep their original plan/digest. First apply
+                # may establish IDs; compare their original attribution fields.
+                actual = [{key: value for key, value in record.items() if key != "id"}
+                          for record in actual or []]
             if actual != expected:
                 raise RuntimeError(f"merge step {step} changed after write: {field}")
         if step not in completed:
@@ -9479,11 +9508,13 @@ async def trace(
     tags: str = "",
     todos: str | list[str] | None = None,
     todo_items: Annotated[
-        list[dict] | None,
+        list[TodoItem] | None,
         Field(
             description=(
                 "Optional structured todo entries with text, said_by, said_at, "
-                "and source_bucket. Mutually exclusive with legacy todos."
+                "source_bucket, and optional id referencing this bucket's existing "
+                "todo identity (including explicit text rewrites). New IDs are server-generated. "
+                "Mutually exclusive with legacy todos."
             )
         ),
     ] = None,
@@ -9655,8 +9686,18 @@ async def trace(
     if tags:
         updates["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
     if todo_items is not None:
+        try:
+            prepare_todo_provenance(
+                structured_todos, structured_provenance,
+                previous_todos=metadata.get("todos"),
+                previous_provenance=metadata.get("todo_provenance"),
+                references_only=True, assign_ids=False,
+            )
+        except ValueError as exc:
+            return f"todo_items 无效：{exc}"
         updates["todos"] = structured_todos
         updates["todo_provenance"] = structured_provenance
+        updates["_todo_references_only"] = True
     elif todos is not None:
         updates["todos"] = _canonical_todos(todos)
     if resolved in (0, 1):
@@ -9776,7 +9817,7 @@ async def trace(
     changed = ", ".join(
         f"{k}={v}"
         for k, v in updates.items()
-        if k not in ("content", "_history_change_type", "provenance_kind")
+        if k not in ("content", "_history_change_type", "_todo_references_only", "provenance_kind")
     )
     if "content" in updates:
         content_label = "content=已追加" if append else "content=已替换"
@@ -9819,6 +9860,15 @@ async def trace(
         if current:
             state = current["metadata"]
             changed += f"; pinned={bool(state.get('pinned'))}, type={state.get('type')}"
+    if todo_items is not None:
+        written = await bucket_mgr.get(bucket_id)
+        if written:
+            records = reconcile_todo_provenance(
+                written["metadata"].get("todos"), written["metadata"].get("todo_provenance"),
+            )
+            changed += "\n" + "\n".join(
+                f"- {record['text']} | todo_id:{record['id']}" for record in records
+            )
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 @mcp.tool()
@@ -9961,25 +10011,23 @@ async def todos(
         name = meta.get("name", bucket["id"])
         importance = meta.get("importance", "?")
         if include_provenance:
-            provenance_by_text = {
-                record["text"]: record
-                for record in reconcile_todo_provenance(
-                    _canonical_todos(meta.get("todos")),
-                    meta.get("todo_provenance"),
-                )
-            }
+            records = reconcile_todo_provenance(
+                _canonical_todos(meta.get("todos")), meta.get("todo_provenance"),
+            )
             for item in items:
-                record = provenance_by_text.get(item, {})
-                said_by = record.get("said_by", "unknown")
-                said_at = record.get("said_at")
-                suffix = f" | said_at:{said_at}" if said_at else ""
-                provenance_groups[said_by].append(
-                    (
-                        int(meta.get("importance", 0) or 0),
-                        f"- {item} [bucket_id:{bucket['id']}] {name} "
-                        f"| 重要度:{importance}{suffix}",
+                matches = [record for record in records if record["text"] == item] or [{}]
+                for record in matches:
+                    said_by = record.get("said_by", "unknown")
+                    said_at = record.get("said_at")
+                    suffix = f" | said_at:{said_at}" if said_at else ""
+                    suffix += f" | todo_id:{record.get('id') or 'null'}"
+                    provenance_groups[said_by].append(
+                        (
+                            int(meta.get("importance", 0) or 0),
+                            f"- {item} [bucket_id:{bucket['id']}] {name} "
+                            f"| 重要度:{importance}{suffix}",
+                        )
                     )
-                )
             continue
         lines = [
             f"[bucket_id:{bucket['id']}] {name} | 重要度:{importance}",

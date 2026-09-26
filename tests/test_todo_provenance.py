@@ -16,6 +16,12 @@ def _load_server(tmp_path, monkeypatch):
     return server
 
 
+def _attributes(records):
+    from bucket_manager import valid_todo_id
+    assert all(valid_todo_id(record.get("id")) for record in records)
+    return [{key: value for key, value in record.items() if key != "id"} for record in records]
+
+
 def _record(text, said_by="ting", said_at=None, source_bucket=None):
     return {
         "text": text,
@@ -57,21 +63,21 @@ async def test_trace_structured_todo_items_and_legacy_reconciliation(tmp_path, m
     assert bucket["metadata"]["todos"] == [
         "ting task", "model task", "system task", "unknown task"
     ]
-    assert bucket["metadata"]["todo_provenance"][0] == _record(
+    assert _attributes(bucket["metadata"]["todo_provenance"])[0] == _record(
         "ting task", "ting", "2026-09-17T12:00:00+08:00", "external-id"
     )
 
     await server.trace(bucket_id, todos=["ting task", "legacy new"])
     bucket = await server.bucket_mgr.get(bucket_id)
     assert bucket["metadata"]["todos"] == ["ting task", "legacy new"]
-    assert bucket["metadata"]["todo_provenance"] == [_record(
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record(
         "ting task", "ting", "2026-09-17T12:00:00+08:00", "external-id"
-    )]
+    ), _record("legacy new", "unknown")]
 
     await server.trace(bucket_id, todos=["renamed task"])
     bucket = await server.bucket_mgr.get(bucket_id)
     assert bucket["metadata"]["todos"] == ["renamed task"]
-    assert "todo_provenance" not in bucket["metadata"]
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record("renamed task", "unknown")]
 
 
 @pytest.mark.asyncio
@@ -103,7 +109,7 @@ async def test_automatic_extraction_persists_unknown_sidecar_without_source_time
         bucket for bucket in await server.bucket_mgr.list_all()
         if "extracted task" in bucket["metadata"].get("todos", [])
     )
-    assert bucket["metadata"]["todo_provenance"] == [_record("extracted task", "unknown")]
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record("extracted task", "unknown")]
 
     server.dehydrator.analyze = AsyncMock(return_value={
         "domain": ["事务"], "valence": 0.5, "arousal": 0.5,
@@ -130,7 +136,7 @@ async def test_automatic_extraction_persists_unknown_sidecar_without_source_time
             item for item in await server.bucket_mgr.list_all()
             if task in item["metadata"].get("todos", [])
         )
-        assert bucket["metadata"]["todo_provenance"] == [_record(task, "unknown")]
+        assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record(task, "unknown")]
 
 
 @pytest.mark.asyncio
@@ -146,7 +152,7 @@ async def test_content_resolve_reopen_and_provenance_only_delta(tmp_path, monkey
     assert server.bucket_mgr.get_boot_delta_high_water() == high_water
     await server.trace(bucket_id, content="after", resolved=1)
     bucket = await server.bucket_mgr.get(bucket_id)
-    assert bucket["metadata"]["todo_provenance"] == [_record("keep", "model")]
+    assert _attributes(bucket["metadata"]["todo_provenance"]) == [_record("keep", "model")]
     assert "keep" not in await server.todos()
     await server.trace(bucket_id, resolved=0)
     assert "keep" in await server.todos()
@@ -183,7 +189,7 @@ async def test_merge_supersession_and_delete_preserve_or_remove_sidecar(tmp_path
     await server.trace(target_id, merge=source_id,
                        confirm_token=preview.split("confirm_token:", 1)[1].strip())
     merged = await server.bucket_mgr.get(target_id)
-    assert merged["metadata"]["todo_provenance"] == [
+    assert _attributes(merged["metadata"]["todo_provenance"]) == [
         _record("target task", "ting"), _record("source task", "system")
     ]
     await server.trace(target_id, superseded_by="none")
@@ -203,7 +209,7 @@ async def test_delete_never_rewrites_another_bucket_opaque_source_reference(tmp_
     )
     assert await server.bucket_mgr.delete(source_id) is True
     holder = await server.bucket_mgr.get(holder_id)
-    assert holder["metadata"]["todo_provenance"] == [
+    assert _attributes(holder["metadata"]["todo_provenance"]) == [
         _record("copied", "ting", source_bucket=source_id)
     ]
 

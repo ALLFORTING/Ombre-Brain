@@ -34,6 +34,7 @@ import hashlib
 import json
 import tempfile
 import inspect
+from uuid import UUID, uuid4
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -144,11 +145,16 @@ def _todo_provenance_record(
         if strict:
             raise ValueError("todo provenance entries must be objects.")
         return None
-    allowed = {"text", "said_by", "said_at", "source_bucket"}
+    allowed = {"id", "text", "said_by", "said_at", "source_bucket"}
     unexpected = set(raw) - allowed
     if unexpected:
         if strict:
             raise ValueError("todo provenance entries contain unsupported fields.")
+        return None
+    todo_id = raw.get("id")
+    if "id" in raw and not valid_todo_id(todo_id):
+        if strict:
+            raise ValueError("todo id must be todo_<uuid>.")
         return None
     text = raw.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -183,6 +189,7 @@ def _todo_provenance_record(
             return None
         source_bucket = source_bucket.strip() or None
     return {
+        **({"id": todo_id} if todo_id is not None else {}),
         "text": text.strip(),
         "said_by": said_by,
         "said_at": said_at,
@@ -190,37 +197,14 @@ def _todo_provenance_record(
     }
 
 
-def reconcile_todo_provenance(
-    todos: Any,
-    raw_provenance: Any,
-    *,
-    strict: bool = False,
-) -> list[dict[str, Any]]:
-    """Return safe sidecar records for the canonical todo text list.
-
-    First valid record wins for duplicate canonical text.  A missing sidecar
-    record means unknown provenance; this helper never manufactures records
-    for legacy or automatic-extraction todos.
-    """
-    canonical_todos = canonicalize_todos(todos)
-    if raw_provenance is None:
-        return []
-    if not isinstance(raw_provenance, list):
-        if strict:
-            raise ValueError("todo_provenance must be a list.")
-        return []
-    allowed_texts = set(canonical_todos)
-    records_by_text: dict[str, dict[str, Any]] = {}
-    for raw_record in raw_provenance:
-        record = _todo_provenance_record(raw_record, strict=strict)
-        if record is None:
-            continue
-        if record["text"] not in allowed_texts:
-            if strict:
-                raise ValueError("todo provenance text must appear in todos.")
-            continue
-        records_by_text.setdefault(record["text"], record)
-    return [records_by_text[text] for text in canonical_todos if text in records_by_text]
+def valid_todo_id(value: Any) -> bool:
+    """Accept the canonical opaque identity format; never derive it from text."""
+    if not isinstance(value, str) or not value.startswith("todo_"):
+        return False
+    try:
+        return str(UUID(value[5:])) == value[5:]
+    except (ValueError, AttributeError):
+        return False
 
 
 def _todo_provenance_is_known(record: dict[str, Any] | None) -> bool:
@@ -231,48 +215,138 @@ def _todo_provenance_is_known(record: dict[str, Any] | None) -> bool:
     )
 
 
+def _merge_todo_attribution(target: dict, source: dict) -> dict:
+    """Resolve attribution only. Identity never participates in attribution."""
+    identity = target.get("id") or source.get("id")
+    target = {**target, **({"id": identity} if identity else {})}
+    source = {**source, **({"id": identity} if identity else {})}
+    fields = ("said_by", "said_at", "source_bucket")
+    if all(target.get(key) == source.get(key) for key in fields):
+        return dict(target)
+    if _todo_provenance_is_known(target) and not _todo_provenance_is_known(source):
+        return dict(target)
+    if _todo_provenance_is_known(source) and not _todo_provenance_is_known(target):
+        return {**source, **({"id": target["id"]} if "id" in target else {})}
+    return {**target, "said_by": "unknown", "said_at": None, "source_bucket": None}
+
+
+def reconcile_todo_provenance(
+    todos: Any,
+    raw_provenance: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    """Read sidecars without assigning IDs or writing legacy data.
+
+    Distinct identities can share text. Repeated IDs fold attribution, while
+    legacy records retain their first-valid-record-per-text compatibility.
+    """
+    texts = canonicalize_todos(todos)
+    if raw_provenance is None:
+        return []
+    if not isinstance(raw_provenance, list):
+        if strict:
+            raise ValueError("todo_provenance must be a list.")
+        return []
+    records: dict[tuple[str, str], dict] = {}
+    for raw in raw_provenance:
+        record = _todo_provenance_record(raw, strict=strict)
+        if record is None:
+            continue
+        key = ("id", record["id"]) if "id" in record else ("text", record["text"])
+        previous = records.get(key)
+        if previous is not None and previous["text"] != record["text"]:
+            if strict:
+                raise ValueError("todo identity conflict: one id has different texts.")
+            continue
+        if record["text"] not in texts:
+            if strict:
+                raise ValueError("todo provenance text must appear in todos.")
+            continue
+        if previous is None:
+            records[key] = record
+        elif "id" in record:
+            records[key] = _merge_todo_attribution(previous, record)
+    return [record for text in texts for record in records.values() if record["text"] == text]
+
+
+def prepare_todo_provenance(
+    todos: Any,
+    raw_provenance: Any = None,
+    *,
+    previous_todos: Any = None,
+    previous_provenance: Any = None,
+    references_only: bool = False,
+    assign_ids: bool = True,
+) -> list[dict[str, Any]]:
+    """Assign server identities only for an explicit todo write.
+
+    Internal import/merge records may carry persisted identities. MCP callers
+    use references_only and may reference only identities already in this bucket.
+    """
+    texts = canonicalize_todos(todos)
+    incoming = reconcile_todo_provenance(texts, raw_provenance, strict=True)
+    previous = reconcile_todo_provenance(previous_todos, previous_provenance, strict=True)
+    by_id = {record["id"]: record for record in previous if "id" in record}
+    output = []
+    for text in texts:
+        candidates = [record for record in previous if record["text"] == text]
+        submitted = [record for record in incoming if record["text"] == text]
+        if not submitted:
+            submitted = candidates or automatic_todo_provenance([text])
+        for record in submitted:
+            record = dict(record)
+            todo_id = record.get("id")
+            if todo_id is not None:
+                if references_only and todo_id not in by_id:
+                    raise ValueError("todo id is not an existing identity in this bucket.")
+                if not references_only and todo_id in by_id and by_id[todo_id]["text"] != text:
+                    raise ValueError("todo identity conflict: one id has different texts.")
+            else:
+                matches = [item for item in candidates if "id" in item]
+                if len(matches) > 1:
+                    raise ValueError("ambiguous todo identity: specify an existing id.")
+                if matches:
+                    record["id"] = matches[0]["id"]
+                elif assign_ids:
+                    record["id"] = "todo_" + str(uuid4())
+            output.append(record)
+    return reconcile_todo_provenance(texts, output, strict=True)
+
+
 def merge_todo_provenance(
     target_todos: Any,
     target_provenance: Any,
     source_todos: Any,
     source_provenance: Any,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Merge todo text and sidecars without arbitrarily choosing attribution."""
+    """Union identities; attach id-less contributions only on a unique match."""
     target = canonicalize_todos(target_todos)
     source = canonicalize_todos(source_todos)
-    merged_todos = list(dict.fromkeys(target + source))
-    target_records = {
-        record["text"]: record
-        for record in reconcile_todo_provenance(target, target_provenance)
-    }
-    source_records = {
-        record["text"]: record
-        for record in reconcile_todo_provenance(source, source_provenance)
-    }
-    merged_records = []
-    for text in merged_todos:
-        target_record = target_records.get(text)
-        source_record = source_records.get(text)
-        if target_record is None:
-            chosen = source_record
-        elif source_record is None or target_record == source_record:
-            chosen = target_record
-        elif _todo_provenance_is_known(target_record) and not _todo_provenance_is_known(source_record):
-            chosen = target_record
-        elif _todo_provenance_is_known(source_record) and not _todo_provenance_is_known(target_record):
-            chosen = source_record
+    texts = list(dict.fromkeys(target + source))
+    records = reconcile_todo_provenance(target, target_provenance, strict=True)
+    incoming = reconcile_todo_provenance(source, source_provenance, strict=True)
+    for record in incoming:
+        record = dict(record)
+        if "id" in record:
+            matches = [item for item in records if item.get("id") == record["id"]]
         else:
-            # Both sides claim incompatible known provenance.  Preserve the
-            # todo text but deliberately discard unsupported attribution.
-            chosen = {
-                "text": text,
-                "said_by": "unknown",
-                "said_at": None,
-                "source_bucket": None,
-            }
-        if chosen is not None:
-            merged_records.append(dict(chosen))
-    return merged_todos, merged_records
+            matches = [item for item in records if item["text"] == record["text"]]
+            if len(matches) > 1:
+                if _todo_provenance_is_known(record):
+                    raise ValueError("ambiguous todo identity: specify an existing id.")
+                # An unknown extraction adds no attribution or identity to choose.
+                continue
+        if matches:
+            previous = matches[0]
+            if previous["text"] != record["text"]:
+                raise ValueError("todo identity conflict: one id has different texts.")
+            if "id" in previous:
+                record["id"] = previous["id"]
+            records[records.index(previous)] = _merge_todo_attribution(previous, record)
+        else:
+            records.append(record)
+    return texts, reconcile_todo_provenance(texts, records, strict=True)
 
 
 class BucketIdempotencyError(RuntimeError):
@@ -568,6 +642,10 @@ class BucketManager:
     def _get_import_operation(self, operation_key: str) -> dict[str, Any] | None:
         with sqlite3.connect(self.history_db_path) as conn:
             conn.row_factory = sqlite3.Row
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ob_import_operations'"
+            ).fetchone():
+                return None
             row = conn.execute(
                 "SELECT * FROM ob_import_operations WHERE operation_key = ?",
                 (operation_key,),
@@ -603,6 +681,38 @@ class BucketManager:
             or any(char not in "0123456789abcdef" for char in memory_mutation_id)
         ):
             raise BucketIdempotencyError("memory_mutation_invalid")
+        if payload is not None and payload_digest is None:
+            existing = self._get_import_operation(operation_key)
+            if existing is not None:
+                # Repeated planning reuses stored IDs, but still rejects changed input.
+                compared = json.loads(json.dumps(payload))
+                stored = existing["payload"]
+                requested = compared if operation_kind == "create" else compared.get("kwargs", {})
+                persisted = stored if operation_kind == "create" else stored.get("kwargs", {})
+                if ("todos" in requested and any(
+                    "id" in record for record in persisted.get("todo_provenance", [])
+                    if isinstance(record, dict)
+                )):
+                    requested["todo_provenance"] = prepare_todo_provenance(
+                        requested["todos"], requested.get("todo_provenance"),
+                        previous_todos=persisted.get("todos"),
+                        previous_provenance=persisted["todo_provenance"],
+                    )
+                payload = compared
+            else:
+                payload = json.loads(json.dumps(payload))
+                values = payload if operation_kind == "create" else payload.get("kwargs", {})
+                if "todos" in values or "todo_provenance" in values:
+                    previous = None
+                    if operation_kind == "update" and target_bucket_id:
+                        path = self._find_bucket_file(target_bucket_id)
+                        previous = frontmatter.load(path) if path else None
+                    values["todo_provenance"] = prepare_todo_provenance(
+                        values.get("todos", previous.get("todos") if previous else []),
+                        values.get("todo_provenance"),
+                        previous_todos=previous.get("todos") if previous else None,
+                        previous_provenance=previous.get("todo_provenance") if previous else None,
+                    )
         if payload is not None:
             serialized, computed_digest = self._canonical_import_payload(payload)
             if payload_digest is not None and payload_digest != computed_digest:
@@ -1565,14 +1675,40 @@ class BucketManager:
             if operation["operation_kind"] != "create":
                 raise BucketIdempotencyError("operation_kind_conflict")
             bucket_id = operation["result_id"]
+            canonical_todo_provenance = reconcile_todo_provenance(
+                canonical_todos, operation["payload"].get("todo_provenance"), strict=True,
+            )
         else:
             bucket_id = generate_bucket_id()
+        if operation is not None:
+            existing_path = self._find_bucket_file(bucket_id)
+            if existing_path:
+                try:
+                    existing_post = frontmatter.load(existing_path)
+                except Exception as exc:
+                    raise BucketIdempotencyError("operation_marker_invalid") from exc
+                marker = self._operation_marker(existing_post, _o5b_operation_key)
+                if (
+                    marker is None
+                    or marker.get("payload_digest") != operation["payload_digest"]
+                    or (
+                        operation.get("memory_mutation_id") is not None
+                        and marker.get("memory_mutation_id")
+                        != operation["memory_mutation_id"]
+                    )
+                ):
+                    raise BucketIdempotencyError("idempotency_conflict")
+                self._mark_import_operation_applied(_o5b_operation_key)
+                return bucket_id
+            if operation["status"] == "applied":
+                raise BucketIdempotencyError("target_bucket_missing")
+
         content = apply_display_aliases(content)
         name = apply_display_aliases(name) if name else name
         tags = apply_display_aliases_to_value(tags or [])
         domain = apply_display_aliases_to_value(domain) if domain else domain
         todos = apply_display_aliases_to_value(canonical_todos)
-        todo_provenance = reconcile_todo_provenance(
+        todo_provenance = prepare_todo_provenance(
             todos,
             [
                 {**record, "text": apply_display_aliases(record["text"])}
@@ -1634,27 +1770,6 @@ class BucketManager:
             metadata["type"] = "permanent"
         post = frontmatter.Post(linked_content, **metadata)
         if operation is not None:
-            existing_path = self._find_bucket_file(bucket_id)
-            if existing_path:
-                try:
-                    existing_post = frontmatter.load(existing_path)
-                except Exception as exc:
-                    raise BucketIdempotencyError("operation_marker_invalid") from exc
-                marker = self._operation_marker(existing_post, _o5b_operation_key)
-                if (
-                    marker is None
-                    or marker.get("payload_digest") != operation["payload_digest"]
-                    or (
-                        operation.get("memory_mutation_id") is not None
-                        and marker.get("memory_mutation_id")
-                        != operation["memory_mutation_id"]
-                    )
-                ):
-                    raise BucketIdempotencyError("idempotency_conflict")
-                self._mark_import_operation_applied(_o5b_operation_key)
-                return bucket_id
-            if operation["status"] == "applied":
-                raise BucketIdempotencyError("target_bucket_missing")
             self._append_operation_marker(
                 post,
                 operation_key=_o5b_operation_key,
@@ -1662,6 +1777,7 @@ class BucketManager:
                 operation_kind="create",
                 memory_mutation_id=operation.get("memory_mutation_id"),
             )
+
 
         # --- Choose directory by type + primary domain ---
         # --- 按类型 + 主题域选择存储目录 ---
@@ -1797,6 +1913,22 @@ class BucketManager:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
 
+        if operation is not None:
+            marker = self._operation_marker(post, o5b_operation_key)
+            if marker is not None:
+                if marker.get("payload_digest") != operation["payload_digest"]:
+                    raise BucketIdempotencyError("operation_payload_conflict")
+                if (
+                    operation.get("memory_mutation_id") is not None
+                    and marker.get("memory_mutation_id")
+                    != operation["memory_mutation_id"]
+                ):
+                    raise BucketIdempotencyError("memory_mutation_conflict")
+                self._mark_import_operation_applied(o5b_operation_key)
+                return True
+            if operation["status"] == "applied":
+                raise BucketIdempotencyError("operation_marker_missing")
+
         requested_permanent = kwargs.pop("permanent", None)
         if requested_permanent is not None:
             if requested_permanent not in (0, 1):
@@ -1817,6 +1949,45 @@ class BucketManager:
             previous_todos,
             post.get("todo_provenance"),
         )
+        prepared_todos = None
+        prepared_provenance = None
+        if "todos" in kwargs or "todo_provenance" in kwargs:
+            prepared_todos = (
+                apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
+                if "todos" in kwargs else previous_todos
+            )
+            try:
+                incoming_provenance = kwargs.get("todo_provenance")
+                if operation is not None and o5b_operation_key.startswith("o5b:"):
+                    incoming_provenance = reconcile_todo_provenance(
+                        prepared_todos, incoming_provenance, strict=True,
+                    )
+                    current_ids = {r["id"] for r in previous_todo_provenance if "id" in r}
+                    for record in incoming_provenance:
+                        matches = [r for r in previous_todo_provenance
+                                   if r["text"] == record["text"] and "id" in r]
+                        if record.get("id") not in current_ids and len(matches) == 1:
+                            record["id"] = matches[0]["id"]
+                prepared_provenance = prepare_todo_provenance(
+                    prepared_todos,
+                    incoming_provenance,
+                    previous_todos=previous_todos,
+                    previous_provenance=post.get("todo_provenance"),
+                    references_only=kwargs.pop("_todo_references_only", False),
+                )
+                if operation is not None and o5b_operation_key.startswith("o5b:"):
+                    # Attribution edits made after an extraction plan must survive.
+                    # A confirmed bucket merge instead writes its planned conflict result.
+                    current_by_id = {r["id"]: r for r in previous_todo_provenance if "id" in r}
+                    prepared_provenance = [
+                        {**r, **{k: current_by_id[r["id"]][k]
+                                 for k in ("said_by", "said_at", "source_bucket")}}
+                        if r["id"] in current_by_id and _todo_provenance_is_known(current_by_id[r["id"]])
+                        else r for r in prepared_provenance
+                    ]
+            except ValueError as exc:
+                logger.warning("Refusing invalid todo update for %s: %s", bucket_id, exc)
+                return False
         previous_superseded_by = post.get("superseded_by")
         explicit_provenance_kind = (
             normalize_provenance_kind(kwargs["provenance_kind"], strict=True)
@@ -1825,20 +1996,6 @@ class BucketManager:
         )
 
         if operation is not None:
-            marker = self._operation_marker(post, o5b_operation_key)
-            if marker is not None:
-                if marker.get("payload_digest") != operation["payload_digest"]:
-                    raise BucketIdempotencyError("operation_payload_conflict")
-                if (
-                    operation.get("memory_mutation_id") is not None
-                    and marker.get("memory_mutation_id")
-                    != operation["memory_mutation_id"]
-                ):
-                    raise BucketIdempotencyError("memory_mutation_conflict")
-                self._mark_import_operation_applied(o5b_operation_key)
-                return True
-            if operation["status"] == "applied":
-                raise BucketIdempotencyError("operation_marker_missing")
             self._append_operation_marker(
                 post,
                 operation_key=o5b_operation_key,
@@ -1846,6 +2003,7 @@ class BucketManager:
                 operation_kind="update",
                 memory_mutation_id=operation.get("memory_mutation_id"),
             )
+
 
         previous_sealed = _is_sealed_bucket(post)
         next_sealed = (
@@ -1894,41 +2052,10 @@ class BucketManager:
         if "tags" in kwargs:
             kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
             post["tags"] = kwargs["tags"]
-        if "todos" in kwargs or "todo_provenance" in kwargs:
-            next_todos = (
-                apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
-                if "todos" in kwargs
-                else previous_todos
-            )
-            raw_provenance = (
-                kwargs["todo_provenance"]
-                if "todo_provenance" in kwargs
-                else previous_todo_provenance
-            )
-            try:
-                next_todo_provenance = reconcile_todo_provenance(
-                    next_todos,
-                    raw_provenance,
-                    strict="todo_provenance" in kwargs,
-                )
-            except ValueError as exc:
-                logger.warning("Refusing invalid todo provenance update for %s: %s", bucket_id, exc)
-                return False
-            if operation is not None and "todo_provenance" in kwargs:
-                # An extraction plan may predate explicit provenance edits.
-                # Keep current known attribution for surviving todo text;
-                # replay still uses the original durable payload and marker.
-                records_by_text = {record["text"]: record for record in next_todo_provenance}
-                records_by_text.update({
-                    record["text"]: record for record in previous_todo_provenance
-                    if _todo_provenance_is_known(record)
-                })
-                next_todo_provenance = reconcile_todo_provenance(
-                    next_todos, list(records_by_text.values())
-                )
-            post["todos"] = next_todos
-            if next_todo_provenance:
-                post["todo_provenance"] = next_todo_provenance
+        if prepared_todos is not None:
+            post["todos"] = prepared_todos
+            if prepared_provenance:
+                post["todo_provenance"] = prepared_provenance
             else:
                 post.metadata.pop("todo_provenance", None)
         if "importance" in kwargs:

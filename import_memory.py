@@ -731,10 +731,18 @@ class ImportEngine:
     ) -> dict:
         operation_key = self._o5b_operation_key(run_id, chunk_index, item_index)
         input_digest = self._o5b_digest(item)
-        operation_kind, target_bucket_id, payload, merged = await self._o5b_build_operation(
-            item,
-            preserve_raw,
-        )
+        persisted = self.bucket_mgr.inspect_import_operation(operation_key)
+        if persisted is not None:
+            # The memory plan may have committed before the item checkpoint.
+            # Its identities and body are authoritative; do not plan a second merge.
+            operation_kind = persisted["operation_kind"]
+            target_bucket_id = persisted["target_bucket_id"]
+            payload = persisted["payload"]
+        else:
+            operation_kind, target_bucket_id, payload, _merged = await self._o5b_build_operation(
+                item,
+                preserve_raw,
+            )
         snapshot = coordinator.get_item(run_id, "source_snapshot")
         if not snapshot or not snapshot.get("evidence_id") or not snapshot.get("revision_id"):
             raise RuntimeError("source_snapshot_lineage_missing")
