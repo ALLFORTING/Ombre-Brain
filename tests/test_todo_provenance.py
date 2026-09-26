@@ -91,7 +91,7 @@ async def test_trace_structured_todo_items_rejects_invalid_or_ambiguous_input(tm
 
 
 @pytest.mark.asyncio
-async def test_automatic_extraction_defaults_to_unknown_without_sidecar(tmp_path, monkeypatch):
+async def test_automatic_extraction_persists_unknown_sidecar_without_source_time(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server._detect_conflict_warning = AsyncMock(return_value="")
     server.dehydrator.analyze = AsyncMock(return_value={
@@ -103,7 +103,7 @@ async def test_automatic_extraction_defaults_to_unknown_without_sidecar(tmp_path
         bucket for bucket in await server.bucket_mgr.list_all()
         if "extracted task" in bucket["metadata"].get("todos", [])
     )
-    assert "todo_provenance" not in bucket["metadata"]
+    assert bucket["metadata"]["todo_provenance"] == [_record("extracted task", "unknown")]
 
     server.dehydrator.analyze = AsyncMock(return_value={
         "domain": ["事务"], "valence": 0.5, "arousal": 0.5,
@@ -130,7 +130,7 @@ async def test_automatic_extraction_defaults_to_unknown_without_sidecar(tmp_path
             item for item in await server.bucket_mgr.list_all()
             if task in item["metadata"].get("todos", [])
         )
-        assert "todo_provenance" not in bucket["metadata"]
+        assert bucket["metadata"]["todo_provenance"] == [_record(task, "unknown")]
 
 
 @pytest.mark.asyncio

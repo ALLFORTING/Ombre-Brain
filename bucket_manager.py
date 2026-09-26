@@ -116,6 +116,18 @@ def canonicalize_todos(raw: Any) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def automatic_todo_provenance(todos: Any) -> list[dict[str, Any]]:
+    """Describe extracted todos without inventing a speaker or source time.
+
+    Current extraction paths do not establish a trustworthy per-todo source
+    timestamp. Execution, capture, and retry times are not ``said_at``.
+    """
+    return [
+        {"text": text, "said_by": "unknown", "said_at": None, "source_bucket": None}
+        for text in canonicalize_todos(todos)
+    ]
+
+
 def _todo_provenance_record(
     raw: Any,
     *,
@@ -1902,6 +1914,18 @@ class BucketManager:
             except ValueError as exc:
                 logger.warning("Refusing invalid todo provenance update for %s: %s", bucket_id, exc)
                 return False
+            if operation is not None and "todo_provenance" in kwargs:
+                # An extraction plan may predate explicit provenance edits.
+                # Keep current known attribution for surviving todo text;
+                # replay still uses the original durable payload and marker.
+                records_by_text = {record["text"]: record for record in next_todo_provenance}
+                records_by_text.update({
+                    record["text"]: record for record in previous_todo_provenance
+                    if _todo_provenance_is_known(record)
+                })
+                next_todo_provenance = reconcile_todo_provenance(
+                    next_todos, list(records_by_text.values())
+                )
             post["todos"] = next_todos
             if next_todo_provenance:
                 post["todo_provenance"] = next_todo_provenance

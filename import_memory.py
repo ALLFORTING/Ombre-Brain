@@ -23,8 +23,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils import count_tokens_approx, now_iso
-from bucket_manager import canonicalize_todos
+from utils import apply_display_aliases_to_value, count_tokens_approx, now_iso
+from bucket_manager import (
+    automatic_todo_provenance,
+    canonicalize_todos,
+    merge_todo_provenance,
+    reconcile_todo_provenance,
+)
 from maintenance_write_gate import guarded_mutation
 
 logger = logging.getLogger("ombre_brain.import")
@@ -633,7 +638,8 @@ class ImportEngine:
 
     @staticmethod
     def _o5b_create_payload(item: dict) -> dict:
-        return {
+        todos = canonicalize_todos(item.get("todos"))
+        payload = {
             "content": item["content"],
             "tags": item.get("tags", []),
             "importance": item.get("importance", 5),
@@ -641,8 +647,11 @@ class ImportEngine:
             "valence": item.get("valence", 0.5),
             "arousal": item.get("arousal", 0.3),
             "name": item.get("name") or None,
-            "todos": canonicalize_todos(item.get("todos")),
+            "todos": todos,
         }
+        if todos:
+            payload["todo_provenance"] = automatic_todo_provenance(todos)
+        return payload
 
     async def _o5b_build_operation(self, item: dict, preserve_raw: bool) -> tuple[str, str | None, dict, bool]:
         """Select and fully plan the memory side effect before applying it."""
@@ -657,7 +666,7 @@ class ImportEngine:
         valence = item.get("valence", 0.5)
         arousal = item.get("arousal", 0.3)
         name = item.get("name", "")
-        incoming_todos = canonicalize_todos(item.get("todos"))
+        incoming_todos = canonicalize_todos(apply_display_aliases_to_value(item.get("todos")))
 
         try:
             existing = await self.bucket_mgr.search(
@@ -684,6 +693,10 @@ class ImportEngine:
                     existing_todos = canonicalize_todos(
                         bucket["metadata"].get("todos")
                     )
+                    merged_todos, merged_provenance = merge_todo_provenance(
+                        existing_todos, bucket["metadata"].get("todo_provenance"),
+                        incoming_todos, automatic_todo_provenance(incoming_todos),
+                    )
                     return (
                         "update",
                         bucket["id"],
@@ -695,9 +708,8 @@ class ImportEngine:
                                 "domain": list(set(bucket["metadata"].get("domain", []) + domain)),
                                 "valence": round((old_v + valence) / 2, 2),
                                 "arousal": round((old_a + arousal) / 2, 2),
-                                "todos": list(dict.fromkeys(
-                                    existing_todos + incoming_todos
-                                )),
+                                "todos": merged_todos,
+                                **({"todo_provenance": merged_provenance} if incoming_todos else {}),
                             }
                         },
                         True,
@@ -1065,6 +1077,7 @@ class ImportEngine:
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
                         todos=canonicalize_todos(item.get("todos")),
+                        todo_provenance=automatic_todo_provenance(item.get("todos")),
                     )
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
@@ -1188,17 +1201,25 @@ class ImportEngine:
                 and not (metadata.get("pinned") or metadata.get("protected"))
             ):
                 # Generic imports may reuse only deterministic textual duplicates.
-                incoming_todos = canonicalize_todos(item.get("todos"))
+                incoming_todos = canonicalize_todos(apply_display_aliases_to_value(item.get("todos")))
                 if incoming_todos:
                     existing_todos = canonicalize_todos(metadata.get("todos"))
-                    merged_todos = list(dict.fromkeys(existing_todos + incoming_todos))
+                    existing_provenance = reconcile_todo_provenance(
+                        existing_todos, metadata.get("todo_provenance")
+                    )
+                    merged_todos, merged_provenance = merge_todo_provenance(
+                        existing_todos, existing_provenance,
+                        incoming_todos, automatic_todo_provenance(incoming_todos),
+                    )
                     if (
                         merged_todos != existing_todos
+                        or merged_provenance != existing_provenance
                         or not isinstance(metadata.get("todos"), list)
                     ):
                         updated = await self.bucket_mgr.update(
                             bucket["id"],
                             todos=merged_todos,
+                            todo_provenance=merged_provenance,
                         )
                         if not updated:
                             raise RuntimeError(
@@ -1216,6 +1237,7 @@ class ImportEngine:
             arousal=arousal,
             name=name or None,
             todos=canonicalize_todos(item.get("todos")),
+            todo_provenance=automatic_todo_provenance(item.get("todos")),
         )
         return False
 

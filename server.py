@@ -88,6 +88,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import (
     BucketManager,
+    automatic_todo_provenance,
     canonicalize_todos,
     merge_todo_provenance,
     normalize_provenance_kind,
@@ -1245,7 +1246,10 @@ async def _merge_or_create(
     was reused.
     仅复用确定性重复，否则新建；返回 (桶ID或名称, 是否复用已有记录)。
     """
-    incoming_todos = _canonical_todos(todos)
+    incoming_todos = list(dict.fromkeys(
+        _apply_display_aliases(text) for text in _canonical_todos(todos)
+    ))
+    incoming_provenance = automatic_todo_provenance(incoming_todos)
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None, include_sealed=False)
     except Exception as e:
@@ -1277,12 +1281,19 @@ async def _merge_or_create(
                     writes.update(trigger_date=trigger_date, trigger_last_seen="")
             if incoming_todos:
                 existing_todos = _canonical_todos(metadata.get("todos"))
-                merged_todos = list(dict.fromkeys(existing_todos + incoming_todos))
+                merged_todos, merged_provenance = merge_todo_provenance(
+                    existing_todos, metadata.get("todo_provenance"),
+                    incoming_todos, incoming_provenance,
+                )
                 if (
                     merged_todos != existing_todos
                     or not isinstance(metadata.get("todos"), list)
                 ):
                     writes["todos"] = merged_todos
+                if merged_provenance != reconcile_todo_provenance(
+                    existing_todos, metadata.get("todo_provenance")
+                ):
+                    writes["todo_provenance"] = merged_provenance
             if writes and not await bucket_mgr.update(bucket["id"], **writes):
                 raise RuntimeError(f"failed to update duplicate bucket {bucket['id']}")
             if outcome_out is not None:
@@ -1304,6 +1315,7 @@ async def _merge_or_create(
         arousal=arousal,
         name=(name.strip() if isinstance(name, str) else "") or _canonical_body_name(content),
         todos=incoming_todos,
+        todo_provenance=incoming_provenance,
         provenance_kind=provenance_kind,
     )
     await _auto_link_related(bucket_id)
@@ -1317,6 +1329,7 @@ async def _merge_or_create(
         outcome_out.update(bucket_id=bucket_id, reused=False,
                            written_fields=["content", "tags", "importance", "domain",
                                            "valence", "arousal", "name", "todos",
+                                           *(["todo_provenance"] if incoming_provenance else []),
                                            *(["trigger_date"] if trigger_date else [])],
                            ignored_fields=[])
     return bucket_id, False
@@ -9066,7 +9079,6 @@ async def hold(
             arousal=feel_arousal,
             name=feel_name,
             bucket_type="feel",
-            todos=_canonical_todos(feel_analysis.get("todos")),
             provenance_kind=(explicit_provenance_kind or "inference"),
         )
         if should_record_emotion:
@@ -9133,6 +9145,7 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
             todos=analysis_todos,
+            todo_provenance=automatic_todo_provenance(analysis_todos),
             provenance_kind=explicit_provenance_kind,
         )
         if should_record_emotion:
