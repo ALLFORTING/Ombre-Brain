@@ -138,6 +138,8 @@ from asset_viewer import (
 from dehydrator import AnalysisParseError, Dehydrator
 from openai import APIConnectionError, APITimeoutError
 from decay_engine import DecayEngine
+from related_integrity import (RelatedError, parse_related, scan_relation_store,
+                               automatic_eligible, digest as related_digest)
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
 from import_memory import ImportEngine
@@ -2105,46 +2107,11 @@ def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) ->
 
 
 def _related_ids(meta: dict) -> list[str]:
-    raw = meta.get("related_buckets", "")
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item).strip()]
-    return _parse_csv_ids(str(raw))
+    return parse_related(meta).require_safe()
 
 
 async def _unlink_related(source: dict, relation_ids: list[str]) -> bool:
-    """Remove only the requested related links from both sides, with rollback on failure."""
-    source_id = str(source.get("id", ""))
-    source_meta = source.get("metadata", {})
-    requested = set(relation_ids)
-    operations: list[tuple[str, str, str]] = []
-    source_related = _related_ids(source_meta)
-    next_source_related = [
-        relation_id for relation_id in source_related if relation_id not in requested
-    ]
-    if next_source_related != source_related:
-        operations.append(
-            (source_id, ",".join(next_source_related), ",".join(source_related))
-        )
-    for relation_id in relation_ids:
-        if relation_id == source_id:
-            continue
-        relation = await bucket_mgr.get(relation_id)
-        if not relation:
-            continue
-        relation_meta = relation.get("metadata", {})
-        current_related = _related_ids(relation_meta)
-        next_related = [item for item in current_related if item != source_id]
-        if next_related != current_related:
-            operations.append(
-                (relation_id, ",".join(next_related), ",".join(current_related))
-            )
-    applied: list[tuple[str, str]] = []
-    for relation_id, update_value, restore_value in operations:
-        if not await bucket_mgr.update(relation_id, related_buckets=update_value):
-            for applied_id, applied_restore in reversed(applied):
-                await bucket_mgr.update(applied_id, related_buckets=applied_restore)
-            return False
-        applied.append((relation_id, restore_value))
+    bucket_mgr.mutate_related(str(source['id']), remove=relation_ids)
     return True
 
 
@@ -2342,6 +2309,10 @@ async def _merge_bucket_into_target(
     source_sealed = _is_sealed(source)
     target_sealed = _is_sealed(target)
     if source_sealed != target_sealed: return "合并失败：不允许跨隐私边界合并（sealed 状态不匹配）。"
+    try:
+        related_plan = bucket_mgr.preview_related_delete(source_id, target_id=target_id)
+    except RelatedError as exc:
+        return f"merge blocked: {exc.code}; repair the unsafe relation inventory first."
     all_buckets = await bucket_mgr.list_all(include_archive=True)
     inbound = [
         bucket for bucket in all_buckets
@@ -2452,6 +2423,7 @@ async def _merge_bucket_into_target(
     plan = {
         "target_id": target_id, "source_id": source_id,
         "source_sealed": source_sealed,
+        "related_inventory": related_plan['inventory'],
         "target_content_sha256": hashlib.sha256(
             str(target.get("content", "")).encode("utf-8")
         ).hexdigest(),
@@ -2543,6 +2515,7 @@ def _todo_resume_matches(expected: list, actual: list | None, *, allow_legacy_as
     return all(_todo_is_terminal(r) for r in remaining)
 
 
+@guarded_async_mutation("merge_resume")
 async def _execute_merge_operation(operation: dict) -> str:
     """Resume a confirmed merge from durable steps without rebuilding its body."""
     operation_id = operation["operation_id"]
@@ -2589,6 +2562,16 @@ async def _execute_merge_operation(operation: dict) -> str:
             persist("running")
 
     try:
+        relation_child_key = f"merge:{operation_id}:related-delete"
+        relation_child = bucket_mgr.relation_store.lookup(relation_child_key)
+        current_source = await bucket_mgr.get(source_id)
+        if current_source is None and relation_child is None:
+            raise RelatedError('legacy_merge_relation_unrecoverable')
+        if relation_child is None:
+            relation_preview = bucket_mgr.preview_related_delete(source_id, target_id=target_id)
+            if (plan.get('related_inventory') is not None
+                    and relation_preview['inventory'] != plan['related_inventory']):
+                raise RelatedError('related_plan_stale')
         persist("running")
         target_step = bucket_mgr.inspect_import_operation(f"merge:{operation_id}:target")
         if "target" not in completed and not (target_step and target_step["marker"]):
@@ -2624,11 +2607,18 @@ async def _execute_merge_operation(operation: dict) -> str:
                     persist("running")
                 if not await bucket_mgr.delete(source_id,
                         _allow_sealed=plan["source_sealed"],
+                        _relation_target=target_id,
+                        _relation_operation_key=relation_child_key,
+                        _relation_expected_inventory=plan.get('related_inventory'),
                         _expected_todo_state=(source["metadata"].get("todos"),
                                               source["metadata"].get("todo_provenance"))):
                     raise RuntimeError("source deletion failed")
-            elif "delete_started" not in completed:
-                raise RuntimeError("source disappeared before the delete step")
+            elif relation_child is None:
+                raise RelatedError('legacy_merge_relation_unrecoverable')
+            else:
+                bucket_mgr.relation_store.commit(lambda inv: None,
+                    operation_key=relation_child_key,
+                    request_digest=related_digest({'source': source_id, 'target': target_id}))
             completed.append("delete_source")
             persist("running")
         persist("complete")
@@ -2772,9 +2762,11 @@ def _format_delete_confirmation(buckets: list[dict], plans: list[dict], token: s
             )
         if plan["incoming_related"]:
             lines.append(
-                "  incoming related_buckets 引用（现有删除流程不清理）: "
+                "  将清理 incoming related_buckets 引用: "
                 + ", ".join(plan["incoming_related"])
             )
+        if plan.get('sealed_backlink_count'):
+            lines.append(f"  存在 {plan['sealed_backlink_count']} 个 sealed backlink 需要清理。")
     lines.append(f"confirm_token: {token}")
     lines.append(
         f"确认有效期: {_MUTATION_CONFIRM_TTL_SECONDS} 秒；请使用相同 bucket_id 和 delete=True 重试。"
@@ -2788,6 +2780,12 @@ async def _prepare_trace_delete(
     """Validate every delete target before issuing or consuming any confirmation."""
     buckets = []
     plans = []
+    inventory = scan_relation_store(config['buckets_dir'])
+    try:
+        inventory.require_complete()
+    except RelatedError as exc:
+        kinds = ','.join(sorted({b['kind'] for b in inventory.blockers}))
+        return None, f"delete blocked: {exc.code} ({kinds}); backlink integrity unknown.", []
     all_buckets = await bucket_mgr.list_all(include_archive=True)
     for bucket_id in bucket_ids:
         bucket = await bucket_mgr.get(bucket_id)
@@ -2818,7 +2816,10 @@ async def _prepare_trace_delete(
             "incoming_supersession": sorted(str(item.get("id", "")) for item in inbound),
             "incoming_related": related,
             "outgoing_supersession": _superseded_by_id(metadata),
-            "related_cleanup": False,
+            "related_cleanup": True,
+            "sealed_backlink_count": sum(1 for endpoint in inventory.endpoints.values()
+                if endpoint.metadata.get('sealed') and bucket_id in endpoint.related.ids),
+            "related_plan_digest": related_digest(bucket_mgr.preview_related_delete(bucket_id)),
         }
         plans.append(plan)
         if protections:
@@ -2850,7 +2851,15 @@ async def _execute_trace_delete(bucket: dict) -> tuple[bool, str]:
         cleaned = await _clear_outgoing_supersession_for_delete(bucket)
         if not cleaned:
             return False, "删除失败：无法清理 superseded_by 反向关系。"
-    success = await bucket_mgr.delete(bucket_id)
+    try:
+        success = await bucket_mgr.delete(bucket_id)
+    except Exception as exc:
+        # Preserve R-5's pre-intent restore. An accepted deletion must instead
+        # roll forward, so its supersession cleanup is never rolled back.
+        if getattr(exc, 'operation_id', None) is None and successor:
+            await bucket_mgr.update(successor_id, supersedes=successor_restore)
+        detail = str(exc) if isinstance(exc, RelatedError) else 'related_commit_failed'
+        return False, f"delete pending/blocked: {detail}; retry after recovery."
     if not success and successor:
         await bucket_mgr.update(successor_id, supersedes=successor_restore)
     return success, (
@@ -3970,8 +3979,9 @@ async def _auto_link_related(bucket_id: str, threshold: float | None = None, top
         threshold = float(os.environ.get("OMBRE_RELATED_THRESHOLD", "0.75") or "0.75")
     if not embedding_engine or not embedding_engine.enabled:
         return []
+    inventory = scan_relation_store(config['buckets_dir'])
     bucket = await bucket_mgr.get(bucket_id)
-    if not bucket or _is_sealed(bucket):
+    if not bucket or not automatic_eligible(inventory, bucket_id):
         return []
     target_embedding = await embedding_engine.get_embedding(bucket_id)
     if target_embedding is None:
@@ -3983,7 +3993,7 @@ async def _auto_link_related(bucket_id: str, threshold: float | None = None, top
     scored = []
     for other in all_buckets:
         other_id = other["id"]
-        if other_id == bucket_id or _is_sealed(other):
+        if other_id == bucket_id or not automatic_eligible(inventory, other_id):
             continue
         other_embedding = await embedding_engine.get_embedding(other_id)
         if other_embedding is None:
@@ -3996,73 +4006,65 @@ async def _auto_link_related(bucket_id: str, threshold: float | None = None, top
     if not selected:
         return []
 
-    target_related = _related_ids(bucket.get("metadata", {}))
-    selected_ids = [bucket_id for bucket_id, _ in selected]
-    await bucket_mgr.update(
-        bucket_id,
-        related_buckets=",".join(dict.fromkeys(target_related + selected_ids)),
-    )
-    for related_id, _ in selected:
-        related_bucket = await bucket_mgr.get(related_id)
-        if not related_bucket or _is_sealed(related_bucket):
-            continue
-        current_related = _related_ids(related_bucket.get("metadata", {}))
-        if bucket_id not in current_related:
-            await bucket_mgr.update(
-                related_id,
-                related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
-            )
+    bucket_mgr.mutate_related(bucket_id, add=[identity for identity, _ in selected], origin='inferred')
     return selected
 
 
 async def _run_related_backfill(dry_run: bool = True, limit: int = 100, threshold: float | None = None) -> str:
     if threshold is None:
         threshold = float(os.environ.get("OMBRE_RELATED_THRESHOLD", "0.75") or "0.75")
-    if not embedding_engine or not embedding_engine.enabled:
+    # No lazy proxy access on dry-run: no runtime, provider, decay or recovery.
+    from related_integrity import read_vectors
+    runtime = _runtime_components
+    if runtime is not None:
+        engine = runtime['embedding_engine']
+        enabled, db_path, model = engine.enabled, engine.db_path, engine.model
+    else:
+        embedding = config.get('embedding', {})
+        dehy = config.get('dehydration', {})
+        key = embedding.get('api_key') or ('' if embedding.get('independent') else dehy.get('api_key')) or ''
+        enabled = bool(str(key).strip()) and embedding.get('enabled', True)
+        db_path = os.path.join(config['buckets_dir'], 'embeddings.db')
+        model = embedding.get('model', 'gemini-embedding-001')
+    if not enabled:
         return "自动 related 回填不可用：embedding 未启用。"
-    buckets = [
-        bucket for bucket in await bucket_mgr.list_all(include_archive=False)
-        if not _is_sealed(bucket)
-    ][:max(1, limit)]
+    inventory = scan_relation_store(config['buckets_dir'])
+    ids = [i for i in inventory.order if automatic_eligible(inventory, i)][:max(1, limit)]
+    vectors = read_vectors(db_path, model)
     planned = []
-    for bucket in buckets:
-        target_embedding = await embedding_engine.get_embedding(bucket["id"])
+    for identity in ids:
+        target_embedding = vectors.get(identity)
         if target_embedding is None:
             continue
         scored = []
-        for other in buckets:
-            if other["id"] == bucket["id"] or _is_sealed(other):
+        for other_id in ids:
+            if other_id == identity or other_id not in vectors:
                 continue
-            other_embedding = await embedding_engine.get_embedding(other["id"])
-            if other_embedding is None:
-                continue
-            score = embedding_engine._cosine_similarity(target_embedding, other_embedding)
+            score = EmbeddingEngine._cosine_similarity(target_embedding, vectors[other_id])
             if score >= threshold:
-                scored.append((other["id"], score))
+                scored.append((other_id, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         top = scored[:3]
         if top:
-            planned.append((bucket["id"], top))
-    lines = [
-        "=== 自动 related dry-run ===" if dry_run else "=== 自动 related 回填 ===",
-        f"扫描桶数: {len(buckets)}",
-        f"计划关联: {len(planned)} 个桶",
-    ]
-    for bucket_id, links in planned[:50]:
-        lines.append(
-            f"- {bucket_id}: "
-            + ", ".join(f"{related_id}({score:.3f})" for related_id, score in links)
-        )
+            planned.append((identity, top))
+    lines = ["=== 自动 related dry-run ===" if dry_run else "=== 自动 related 回填 ===",
+             f"扫描桶数: {len(ids)}", f"计划关联: {len(planned)} 个桶"]
+    for identity, links in planned[:50]:
+        lines.append(f"- {identity}: " + ', '.join(f"{i}({score:.3f})" for i, score in links))
     if dry_run:
-        return "\n".join(lines)
-    for bucket_id, links in planned:
-        bucket = await bucket_mgr.get(bucket_id)
-        if not bucket or _is_sealed(bucket):
-            continue
-        current = _related_ids(bucket.get("metadata", {}))
-        next_ids = [related_id for related_id, _ in links]
-        await bucket_mgr.update(bucket_id, related_buckets=",".join(dict.fromkeys(current + next_ids)))
-    return "\n".join(lines)
+        return '\n'.join(lines)
+    applied, unchanged = 0, 0
+    for identity, links in planned:
+        try:
+            result = bucket_mgr.mutate_related(identity, add=[i for i, _ in links], origin='inferred')
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, RelatedError) else 'related_commit_failed'
+            lines.append(f"partial failure: {detail}; committed: {applied}; unchanged: {unchanged}; later operations not started; failing relation not reported as successful.")
+            return '\n'.join(lines)
+        applied += int(result['changed'])
+        unchanged += int(not result['changed'])
+    lines.append(f"committed: {applied}; unchanged: {unchanged}")
+    return '\n'.join(lines)
 
 
 async def _call_conflict_api(new_content: str, old_buckets: list[dict]) -> str:
@@ -9362,7 +9364,6 @@ async def related_backfill(
     threshold: Annotated[float, Field(description="-1 uses the configured default threshold; a non-negative value sets the semantic-link threshold.")] = -1,
 ) -> str:
     """Controlled related-link maintenance: dry-run by default; execution writes links and skips sealed buckets."""
-    await decay_engine.ensure_started()
     try:
         actual_threshold = None if threshold < 0 else threshold
         return await _run_related_backfill(dry_run=dry_run, limit=limit, threshold=actual_threshold)
@@ -10161,6 +10162,15 @@ async def trace(
             return "批量 trace 不支持 superseded_by。"
         if delete:
             return await _trace_delete_with_confirmation(bucket_ids, confirm_token)
+        if related or unrelate:
+            try:
+                add_ids, remove_ids = _parse_csv_ids(related), _parse_csv_ids(unrelate)
+                if add_ids and remove_ids:
+                    return "related 与 unrelate 不能同时使用。"
+                for current_id in bucket_ids:
+                    bucket_mgr.preview_related(current_id, add=add_ids, remove=remove_ids)
+            except RelatedError as exc:
+                return f"related rejected: {exc.code}; no batch changes made."
         results = []
         for current_id in bucket_ids:
             result = await trace(
@@ -10317,9 +10327,11 @@ async def trace(
     unrelated_ids = _parse_csv_ids(unrelate)
     if related_ids and unrelated_ids:
         return "related 与 unrelate 不能同时使用。"
-    if related_ids:
-        current_related = _related_ids(bucket.get("metadata", {}))
-        updates["related_buckets"] = ",".join(dict.fromkeys(current_related + related_ids))
+    if related_ids or unrelated_ids:
+        try:
+            bucket_mgr.preview_related(bucket_id, add=related_ids, remove=unrelated_ids)
+        except RelatedError as exc:
+            return f"related rejected: {exc.code}; no changes made."
 
     if "valence" in updates or "arousal" in updates:
         meta = bucket.get("metadata", {})
@@ -10329,7 +10341,7 @@ async def trace(
 
     if importance_protected:
         updates.pop("importance", None)
-        if not updates:
+        if not updates and not related_ids and not unrelated_ids:
             return (
                 f"importance 未修改：记忆桶 {bucket_id} 受到 {protection_label} protection，"
                 "importance 锁定为 10。"
@@ -10361,7 +10373,7 @@ async def trace(
         if not _consume_mutation_confirmation("trace.lifecycle", payload, confirm_token):
             return "lifecycle confirmation invalid, expired, used, or stale; preview again."
 
-    if not updates and requested_superseded_by is None and not unrelated_ids:
+    if not updates and requested_superseded_by is None and not unrelated_ids and not related_ids:
         return "没有任何字段需要修改。"
 
     if updates:
@@ -10369,22 +10381,14 @@ async def trace(
         if not success:
             return f"修改失败: {bucket_id}"
 
-    if related_ids:
-        for related_id in related_ids:
-            if related_id == bucket_id:
-                continue
-            related_bucket = await bucket_mgr.get(related_id)
-            if not related_bucket:
-                continue
-            current_related = _related_ids(related_bucket.get("metadata", {}))
-            if bucket_id not in current_related:
-                await bucket_mgr.update(
-                    related_id,
-                    related_buckets=",".join(dict.fromkeys(current_related + [bucket_id])),
-                )
-
-    if unrelated_ids and not await _unlink_related(bucket, unrelated_ids):
-        return "解除 related 失败，未完成双向关系写入。"
+    relation_result = None
+    if related_ids or unrelated_ids:
+        try:
+            relation_result = bucket_mgr.mutate_related(bucket_id, add=related_ids, remove=unrelated_ids)
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, RelatedError) else 'related_commit_failed'
+            return (f"related failure: {detail}; ordinary mutation={'applied' if updates else 'unchanged'}; "
+                    "relation not reported as successful; retry relation-only after recovery.")
 
     supersession_label = None
     if requested_superseded_by is not None:
@@ -10433,8 +10437,11 @@ async def trace(
     if supersession_label is not None:
         supersession_change = f"superseded_by={supersession_label}"
         changed += f", {supersession_change}" if changed else supersession_change
+    if related_ids:
+        relation_change = f"related={','.join(related_ids)} ({relation_result['status']})"
+        changed += f", {relation_change}" if changed else relation_change
     if unrelated_ids:
-        unrelate_change = f"unrelate={','.join(unrelated_ids)}"
+        unrelate_change = f"unrelate={','.join(unrelated_ids)} ({relation_result['status']})"
         changed += f", {unrelate_change}" if changed else unrelate_change
     if pinned == 0 or permanent in (0, 1):
         current = await bucket_mgr.get(bucket_id)

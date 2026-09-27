@@ -90,11 +90,12 @@ def _acquire(root):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("writer", ["update", "touch", "set_dormant", "refresh_tg_summary", "archive"])
+@pytest.mark.parametrize("writer", ["related", "update", "touch", "set_dormant", "refresh_tg_summary", "archive"])
 @pytest.mark.parametrize("terminal", ["done_at", "dropped_at"])
 async def test_all_full_frontmatter_writers_wait_for_completion(test_config, writer, terminal):
     manager = BucketManager(test_config)
     bucket = await manager.create("body", todos=["task"])
+    related_neighbor = await manager.create("neighbor") if writer == "related" else None
     identity = (await manager.get(bucket))["metadata"]["todo_provenance"][0]["id"]
     other = BucketManager(test_config)
     entered, release, attempting = threading.Event(), threading.Event(), threading.Event()
@@ -104,6 +105,7 @@ async def test_all_full_frontmatter_writers_wait_for_completion(test_config, wri
         return True
     def rewrite():
         attempting.set()
+        if writer == "related": return other.mutate_related(bucket, add=[related_neighbor])
         if writer == "update": return asyncio.run(other.update(bucket, tags=["changed"]))
         if writer == "touch": return asyncio.run(other.touch(bucket, ripple_ids=set()))
         if writer == "set_dormant": return asyncio.run(other.set_dormant(bucket))
@@ -166,7 +168,7 @@ print(m.preview_todo_completion(bucket, old[0]['id'])['target'][sys.argv[3]], fl
 
 def test_managed_mutex_blocks_have_no_await():
     root = Path(__file__).resolve().parents[1]
-    for name in ["bucket_manager.py", "add_timestamps.py", "reclassify_api.py", "reclassify_domains.py", "migrate_to_domains.py"]:
+    for name in ["related_integrity.py", "bucket_manager.py", "add_timestamps.py", "reclassify_api.py", "reclassify_domains.py", "migrate_to_domains.py"]:
         tree = ast.parse((root / name).read_text())
         scopes = [node for node in ast.walk(tree) if isinstance(node, ast.With)
                   and any(isinstance(item.context_expr, ast.Call)

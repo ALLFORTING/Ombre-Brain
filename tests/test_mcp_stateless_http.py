@@ -470,7 +470,7 @@ async def test_stateless_digest_cancel_then_http_resume_uses_disk_markers(ob, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stateless", [False, True])
-async def test_trace_cancel_at_embedding_boundary_can_leave_one_way_relation(ob, monkeypatch, stateless):
+async def test_trace_cancel_at_embedding_boundary_never_leaves_one_way_relation(ob, monkeypatch, stateless):
     monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
     left = await ob.bucket_mgr.create("original left")
     right = await ob.bucket_mgr.create("original right")
@@ -503,9 +503,9 @@ async def test_trace_cancel_at_embedding_boundary_can_leave_one_way_relation(ob,
         # Stateful continues the reciprocal write after the embedding await returns.
         result(await rpc(client, "tools/list"))
         left_bucket, right_bucket = await ob.bucket_mgr.get(left), await ob.bucket_mgr.get(right)
-        assert right in left_bucket["metadata"]["related_buckets"]
+        forward = right in left_bucket["metadata"].get("related_buckets", "")
         reverse = left in right_bucket["metadata"].get("related_buckets", "")
-        assert reverse is not stateless
+        assert forward == reverse == (not stateless)
         print("S2 trace relation", stateless, "reciprocal", reverse)
         if stateless:
             monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", original)

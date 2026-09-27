@@ -1464,3 +1464,53 @@ pytest tests/ -v                       # 详细输出
 ## License
 
 MIT
+
+
+### Related integrity (W-8)
+
+`trace(related="ID,ID")` adds an undirected relation; `trace(unrelate="ID")`
+removes both sides. Self and missing-target add fail before any mixed content or
+metadata edit. A missing-target remove can clean a dangling edge. Repeated
+complete add/remove is unchanged and does not refresh activity. Explicit
+relations allow all lifecycle states, including sealed/archive/dormant.
+Automatic inference excludes sealed, archive, dormant and buckets with an
+actually existing successor; similarity, threshold and ranking are unchanged.
+
+Relation commits use the shared bucket writer mutex and lazy
+`bucket_history.sqlite3.ob_related_operations` durable intents. Normal success
+means both sides were published. A crash may leave a recorded intermediate
+state; startup and the next relation mutation resume only those intents.
+Conflicting relation edits block recovery instead of overwriting newer state.
+Internal reverse/backfill/delete/merge/repair/recovery writes preserve activity
+and `updated_at`; the explicit source can refresh them on an actual edge change.
+This addresses S-4 relation consistency only; append retry and other writers
+remain outside W-8. Keep `OMBRE_MCP_STATELESS_HTTP=false` or unset.
+
+Historical repair is a separate operator action, never startup graph repair:
+
+```sh
+python scripts/related_integrity.py scan --buckets-dir /explicit/isolated/store
+python scripts/related_integrity.py dry-run --buckets-dir /explicit/isolated/store --plan-out /explicit/new-plan.json
+python scripts/related_integrity.py apply --buckets-dir /explicit/isolated/store --plan /explicit/new-plan.json
+```
+
+Scan/dry-run do not import the server, start decay, or mutate the store. Apply
+requires that exact deterministic plan, checks identities and fingerprints,
+rejects stale/unsafe plans, and records an idempotent durable intent. Repair
+removes self/dangling edges, deduplicates in first occurrence order, normalizes
+null to empty, and fills valid reverse edges. This preserves the existing
+half-edge as an undirected relation; it cannot tell whether history contained
+an interrupted add or remove. Complex values, conflicting identities and
+unreadable buckets require operator investigation; there is no coercion or
+unsafe override. Plans contain endpoint identities, so treat plan files as
+private maintenance artifacts. Do not run repair on a live store without a
+separate, explicit operator decision.
+
+Delete scans every formal location and cleans even incoming-only and sealed
+backlinks before removing the target. Sealed cleanup changes related metadata
+only; public delete preview exposes its count rather than sealed identities.
+Unreadable/ambiguous inventory blocks deletion. Merge migrates outgoing and
+incoming-only source relations to its target with a durable child intent.
+An unfinished legacy merge whose source is already absent and which has no
+relation child fails with `legacy_merge_relation_unrecoverable`; completed old
+merges are not reopened.

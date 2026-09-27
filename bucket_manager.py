@@ -34,6 +34,8 @@ import hashlib
 import json
 import tempfile
 import inspect
+from related_integrity import (RelationStore, RelatedError, plan_mutation, scan_relation_store,
+                               plan_delete, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from uuid import UUID, uuid4
 from datetime import datetime
@@ -529,6 +531,36 @@ class BucketManager:
         self.embedding_engine = embedding_engine
         self._init_history_db()
         initialize_bucket_write_lock(self.base_dir)
+        self.relation_store = RelationStore(self.base_dir, self.write_coordinator)
+        self.recover_related_operations()
+
+    def preview_related(self, source_id, **kwargs):
+        return self.relation_store.preview(source_id, **kwargs)
+
+    def mutate_related(self, source_id, **kwargs):
+        return self.relation_store.mutate(source_id, **kwargs)
+
+    def apply_related_plan(self, plan, *, operation_key=None):
+        if plan.get('kind') == 'repair':
+            return self.relation_store.apply_repair(plan)
+        if plan.get('kind') != 'relation':
+            raise RelatedError('related_plan_stale')
+        def validate(inventory):
+            request = plan['request']
+            replacement = {'replace': request['replace']} if request['replacement'] else {}
+            expected = plan_mutation(inventory, request['source'], add=request['add'],
+                remove=request['remove'], origin=request['origin'], **replacement)
+            if expected != plan:
+                raise RelatedError('related_plan_stale')
+            return expected
+        return self.relation_store.commit(validate, operation_key=operation_key,
+                                           request_digest=related_digest(plan['request']))
+
+    def recover_related_operations(self):
+        return self.relation_store.recover()
+
+    def preview_related_delete(self, source_id, *, target_id=None):
+        return plan_delete(scan_relation_store(self.base_dir), source_id, target_id=target_id)
 
     async def _delete_ordinary_embedding(self, bucket_id: str) -> None:
         """Delete the local ordinary vector, regardless of provider enablement."""
@@ -2063,6 +2095,15 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
+        relation_requested = "related_buckets" in kwargs
+        relation_value = kwargs.pop("related_buckets", None)
+        if relation_requested:
+            if kwargs.get("_o5b_operation_key") is not None:
+                raise RelatedError("related_operation_key_conflict")
+            self.preview_related(bucket_id, replace=relation_value)
+            if not kwargs:
+                self.mutate_related(bucket_id, replace=relation_value)
+                return True
         with bucket_write_scope(self.base_dir):
             history_change_type = kwargs.pop("_history_change_type", "replace")
             o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
@@ -2289,8 +2330,6 @@ class BucketManager:
                 post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
             if "emotion_history" in kwargs:
                 post["emotion_history"] = kwargs["emotion_history"]
-            if "related_buckets" in kwargs:
-                post["related_buckets"] = kwargs["related_buckets"]
             if "source_bucket" in kwargs:
                 post["source_bucket"] = kwargs["source_bucket"]
             if "trigger_date" in kwargs:
@@ -2390,6 +2429,8 @@ class BucketManager:
                 {"mode": str(current_superseded_by).strip()},
             )
 
+        if relation_requested:
+            self.mutate_related(bucket_id, replace=relation_value)
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
 
@@ -2460,11 +2501,29 @@ class BucketManager:
         *,
         _allow_sealed: bool = False,
         _expected_todo_state: tuple[Any, Any] | None = None,
+        _relation_target: str | None = None,
+        _relation_operation_key: str | None = None,
+        _relation_expected_inventory: str | None = None,
     ) -> bool:
         """
         Delete a memory bucket file.
         删除指定的记忆桶文件。
         """
+        if _relation_operation_key:
+            receipt = self.relation_store.lookup(_relation_operation_key)
+            if receipt:
+                self.relation_store.commit(lambda inv: None,
+                    operation_key=_relation_operation_key,
+                    request_digest=related_digest({"source": bucket_id, "target": _relation_target}))
+                return True
+        self.recover_related_operations()
+        if not self._find_bucket_file(bucket_id):
+            await self._delete_ordinary_embedding(bucket_id)
+            return False
+        relation_plan = self.preview_related_delete(bucket_id, target_id=_relation_target)
+        if (_relation_expected_inventory is not None
+                and relation_plan['inventory'] != _relation_expected_inventory):
+            raise RelatedError('related_plan_stale')
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             try:
@@ -2511,20 +2570,13 @@ class BucketManager:
             )
             return False
 
-        with bucket_write_scope(self.base_dir):
-            current_path = self._find_bucket_file(bucket_id)
-            if not current_path or frontmatter.dumps(frontmatter.load(current_path)) != frontmatter.dumps(post):
-                return False
-            file_path = current_path
-            try:
-                os.remove(file_path)
-            except OSError as exc:
-                logger.error(
-                    "Bucket file removal failed after vector cleanup / 删除桶文件失败: %s: %s",
-                    file_path,
-                    exc,
-                )
-                return False
+        def validate(inventory):
+            planned = plan_delete(inventory, bucket_id, target_id=_relation_target)
+            if planned != relation_plan:
+                raise RelatedError('related_plan_stale')
+            return planned
+        self.relation_store.commit(validate, operation_key=_relation_operation_key,
+            request_digest=related_digest({"source": bucket_id, "target": _relation_target}))
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True

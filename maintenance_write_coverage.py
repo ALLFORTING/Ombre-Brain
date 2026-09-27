@@ -16,6 +16,14 @@ COVERAGE_SCHEMA_VERSION = 3
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
+    "related_integrity.py": {
+        "_save": "guarded_mutation",
+        "_publish": "guarded_mutation",
+        "_execute": "guarded_mutation",
+        "mutate": "guarded_mutation",
+        "apply_repair": "guarded_mutation",
+    },
+    "scripts/related_integrity.py": {"main": "standalone_maintenance_script"},
     "bucket_write_lock.py": {"initialize_bucket_write_lock": "guarded_mutation"},
     "add_timestamps.py": {"main": "standalone_maintenance_script"},
     "migrate_to_domains.py": {"migrate": "standalone_maintenance_script"},
@@ -78,6 +86,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_ensure_import_operation": "guarded_caller_only",
         "_mark_import_operation_applied": "guarded_caller_only",
         "_write_post_atomic": "guarded_caller_only",
+        "apply_related_plan": "guarded_caller_only",
         "plan_import_operation": "guarded_mutation",
         "apply_import_operation": "guarded_async_mutation",
         "write_digest_operation": "guarded_mutation",
@@ -293,6 +302,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "save": "guarded_mutation",
     },
     "server.py": {
+        "_execute_merge_operation": "guarded_async_mutation",
         "_save_password_hash": "guarded_mutation",
         "_atomic_write_auth_payload": "guarded_caller_only",
         "_write_fd_bytes": "guarded_caller_only",
