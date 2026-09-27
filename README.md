@@ -1094,11 +1094,34 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 
 - `hold(content="...", feel=True, source_bucket="源记忆ID", valence=模型自己的感受)`
 - `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
-- `source_bucket` 指向被消化的记忆，会被标记为「已消化」→ 加速淡化到无限小，但不会被删除
+- `source_bucket` 指向被消化的记忆；成功 marking 写入「已消化」。feel 创建与 source marking 的结果须分别检查，已消化且 resolved 的记忆会加速淡化，不会因此删除。
 - Feel 不参与普通浮现、不衰减、不参与 dreaming；但 `boot()` 会在“回声”区随机带出 1 条可见 feel，`breath(feels=True)` 可专门检索 feel
 - 用 `breath(domain="feel")` 或 `breath(feels=True)` 读取之前的 feel；sealed feel 仍默认隐藏
 - Feel does not join normal surfacing, does not decay, and does not join dreaming; `boot()` surfaces one visible feel in the echo section, and `breath(feels=True)` searches feel memories directly.
 - Use `breath(domain="feel")` or `breath(feels=True)` to read previous feel; sealed feel remains hidden by default.
+
+当 source_bucket 去除首尾空白后非空时，hold 会在创建 feel 前严格验证 source 的可读性和唯一身份；missing、unreadable、malformed identity、duplicate identity、filename/metadata ID conflict 或无法证明唯一身份时直接拒绝，不创建 feel。sealed、dormant、archived、superseded 和 feel source 仍可标记，生命周期和目录不变。
+
+feel 创建后，source 会在存储锁内重新读取、原子标记并验证。成功只改 digested、显式 valence 对应的 model_valence，以及 last_active / updated_at；source 已满足 marking 时仍刷新时间。若 source 此时消失、发生身份冲突或写入失败，feel 会保留，返回明确的 partial success；无法证明写入结果时返回 write_outcome_unknown。
+
+仅请求 source 时，原 🫧feel→新建 文本末尾追加以下回执；ID 是单行 JSON string，机器判断以回执字段为准：
+
+```text
+[hold_feel_source_receipt]
+feel_created=true
+feel_reused=false
+bucket_id="feel_id"
+source_bucket_id="source_id"
+source_marked=true
+source_mark_error=none
+```
+
+- feel_created：本次 create 已成功返回；preflight 拒绝时为 false，bucket_id 为 ""。
+- feel_reused：当前始终为 false；retry 会创建新的独立 feel，不做正文去重。
+- source_marked：本次完整 marking 和时间更新已验证成功才为 true；只证明本次 marking 当时成立，后续 writer 仍可修改。
+- source_mark_error：成功为 none；身份失败为 source_missing、source_unreadable、source_identity_malformed、source_identity_duplicate、source_identity_conflict 或 source_identity_ambiguous；写入失败为 write_failed，无法证明为 write_outcome_unknown。
+- 没有 source（包括空白字符串）时，行为和文本不变，不追加回执。preflight 失败仍是普通业务文本返回。
+- 此路径不提供 response-loss / cancellation request idempotency。create 自身异常及 marking 前既有 emotion / trigger / related 异常仍走原异常路径，不能据此推断 feel 未创建，也不保证收到回执。
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```

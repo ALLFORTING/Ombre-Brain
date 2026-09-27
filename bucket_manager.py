@@ -74,6 +74,13 @@ TODO_SAID_BY_VALUES = frozenset({"ting", "model", "system", "unknown"})
 PROVENANCE_KIND_VALUES = frozenset({"unknown", "summary", "inference", "system"})
 
 
+class _FeelSourceError(ValueError):
+    """Stable, redacted diagnosis for the narrow feel/source path."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
 class SupersessionError(ValueError):
     """Redacted failure at the canonical forward-write boundary."""
 
@@ -2222,6 +2229,131 @@ class BucketManager:
                         continue
                     catalog["buckets"].setdefault(identity, []).append((str(path), post))
         return catalog
+
+    def _resolve_feel_source_locked(self, source_id):
+        """Prove canonical identity using W-9's catalog, without forward traversal."""
+        if not isinstance(source_id, str) or not source_id or source_id != source_id.strip():
+            raise _FeelSourceError("source_identity_malformed")
+        catalog = self._supersession_catalog_locked()
+        matches = lambda stem: stem == source_id or stem.endswith("_" + source_id)
+        for stem, claim in catalog["conflicts"]:
+            if claim == source_id or matches(stem):
+                malformed = not isinstance(claim, str) or not claim or claim != claim.strip()
+                raise _FeelSourceError(
+                    "source_identity_malformed" if malformed else "source_identity_conflict"
+                )
+        # Only empty metadata can be the parser's silent delimiter fallback.
+        # Check those catalog rows too: an unrelated truncated header could
+        # conceal another claim to source_id.
+        for identity, rows in catalog["buckets"].items():
+            for path, post in rows:
+                if not post.metadata:
+                    try:
+                        _SupersessionHandler().split(Path(path).read_text(encoding="utf-8"))
+                    except Exception:
+                        code = ("source_unreadable" if identity == source_id
+                                or matches(Path(path).stem) else "source_identity_ambiguous")
+                        raise _FeelSourceError(code) from None
+        if any(matches(stem) for stem in catalog["unreadable"]):
+            raise _FeelSourceError("source_unreadable")
+        if len(catalog["buckets"].get(source_id, [])) > 1:
+            raise _FeelSourceError("source_identity_duplicate")
+        if any(other != source_id and any(matches(Path(path).stem) for path, _ in rows)
+               for other, rows in catalog["buckets"].items()):
+            raise _FeelSourceError("source_identity_conflict")
+        # An incomplete/unreadable inventory can conceal another claim to this ID.
+        if catalog["incomplete"] or catalog["unreadable"]:
+            raise _FeelSourceError("source_identity_ambiguous")
+        try:
+            path, catalog_post = self._resolve_supersession_locked(catalog, source_id)
+        except SupersessionError as exc:
+            codes = {
+                "supersession_target_missing": "source_missing",
+                "supersession_bucket_unreadable": "source_unreadable",
+                "supersession_duplicate_identity": "source_identity_duplicate",
+                "supersession_identity_conflict": "source_identity_conflict",
+                "supersession_identity_ambiguous": "source_identity_ambiguous",
+            }
+            raise _FeelSourceError(codes.get(exc.code, "source_identity_ambiguous")) from None
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+            handler = _SupersessionHandler()
+            # frontmatter.parse otherwise swallows a missing closing delimiter
+            # and treats the entire file as a legacy post with no metadata.
+            if not handler.detect(raw):
+                raise ValueError()
+            handler.split(raw)
+            post = frontmatter.loads(raw, handler=handler)
+        except Exception:
+            raise _FeelSourceError("source_unreadable") from None
+        if post.metadata != catalog_post.metadata or post.content != catalog_post.content:
+            raise _FeelSourceError("source_identity_ambiguous")
+        return path, post
+
+    def preview_feel_source(self, source_id):
+        """Read-only proof; never return a post/path/catalog for later publication."""
+        try:
+            with bucket_write_scope(self.base_dir):
+                self._resolve_feel_source_locked(source_id)
+            return {"status": "valid"}
+        except _FeelSourceError as exc:
+            return {"status": exc.code}
+        except Exception:
+            return {"status": "source_identity_ambiguous"}
+
+    @guarded_mutation("bucket_feel_source_mark")
+    def mark_feel_source(self, source_id, *, model_valence=None):
+        """Publish and verify one marking from fresh locked state; no rollback."""
+        attempted = False
+        try:
+            with bucket_write_scope(self.base_dir):
+                path, current = self._resolve_feel_source_locked(source_id)
+                already_satisfied = current.get("digested") is True and (
+                    model_valence is None or current.get("model_valence") == model_valence
+                )
+                draft = copy.deepcopy(current)
+                draft["digested"] = True
+                if model_valence is not None:
+                    if not 0 <= model_valence <= 1:
+                        return {"status": "write_failed"}
+                    draft["model_valence"] = model_valence
+                draft["last_active"] = now_iso()
+                draft["updated_at"] = _date_only()
+                payload = frontmatter.dumps(draft).encode("utf-8")
+                previous_payload = Path(path).read_bytes()
+                attempted = True
+                publication_unconfirmed = False
+                try:
+                    # None is the normal primitive return; False or an exception
+                    # must be reconciled from disk just like any other outcome.
+                    publication_unconfirmed = self._write_bytes_atomic(path, payload) is False
+                except Exception:
+                    publication_unconfirmed = True
+                try:
+                    verified_path, catalog_post = self._resolve_feel_source_locked(source_id)
+                    if verified_path != path:
+                        return {"status": "write_outcome_unknown"}
+                    raw = Path(verified_path).read_bytes()
+                    verified = frontmatter.loads(raw.decode("utf-8"), handler=_SupersessionHandler())
+                    if (verified.content != catalog_post.content
+                            or verified.metadata != catalog_post.metadata):
+                        return {"status": "write_outcome_unknown"}
+                    if (raw != payload or verified.content != draft.content
+                            or verified.metadata != draft.metadata):
+                        return {"status": "write_failed"}
+                    # Same-second retries can already have identical timestamps.
+                    # A failed acknowledgement plus unchanged bytes cannot prove
+                    # this mutation, even when the old state satisfies the plan.
+                    if publication_unconfirmed and previous_payload == payload:
+                        return {"status": "write_outcome_unknown"}
+                    return {"status": "marked",
+                            "mode": "already_satisfied" if already_satisfied else "updated"}
+                except Exception:
+                    return {"status": "write_outcome_unknown"}
+        except _FeelSourceError as exc:
+            return {"status": "write_outcome_unknown" if attempted else exc.code}
+        except Exception:
+            return {"status": "write_outcome_unknown" if attempted else "write_failed"}
 
     def _resolve_supersession_locked(self, catalog, identity):
         if not isinstance(identity, str) or not identity or identity != identity.strip():

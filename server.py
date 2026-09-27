@@ -150,6 +150,7 @@ from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
 from import_memory import ImportEngine
 from maintenance_write_gate import (
+    MaintenanceWriteError,
     guarded_async_mutation,
     guarded_http_mutation,
     guarded_mutation,
@@ -9535,6 +9536,18 @@ async def _format_hold_created(bucket_id: str) -> str:
     )
 
 
+def _format_hold_feel_source_receipt(bucket_id: str, source_id: str, error: str) -> str:
+    """Append six stable fields; JSON IDs cannot inject receipt lines."""
+    return (
+        "[hold_feel_source_receipt]\n"
+        f"feel_created={str(bool(bucket_id)).lower()}\n"
+        "feel_reused=false\n"
+        f"bucket_id={_json_lib.dumps(bucket_id, ensure_ascii=True)}\n"
+        f"source_bucket_id={_json_lib.dumps(source_id, ensure_ascii=True)}\n"
+        f"source_marked={str(error == 'none').lower()}\n"
+        f"source_mark_error={error}"
+    )
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -9603,6 +9616,15 @@ async def hold(
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
     if feel:
+        source_id = source_bucket.strip() if source_bucket else ""
+        if source_id:
+            preview = bucket_mgr.preview_feel_source(source_id)
+            if preview["status"] != "valid":
+                error = preview["status"]
+                return (
+                    f"feel 未创建；source 校验失败（{error}）。\n"
+                    + _format_hold_feel_source_receipt("", source_id, error)
+                )
         # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
@@ -9632,21 +9654,36 @@ async def hold(
         await _auto_link_related(bucket_id)
         # --- Mark source memory as digested + store model's valence perspective ---
         # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
-        if source_bucket and source_bucket.strip():
+        source_error = "none"
+        if source_id:
             try:
-                update_kwargs = {"digested": True}
-                if 0 <= valence <= 1:
-                    update_kwargs["model_valence"] = feel_valence
-                await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
-            except Exception as e:
-                logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
-        response = f"🫧feel→{await _format_hold_created(bucket_id)}"
+                outcome = bucket_mgr.mark_feel_source(
+                    source_id, model_valence=feel_valence if 0 <= valence <= 1 else None,
+                )
+                source_error = "none" if outcome["status"] == "marked" else outcome["status"]
+            except MaintenanceWriteError:
+                source_error = "write_failed"
+            except Exception:
+                source_error = "write_outcome_unknown"
+            try:
+                created_text = await _format_hold_created(bucket_id)
+            except Exception:
+                created_text = f"新建 {bucket_id}"
+            response = f"🫧feel→{created_text}"
+        else:
+            response = f"🫧feel→{await _format_hold_created(bucket_id)}"
         if similarity_notice:
             response += f"\nsimilarity: {similarity_notice}"
         if conflict_warning:
             response += f"\nconflict: {conflict_warning}"
         if feel_failure:
             response += f"\n自动打标失败；原因={feel_failure}；已使用默认 metadata"
+        if source_id:
+            if source_error == "write_outcome_unknown":
+                response += "\nfeel 已创建；source 标记结果无法确认，feel 保留。"
+            elif source_error != "none":
+                response += f"\nfeel 已创建；source 标记失败（{source_error}），feel 保留。"
+            response += "\n" + _format_hold_feel_source_receipt(bucket_id, source_id, source_error)
         return response
 
     # --- Step 1: auto-tagging / 自动打标 ---
