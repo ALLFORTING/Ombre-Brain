@@ -1673,16 +1673,18 @@ async def _dream_summary_line(bucket: dict) -> str:
 
 
 def _recent_cutoff(recent_days: int) -> str | None:
-    if recent_days <= 0:
+    if recent_days == -1:
         return None
+    if recent_days < -1:
+        raise ValueError("recent_days must be -1 or non-negative.")
     return (datetime.now().date() - timedelta(days=recent_days)).isoformat()
 
 
-def _is_recent_bucket(bucket: dict, cutoff: str | None) -> bool:
+def _is_recent_bucket(bucket: dict, cutoff: str | None, *, exact_day: bool = False) -> bool:
     if not cutoff:
         return True
     updated = _bucket_date(bucket.get("metadata", {}), "updated_at", "last_active", "created")
-    return bool(updated and updated >= cutoff)
+    return bool(updated and (updated == cutoff if exact_day else updated >= cutoff))
 
 
 def _parse_date_filter(value: str, parameter: str) -> str:
@@ -1859,6 +1861,8 @@ def _filter_breath_candidates(
     topic_filter: list[str] | None = None,
     apply_domain: bool = True,
     apply_dormant: bool = True,
+    importance_min: int = -1,
+    recent_days: int = -1,
 ) -> list[dict]:
     """Apply the shared privacy and structured Breath candidate gates."""
     domain_set = {
@@ -1892,8 +1896,9 @@ def _filter_breath_candidates(
     return [
         bucket
         for bucket in candidates
-        if _is_recent_bucket(bucket, recent_cutoff)
+        if _is_recent_bucket(bucket, recent_cutoff, exact_day=recent_days == 0)
         and _is_in_date_range(bucket, date_from, date_to)
+        and _breath_importance_matches(bucket, importance_min)
         and _matches_any_structured_filter(bucket, "tags", tags_filter)
         and _matches_any_structured_filter(bucket, "topics", topic_filter)
     ]
@@ -4411,6 +4416,183 @@ async def _digest_scheduler_loop() -> None:
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
+_BREATH_ALLOWED = {
+    "ordinary_query": "query, domain, importance_min, tags_filter, recent_days, date_from, date_to, include_dormant, include_sealed, valence/arousal, resonance, min_score, max_results, max_tokens, mode, emotion_trend, touch, wake_dormant; cursor only without tags_filter",
+    "session": "query, domain=session, importance_min, tags_filter, topic_filter, recent_days, date_from, date_to, include_sealed, max_results, max_tokens, emotion_trend, touch; mode=full only with query",
+    "feel": "query, domain=feel or feels=True, importance_min, tags_filter, recent_days, date_from, date_to, include_sealed, max_results, max_tokens, emotion_trend, touch; mode=full only with query and tags_filter",
+    "resonance": "resonance, domain, importance_min, tags_filter, recent_days, date_from, date_to, include_dormant, include_sealed, max_results, max_tokens, emotion_trend, touch, wake_dormant; mode=summary",
+    "tags_only": "tags_filter, domain, importance_min, recent_days, date_from, date_to, include_dormant, include_sealed, valence (presentation only), max_results, max_tokens, emotion_trend, touch, wake_dormant; mode=summary",
+    "importance_only": "importance_min, domain, recent_days, date_from, date_to, include_dormant, include_sealed, max_results, max_tokens, emotion_trend, touch, wake_dormant; mode=summary",
+    "default_emergence": "domain, recent_days, date_from, date_to, include_dormant, include_sealed, max_results, max_tokens, mode, emotion_trend, touch, wake_dormant",
+    "historical_query": "as_of, query, domain (normal values), include_dormant, include_sealed, valence+arousal, min_score, max_results, max_tokens, cursor, mode (fixed historical body), touch (always read-only)",
+    "mailbox": "mailbox, mailbox_limit, include_sealed",
+}
+
+
+def _breath_parameter_error(selector: str, parameter: str, reason: str) -> str:
+    return (
+        f"breath mode={selector} 不支持参数 {parameter}：{reason}。\n"
+        f"该模式可使用：{_BREATH_ALLOWED[selector]}。"
+    )
+
+
+def _breath_importance_matches(bucket: dict, importance_min: int) -> bool:
+    if importance_min == -1:
+        return True
+    try:
+        return int(bucket.get("metadata", {}).get("importance", 0)) >= importance_min
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _prepare_breath_request(**arguments) -> dict:
+    """Resolve selectors and reject ignored arguments before reads or writes."""
+    request = {
+        name: parameter.default
+        for name, parameter in inspect.signature(breath).parameters.items()
+    }
+    request.update(arguments)
+    request["mode"] = (request["mode"] or "").strip().lower()
+    request["as_of"] = (request["as_of"] or "").strip()
+    filter_errors = []
+    for name in ("tags_filter", "topic_filter"):
+        try:
+            request[name] = _normalize_breath_filter(
+                request[name], name, apply_aliases=name == "tags_filter"
+            )
+        except ValueError as exc:
+            filter_errors.append((name, str(exc)))
+    domains = sorted({part.strip().casefold() for part in (request["domain"] or "").split(",") if part.strip()})
+    request["domain"] = ",".join(domains)
+    reserved = set(domains) & {"session", "feel"}
+    selector = (
+        "mailbox" if request["mailbox"] else
+        "historical_query" if request["as_of"] else
+        "feel" if request["feels"] or reserved == {"feel"} else
+        "session" if request["topic_filter"] or reserved == {"session"} else
+        "ordinary_query" if request["query"].strip() else
+        "resonance" if request["resonance"].strip() else
+        "tags_only" if request["tags_filter"] else
+        "importance_only" if request["importance_min"] != -1 else
+        "default_emergence"
+    )
+    request["selector"] = selector
+
+    def reject(parameter, reason):
+        raise ValueError(_breath_parameter_error(selector, parameter, reason))
+
+    for name, reason in filter_errors:
+        reject(name, reason)
+    for field in ("valence", "arousal"):
+        value = request[field]
+        if value != -1 and not 0 <= value <= 1:
+            reject(field, f"{field} must be -1 or within 0.0-1.0")
+    if request["importance_min"] != -1 and not 1 <= request["importance_min"] <= 10:
+        reject("importance_min", "importance_min must be -1 or within 1-10")
+    if request["recent_days"] < -1:
+        reject("recent_days", "recent_days must be -1 or non-negative")
+    if request["mode"] not in ("summary", "full"):
+        reject("mode", "mode must be summary or full")
+    if request["min_score"] != -1 and not 0 <= request["min_score"] <= 1:
+        reject("min_score", "min_score 必须是 -1 或 0 到 1 之间的数字")
+    if reserved and (len(reserved) != 1 or len(domains) != 1):
+        reject("domain", "reserved session/feel 必须单独使用，不能混合 selector 或普通 domain")
+    if selector == "mailbox":
+        defaults = inspect.signature(breath).parameters
+        for name in defaults:
+            if name in ("mailbox", "mailbox_limit", "include_sealed"):
+                continue
+            value = request[name]
+            disabled = not value if name in ("tags_filter", "topic_filter") else value == defaults[name].default
+            if not disabled:
+                reject(name, "mailbox 是独立信件模型，不支持 bucket retrieval 参数")
+        return request
+    if request["mailbox_limit"] != 1:
+        reject("mailbox_limit", "仅 mailbox 支持非默认 mailbox_limit")
+    if request["feels"] and (domains and domains != ["feel"]):
+        reject("domain", "feels=True 只能与空 domain 或纯 feel domain 同用")
+    if request["feels"] and (request["topic_filter"] or request["as_of"]):
+        reject("topic_filter" if request["topic_filter"] else "feels", "feel selector 与 session/historical selector 冲突")
+    if request["topic_filter"] and domains and domains != ["session"]:
+        reject("domain", "topic_filter 是 session selector，只兼容空 domain 或纯 session domain")
+    if selector == "historical_query" and reserved:
+        reject("domain", "historical mode 不提供 reserved session/feel historical selector")
+    if request["cursor"] and (selector not in ("ordinary_query", "historical_query") or request["tags_filter"]):
+        reject("cursor", "cursor 仅适用于不带 tags_filter/topic_filter 的 ordinary query 或 historical query")
+    if selector == "historical_query":
+        if not request["query"].strip():
+            reject("query", "as_of 历史检索需要提供 query，且不支持历史浮现模式")
+        for field in ("importance_min", "recent_days"):
+            if request[field] != -1:
+                reject(field, "historical mode 不支持该当前 metadata/time filter")
+        for field in ("date_from", "date_to", "resonance", "tags_filter", "topic_filter", "wake_dormant", "emotion_trend"):
+            if request[field]:
+                reason = (
+                    "as_of 历史检索是只读的，不能 wake_dormant" if field == "wake_dormant" else
+                    "as_of 历史检索不支持 tags_filter/topic_filter" if field in ("tags_filter", "topic_filter") else
+                    "historical mode 不支持该当前 filter/ranking/attachment"
+                )
+                reject(field, reason)
+    if selector in ("session", "feel"):
+        for field in ("min_score", "valence", "arousal", "resonance", "include_dormant", "wake_dormant"):
+            active = request[field] != -1 if field in ("min_score", "valence", "arousal") else bool(request[field])
+            if active:
+                reject(field, "该模式保留子串匹配和 recency 排序，没有 query relevance score、emotion ranking 或 dormant touch/gate")
+    if selector not in ("ordinary_query", "historical_query") and request["min_score"] != -1:
+        reject("min_score", "该模式没有 _breath_score，不能应用 strong/weak 展示阈值")
+    v, a = request["valence"], request["arousal"]
+    if a != -1 and v == -1:
+        reject("arousal", "arousal 没有独立 ranking 语义，必须同时提供 valence")
+    if selector == "historical_query" and ((v == -1) != (a == -1)):
+        reject("valence/arousal", "historical emotion ranking 必须成对提供 valence 和 arousal")
+    if selector not in ("ordinary_query", "historical_query", "tags_only") and (v != -1 or a != -1):
+        reject("valence/arousal", "该模式不支持 emotion ranking 或 valence presentation")
+    if selector == "tags_only" and a != -1:
+        reject("arousal", "tags-only 只保留 valence presentation，不支持 emotion ranking")
+    if selector == "ordinary_query" and v != -1 and a == -1 and request["mode"] == "full":
+        reject("valence", "valence-only 只影响 summary presentation，full canonical body 不使用该参数")
+    if request["mode"] == "full" and (
+        selector in ("resonance", "tags_only", "importance_only")
+        or selector == "session" and not request["query"].strip()
+        or selector == "feel" and not (request["query"].strip() and request["tags_filter"])
+    ):
+        reject("mode", "该路径使用固定 summary/preview 格式，不支持 full")
+    # Read-only calls retain the existing override: wake never writes without touch.
+    if request["wake_dormant"] and request["touch"] and not request["include_dormant"]:
+        reject("wake_dormant", "显式唤醒需要 include_dormant=True")
+    for name in ("date_from", "date_to"):
+        try:
+            request[name] = _parse_date_filter(request[name], name)
+        except ValueError as exc:
+            reject(name, str(exc))
+    if request["date_from"] and request["date_to"] and request["date_from"] > request["date_to"]:
+        reject("date_from/date_to", "date_from cannot be later than date_to")
+    try:
+        request["resonance_target"] = _parse_resonance(request["resonance"])
+    except ValueError as exc:
+        reject("resonance", str(exc))
+    if request["feels"]:
+        request["domain"] = "feel"
+    return request
+
+
+def _breath_side_effect_warning(failures: int) -> str:
+    return (
+        f"\n\n[side-effect/accounting warning] {failures} 个已显示桶的 direct touch 记账失败；"
+        "检索结果及 displayed/omitted/remaining/total 保持不变，未重试 touch。"
+        if failures else ""
+    )
+
+
+def _breath_listing_accounting(total: int, selected: int, displayed: int, failed: int = 0) -> str:
+    return (
+        f"\n共匹配 {total} / 本次显示 {displayed} / "
+        f"后续剩余 {max(0, total - displayed - failed)} / 因组装失败省略 {failed} / "
+        f"因结果上限省略 {max(0, total - selected)} / "
+        f"因 token 预算省略 {max(0, selected - displayed - failed)}"
+    )
+
+
 async def _breath_filtered_impl(
     *,
     query: str,
@@ -4432,6 +4614,8 @@ async def _breath_filtered_impl(
     tags_filter: list[str],
     topic_filter: list[str],
     min_score: float,
+    importance_min: int = -1,
+    recent_days: int = -1,
 ) -> str:
     """Retrieve exact-filtered candidates without changing old breath paths."""
     domain_values = [part.strip() for part in (domain or "").split(",") if part.strip()]
@@ -4463,6 +4647,8 @@ async def _breath_filtered_impl(
             topic_filter=topic_filter,
             apply_domain=apply_domain,
             apply_dormant=apply_dormant,
+            importance_min=importance_min,
+            recent_days=recent_days,
         )
 
     # A topic filter is an archived-session constraint. A session domain is
@@ -4516,17 +4702,11 @@ async def _breath_filtered_impl(
                     f"{f'[显示={display}] ' if query_text else ''}{body}"
                 )
                 result = await _append_bucket_extras(text, bucket, emotion_trend)
-                if results and count_tokens_approx("\n---\n".join(results + [result])) > max_tokens:
+                if not body or count_tokens_approx(body if query_text and mode == "full" else "\n---\n".join(results + [result])) > max_tokens:
                     break
                 results.append(result)
-            if not results:
-                return empty_result("没有找到对话归档。")
             text = "\n---\n".join(results)
-            if query_text:
-                text += (
-                    f"\n共匹配 {total_sessions} / 本次显示 {len(results)} / "
-                    f"后续剩余 {total_sessions - len(results)}"
-                )
+            text += _breath_listing_accounting(total_sessions, len(sessions), len(results))
             return _with_emotion_timeline(text, emotion_trend)
         except Exception as exc:
             logger.error(f"Filtered session retrieval failed: {exc}")
@@ -4585,17 +4765,11 @@ async def _breath_filtered_impl(
                     f"{f'[显示={display}] ' if query_text else ''}{body}"
                 )
                 entry = await _append_bucket_extras(entry, bucket, emotion_trend)
-                if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
+                if not body or count_tokens_approx(body if query_text and mode == "full" else "\n---\n".join(results + [entry])) > max_tokens:
                     break
                 results.append(entry)
-            if not results:
-                return empty_result("没有留下过 feel。")
             text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
-            if query_text:
-                text += (
-                    f"\n共匹配 {total_feels} / 本次显示 {len(results)} / "
-                    f"后续剩余 {total_feels - len(results)}"
-                )
+            text += _breath_listing_accounting(total_feels, len(feels), len(results))
             return _with_emotion_timeline(text, emotion_trend)
         except Exception as exc:
             logger.error(f"Filtered feel retrieval failed: {exc}")
@@ -4624,6 +4798,8 @@ async def _breath_filtered_impl(
     ) -> str:
         results = []
         returned_ids = set()
+        emitted = []
+        failed = 0
         token_used = 0
         token_budget_omitted = 0
         strong_matches = [
@@ -4660,18 +4836,13 @@ async def _breath_filtered_impl(
                 if token_used + summary_tokens > max_tokens:
                     token_budget_omitted += len(strong_matches) - index
                     break
-                returned_ids.add(bucket["id"])
-                if touch:
-                    await bucket_mgr.touch(
-                        bucket["id"],
-                        ripple_ids=returned_ids,
-                        wake_dormant=wake_dormant,
-                    )
                 summary = await _format_breath_query_summary(bucket, summary)
                 results.append(await _append_bucket_extras(summary, bucket, emotion_trend))
+                emitted.append(bucket)
                 token_used += summary_tokens
             except Exception as exc:
                 logger.warning(f"Failed to format filtered search result: {exc}")
+                failed += 1
                 continue
 
         weak_lines = [
@@ -4682,7 +4853,7 @@ async def _breath_filtered_impl(
             f"{' [休眠]' if bucket.get('metadata', {}).get('dormant', False) else ''}"
             for bucket in weak_matches
         ]
-        if not results and not weak_lines:
+        if not results and not weak_lines and not matches and not hidden_count:
             if touch:
                 await _fire_webhook("breath", {"mode": "empty", "matches": 0})
             return empty_result("未找到相关记忆。")
@@ -4694,13 +4865,9 @@ async def _breath_filtered_impl(
             )
         if hidden_count:
             final_text += f"\n\n还有{hidden_count}个相关桶未显示"
-        final_text += (
-            f"\n共匹配 {len(matches) + hidden_count} / "
-            f"本次显示 {len(results) + len(weak_lines)} / "
-            f"因结果上限省略 {hidden_count} / "
-            f"因 token 预算省略 {token_budget_omitted} / "
-            f"因低于阈值降级 {downgraded_count}"
-        )
+        final_text += _breath_listing_accounting(
+            len(matches) + hidden_count, len(matches), len(results) + len(weak_lines), failed
+        ) + f" / 因低于阈值降级 {downgraded_count}"
         if touch:
             await _fire_webhook(
                 "breath",
@@ -4710,7 +4877,19 @@ async def _breath_filtered_impl(
                     "chars": len(final_text),
                 },
             )
-        return _with_emotion_timeline(final_text, emotion_trend)
+        final_text = _with_emotion_timeline(final_text, emotion_trend)
+        touch_failures = 0
+        if touch:
+            for bucket in emitted:
+                returned_ids.add(bucket["id"])
+                try:
+                    await bucket_mgr.touch(
+                        bucket["id"], ripple_ids=returned_ids, wake_dormant=wake_dormant
+                    )
+                except Exception:
+                    logger.warning("Breath tag listing direct touch failed", exc_info=True)
+                    touch_failures += 1
+        return final_text + _breath_side_effect_warning(touch_failures)
 
     if not query_text:
         candidates.sort(key=_breath_recency_key, reverse=True)
@@ -4800,8 +4979,18 @@ def _breath_cursor_scope(
     as_of: str = "",
     touch: bool = True,
     mode: str = "summary",
+    selector: str = "ordinary_query",
+    importance_min: int = -1,
+    wake_dormant: bool = False,
+    recent_days: int = -1,
 ) -> str:
     payload = {
+        "version": 2,
+        "selector": selector,
+        "importance_min": importance_min,
+        "wake_dormant": wake_dormant,
+        "recent_days": recent_days,
+        "rendering_kind": "historical_body" if selector == "historical_query" else mode,
         "query": query,
         "domain": domain,
         "valence": valence,
@@ -4826,7 +5015,7 @@ def _breath_cursor_scope(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _encode_breath_cursor(matches: list[dict], position: int, scope: str) -> str:
+def _encode_breath_cursor(matches: list[dict], position: int, scope: str, *, context: dict | None = None) -> str:
     now = time.monotonic()
     for token, state in list(_BREATH_CURSOR_STATES.items()):
         if float(state.get("expires_at", 0)) <= now:
@@ -4858,20 +5047,31 @@ def _encode_breath_cursor(matches: list[dict], position: int, scope: str) -> str
         "created_at": now,
         "expires_at": now + _BREATH_CURSOR_TTL_SECONDS,
     }
+    if context is not None:
+        _BREATH_CURSOR_STATES[token]["version"] = 2
+        _BREATH_CURSOR_STATES[token]["context"] = dict(context)
     return token
 
 
-def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[dict], int]:
+def _validated_breath_cursor_state(cursor: str, expected_scope: str | None = None, *, require_context: bool = False) -> dict:
     if not isinstance(cursor, str) or not cursor or len(cursor) > 256:
         raise ValueError("invalid cursor")
     state = _BREATH_CURSOR_STATES.get(cursor)
-    if state is None or float(state.get("expires_at", 0)) <= time.monotonic():
+    now = time.monotonic()
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("expires_at"), (int, float))
+        or not isinstance(state.get("created_at"), (int, float))
+        or not state["created_at"] <= now < state["expires_at"]
+        or not 0 < state["expires_at"] - state["created_at"] <= _BREATH_CURSOR_TTL_SECONDS + 1e-7
+    ):
         _BREATH_CURSOR_STATES.pop(cursor, None)
         raise ValueError("invalid cursor")
     frozen_matches = state.get("matches")
     position = state.get("position")
     if (
-        state.get("scope") != expected_scope
+        not isinstance(state.get("scope"), str)
+        or (expected_scope is not None and state.get("scope") != expected_scope)
         or not isinstance(frozen_matches, list)
         or len(frozen_matches) > 1000
         or any(
@@ -4903,7 +5103,31 @@ def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[dict],
         or position > len(frozen_matches)
     ):
         raise ValueError("invalid cursor")
-    return [dict(match) for match in frozen_matches], position
+    if require_context:
+        # The complete token/match/TTL shape is validated before frozen values
+        # can participate in interpretation of the current request.
+        if state.get("version") != 2 or not isinstance(state.get("context"), dict):
+            raise ValueError("invalid cursor")
+        context = state["context"]
+        if context.get("selector") not in ("ordinary_query", "historical_query"):
+            raise ValueError("invalid cursor")
+        days = context.get("recent_days")
+        cutoff = context.get("recent_cutoff")
+        if not isinstance(days, int) or isinstance(days, bool) or days < -1:
+            raise ValueError("invalid cursor")
+        if days == -1:
+            if cutoff is not None:
+                raise ValueError("invalid cursor")
+        elif not isinstance(cutoff, str) or not cutoff or _parse_date_filter(cutoff, "cursor cutoff") != cutoff:
+            raise ValueError("invalid cursor")
+        if context["selector"] == "historical_query" and days != -1:
+            raise ValueError("invalid cursor")
+    return state
+
+
+def _decode_breath_cursor(cursor: str, expected_scope: str) -> tuple[list[dict], int]:
+    state = _validated_breath_cursor_state(cursor, expected_scope)
+    return [dict(match) for match in state["matches"]], state["position"]
 
 
 def _resolve_breath_min_score(min_score: float) -> float:
@@ -5045,12 +5269,14 @@ async def _compose_breath_query_matches(
     prior_consumed: int = 0,
     cursor_scope: str = "",
     touch_ripple: bool = False,
+    cursor_context: dict | None = None,
 ) -> tuple[str, dict]:
     """Consume a prefix of the frozen page; budget omissions remain unconsumed."""
     del cache  # Cache reads are always allowed; only touch controls cache writes.
     results: list[str] = []
     weak_lines: list[str] = []
     shown_buckets: list[dict] = []
+    direct_touch_buckets: list[dict] = []
     returned_ids: set[str] = set()
     token_used = 0
     consumed = 0
@@ -5122,20 +5348,13 @@ async def _compose_breath_query_matches(
                     required = count_tokens_approx(summary)
                 else:
                     break
-            if touch:
-                if touch_ripple:
-                    returned_ids.add(bucket["id"])
-                await bucket_mgr.touch(
-                    bucket["id"],
-                    wake_dormant=wake_dormant,
-                    **({"ripple_ids": returned_ids} if touch_ripple else {}),
-                )
             formatted = await _format_breath_query_summary(
                 bucket, f"[显示={display}] {summary}"
             )
             entry = await _append_bucket_extras(formatted, bucket, emotion_trend)
             results.append(entry)
             shown_buckets.append(bucket)
+            direct_touch_buckets.append(bucket)
             token_used += required
             consumed += 1
             if decision is not None:
@@ -5166,6 +5385,7 @@ async def _compose_breath_query_matches(
                 entry = await _append_bucket_extras(formatted, bucket, emotion_trend)
                 results.append(entry)
                 shown_buckets.append(bucket)
+                direct_touch_buckets.append(bucket)
                 token_used += count_tokens_approx(prefix)
                 consumed += 1
                 if decision is not None:
@@ -5198,7 +5418,7 @@ async def _compose_breath_query_matches(
         else:
             next_position = len(ordered_matches)
         next_cursor = (
-            _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
+            _encode_breath_cursor(ordered_matches, next_position, cursor_scope, context=cursor_context)
             if remaining and cursor_scope else ""
         )
     composition = {
@@ -5243,7 +5463,22 @@ async def _compose_breath_query_matches(
         weak_section = "--- 弱匹配（仅列名） ---\n" + "\n".join(weak_lines)
         final_text = "\n\n".join(part for part in (final_text, weak_section) if part)
     final_text = "\n\n".join(part for part in (final_text, "\n".join(summary_lines)) if part)
-    return _with_emotion_timeline(final_text, emotion_trend), composition
+    final_text = _with_emotion_timeline(final_text, emotion_trend)
+    touch_failures = 0
+    if touch:
+        for bucket in direct_touch_buckets:
+            if touch_ripple:
+                returned_ids.add(bucket["id"])
+            try:
+                await bucket_mgr.touch(
+                    bucket["id"],
+                    wake_dormant=wake_dormant,
+                    **({"ripple_ids": returned_ids} if touch_ripple else {}),
+                )
+            except Exception:
+                logger.warning("Breath emitted result direct touch failed", exc_info=True)
+                touch_failures += 1
+    return final_text + _breath_side_effect_warning(touch_failures), composition
 
 
 def _parse_as_of_timestamp(value: str) -> datetime | None:
@@ -5411,6 +5646,7 @@ async def _compose_historical_breath_matches(
     start_position: int = 0,
     prior_consumed: int = 0,
     cursor_scope: str = "",
+    cursor_context: dict | None = None,
 ) -> str:
     """Render only a consumed prefix of the historical frozen query page."""
     results: list[str] = []
@@ -5462,7 +5698,7 @@ async def _compose_historical_breath_matches(
         else:
             next_position = len(ordered_matches)
         next_cursor = (
-            _encode_breath_cursor(ordered_matches, next_position, cursor_scope)
+            _encode_breath_cursor(ordered_matches, next_position, cursor_scope, context=cursor_context)
             if remaining and cursor_scope else ""
         )
     if total_matches == 0:
@@ -5509,6 +5745,7 @@ async def _breath_as_of_impl(
     wake_dormant: bool,
     cursor: str,
     min_score: float,
+    mode: str = "summary",
 ) -> str:
     """Read the historical-body corpus without activation, cache, or embeddings."""
     try:
@@ -5545,7 +5782,15 @@ async def _breath_as_of_impl(
         min_score=resolved_min_score,
         as_of=as_of_time.isoformat(timespec="seconds"),
         touch=False,
+        mode=mode,
+        selector="historical_query",
     )
+    cursor_context = {"selector": "historical_query", "recent_days": -1, "recent_cutoff": None}
+    if cursor:
+        try:
+            _validated_breath_cursor_state(cursor, cursor_scope, require_context=True)
+        except ValueError:
+            return _breath_parameter_error("historical_query", "cursor", "cursor 无效、已过期或与当前检索条件不匹配")
     try:
         corpus = await _historical_breath_corpus(
             as_of=as_of_time,
@@ -5636,6 +5881,7 @@ async def _breath_as_of_impl(
         start_position=position,
         prior_consumed=prior_consumed,
         cursor_scope=cursor_scope,
+        cursor_context=cursor_context,
     )
 
 
@@ -5662,18 +5908,31 @@ async def _breath_impl(
     cursor: str = "",
     min_score: float = -1,
     as_of: str = "",
+    _request: dict | None = None,
 ) -> str:
     # MCP schema note: emotion_trend must stay in the tool signature.
-    """检索/浮现记忆。默认 summary 模式返回摘要；query 检索始终返回 full 内容。"""
+    """Resolve one canonical selector, then apply its supported filters."""
     try:
-        tags_filter = _normalize_breath_filter(
-            tags_filter,
-            "tags_filter",
-            apply_aliases=True,
-        )
-        topic_filter = _normalize_breath_filter(topic_filter, "topic_filter")
+        request = _request if _request is not None else _prepare_breath_request(**{
+            name: value for name, value in locals().copy().items() if name != "_request"
+        })
     except ValueError as exc:
         return str(exc)
+    selector = request["selector"]
+    domain = request["domain"]
+    mode = request["mode"]
+    tags_filter, topic_filter = request["tags_filter"], request["topic_filter"]
+    date_from, date_to = request["date_from"], request["date_to"]
+    resonance_target = request["resonance_target"]
+    cursor_state = None
+    if cursor:
+        try:
+            cursor_state = _validated_breath_cursor_state(cursor, require_context=True)
+            context = cursor_state["context"]
+            if context["selector"] != selector or context["recent_days"] != recent_days:
+                raise ValueError("invalid cursor")
+        except ValueError:
+            return _breath_parameter_error(selector, "cursor", "cursor 无效、已过期或与当前检索条件不匹配")
 
     if (as_of or "").strip():
         return await _breath_as_of_impl(
@@ -5697,33 +5956,45 @@ async def _breath_impl(
             wake_dormant=wake_dormant,
             cursor=cursor,
             min_score=min_score,
+            mode=mode,
         )
 
-    if touch:
-        await decay_engine.ensure_started()
     query = _apply_display_aliases(query)
     max_results = max(1, min(max_results, 50))
     max_tokens = min(max_tokens, 20000)
-    mode = (mode or "summary").strip().lower()
-    if mode not in ("summary", "full"):
-        mode = "summary"
-    recent_cutoff = _recent_cutoff(recent_days)
+    recent_cutoff = cursor_state["context"]["recent_cutoff"] if cursor_state is not None else _recent_cutoff(recent_days)
     try:
-        date_from = _parse_date_filter(date_from, "date_from")
-        date_to = _parse_date_filter(date_to, "date_to")
-        resonance_target = _parse_resonance(resonance)
+        resolved_min_score = _resolve_breath_min_score(min_score) if selector == "ordinary_query" else 0.0
     except ValueError as exc:
         return str(exc)
-    if date_from and date_to and date_from > date_to:
-        return "date_from cannot be later than date_to."
-    if cursor and (not query.strip() or tags_filter or topic_filter):
-        return "cursor 仅适用于不带 tags_filter/topic_filter 的 query 检索。"
-    try:
-        resolved_min_score = _resolve_breath_min_score(min_score)
-    except ValueError as exc:
-        return str(exc)
+    cursor_context = {"selector": selector, "recent_days": recent_days, "recent_cutoff": recent_cutoff}
+    cursor_scope = _breath_cursor_scope(
+        query=query, domain=domain, valence=valence, arousal=arousal,
+        recent_cutoff=recent_cutoff, include_dormant=include_dormant,
+        include_sealed=include_sealed, date_from=date_from, date_to=date_to,
+        resonance=resonance, min_score=resolved_min_score, touch=touch, mode=mode,
+        selector=selector, importance_min=importance_min,
+        wake_dormant=wake_dormant, recent_days=recent_days,
+    )
+    if cursor:
+        try:
+            _decode_breath_cursor(cursor, cursor_scope)
+        except ValueError:
+            return _breath_parameter_error(selector, "cursor", "cursor 无效、已过期或与当前检索条件不匹配")
+    if touch:
+        await decay_engine.ensure_started()
 
-    if tags_filter or topic_filter:
+    domain_values = domain.split(",") if domain else []
+    def common_filters(buckets, *, core=False):
+        return _filter_breath_candidates(
+            buckets, domain_values=domain_values, recent_cutoff=None if core else recent_cutoff,
+            include_dormant=include_dormant, include_sealed=include_sealed,
+            date_from=date_from, date_to=date_to, tags_filter=tags_filter,
+            importance_min=importance_min, recent_days=-1 if core else recent_days,
+            apply_dormant=not core,
+        )
+
+    if (tags_filter or topic_filter) and selector in ("ordinary_query", "tags_only", "session", "feel"):
         return await _breath_filtered_impl(
             query=query,
             max_tokens=max_tokens,
@@ -5743,6 +6014,8 @@ async def _breath_impl(
             tags_filter=tags_filter,
             topic_filter=topic_filter,
             min_score=resolved_min_score,
+            importance_min=importance_min,
+            recent_days=recent_days,
         )
 
     # --- Session archive retrieval: archived session buckets are searchable by domain ---
@@ -5752,9 +6025,10 @@ async def _breath_impl(
             sessions = [
                 b for b in all_buckets
                 if "session" in b.get("metadata", {}).get("domain", [])
-                and _is_recent_bucket(b, recent_cutoff)
+                and _is_recent_bucket(b, recent_cutoff, exact_day=recent_days == 0)
                 and _is_in_date_range(b, date_from, date_to)
                 and (include_sealed or not _is_sealed(b))
+                and _breath_importance_matches(b, importance_min)
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -5793,13 +6067,12 @@ async def _breath_impl(
                     f"[session] [bucket_id:{b['id']}] {meta.get('name', b['id'])}\n"
                     f"{body}"
                 )
-                results.append(await _append_bucket_extras(text, b, emotion_trend))
+                entry = await _append_bucket_extras(text, b, emotion_trend)
+                if not body or count_tokens_approx(body if query.strip() and mode == "full" else "\n---\n".join(results + [entry])) > max_tokens:
+                    break
+                results.append(entry)
             text = "\n---\n".join(results)
-            if query.strip():
-                text += (
-                    f"\n共匹配 {total_sessions} / 本次显示 {len(results)} / "
-                    f"后续剩余 {total_sessions - len(results)}"
-                )
+            text += _breath_listing_accounting(total_sessions, len(sessions), len(results))
             return _with_emotion_timeline(text, emotion_trend)
         except Exception as e:
             logger.error(f"Session archive retrieval failed: {e}")
@@ -5812,9 +6085,10 @@ async def _breath_impl(
             feels = [
                 b for b in all_buckets
                 if b["metadata"].get("type") == "feel"
-                and _is_recent_bucket(b, recent_cutoff)
+                and _is_recent_bucket(b, recent_cutoff, exact_day=recent_days == 0)
                 and _is_in_date_range(b, date_from, date_to)
                 and (include_sealed or not _is_sealed(b))
+                and _breath_importance_matches(b, importance_min)
             ]
             if query and query.strip():
                 q = query.strip().lower()
@@ -5839,11 +6113,12 @@ async def _breath_impl(
                     f"{strip_wikilinks(f['content'])}"
                 )
                 entry = await _append_bucket_extras(entry, f, emotion_trend)
-                results.append(entry)
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                if count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
                     break
+                results.append(entry)
             return _with_emotion_timeline(
-                "=== 你留下的 feel ===\n" + "\n---\n".join(results),
+                "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+                + _breath_listing_accounting(len(feels), min(len(feels), max_results), len(results)),
                 emotion_trend,
             )
         except Exception as e:
@@ -5851,20 +6126,12 @@ async def _breath_impl(
             return "读取 feel 失败。"
 
     # --- importance_min mode: bulk fetch by importance threshold ---
-    if importance_min >= 1:
+    if selector == "importance_only":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error("Breath importance retrieval failed: %s", e); return "记忆系统暂时无法访问。"
-        filtered = [
-            b for b in all_buckets
-            if int(b["metadata"].get("importance", 0)) >= importance_min
-            and b["metadata"].get("type") not in ("feel",)
-            and (include_dormant or not b["metadata"].get("dormant", False))
-            and (include_sealed or not _is_sealed(b))
-            and _is_recent_bucket(b, recent_cutoff)
-            and _is_in_date_range(b, date_from, date_to)
-        ]
+        filtered = [b for b in common_filters(all_buckets) if b["metadata"].get("type") != "feel"]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         total_filtered = len(filtered)
         filtered = filtered[:max_results]
@@ -5873,26 +6140,31 @@ async def _breath_impl(
                 f"没有重要度 >= {importance_min} 的记忆。",
                 emotion_trend,
             )
-        # Touch only the already privacy-filtered candidates.
-        if touch:
-            for bucket in filtered:
-                await bucket_mgr.touch(
-                    bucket["id"],
-                    wake_dormant=wake_dormant,
-                )
-        results = [
-            await _append_bucket_extras(
-                await _bucket_summary_line(b, importance_only=True),
-                b,
-                emotion_trend,
-            )
-            for b in filtered
-        ]
+        results, emitted, failed = [], [], 0
+        for b in filtered:
+            try:
+                entry = await _append_bucket_extras(await _bucket_summary_line(b, importance_only=True), b, emotion_trend)
+                if count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
+                    break
+                results.append(entry)
+                emitted.append(b)
+            except Exception:
+                failed += 1
+                logger.warning("Breath importance rendering failed", exc_info=True)
         response = "\n---\n".join(results) if results else "没有可以展示的记忆。"
         hidden_count = max(0, total_filtered - len(filtered))
         if hidden_count:
             response += f"\n\n还有{hidden_count}个相关桶未显示"
-        return _with_emotion_timeline(response, emotion_trend)
+        response = _with_emotion_timeline(response + _breath_listing_accounting(total_filtered, len(filtered), len(results), failed), emotion_trend)
+        touch_failures = 0
+        if touch:
+            for bucket in emitted:
+                try:
+                    await bucket_mgr.touch(bucket["id"], wake_dormant=wake_dormant)
+                except Exception:
+                    logger.warning("Breath importance direct touch failed", exc_info=True)
+                    touch_failures += 1
+        return response + _breath_side_effect_warning(touch_failures)
 
     # --- Resonance mode without query: sort visible memories by emotion distance ---
     if resonance_target and (not query or not query.strip()):
@@ -5901,38 +6173,38 @@ async def _breath_impl(
         except Exception as e:
             logger.error(f"Failed to list buckets for resonance: {e}")
             return "记忆系统暂时无法访问。"
-        candidates = [
-            b for b in all_buckets
-            if b["metadata"].get("type") not in ("feel",)
-            and (include_dormant or not b["metadata"].get("dormant", False))
-            and (include_sealed or not _is_sealed(b))
-            and _is_recent_bucket(b, recent_cutoff)
-            and _is_in_date_range(b, date_from, date_to)
-        ]
+        candidates = [b for b in common_filters(all_buckets) if b["metadata"].get("type") != "feel"]
         candidates.sort(key=lambda b: _resonance_distance(b, resonance_target))
         total = len(candidates)
         candidates = candidates[:max_results]
-        if touch:
-            for bucket in candidates:
-                await bucket_mgr.touch(
-                    bucket["id"],
-                    wake_dormant=wake_dormant,
-                )
-        results = [
-            await _append_bucket_extras(
-                await _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)),
-                b,
-                emotion_trend,
-            )
-            for b in candidates
-        ]
+        results, emitted, failed = [], [], 0
+        for b in candidates:
+            try:
+                entry = await _append_bucket_extras(await _bucket_summary_line(b, score=_resonance_distance(b, resonance_target)), b, emotion_trend)
+                if count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
+                    break
+                results.append(entry)
+                emitted.append(b)
+            except Exception:
+                failed += 1
+                logger.warning("Breath resonance rendering failed", exc_info=True)
         if not results:
-            return _with_emotion_timeline("未找到共鸣记忆。", emotion_trend)
+            if total == 0:
+                return _with_emotion_timeline("未找到共鸣记忆。", emotion_trend)
         response = "\n---\n".join(results)
         hidden_count = max(0, total - len(candidates))
         if hidden_count:
             response += f"\n\n还有{hidden_count}个共鸣桶未显示"
-        return _with_emotion_timeline(response, emotion_trend)
+        response = _with_emotion_timeline(response + _breath_listing_accounting(total, len(candidates), len(results), failed), emotion_trend)
+        touch_failures = 0
+        if touch:
+            for bucket in emitted:
+                try:
+                    await bucket_mgr.touch(bucket["id"], wake_dormant=wake_dormant)
+                except Exception:
+                    logger.warning("Breath resonance direct touch failed", exc_info=True)
+                    touch_failures += 1
+        return response + _breath_side_effect_warning(touch_failures)
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     if not query or not query.strip():
@@ -5943,13 +6215,13 @@ async def _breath_impl(
             return "记忆系统暂时无法访问。"
 
         pinned_buckets = [
-            b for b in all_buckets
+            b for b in common_filters(all_buckets, core=True)
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
             if _is_in_date_range(b, date_from, date_to)
             if include_sealed or not _is_sealed(b)
         ]
         unresolved = [
-            b for b in all_buckets
+            b for b in common_filters(all_buckets)
             if not b["metadata"].get("resolved", False)
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
@@ -5982,29 +6254,40 @@ async def _breath_impl(
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
         candidates = candidates[:max_results]
-        if touch:
-            for bucket in candidates:
-                await bucket_mgr.touch(
-                    bucket["id"],
-                    wake_dormant=wake_dormant,
-                )
         summary_mode = mode == "summary"
         pinned_results = []
         dynamic_results = []
+        emitted = []
+        failed = 0
         token_budget = max_tokens
 
         if summary_mode:
             for b in pinned_buckets:
-                pinned_results.append(await _append_bucket_extras(
+                entry = await _append_bucket_extras(
                     await _bucket_summary_line(
                         b,
                         pinned=bool(b["metadata"].get("pinned", False)),
                     ),
                     b,
                     emotion_trend,
-                ))
+                )
+                required = count_tokens_approx(entry)
+                if required > token_budget:
+                    break
+                pinned_results.append(entry)
+                token_budget -= required
             for b in candidates:
-                dynamic_results.append(await _append_bucket_extras(await _bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend))
+                try:
+                    entry = await _append_bucket_extras(await _bucket_summary_line(b, score=decay_engine.calculate_score(b["metadata"])), b, emotion_trend)
+                    required = count_tokens_approx(entry)
+                    if required > token_budget:
+                        break
+                    dynamic_results.append(entry)
+                    emitted.append(b)
+                    token_budget -= required
+                except Exception:
+                    failed += 1
+                    logger.warning("Breath emergence rendering failed", exc_info=True)
         else:
             for b in pinned_buckets:
                 try:
@@ -6025,6 +6308,7 @@ async def _breath_impl(
                     token_budget -= t
                 except Exception as e:
                     logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+                    failed += 1
             for b in candidates:
                 if token_budget <= 0:
                     break
@@ -6043,12 +6327,14 @@ async def _breath_impl(
                     score = decay_engine.calculate_score(b["metadata"])
                     line = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
                     dynamic_results.append(await _append_bucket_extras(line, b, emotion_trend))
+                    emitted.append(b)
                     token_budget -= summary_tokens
                 except Exception as e:
                     logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+                    failed += 1
                     continue
 
-        if not pinned_results and not dynamic_results:
+        if not pinned_buckets and not unresolved:
             return _with_emotion_timeline(
                 "权重池平静，没有需要处理的记忆。",
                 emotion_trend,
@@ -6059,7 +6345,21 @@ async def _breath_impl(
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
-        return _with_emotion_timeline("\n\n".join(parts), emotion_trend)
+        response = _with_emotion_timeline(
+            "\n\n".join(parts) + _breath_listing_accounting(
+                len(pinned_buckets) + len(unresolved), len(pinned_buckets) + len(candidates),
+                len(pinned_results) + len(dynamic_results), failed,
+            ), emotion_trend,
+        )
+        touch_failures = 0
+        if touch:
+            for bucket in emitted:
+                try:
+                    await bucket_mgr.touch(bucket["id"], wake_dormant=wake_dormant)
+                except Exception:
+                    logger.warning("Breath emergence direct touch failed", exc_info=True)
+                    touch_failures += 1
+        return response + _breath_side_effect_warning(touch_failures)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
     # --- Feel 检索：domain="feel" 是独立入口 ---
@@ -6105,21 +6405,6 @@ async def _breath_impl(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
-    cursor_scope = _breath_cursor_scope(
-        query=query,
-        domain=domain,
-        valence=valence,
-        arousal=arousal,
-        recent_cutoff=recent_cutoff,
-        include_dormant=include_dormant,
-        include_sealed=include_sealed,
-        date_from=date_from,
-        date_to=date_to,
-        resonance=resonance,
-        min_score=resolved_min_score,
-        touch=touch,
-        mode=mode,
-    )
     search_trace = {}
     if cursor:
         try:
@@ -6157,6 +6442,8 @@ async def _breath_impl(
                 continue
             if not include_dormant and rendered.get("metadata", {}).get("dormant", False):
                 continue
+            if not common_filters([rendered]):
+                continue
             eligible.append(rendered)
         prior_consumed = sum(1 for bucket in eligible if bucket["_breath_index"] < position)
         matches = [bucket for bucket in eligible if bucket["_breath_index"] >= position][:max_results]
@@ -6165,16 +6452,20 @@ async def _breath_impl(
         downgraded_count = sum(1 for bucket in eligible if bucket["_breath_weak"])
     else:
         try:
+            scoped_candidates = None
+            if domain_values or importance_min != -1 or recent_days != -1 or date_from or date_to:
+                scoped_candidates = common_filters(await bucket_mgr.list_all(include_archive=False))
             matches = await bucket_mgr.search(
                 query,
                 limit=1000,
-                domain_filter=domain_filter,
+                domain_filter=domain_filter if scoped_candidates is None else None,
                 query_valence=q_valence,
                 query_arousal=q_arousal,
                 include_dormant=include_dormant,
                 include_sealed=include_sealed,
                 trace=search_trace,
-            )
+                **({"candidate_buckets": scoped_candidates} if scoped_candidates is not None else {}),
+            ) if scoped_candidates is None or scoped_candidates else []
         except Exception as e:
             logger.error(f"Search failed / 检索失败: {e}")
             return "检索过程出错，请稍后重试。"
@@ -6186,6 +6477,7 @@ async def _breath_impl(
             date_to=date_to,
             include_sealed=include_sealed,
         )
+        matches = common_filters(matches)
         if resonance_target:
             matches.sort(key=lambda bucket: _resonance_distance(bucket, resonance_target))
         trace_by_id = {
@@ -6227,6 +6519,7 @@ async def _breath_impl(
         start_position=position,
         prior_consumed=prior_consumed,
         cursor_scope=cursor_scope,
+        cursor_context=cursor_context,
     )
     if not final_text:
         if touch:
@@ -9082,32 +9375,32 @@ async def related_backfill(
 async def breath(
     query: str = "",
     max_tokens: int = 10000,
-    domain: str = "",
-    valence: Annotated[float, Field(description="-1 means no valence filter; 0.0-1.0 filters recall by valence.")] = -1,
-    arousal: Annotated[float, Field(description="-1 means no arousal filter; 0.0-1.0 filters recall by arousal.")] = -1,
+    domain: Annotated[str, Field(description="Comma-separated normal domains are exact metadata filters (OR), never a fallback to all buckets. Pure session/feel selects that mode; reserved and normal domains cannot be mixed.")] = "",
+    valence: Annotated[float, Field(description="-1 disables this coordinate. With arousal, 0.0-1.0 participates in existing query emotion ranking. Valence alone is summary presentation only for ordinary query or tags-only; unsupported in full/session/feel. Historical query requires both coordinates.")] = -1,
+    arousal: Annotated[float, Field(description="-1 disables this coordinate. A 0.0-1.0 value requires valence and participates only in ordinary/historical query emotion ranking; it is not a metadata filter.")] = -1,
     max_results: int = 5,
-    importance_min: Annotated[int, Field(description="-1 means no minimum-importance filter; 1-10 sets the minimum stored importance.")] = -1,
-    mode: str = "summary",
-    recent_days: Annotated[int, Field(description="-1 means no recency filter; non-negative values restrict recall to that many days.")] = -1,
+    importance_min: Annotated[int, Field(description="-1 disables the stored bucket importance filter; 1-10 intersects with the selected bucket candidates. Only without another selector, retain importance-descending listing. Unsupported with as_of/mailbox.")] = -1,
+    mode: Annotated[str, Field(description="summary/full control ordinary query and default emergence (full retains legacy dehydration). Session full requires query; feel full requires query plus tags_filter. Fixed listings/mailbox reject full. as_of always renders historical body for either mode, and cursors bind the requested mode.")] = "summary",
+    recent_days: Annotated[int, Field(description="-1 disables recency; 0 means the service-local current calendar day; positive N retains the inclusive date cutoff today minus N. Values below -1 are invalid. Query cursors freeze the first-page window; pinned/protected emergence retains its exception. Unsupported with as_of/mailbox.")] = -1,
     emotion_trend: bool = False,
-    include_dormant: bool = False,
+    include_dormant: Annotated[bool, Field(description="Include dormant ordinary/historical candidates. Session/feel retain their existing eligibility and reject True; pinned/protected emergence retains its eligibility exception.")] = False,
     include_sealed: bool = False,
     date_from: str = "",
     date_to: str = "",
     resonance: str = "",
-    mailbox: bool = False,
-    mailbox_limit: int = 1,
-    feels: bool = False,
+    mailbox: Annotated[bool, Field(description="Independent letter selector. Only mailbox_limit and include_sealed may vary; non-default bucket retrieval arguments are rejected.")] = False,
+    mailbox_limit: Annotated[int, Field(description="Mailbox letter limit, clamped to 1-50. Outside mailbox only the default 1 is accepted.")] = 1,
+    feels: Annotated[bool, Field(description="Explicit feel selector; compatible only with empty or pure feel domain. Conflicts with topic_filter, mailbox, as_of and resonance.")] = False,
     tags_filter: Annotated[
         list[str] | None,
-        Field(description="Optional exact bucket-tag filters. Any listed tag may match."),
+        Field(description="Optional exact bucket-tag filters (OR), intersecting with domain/importance and session topics. Tags do not override query/resonance; tagged query does not support cursor."),
     ] = None,
     topic_filter: Annotated[
         list[str] | None,
         Field(
             description=(
-                "Optional exact archived-session topic filters. "
-                "Any listed topic may match."
+                "Optional exact archived-session topic filters (OR), selecting session mode. "
+                "Tags and importance intersect; only empty or pure session domain is compatible."
             )
         ),
     ] = None,
@@ -9115,8 +9408,8 @@ async def breath(
         bool,
         Field(
             description=(
-                "Defaults to False. Only when explicitly True, clear the target "
-                "bucket's dormant flag; activation touch accounting is unchanged."
+                "Defaults to False. With touch=True requires include_dormant=True; touch=False overrides all waking. "
+                "wake only emitted, directly touched dormant buckets. Unsupported for session/feel/as_of/mailbox; query cursors bind this choice."
             )
         ),
     ] = False,
@@ -9130,7 +9423,7 @@ async def breath(
             )
         ),
     ] = True,
-    min_score: Annotated[float, Field(description="-1 reads OMBRE_BREATH_MIN_SCORE and otherwise uses 0.0; a non-negative value overrides that threshold.")] = -1,
+    min_score: Annotated[float, Field(description="Strong/weak display threshold, not a hard filter or the displayed ranking score. Only ordinary/historical query supports it. -1 reads OMBRE_BREATH_MIN_SCORE, defaulting to 0; explicit values must be 0-1. Weak matches remain in total accounting.")] = -1,
     as_of: Annotated[
         str,
         Field(
@@ -9145,28 +9438,23 @@ async def breath(
         str,
         Field(
             description=(
-                "Opaque cursor returned by a previous query Breath page. "
-                "Reuse it with the same query and filters."
+                "Process-local opaque cursor for untagged ordinary query or historical query. "
+                "Reuse the same selector, query, filters, mode, touch and wake_dormant; recency stays frozen. max_results/max_tokens may change."
             )
         ),
     ] = "",
 ) -> str:
     """Retrieval-oriented memory search; touch=False keeps maintenance retrieval read-only."""
-    for field_name, value in (("valence", valence), ("arousal", arousal)):
-        if value != -1 and not 0 <= value <= 1:
-            return f"{field_name} must be -1 or within 0.0-1.0."
-    if importance_min != -1 and not 1 <= importance_min <= 10:
-        return "importance_min must be -1 or within 1-10."
-    if (mode or "").strip().lower() not in ("summary", "full"):
-        return "mode must be summary or full."
-    if (as_of or "").strip() and mailbox:
-        return _with_response_seal("as_of 历史检索不支持 mailbox。")
+    arguments = locals().copy()
+    try:
+        request = _prepare_breath_request(**arguments)
+    except ValueError as exc:
+        return _with_response_seal(str(exc))
     if mailbox:
         return _with_response_seal(
             _format_mailbox(mailbox_limit, include_sealed=include_sealed)
         )
-    if feels:
-        domain = "feel"
+    domain = request["domain"]
     result = await _breath_impl(
         query=query,
         max_tokens=max_tokens,
@@ -9190,8 +9478,9 @@ async def breath(
         cursor=cursor,
         min_score=min_score,
         as_of=as_of,
+        _request=request,
     )
-    if emotion_trend and not (as_of or "").strip():
+    if emotion_trend and not (as_of or "").strip() and not result.startswith("breath mode="):
         result = _with_emotion_timeline(result, True, min(max_tokens, 20000))
     return _with_response_seal(result)
 
@@ -11797,8 +12086,14 @@ async def api_breath_debug(request):
             if include_sealed or not _is_sealed(bucket)
         ]
         structured_filters = bool(tags_filter)
-        candidate_buckets = visible_buckets
-        search_domain_filter = domain_values or None
+        candidate_buckets = _filter_breath_candidates(
+            visible_buckets, domain_values=domain_values,
+            recent_cutoff=recent_cutoff, recent_days=recent_days,
+            include_dormant=include_dormant, include_sealed=True,
+            date_from=date_from, date_to=date_to,
+            tags_filter=tags_filter, topic_filter=[],
+        )
+        search_domain_filter = None
         search_include_dormant = include_dormant
         candidate_source = "privacy_filtered_active_buckets"
         if structured_filters:
@@ -11806,6 +12101,7 @@ async def api_breath_debug(request):
                 visible_buckets,
                 domain_values=domain_values,
                 recent_cutoff=recent_cutoff,
+                recent_days=recent_days,
                 include_dormant=include_dormant,
                 include_sealed=True,
                 date_from=date_from,
@@ -11828,7 +12124,7 @@ async def api_breath_debug(request):
             include_sealed=include_sealed,
             candidate_buckets=candidate_buckets,
             trace=search_trace,
-        )
+        ) if candidate_buckets else []
         search_trace["candidate_source"] = candidate_source
         if not structured_filters:
             matches = _filter_breath_query_matches(

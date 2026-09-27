@@ -23,7 +23,7 @@ async def test_breath_filters_search_results_by_updated_date(tmp_path, monkeypat
     inside["metadata"]["updated_at"] = "2026-06-10"
     outside["metadata"]["updated_at"] = "2026-05-01"
     server.bucket_mgr.search = AsyncMock(return_value=[inside, outside])
-    server.bucket_mgr.list_all = AsyncMock(return_value=[])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[inside, outside])
 
     result = await server.breath(
         query="date needle",

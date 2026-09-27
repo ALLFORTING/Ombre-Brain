@@ -259,7 +259,8 @@ async def test_topic_filter_domain_mismatch_does_not_fallback(tmp_path, monkeypa
     )
 
     assert session_id not in result
-    assert "没有找到对话归档。" in result
+    assert "breath mode=feel 不支持参数 domain" in result
+    assert "该模式可使用" in result
 
 
 @pytest.mark.asyncio
@@ -440,12 +441,12 @@ async def test_mcp_schema_has_nullable_string_arrays_and_descriptions(
     for name, description in (
         (
             "cursor",
-            "Opaque cursor returned by a previous query Breath page. Reuse it with the same query and filters.",
+            "Process-local opaque cursor for untagged ordinary query or historical query. Reuse the same selector, query, filters, mode, touch and wake_dormant; recency stays frozen. max_results/max_tokens may change.",
         ),
-        ("tags_filter", "Optional exact bucket-tag filters. Any listed tag may match."),
+        ("tags_filter", "Optional exact bucket-tag filters (OR), intersecting with domain/importance and session topics. Tags do not override query/resonance; tagged query does not support cursor."),
         (
             "topic_filter",
-            "Optional exact archived-session topic filters. Any listed topic may match.",
+            "Optional exact archived-session topic filters (OR), selecting session mode. Tags and importance intersect; only empty or pure session domain is compatible.",
         ),
     ):
         property_schema = schema["properties"][name]

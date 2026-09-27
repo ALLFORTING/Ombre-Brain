@@ -66,7 +66,7 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 - 无记忆时：`"权重池平静，没有需要处理的记忆。"`
 - 有记忆时：`"=== 核心准则 ===\n📌 ...\n\n=== 浮现记忆 ===\n[权重:X.XX] [bucket_id:xxx] ..."`
 
-**注意**：浮现模式**不调用** `touch()`，不重置衰减计时器
+**注意**：浮现动态桶仅在通过过滤、预算且完整输出组装成功后 direct touch；核心钉选/保护桶不新增 direct touch。`touch=False` 不启动 decay、不写缓存、不 touch；合法 touch 的既有 ripple 保持。
 
 ---
 
@@ -622,7 +622,7 @@ feel 桶自身:
 
 ### 5.3 已确认正常实现
 
-- `breath()` 浮现模式不调用 `touch()`，不重置衰减计时器
+- `breath()` 浮现动态桶只在本页实际展示后 direct touch，核心桶不新增 direct touch；`touch=False` 始终只读
 - `feel` 桶 `calculate_score()` 返回固定 50.0，永不归档
 - `breath(domain="feel")` 独立通道，按 `created` 降序，不压缩展示原文
 - `decay_engine.calculate_score()` 短期（≤3天）/ 长期（>3天）权重分离公式
@@ -633,5 +633,28 @@ feel 桶自身:
 - `grow()` 单条失败 `try/except` 隔离，标注 `⚠️条目名`，其他条继续
 
 ---
+
+### W-7：breath 参数适用契约
+
+先决定 canonical selector，再应用 visibility 与 metadata filters，之后匹配/排序、计算 total/page、渲染预算，最后对本页完整显示的既有可 touch 对象 direct touch。filter 不抢 selector；不适用的非默认参数在 dispatch 前返回实际 mode、参数、原因和可用参数。
+
+| 模式 | 候选/排序 | metadata filters | rendering / cursor |
+|---|---|---|---|
+| ordinary query（含 tags query） | 既有 search、emotion/resonance 排序 | normal domain、sealed、dormant、date、recent、importance、tags | summary/full；只有无 tags query 支持 cursor |
+| session（domain 或 topic） | 既有 session 边界、子串、recency | sealed、date、recent、importance、tags、topics；不套 dormant gate | 默认 1200 字符节选及 W-2 提示；full 需要 query；无 cursor/direct touch |
+| feel（domain 或 feels） | active feel、子串、recency | sealed、date、recent、importance、tags；不套 dormant gate | 既有正文格式；full 需要 query+tags；无 cursor/direct touch |
+| no-query resonance | metadata 过滤后按既有距离排序 | normal domain、sealed、dormant、date、recent、importance、tags | summary；无 cursor |
+| tags-only | recency | normal domain、sealed、dormant、date、recent、importance、tags | summary；valence-only presentation；无 cursor |
+| importance-only | stored importance 降序、W-5 图标/重要值 | normal domain、sealed、dormant、date、recent、importance | summary；无 cursor |
+| default emergence | 既有 decay/cold-start/random | normal domain、sealed、date；动态桶另有 dormant/recent，核心桶保留例外 | summary/full；full 保留脱水详细输出；无 cursor |
+| as_of historical query | 固定历史正文、既有非 semantic search | 当前 normal domain、sealed、dormant；不接受 importance/recent/date/tags/topic/resonance | 两种 mode 均固定 historical body，无 LLM；cursor 绑定 requested mode；始终只读 |
+| mailbox | 独立信件 | 只允许 include_sealed 与 mailbox_limit 变化 | 固定格式；其它非默认 retrieval 参数拒绝 |
+
+- selector 顺序：mailbox、historical、session/feel、ordinary query、resonance、tags-only、importance-only、default；顺序只选模式，不能代替冲突验证。domain 逗号列表 trim/casefold/去重、普通值 OR；reserved session/feel 必须单独出现。topic 只能选择 session，feels 仅兼容空/纯 feel domain；冲突不猜测、不返回伪装的空结果。
+- importance 是 stored metadata 最低值，与 selector 候选相交；仅无其它 selector 时使用 importance-only 展示。普通 domain 空候选返回零条，不回退全库。
+- min_score 仅 ordinary/historical `_breath_score` 的 strong/weak 展示阈值，弱匹配计入 total。session/feel 与其它 scoreless 模式拒绝显式阈值，不制造 relevance score。valence/arousal 成对仅在既有 query ranking 生效；arousal 单独拒绝，historical 单坐标拒绝，ordinary valence-only 保留 summary presentation（full 拒绝）。
+- recent_days=-1 关闭；0 使用服务本地当天与桶日期相等（updated_at / last_active / created），正数保持 today-N 包含式下界，小于 -1 非法；as_of 任何非 -1 都拒绝。pinned/protected 的既有 recency/dormant 例外只用于浮现，不绕过 domain/date/sealed。
+- cursor 仍为 15 分钟 process-local token。先验证 token/state/格式/TTL/version/selector，再读取冻结 recent_days/cutoff、构造 expected scope、比较请求、重验候选。scope 绑定 selector、query、domain、emotion、importance、visibility、date、raw recent_days、cutoff、resonance、threshold、mode、touch/wake 和 historical rendering kind。max_results/max_tokens 可逐页变化；预算遗漏不推进位置，过滤后的 total、displayed、failed、remaining 真实，continuation 不跳项。
+- direct touch 在完整结果和 accounting 组装后执行；过滤掉、预算未显示、辅助 related/successor 或弱匹配不新增 direct touch。session/feel/historical/mailbox 保留边界，default 核心桶不新增 direct touch。touch=False 禁止 direct touch、cache write 和 decay，覆盖 wake 的写入效果。合法 touch 的核心 ripple/propagation 不改；touch 失败只追加 side-effect/accounting warning，结果与计数保持、不重搜、不重渲染、不重试。
 
 *本文档基于代码直接推导，每个步骤均可对照源文件函数名和行为验证。如代码更新，请同步修订此文档。*
