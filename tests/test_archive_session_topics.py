@@ -154,8 +154,11 @@ async def test_archive_session_mcp_schema_has_optional_topic_strings(tmp_path, m
         "letter",
         "sealed",
         "topics",
+        "operation_id",
     ]
     assert schema["required"] == ["summary"]
+    assert schema["properties"]["operation_id"]["default"] is None
+    assert schema["properties"]["operation_id"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
     assert array_schema == {"items": {"type": "string"}, "type": "array"}
     assert topics_schema["default"] is None
     assert topics_schema["description"] == (

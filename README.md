@@ -518,9 +518,17 @@ boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未
 
 #### `archive_session`
 
-`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。`topics` 是可选的结构化主题标签列表；有帮助时可提供大约 3–8 个适度范围的标签。
+`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None, operation_id=None)` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。`topics` 是可选的结构化主题标签列表；有帮助时可提供大约 3–8 个适度范围的标签。
 
-`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None)` creates a `session_YYYY-MM-DD_NN` archive bucket with `domain=["session"]`. When `letter` is provided, it is also stored in the independent `letters` mailbox table and surfaced by the next `boot()`. `topics` is an optional list of structured topic labels; when useful, provide roughly 3–8 moderately scoped labels such as `项目/OB`, `项目/RM`, `学习/生化`, `关系/沟通`, or `日常/作息`. Avoid labels that are too broad or excessively narrow.
+`archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None, operation_id=None)` creates a `session_YYYY-MM-DD_NN` archive bucket with `domain=["session"]`. When `letter` is provided, it is also stored in the independent `letters` mailbox table and surfaced by the next `boot()`. `topics` is an optional list of structured topic labels; when useful, provide roughly 3–8 moderately scoped labels such as `项目/OB`, `项目/RM`, `学习/生化`, `关系/沟通`, or `日常/作息`. Avoid labels that are too broad or excessively narrow.
+
+`operation_id` 可选，必填参数仍只有 `summary`。调用方应在首次调用前生成稳定 ID，并在 response 丢失、取消、重连或进程重启后的 retry 中复用。ID 为 1–128 个 ASCII 字符，首字符为字母或数字，其余允许字母、数字、`.`、`_`、`:`、`-`；大小写敏感，不自动去除空白。同 ID、同规范化参数恢复或重放同一个 durable operation；同 ID 改参数会明确拒绝；不同 ID 即使内容相同也会创建独立 session。不要使用 MCP session ID、JSON-RPC ID 或内容 hash 代替业务请求 ID。
+
+带 ID 的请求先持久化固定 bucket/name/date/正文 plan，再原子发布最终 archived 文件，依据文件、SQLite receipt、vector digest 和 emotion snapshot 恢复后续阶段。成功重试返回原结果，不刷新时间或重复 letter、emotion、boot event，也不恢复后来合法修改或删除的 bucket。journal 不自动过期；磁盘证据矛盾时拒绝继续，不执行自动 repair。Embedding 保持 best-effort，sealed session 不产生普通 vector；外部 provider 调用不能承诺 exactly-once，并发或中断可能再次调用 provider，但 durable vector 只接受一个结果。
+
+不传 ID 的旧调用保持兼容，使用直接 archived 发布，但 response-loss retry 仍会创建新的 session，无法提供请求去重保证。S-3 的恢复和幂等保证适用于携带稳定 ID 的调用。`OMBRE_MCP_STATELESS_HTTP` 仍默认关闭；S-5 正式上线前还需真实 Claude connector 验证 retry/reconnect 是否稳定复用 `operation_id`。
+
+The only required argument remains `summary`. Generate the optional case-sensitive `operation_id` before the first call and reuse it on retry/reconnect. The ID accepts 1–128 ASCII characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`, without trimming. The same ID and canonical payload resume/replay the fixed session; changed parameters conflict; different IDs with identical content create independent sessions. Durable evidence supports process restart and response-loss retry without duplicate mailbox letters, emotion snapshots or boot events. Legacy callers without an ID remain compatible and create another session on response-loss retry. Embedding remains best-effort; external provider calls do not have an exactly-once guarantee. Stateless HTTP stays default-off; S-5 still requires a real Claude connector retry/reconnect check.
 
 新的 sealed session 归档不写入普通情绪时间线；普通归档的 timeline 记录关联其 bucket ID。ordinary portable export 只导出能验证来源属于非 sealed 桶的 timeline 记录，旧无来源记录仍保留在源文件和私有完整备份中，不导入 ordinary portable export。
 

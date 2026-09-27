@@ -17,6 +17,8 @@ import math
 import sqlite3
 import logging
 import re
+import hashlib
+from contextlib import closing
 from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI
@@ -147,13 +149,13 @@ class EmbeddingEngine:
         """Generate one embedding through the existing Host provider path."""
         return await self._generate_embedding(text)
 
-    async def _generate_embedding(self, text: str) -> list[float]:
+    async def _generate_embedding(self, text: str, *, model: str | None = None) -> list[float]:
         """Call API to generate embedding vector."""
         # Truncate to avoid token limits
         truncated = text[:2000]
         try:
             response = await self.client.embeddings.create(
-                model=self.model,
+                model=self.model if model is None else model,
                 input=truncated,
             )
             if response.data and len(response.data) > 0:
@@ -217,6 +219,53 @@ class EmbeddingEngine:
         )
         conn.commit()
         conn.close()
+
+    def archive_embedding_evidence(self, bucket_id, input_digest, model):
+        """Read legacy schemas without migration; only bound, valid rows prove input."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+            if "input_digest" not in columns:
+                if conn.execute("SELECT 1 FROM embeddings WHERE bucket_id=?", (bucket_id,)).fetchone():
+                    raise ValueError("archive_embedding_evidence_conflict")
+                return None
+            row = conn.execute(
+                "SELECT embedding, model, input_digest FROM embeddings WHERE bucket_id=?",
+                (bucket_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[1:] != (model, input_digest):
+            raise ValueError("archive_embedding_evidence_conflict")
+        try:
+            vector = json.loads(row[0])
+            if not self._valid_archive_vector(vector):
+                raise ValueError("archive_embedding_evidence_conflict")
+        except (TypeError, ValueError):
+            raise ValueError("archive_embedding_evidence_conflict") from None
+        return {"outcome": "stored", "input_digest": input_digest, "model": model,
+                "vector_digest": hashlib.sha256(row[0].encode()).hexdigest()}
+
+    @staticmethod
+    def _valid_archive_vector(vector):
+        return (isinstance(vector, list) and bool(vector)
+                and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) for value in vector))
+
+    @guarded_mutation("archive_embedding_store")
+    def store_archive_embedding(self, bucket_id, vector, input_digest, model, created_at):
+        """Called only under the archive root mutex after winner revalidation."""
+        if not self._valid_archive_vector(vector):
+            raise ValueError("archive_embedding_invalid")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+            if "input_digest" not in columns:
+                conn.execute("ALTER TABLE embeddings ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings "
+                "(bucket_id,embedding,model,updated_at,input_digest) VALUES(?,?,?,?,?)",
+                (bucket_id, json.dumps(vector), model, created_at, input_digest),
+            )
 
     @guarded_mutation("bucket_embedding_delete")
     def delete_embedding(self, bucket_id: str):

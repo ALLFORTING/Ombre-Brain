@@ -983,7 +983,8 @@ class BucketManager:
         for marker in markers:
             if not isinstance(marker, dict):
                 raise BucketIdempotencyError("operation_marker_invalid")
-            if marker.get("operation_key") == operation_key:
+            if (marker.get("operation_key") == operation_key
+                    and marker.get("operation_kind") in {"create", "update"}):
                 return marker
         return None
 
@@ -1026,7 +1027,11 @@ class BucketManager:
     @staticmethod
     def _write_post_atomic(file_path: str, post: frontmatter.Post) -> None:
         """Atomically publish an O5B-marked memory file."""
+        BucketManager._write_bytes_atomic(file_path, frontmatter.dumps(post).encode("utf-8"))
 
+    @staticmethod
+    def _write_bytes_atomic(file_path: str, payload: bytes) -> None:
+        """Publish frozen bytes with file and directory persistence barriers."""
         parent = os.path.dirname(file_path)
         fd, temporary = tempfile.mkstemp(
             prefix=f".{os.path.basename(file_path)}.",
@@ -1034,17 +1039,27 @@ class BucketManager:
             dir=parent,
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-                handle.write(frontmatter.dumps(post))
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, file_path)
+            BucketManager._sync_directory(parent)
         except Exception:
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _sync_directory(path: str) -> None:
+        if os.name != "nt":
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     @guarded_mutation("bucket_import_idempotency_plan")
     def plan_import_operation(
@@ -1300,14 +1315,18 @@ class BucketManager:
         """Record a compact business change for the next successful boot."""
         serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         with sqlite3.connect(self.history_db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO boot_delta_events
-                    (bucket_id, event_type, payload_json, occurred_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (bucket_id, event_type, serialized, now_iso()),
-            )
+            self._insert_boot_delta_event(conn, bucket_id, event_type, serialized, now_iso())
+
+    @staticmethod
+    def _insert_boot_delta_event(conn, bucket_id, event_type, serialized, occurred_at):
+        return conn.execute(
+            """
+            INSERT INTO boot_delta_events
+                (bucket_id, event_type, payload_json, occurred_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (bucket_id, event_type, serialized, occurred_at),
+        ).lastrowid
 
     def get_boot_delta_checkpoint(self, profile: str = "talk") -> dict[str, Any] | None:
         """Return one profile's last successful boot checkpoint."""
@@ -1472,13 +1491,17 @@ class BucketManager:
         if not content or not content.strip():
             return
         with sqlite3.connect(self.history_db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO letters (content, created_at, session_id, sealed)
-                VALUES (?, ?, ?, ?)
-                """,
-                (content.strip(), now_iso(), session_id or "", 1 if sealed else 0),
-            )
+            self._insert_letter(conn, content.strip(), session_id or "", sealed, now_iso())
+
+    @staticmethod
+    def _insert_letter(conn, content, session_id, sealed, created_at):
+        return conn.execute(
+            """
+            INSERT INTO letters (content, created_at, session_id, sealed)
+            VALUES (?, ?, ?, ?)
+            """,
+            (content, created_at, session_id, 1 if sealed else 0),
+        ).lastrowid
 
     def get_letters(self, limit: int = 1, include_sealed: bool = False) -> list[dict]:
         """Return latest handoff letters, newest first."""
@@ -1776,6 +1799,91 @@ class BucketManager:
     # Write content and metadata into a .md file
     # 将内容和元数据写入一个 .md 文件
     # ---------------------------------------------------------
+    @staticmethod
+    def _build_bucket_post(
+        bucket_id, content, *, tags=None, importance=5, domain=None,
+        valence=0.5, arousal=0.3, bucket_type="dynamic", name=None,
+        pinned=False, protected=False, sealed=False, topics=None, todos=None,
+        todo_provenance=None, provenance_kind=None, created=None,
+        last_active=None, created_date=None,
+    ):
+        """Pure, shared construction; no storage, index, or operation writes."""
+        canonical_todos = canonicalize_todos(todos)
+        normalized_provenance_kind = (
+            normalize_provenance_kind(provenance_kind, strict=True)
+            if provenance_kind is not None else "unknown"
+        )
+        canonical_todo_provenance = reconcile_todo_provenance(
+            canonical_todos, todo_provenance, strict=todo_provenance is not None,
+        )
+        content = apply_display_aliases(content)
+        name = apply_display_aliases(name) if name else name
+        tags = apply_display_aliases_to_value(tags or [])
+        domain = apply_display_aliases_to_value(domain) if domain else domain
+        todos = apply_display_aliases_to_value(canonical_todos)
+        todo_provenance = prepare_todo_provenance(
+            todos,
+            [
+                {**record, "text": apply_display_aliases(record["text"])}
+                for record in canonical_todo_provenance
+            ],
+        )
+        bucket_name = sanitize_name(name) if name else bucket_id
+        # feel buckets are allowed to have empty domain; others default to ["未分类"]
+        if bucket_type == "feel":
+            domain = domain if domain is not None else []
+        else:
+            domain = domain or ["未分类"]
+        linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
+
+        # --- Pinned/protected buckets: lock importance to 10 ---
+        # --- 钉选/保护桶：importance 强制锁定为 10 ---
+        if pinned or protected:
+            importance = 10
+
+        # --- Build YAML frontmatter metadata / 构建元数据 ---
+        today = created_date or _date_only()
+        metadata = {
+            "id": bucket_id,
+            "name": bucket_name,
+            "tags": tags,
+            "domain": domain,
+            "valence": max(0.0, min(1.0, valence)),
+            "arousal": max(0.0, min(1.0, arousal)),
+            "importance": max(1, min(10, importance)),
+            "type": bucket_type,
+            "created": created or now_iso(),
+            "last_active": last_active or now_iso(),
+            "created_at": today,
+            "updated_at": today,
+            "emotion_history": "[]",
+            "related_buckets": "",
+            "source_bucket": "",
+            "trigger_date": "",
+            "trigger_last_seen": "",
+            "dormant": False,
+            "sealed": 1 if sealed else 0,
+            "activation_count": 0,
+            "todos": todos,
+        }
+        if provenance_kind is not None:
+            metadata["provenance_kind"] = normalized_provenance_kind
+        if todo_provenance:
+            metadata["todo_provenance"] = todo_provenance
+        if pinned:
+            metadata["pinned"] = True
+        if protected:
+            metadata["protected"] = True
+        if topics is not None:
+            metadata["topics"] = topics
+
+        # --- Assemble Markdown file (frontmatter + body) ---
+        # --- 组装 Markdown 文件 ---
+        if pinned:
+            metadata["type"] = "permanent"
+        post = frontmatter.Post(linked_content, **metadata)
+        return post
+
     @guarded_async_mutation("bucket_create")
     async def create(
         self,
@@ -1873,72 +1981,14 @@ class BucketManager:
                 if operation["status"] == "applied":
                     raise BucketIdempotencyError("target_bucket_missing")
 
-        content = apply_display_aliases(content)
-        name = apply_display_aliases(name) if name else name
-        tags = apply_display_aliases_to_value(tags or [])
-        domain = apply_display_aliases_to_value(domain) if domain else domain
-        todos = apply_display_aliases_to_value(canonical_todos)
-        todo_provenance = prepare_todo_provenance(
-            todos,
-            [
-                {**record, "text": apply_display_aliases(record["text"])}
-                for record in canonical_todo_provenance
-            ],
+        post = self._build_bucket_post(
+            bucket_id, content, tags=tags, importance=importance, domain=domain,
+            valence=valence, arousal=arousal, bucket_type=bucket_type, name=name,
+            pinned=pinned, protected=protected, sealed=sealed, topics=topics,
+            todos=canonical_todos, todo_provenance=canonical_todo_provenance,
+            provenance_kind=provenance_kind,
         )
-        bucket_name = sanitize_name(name) if name else bucket_id
-        # feel buckets are allowed to have empty domain; others default to ["未分类"]
-        if bucket_type == "feel":
-            domain = domain if domain is not None else []
-        else:
-            domain = domain or ["未分类"]
-        linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
-
-        # --- Pinned/protected buckets: lock importance to 10 ---
-        # --- 钉选/保护桶：importance 强制锁定为 10 ---
-        if pinned or protected:
-            importance = 10
-
-        # --- Build YAML frontmatter metadata / 构建元数据 ---
-        today = _date_only()
-        metadata = {
-            "id": bucket_id,
-            "name": bucket_name,
-            "tags": tags,
-            "domain": domain,
-            "valence": max(0.0, min(1.0, valence)),
-            "arousal": max(0.0, min(1.0, arousal)),
-            "importance": max(1, min(10, importance)),
-            "type": bucket_type,
-            "created": now_iso(),
-            "last_active": now_iso(),
-            "created_at": today,
-            "updated_at": today,
-            "emotion_history": "[]",
-            "related_buckets": "",
-            "source_bucket": "",
-            "trigger_date": "",
-            "trigger_last_seen": "",
-            "dormant": False,
-            "sealed": 1 if sealed else 0,
-            "activation_count": 0,
-            "todos": todos,
-        }
-        if provenance_kind is not None:
-            metadata["provenance_kind"] = normalized_provenance_kind
-        if todo_provenance:
-            metadata["todo_provenance"] = todo_provenance
-        if pinned:
-            metadata["pinned"] = True
-        if protected:
-            metadata["protected"] = True
-        if topics is not None:
-            metadata["topics"] = topics
-
-        # --- Assemble Markdown file (frontmatter + body) ---
-        # --- 组装 Markdown 文件 ---
-        if pinned:
-            metadata["type"] = "permanent"
-        post = frontmatter.Post(linked_content, **metadata)
+        content, bucket_name, domain = post.content, post["name"], post["domain"]
         if operation is not None:
             self._append_operation_marker(
                 post,

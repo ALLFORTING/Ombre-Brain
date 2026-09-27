@@ -139,6 +139,11 @@ from asset_viewer import (
 from dehydrator import AnalysisParseError, Dehydrator
 from openai import APIConnectionError, APITimeoutError
 from decay_engine import DecayEngine
+from bucket_write_lock import bucket_write_scope
+from archive_session_operations import (
+    ArchiveSessionError, ArchiveSessionOperations, canonical_payload,
+    validate_operation_id, short_step, execute_archive_operation,
+)
 from related_integrity import (RelatedError, parse_related, scan_relation_store,
                                automatic_eligible, digest as related_digest)
 from embedding_engine import EmbeddingEngine
@@ -2033,12 +2038,12 @@ def _load_emotion_timeline() -> list[dict]:
 
 @guarded_mutation("emotion_timeline_write")
 def _record_emotion_snapshot(
-    valence: float, arousal: float, source: str, bucket_id: str = ""
+    valence: float, arousal: float, source: str, bucket_id: str = "",
+    *, _expected_entry: dict | None = None, _strict: bool = False, _verify_only: bool = False,
 ) -> None:
     if not (0 <= valence <= 1 and 0 <= arousal <= 1):
         return
-    timeline = _load_emotion_timeline()
-    entry = {
+    entry = dict(_expected_entry) if _expected_entry is not None else {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "valence": round(float(valence), 3),
         "arousal": round(float(arousal), 3),
@@ -2046,16 +2051,56 @@ def _record_emotion_snapshot(
     }
     if bucket_id:
         entry["bucket_id"] = bucket_id
-    timeline.append(entry)
     path = _emotion_timeline_path()
-    temp_path = f"{path}.tmp"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            _json_lib.dump(timeline, handle, ensure_ascii=False, separators=(",", ":"))
-        os.replace(temp_path, path)
-    except OSError as e:
-        logger.warning(f"Failed to persist emotion timeline: {e}")
+        with bucket_write_scope(config["buckets_dir"]):
+            timeline = _read_emotion_timeline_for_write(path)
+            if source == "archive" and bucket_id:
+                existing = [item for item in timeline if item.get("source") == source
+                            and item.get("bucket_id") == bucket_id]
+                if existing:
+                    if existing != [entry]:
+                        raise ArchiveSessionError("archive_emotion_evidence_conflict")
+                    BucketManager._sync_directory(os.path.dirname(path))
+                    return
+                if _verify_only:
+                    raise ArchiveSessionError("archive_emotion_receipt_conflict")
+            timeline.append(entry)
+            payload = _json_lib.dumps(timeline, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            BucketManager._write_bytes_atomic(path, payload)
+            if _read_emotion_timeline_for_write(path) != timeline:
+                raise ArchiveSessionError("archive_emotion_evidence_conflict")
+    except (OSError, ValueError) as exc:
+        if _strict:
+            if isinstance(exc, ArchiveSessionError):
+                raise
+            raise ArchiveSessionError("archive_emotion_write_failed") from None
+        logger.warning("Failed to persist emotion timeline: emotion_timeline_write_failed")
+
+
+def _read_emotion_timeline_for_write(path: str) -> list[dict]:
+    def invalid_constant(_value):
+        raise ValueError()
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError()
+            result[key] = value
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            timeline = _json_lib.load(handle, parse_constant=invalid_constant, object_pairs_hook=unique_keys)
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise ArchiveSessionError("archive_emotion_timeline_invalid") from None
+        return []
+    except (OSError, ValueError):
+        raise ArchiveSessionError("archive_emotion_timeline_invalid") from None
+    if (os.path.islink(path) or not isinstance(timeline, list)
+            or any(not isinstance(item, dict) for item in timeline)):
+        raise ArchiveSessionError("archive_emotion_timeline_invalid")
+    return timeline
 
 
 def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) -> str:
@@ -10477,6 +10522,7 @@ async def archive_session(
             )
         ),
     ] = None,
+    operation_id: str | None = None,
 ) -> str:
     # MCP schema note: this function is intentionally registered as a tool.
     """Archive the current conversation summary into archive/session.
@@ -10486,52 +10532,60 @@ async def archive_session(
     labels, such as ``项目/OB``, ``项目/RM``, ``学习/生化``, ``关系/沟通``, or
     ``日常/作息``. Avoid labels that are too broad, such as ``闲聊``, or
     excessively narrow labels.
+
+    Generate optional operation_id before the first call and reuse it on retry
+    or reconnect. IDs are case-sensitive, 1–128 ASCII characters matching
+    [A-Za-z0-9][A-Za-z0-9._:-]*, with no trimming.
+    Same ID with changed parameters conflicts; different IDs with
+    identical content create independent sessions. Omitted IDs remain compatible
+    but cannot deduplicate response-loss retries. Provider calls are best-effort
+    and are not guaranteed exactly-once.
     """
-    await decay_engine.ensure_started()
-    if not summary or not summary.strip():
-        return "summary 不能为空。"
+    store = ArchiveSessionOperations(config["buckets_dir"])
+    operation = None
     try:
-        normalized_topics = _normalize_archive_topics(topics)
-    except ValueError as exc:
-        return str(exc)
+        validate_operation_id(operation_id)
+        payload = canonical_payload(summary, highlights, mood, valence, arousal, letter, sealed, topics)
+        if operation_id is not None:
+            operation = store.lookup(operation_id, payload)
+            if operation is not None and operation["status"] == "completed":
+                return operation["result_text"]
+            operation = await short_step(store.lookup_or_plan, operation_id, payload, config)
+            if operation["status"] == "completed":
+                return operation["result_text"]
+        await decay_engine.ensure_started()
+        if operation_id is not None:
+            def write_snapshot(entry, *, verify_only=False):
+                _record_emotion_snapshot(
+                    entry["valence"], entry["arousal"], "archive", entry["bucket_id"],
+                    _expected_entry=entry, _strict=True, _verify_only=verify_only,
+                )
+            return await execute_archive_operation(
+                store, operation, bucket_mgr.embedding_engine, write_snapshot,
+            )
+        plan = await short_step(store.publish_legacy, payload, config)
+        bucket_id = plan["bucket_id"]
+        bucket_mgr._record_boot_delta_event(bucket_id, "created")
+        if not sealed:
+            await bucket_mgr._refresh_ordinary_embedding_best_effort(bucket_id, plan["embedding_input"])
+        if payload["letter"]:
+            bucket_mgr.record_letter(payload["letter"], bucket_id, sealed=sealed)
+        if plan["snapshot"] is not None:
+            entry = plan["snapshot"]
+            _record_emotion_snapshot(entry["valence"], entry["arousal"], "archive", bucket_id)
+        return plan["result_text"]
+    except Exception as exc:
+        code = exc.code if isinstance(exc, ArchiveSessionError) else "archive_session_storage_failed"
+        if operation is not None and code != "archive_operation_payload_conflict":
+            try:
+                store.blocked(operation_id, code)
+            except Exception:
+                logger.warning("archive_session journal error: archive_journal_unavailable")
+        if code in {"topics must be a list of strings.", "summary 不能为空。"}:
+            return code
+        return f"archive_session: {code}"
 
-    today = datetime.now().date().isoformat()
-    all_buckets = await bucket_mgr.list_all(include_archive=True)
-    existing = [
-        b for b in all_buckets
-        if "session" in b.get("metadata", {}).get("domain", [])
-        and str(b.get("metadata", {}).get("name", "")).startswith(f"session_{today}_")
-    ]
-    session_name = f"session_{today}_{len(existing) + 1:02d}"
 
-    parts = [f"# {session_name}", "", "## Summary", summary.strip()]
-    if highlights.strip():
-        parts.extend(["", "## Highlights", highlights.strip()])
-    if mood.strip():
-        parts.extend(["", "## Mood", mood.strip()])
-
-    archive_valence = valence if 0 <= valence <= 1 else 0.5
-    archive_arousal = arousal if 0 <= arousal <= 1 else 0.3
-
-    bucket_id = await bucket_mgr.create(
-        content="\n".join(parts),
-        tags=["session", "archive"],
-        importance=5,
-        domain=["session"],
-        valence=archive_valence,
-        arousal=archive_arousal,
-        bucket_type="dynamic",
-        name=session_name,
-        sealed=sealed,
-        topics=normalized_topics,
-        provenance_kind="summary",
-    )
-    await bucket_mgr.archive(bucket_id)
-    if letter.strip():
-        bucket_mgr.record_letter(letter.strip(), bucket_id, sealed=sealed)
-    if not sealed and 0 <= valence <= 1 and 0 <= arousal <= 1:
-        _record_emotion_snapshot(valence, arousal, "archive", bucket_id)
-    return f"已归档本次对话: {session_name} bucket_id:{bucket_id}"
 
 
 # =============================================================

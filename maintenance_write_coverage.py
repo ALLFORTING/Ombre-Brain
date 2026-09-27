@@ -16,6 +16,19 @@ COVERAGE_SCHEMA_VERSION = 3
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
+    "archive_session_operations.py": {
+        "lookup_or_plan": "guarded_mutation",
+        "_sealed_cleanup": "guarded_caller_only",
+        "_publish": "guarded_caller_only",
+        "publish_legacy": "guarded_mutation",
+        "publish": "guarded_mutation",
+        "boot_event": "guarded_mutation",
+        "letter": "guarded_mutation",
+        "embedding": "guarded_mutation",
+        "emotion": "guarded_mutation",
+        "complete": "guarded_mutation",
+        "blocked": "guarded_mutation",
+    },
     "related_integrity.py": {
         "_save": "guarded_mutation",
         "_publish": "guarded_mutation",
@@ -86,6 +99,9 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_ensure_import_operation": "guarded_caller_only",
         "_mark_import_operation_applied": "guarded_caller_only",
         "_write_post_atomic": "guarded_caller_only",
+        "_write_bytes_atomic": "guarded_caller_only",
+        "_insert_boot_delta_event": "guarded_caller_only",
+        "_insert_letter": "guarded_caller_only",
         "apply_related_plan": "guarded_caller_only",
         "plan_import_operation": "guarded_mutation",
         "apply_import_operation": "guarded_async_mutation",
@@ -253,6 +269,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "index_asset": "inline_writer_scope_after_network",
     },
     "embedding_engine.py": {
+        "store_archive_embedding": "guarded_mutation",
         "_init_db": "startup_initialization",
         "_store_embedding": "guarded_mutation_after_network",
         "delete_embedding": "guarded_mutation",

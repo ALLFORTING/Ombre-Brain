@@ -373,7 +373,7 @@ async def test_archive_response_loss_retry_duplicate(ob, monkeypatch, stateless)
 
 
 @pytest.mark.asyncio
-async def test_archive_cancel_after_create_leaves_unarchived_bucket(ob, monkeypatch):
+async def test_legacy_archive_cancel_after_publish_leaves_archived_bucket(ob, monkeypatch):
     monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
     started, cancelled = asyncio.Event(), asyncio.Event()
     original = ob.bucket_mgr.embedding_engine
@@ -392,11 +392,123 @@ async def test_archive_cancel_after_create_leaves_unarchived_bucket(ob, monkeypa
         await wait(cancelled)
         buckets = await ob.bucket_mgr.list_all(include_archive=True)
         assert len(buckets) == 1
-        assert buckets[0]["metadata"]["type"] == "dynamic"
+        assert buckets[0]["metadata"]["type"] == "archived"
         monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", original)
         text(await call(client, "archive_session", {"summary": "partial isolated summary"}))
         buckets = await ob.bucket_mgr.list_all(include_archive=True)
-        assert sorted(bucket["metadata"]["type"] for bucket in buckets) == ["archived", "dynamic"]
+        assert sorted(bucket["metadata"]["type"] for bucket in buckets) == ["archived", "archived"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_archive_operation_http_response_loss_replays_receipt(ob, monkeypatch, stateless):
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
+    started, release, finished = [asyncio.Event() for _ in range(3)]
+    first_result = []
+    async def completed_then_pause(**kwargs):
+        outcome = await ob.archive_session(**kwargs)
+        if not first_result:
+            first_result.append(outcome)
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                finished.set()
+        return outcome
+    monkeypatch.setattr(ob.mcp._tool_manager.get_tool("archive_session"), "fn", completed_then_pause)
+    args = {"summary": "response lost", "letter": "handoff", "valence": .7,
+            "arousal": .4, "operation_id": "http-stable"}
+    async with live(ob) as client:
+        await initialize(client)
+        assert await disconnect_call(client, "archive_session", args, started)
+        release.set()
+        await wait(finished)
+        root = Path(ob.config["buckets_dir"])
+        before = {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        assert text(await call(client, "archive_session", args)) == first_result[0]
+        assert before == {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        assert len(await ob.bucket_mgr.list_all(include_archive=True)) == 1
+        assert len(ob.bucket_mgr.get_letters(limit=10)) == len(ob._load_emotion_timeline()) == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_operation_real_tcp_cancel_and_reconnect_without_detached_worker(ob, monkeypatch):
+    from embedding_engine import EmbeddingEngine
+    from archive_session_operations import ArchiveSessionOperations
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
+    engine = EmbeddingEngine(ob.config)
+    engine.enabled = True
+    monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", engine)
+    started, cancelled, finished = [asyncio.Event() for _ in range(3)]
+    async def provider(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            finished.set()
+    monkeypatch.setattr(engine, "_generate_embedding", provider)
+    args = {"summary": "interrupted", "letter": "handoff", "valence": .7,
+            "arousal": .4, "operation_id": "reconnect-stable"}
+    journal = ArchiveSessionOperations(ob.config["buckets_dir"])
+    async with live(ob) as client:
+        assert await disconnect_call(client, "archive_session", args, started)
+        await wait(cancelled)
+        await wait(finished)
+        op = journal.lookup(args["operation_id"])
+        assert op["status"] == "pending" and op["embedding_resolution"] is None
+        assert op["boot_event_id"] is not None and op["letter_id"] is None
+        assert len(await ob.bucket_mgr.list_all(include_archive=True)) == 1
+        assert not ob.bucket_mgr.get_letters(limit=10) and not ob._load_emotion_timeline()
+        result(await rpc(client, "tools/list"))  # Allow server work to run; no detached continuation.
+        assert journal.lookup(args["operation_id"])["status"] == "pending"
+        assert not ob.bucket_mgr.get_letters(limit=10)
+        monkeypatch.setattr(engine, "_generate_embedding", AsyncMock(return_value=[.1, .2]))
+        assert text(await call(client, "archive_session", args)) == op["result_text"]
+        assert len(await ob.bucket_mgr.list_all(include_archive=True)) == 1
+        assert len(ob.bucket_mgr.get_letters(limit=10)) == len(ob._load_emotion_timeline()) == 1
+        assert journal.lookup(args["operation_id"])["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_archive_operation_concurrent_http_calls(ob, monkeypatch, stateless):
+    from embedding_engine import EmbeddingEngine
+    from archive_session_operations import ArchiveSessionOperations
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
+    engine = EmbeddingEngine(ob.config)
+    engine.enabled = True
+    monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", engine)
+    both = asyncio.Event()
+    entered = 0
+    async def provider(*args, **kwargs):
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both.set()
+        await wait(both)
+        return [.1, .2]
+    monkeypatch.setattr(engine, "_generate_embedding", provider)
+    args = {"summary": "concurrent", "letter": "handoff", "valence": .7,
+            "arousal": .4, "operation_id": "http-concurrent"}
+    async with live(ob) as client:
+        await initialize(client)
+        # Separate JSON-RPC IDs within a stateful session.
+        async def request(identity):
+            response = await client.post("/mcp", json={"jsonrpc": "2.0", "id": identity,
+                "method": "tools/call", "params": {"name": "archive_session", "arguments": args}})
+            assert response.status_code == 200
+            message = next(json.loads(line[6:]) for line in response.text.splitlines()
+                           if line.startswith("data: "))
+            assert not message["result"].get("isError")
+            return message["result"]["content"][0]["text"]
+        first, second = await asyncio.gather(request(21), request(22))
+        assert entered == 2 and first == second and "已归档" in first
+        assert len(await ob.bucket_mgr.list_all(include_archive=True)) == 1
+        assert len(ob.bucket_mgr.get_letters(limit=10)) == len(ob._load_emotion_timeline()) == 1
+        assert ArchiveSessionOperations(ob.config["buckets_dir"]).lookup(args["operation_id"])["status"] == "completed"
 
 
 @pytest.mark.asyncio
