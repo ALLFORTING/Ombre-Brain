@@ -109,6 +109,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import (
     BucketManager,
+    SupersessionError,
     automatic_todo_provenance,
     active_todo_projection,
     canonicalize_todos,
@@ -2126,16 +2127,10 @@ async def _apply_supersession(
     *,
     preserve_superseded_at: bool = False,
 ) -> tuple[bool, str]:
-    """Maintain the forward and reverse supersession metadata together.
-
-    All buckets are validated before writes. If a later metadata write fails, the
-    already-written metadata is compensated with its original value so callers
-    do not report a successful half-link.
-    """
+    """Delegate the current forward/reverse mutation to one storage lock."""
     source_id = str(source.get("id", ""))
     source_meta = source.get("metadata", {})
     requested = str(superseded_by).strip()
-    previous = _superseded_by_id(source_meta)
 
     if requested and requested != "none" and requested == source_id:
         return False, "superseded_by 不能指向自身。"
@@ -2148,10 +2143,6 @@ async def _apply_supersession(
         if _is_sealed(target):
             return False, f"superseded_by 目标桶已封存，不能作为取代桶: {requested}"
 
-    previous_target = None
-    if previous and previous != "none":
-        previous_target = await bucket_mgr.get(previous)
-
     source_update = {
         "superseded_by": requested or None,
         "superseded_at": (
@@ -2160,45 +2151,12 @@ async def _apply_supersession(
             else (datetime.now().isoformat() if requested else None)
         ),
     }
-    source_restore = {
-        "superseded_by": _metadata_restore_value(source_meta, "superseded_by"),
-        "superseded_at": _metadata_restore_value(source_meta, "superseded_at"),
-    }
-    operations: list[tuple[str, dict, dict]] = [
-        (source_id, source_update, source_restore)
-    ]
-
-    if previous_target and previous != requested:
-        previous_meta = previous_target.get("metadata", {})
-        operations.append(
-            (
-                previous,
-                {"supersedes": [
-                    item for item in _supersedes_ids(previous_meta)
-                    if item != source_id
-                ]},
-                {"supersedes": _metadata_restore_value(previous_meta, "supersedes")},
-            )
-        )
-    if target:
-        target_meta = target.get("metadata", {})
-        operations.append(
-            (
-                requested,
-                {"supersedes": list(dict.fromkeys(
-                    _supersedes_ids(target_meta) + [source_id]
-                ))},
-                {"supersedes": _metadata_restore_value(target_meta, "supersedes")},
-            )
-        )
-
-    applied: list[tuple[str, dict]] = []
-    for bucket_id, update, restore in operations:
-        if not await bucket_mgr.update(bucket_id, **update):
-            for applied_id, applied_restore in reversed(applied):
-                await bucket_mgr.update(applied_id, **applied_restore)
-            return False, "superseded_by 修改失败，未完成关系写入。"
-        applied.append((bucket_id, restore))
+    try:
+        success = await bucket_mgr.update(source_id, **source_update, _supersession_reverse=True)
+    except SupersessionError as exc:
+        return False, f"superseded_by rejected: {exc.code}"
+    if not success:
+        return False, "superseded_by 修改失败，未完成关系写入。"
 
     if requested == "none":
         return True, "none"
@@ -2413,6 +2371,12 @@ async def _merge_bucket_into_target(
             )
         )
 
+    try:
+        bucket_mgr.validate_supersession_rewire(source_id, target_id,
+            {identity: target_id for identity in inbound_ids}, planning=True)
+    except SupersessionError as exc:
+        return f"merge blocked: {exc.code}"
+
     target_update = {
         "content": merged_content, "tags": merged_tags,
         "importance": merged_importance, "valence": merged_valence,
@@ -2562,6 +2526,16 @@ async def _execute_merge_operation(operation: dict) -> str:
             persist("running")
 
     try:
+        pending_rewires = {}
+        for index, relation in enumerate(plan["relations"]):
+            if "superseded_by" not in relation["updates"]:
+                continue
+            step = f"relation:{index}"
+            marker = bucket_mgr.inspect_import_operation(f"merge:{operation_id}:{step}")
+            if step not in completed and not (marker and marker["marker"]):
+                pending_rewires[relation["bucket_id"]] = relation["updates"]["superseded_by"]
+        if pending_rewires:
+            bucket_mgr.validate_supersession_rewire(source_id, target_id, pending_rewires)
         relation_child_key = f"merge:{operation_id}:related-delete"
         relation_child = bucket_mgr.relation_store.lookup(relation_child_key)
         current_source = await bucket_mgr.get(source_id)
@@ -10250,6 +10224,10 @@ async def trace(
                     "superseded_by 目标桶已封存，不能作为取代桶: "
                     f"{requested_superseded_by}"
                 )
+        try:
+            bucket_mgr.preflight_supersession(bucket_id, requested_superseded_by)
+        except SupersessionError as exc:
+            return f"superseded_by rejected: {exc.code}"
     importance_requested = 1 <= importance <= 10
     importance_protected = importance_requested and (
         metadata.get("pinned") or metadata.get("protected")

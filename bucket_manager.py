@@ -34,6 +34,7 @@ import hashlib
 import json
 import tempfile
 import inspect
+import copy
 from related_integrity import (RelationStore, RelatedError, plan_mutation, scan_relation_store,
                                plan_delete, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
@@ -43,6 +44,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import frontmatter
+import yaml
+from frontmatter.default_handlers import YAMLHandler
 from rapidfuzz import fuzz
 
 from maintenance_write_gate import (
@@ -69,6 +72,44 @@ _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
 _BOOT_DELTA_PROFILES = ("talk", "code", "tg")
 TODO_SAID_BY_VALUES = frozenset({"ting", "model", "system", "unknown"})
 PROVENANCE_KIND_VALUES = frozenset({"unknown", "summary", "inference", "system"})
+
+
+class SupersessionError(ValueError):
+    """Redacted failure at the canonical forward-write boundary."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class _SupersessionLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate_frontmatter_key")
+        return super().construct_mapping(node, deep=deep)
+
+
+class _SupersessionHandler(YAMLHandler):
+    def load(self, fm, **kwargs):
+        metadata = yaml.load(fm, Loader=_SupersessionLoader)
+        if not isinstance(metadata, dict):
+            raise ValueError("unreadable_frontmatter")
+        return metadata
+
+
+def _successor_id_strict(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise SupersessionError("supersession_malformed_forward")
+    return value.strip()
+
+
+def _supersedes_for_mutation(metadata):
+    value = metadata.get("supersedes", [])
+    values = value.split(",") if isinstance(value, str) else value if isinstance(value, list) else []
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
 def normalize_provenance_kind(raw: Any, *, strict: bool = False) -> str:
@@ -2089,6 +2130,152 @@ class BucketManager:
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
+    def _supersession_catalog_locked(self):
+        """Read a fresh identity catalog, only while the root mutex is held.
+
+        Forward metadata is interpreted lazily along the requested chain. Other
+        relation fields never determine either identity or cycle eligibility.
+        """
+        root = Path(self.base_dir).resolve()
+        catalog = {"buckets": {}, "conflicts": [], "unreadable": [], "incomplete": False}
+        for location in (self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir):
+            directory = Path(location)
+            if not directory.exists() and not directory.is_symlink():
+                continue
+            if directory.is_symlink() or not directory.is_dir() or not directory.resolve().is_relative_to(root):
+                catalog["incomplete"] = True
+                continue
+            def onerror(_):
+                catalog["incomplete"] = True
+            for parent, dirs, files in os.walk(directory, followlinks=False, onerror=onerror):
+                if any((Path(parent) / name).is_symlink() for name in dirs):
+                    catalog["incomplete"] = True
+                dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    path = Path(parent) / filename
+                    try:
+                        if path.is_symlink() or not path.resolve().is_relative_to(root):
+                            raise ValueError("unsafe_bucket_path")
+                        raw = path.read_text(encoding="utf-8")
+                        if not YAMLHandler().detect(raw):
+                            raise ValueError("unreadable_frontmatter")
+                        post = frontmatter.loads(raw, handler=_SupersessionHandler())
+                    except Exception:
+                        catalog["unreadable"].append(path.stem)
+                        continue
+                    identity = post.get("id", path.stem)
+                    if (not isinstance(identity, str) or not identity or identity != identity.strip()
+                            or not (path.stem == identity or path.stem.endswith("_" + identity))):
+                        catalog["conflicts"].append((path.stem, identity))
+                        continue
+                    catalog["buckets"].setdefault(identity, []).append((str(path), post))
+        return catalog
+
+    def _resolve_supersession_locked(self, catalog, identity):
+        if not isinstance(identity, str) or not identity or identity != identity.strip():
+            raise SupersessionError("supersession_identity_ambiguous")
+        if catalog["incomplete"]:
+            raise SupersessionError("supersession_identity_ambiguous")
+        matches = lambda stem: stem == identity or stem.endswith("_" + identity)
+        if any(claim == identity or matches(stem) for stem, claim in catalog["conflicts"]):
+            raise SupersessionError("supersession_identity_conflict")
+        if any(matches(stem) for stem in catalog["unreadable"]):
+            raise SupersessionError("supersession_bucket_unreadable")
+        records = catalog["buckets"].get(identity, [])
+        # A filename that can select a different canonical ID is also ambiguous.
+        if any(other != identity and any(matches(Path(path).stem) for path, _ in rows)
+               for other, rows in catalog["buckets"].items()):
+            raise SupersessionError("supersession_identity_conflict")
+        if len(records) > 1:
+            raise SupersessionError("supersession_duplicate_identity")
+        if not records:
+            raise SupersessionError("supersession_target_missing")
+        return records[0]
+
+    def _validate_supersession_forward_locked(self, source_id, value, *, catalog=None,
+                                               overlay=None, removed=(), allow_same=True):
+        # Callers acquire the root mutex before constructing this catalog and
+        # retain it through publication. Never accept a preflight catalog here.
+        if catalog is None:
+            catalog = self._supersession_catalog_locked()
+        source = self._resolve_supersession_locked(catalog, source_id)
+        requested = _successor_id_strict(value)
+        if requested in ("", "none"):
+            return catalog, source
+        if requested == source_id:
+            raise SupersessionError("supersession_self_loop")
+        self._resolve_supersession_locked(catalog, requested)
+        previous = source[1].get("superseded_by")
+        if allow_same and isinstance(previous, str) and previous.strip() == requested:
+            return catalog, source
+        # An unreadable file may conceal another identity; additions need a
+        # complete identity proof. Clear and identical edges need no downstream.
+        if catalog["unreadable"]:
+            raise SupersessionError("supersession_identity_ambiguous")
+        overlay = overlay or {}
+        seen = set()
+        current = requested
+        while current not in ("", "none"):
+            if current == source_id or current in seen:
+                raise SupersessionError("supersession_cycle")
+            if current in removed:
+                raise SupersessionError("supersession_target_missing")
+            seen.add(current)
+            _, post = self._resolve_supersession_locked(catalog, current)
+            current = _successor_id_strict(overlay.get(current, post.get("superseded_by")))
+        return catalog, source
+
+    def preflight_supersession(self, source_id, value):
+        with bucket_write_scope(self.base_dir):
+            self._validate_supersession_forward_locked(source_id, value)
+
+    def validate_supersession_rewire(self, source_id, target_id, rewires, *, planning=False):
+        """Validate a transient merge overlay; do not publish or persist it."""
+        with bucket_write_scope(self.base_dir):
+            catalog = self._supersession_catalog_locked()
+            self._resolve_supersession_locked(catalog, target_id)
+            if planning:
+                self._resolve_supersession_locked(catalog, source_id)
+                incoming = {identity for identity, rows in catalog["buckets"].items()
+                            if identity != source_id and any(
+                                isinstance(post.get("superseded_by"), str)
+                                and post["superseded_by"].strip() == source_id for _, post in rows)}
+                if incoming != set(rewires) or any(value != target_id for value in rewires.values()):
+                    raise SupersessionError("supersession_plan_stale")
+            for identity, value in rewires.items():
+                self._validate_supersession_forward_locked(identity, value, catalog=catalog,
+                    overlay=rewires, removed={source_id}, allow_same=False)
+
+    def _plan_supersession_reverse_locked(self, catalog, source_id, source_post, value):
+        """Stage only the old/new successor reverse deltas from current posts."""
+        requested = _successor_id_strict(value)
+        previous = catalog["buckets"][source_id][0][1].get("superseded_by")
+        previous = previous.strip() if isinstance(previous, str) else ""
+        neighbors = {}
+        for identity, adding in ((previous, False), (requested, True)):
+            if identity in ("", "none") or (not adding and previous == requested):
+                continue
+            try:
+                path, original = self._resolve_supersession_locked(catalog, identity)
+            except SupersessionError:
+                if adding:
+                    raise
+                continue  # Preserve clear for a broken/ambiguous old successor.
+            if identity == source_id:
+                draft = source_post
+            else:
+                if identity not in neighbors:
+                    neighbors[identity] = (path, copy.deepcopy(original), original)
+                draft = neighbors[identity][1]
+            reverse = _supersedes_for_mutation(draft.metadata)
+            draft["supersedes"] = (list(dict.fromkeys(reverse + [source_id])) if adding
+                                   else [item for item in reverse if item != source_id])
+            draft["last_active"] = now_iso()
+            draft["updated_at"] = _date_only()
+        return list(neighbors.values())
+
     @guarded_async_mutation("bucket_update")
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
@@ -2096,6 +2283,7 @@ class BucketManager:
         更新桶的内容或元数据字段。
         """
         relation_requested = "related_buckets" in kwargs
+        paired_supersession = kwargs.pop("_supersession_reverse", False)
         relation_value = kwargs.pop("related_buckets", None)
         if relation_requested:
             if kwargs.get("_o5b_operation_key") is not None:
@@ -2182,6 +2370,22 @@ class BucketManager:
                     return True
                 if operation["status"] == "applied":
                     raise BucketIdempotencyError("operation_marker_missing")
+
+            reverse_updates = []
+            supersession_original = None
+            if "superseded_by" in kwargs:
+                catalog, (file_path, current_post) = self._validate_supersession_forward_locked(
+                    bucket_id, kwargs["superseded_by"])
+                post = copy.deepcopy(current_post)
+                if paired_supersession:
+                    requested = _successor_id_strict(kwargs["superseded_by"])
+                    if requested not in ("", "none"):
+                        target = self._resolve_supersession_locked(catalog, requested)[1]
+                        if _is_sealed_bucket(target):
+                            raise SupersessionError("supersession_target_sealed")
+                    supersession_original = copy.deepcopy(post)
+                    reverse_updates = self._plan_supersession_reverse_locked(
+                        catalog, bucket_id, post, kwargs["superseded_by"])
 
             requested_permanent = kwargs.pop("permanent", None)
             if requested_permanent is not None:
@@ -2366,15 +2570,30 @@ class BucketManager:
             post["last_active"] = now_iso()
             post["updated_at"] = _date_only()
 
+            applied_supersession = []
             try:
-                if operation is not None or content_changed or prepared_todos is not None or requested_permanent is not None or kwargs.get("pinned"):
+                if paired_supersession or operation is not None or content_changed or prepared_todos is not None or requested_permanent is not None or kwargs.get("pinned"):
                     self._write_post_atomic(file_path, post)
                     if operation is not None:
                         self._mark_import_operation_applied(o5b_operation_key)
                 else:
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(frontmatter.dumps(post))
+                if supersession_original is not None:
+                    applied_supersession.append((bucket_id, file_path, supersession_original))
+                for neighbor_path, draft, original in reverse_updates:
+                    self._write_post_atomic(neighbor_path, draft)
+                    applied_supersession.append((original.get("id", Path(neighbor_path).stem),
+                                                  neighbor_path, original))
             except OSError as e:
+                for restore_id, restore_path, original in reversed(applied_supersession):
+                    try:
+                        # Even compensation must not recreate an unsafe edge.
+                        self._validate_supersession_forward_locked(
+                            restore_id, original.get("superseded_by"))
+                        self._write_post_atomic(restore_path, original)
+                    except (OSError, SupersessionError):
+                        logger.warning("Supersession compensation refused or failed for %s", restore_id)
                 logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
                 return False
 
@@ -2389,6 +2608,14 @@ class BucketManager:
                 try:
                     self._move_bucket(file_path, type_dir, domain)
                 except OSError as exc:
+                    if "superseded_by" in kwargs:
+                        try:
+                            original_post = frontmatter.loads(original_file_bytes.decode("utf-8"))
+                            self._validate_supersession_forward_locked(
+                                bucket_id, original_post.get("superseded_by"))
+                        except SupersessionError:
+                            logger.warning("Refusing unsafe forward restoration after lifecycle move failure")
+                            return False
                     with open(file_path, "wb") as restore_file:
                         restore_file.write(original_file_bytes)
                     logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
