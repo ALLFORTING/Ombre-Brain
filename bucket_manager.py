@@ -35,6 +35,10 @@ import json
 import tempfile
 import inspect
 import copy
+import asyncio
+import time
+import weakref
+from contextlib import nullcontext
 from related_integrity import (RelationStore, RelatedError, plan_mutation, scan_relation_store,
                                plan_delete, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
@@ -68,6 +72,8 @@ from utils import (
 logger = logging.getLogger("ombre_brain.bucket")
 
 _IMPORT_MARKER_FIELD = "_ob_import_operations"
+_S4_LOCKS = weakref.WeakValueDictionary()
+_S4_LEASE_SECONDS = 60.0
 _IMPORT_OPERATION_STATUSES = frozenset({"planned", "applied"})
 _BOOT_DELTA_PROFILES = ("talk", "code", "tg")
 TODO_SAID_BY_VALUES = frozenset({"ting", "model", "system", "unknown"})
@@ -1099,17 +1105,21 @@ class BucketManager:
         payload: dict[str, Any] | None = None,
         payload_digest: str | None = None,
         memory_mutation_id: str | None = None,
+        _s4_context: dict | None = None,
     ) -> dict[str, Any]:
         """Apply or replay one durable import memory operation."""
 
-        operation = self._ensure_import_operation(
-            operation_key,
-            operation_kind=operation_kind,
-            target_bucket_id=target_bucket_id,
-            payload=payload,
-            payload_digest=payload_digest,
-            memory_mutation_id=memory_mutation_id,
-        )
+        with bucket_write_scope(self.base_dir) if _s4_context is not None else nullcontext():
+            if _s4_context is not None:
+                self._trace_fence(_s4_context)
+            operation = self._ensure_import_operation(
+                operation_key,
+                operation_kind=operation_kind,
+                target_bucket_id=target_bucket_id,
+                payload=payload,
+                payload_digest=payload_digest,
+                memory_mutation_id=memory_mutation_id,
+            )
         stored_payload = operation["payload"]
         if operation["operation_kind"] == "create":
             bucket_id = await self.create(
@@ -1132,10 +1142,334 @@ class BucketManager:
             _o5b_operation_key=operation_key,
             _o5b_payload_digest=operation["payload_digest"],
             _o5c_memory_mutation_id=operation.get("memory_mutation_id"),
+            **({"_s4_context": _s4_context} if _s4_context is not None else {}),
         )
         if not applied:
             raise BucketIdempotencyError("target_bucket_missing")
         return {"operation_key": operation_key, "result_id": bucket_id, "kind": "update"}
+
+    @staticmethod
+    def validate_trace_operation_id(operation_id):
+        if operation_id is not None and (
+            not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128
+        ):
+            raise BucketIdempotencyError("operation_id_invalid")
+
+    def inspect_trace_request(self, operation_id):
+        """Read a request without creating a table or inspecting its target."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_s4_requests'").fetchone():
+                return None
+            row = conn.execute("SELECT * FROM ob_s4_requests WHERE operation_id=?", (operation_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for field in ("payload", "normalization_context", "plan", "resolutions"):
+            result[field] = json.loads(result.pop(field + "_json"))
+        return result
+
+    def _ensure_trace_request_table(self):
+        self._ensure_import_operation_table()
+        with sqlite3.connect(self.history_db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS ob_s4_requests (
+                operation_id TEXT PRIMARY KEY COLLATE BINARY,
+                kind TEXT NOT NULL CHECK(kind='trace'), schema_version INTEGER NOT NULL,
+                root_binding TEXT NOT NULL, payload_json TEXT NOT NULL,
+                payload_digest TEXT NOT NULL, normalization_context_json TEXT NOT NULL,
+                phase TEXT NOT NULL, status TEXT NOT NULL,
+                plan_json TEXT NOT NULL DEFAULT '{}', resolutions_json TEXT NOT NULL DEFAULT '{}',
+                result_text TEXT, completed_receipt_json TEXT,
+                owner_instance TEXT, epoch INTEGER NOT NULL DEFAULT 0,
+                lease_until REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                completed_at TEXT, last_error_code TEXT)""")
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(ob_import_operations)")}
+            if "effects_json" not in columns:
+                conn.execute("ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT")
+
+    @guarded_mutation("trace_request_claim")
+    def _claim_trace_request(self, operation_id, payload, normalization_context, owner):
+        if payload.get('kind') != 'trace':
+            raise BucketIdempotencyError('operation_id_conflict')
+        serialized, digest = self._canonical_import_payload(payload)
+        root = str(Path(self.base_dir).resolve())
+        with bucket_write_scope(self.base_dir):
+            self._ensure_trace_request_table()
+            with sqlite3.connect(self.history_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM ob_s4_requests WHERE operation_id=?", (operation_id,)).fetchone()
+                if row is None:
+                    path = self._find_bucket_file(payload['bucket_id'])
+                    if not path:
+                        raise BucketIdempotencyError('target_bucket_missing')
+                    post = frontmatter.load(path)
+                    if _is_sealed_bucket(post):
+                        raise BucketIdempotencyError('unsupported_combination: sealed target')
+                    if payload['content'] and post.get('protected'):
+                        raise BucketIdempotencyError('content_protected')
+                    conn.execute("""INSERT INTO ob_s4_requests
+                        (operation_id,kind,schema_version,root_binding,payload_json,payload_digest,
+                         normalization_context_json,phase,status,created_at)
+                        VALUES (?,'trace',1,?,?,?,?,'accepted','pending',?)""",
+                        (operation_id, root, serialized, digest, json.dumps(normalization_context), now_iso()))
+                else:
+                    if row['kind'] != 'trace' or row['payload_digest'] != digest:
+                        raise BucketIdempotencyError("operation_id_conflict")
+                    if row['root_binding'] != root:
+                        raise BucketIdempotencyError("operation_root_conflict")
+                    if row['status'] == 'completed':
+                        return {"replay": row['result_text']}
+                    if row['owner_instance'] and row['lease_until'] > time.time():
+                        return None
+                conn.execute("""UPDATE ob_s4_requests SET owner_instance=?, epoch=epoch+1,
+                    lease_until=? WHERE operation_id=?""", (owner, time.time() + _S4_LEASE_SECONDS, operation_id))
+                epoch = conn.execute("SELECT epoch FROM ob_s4_requests WHERE operation_id=?", (operation_id,)).fetchone()[0]
+        return {"operation_id": operation_id, "owner": owner, "epoch": epoch}
+
+    def _trace_fence(self, context):
+        request = self.inspect_trace_request(context['operation_id'])
+        if (request is None or request['owner_instance'] != context['owner']
+                or request['epoch'] != context['epoch'] or request['lease_until'] <= time.time()):
+            raise BucketIdempotencyError("operation_claim_stale")
+        return request
+
+    @guarded_mutation("trace_request_checkpoint")
+    def _trace_checkpoint(self, context, phase=None, *, plan=None, resolutions=None, result=None):
+        with bucket_write_scope(self.base_dir):
+            request = self._trace_fence(context)
+            with sqlite3.connect(self.history_db_path) as conn:
+                conn.execute("""UPDATE ob_s4_requests SET phase=?, plan_json=?, resolutions_json=?,
+                    result_text=?, completed_receipt_json=?, status=?, completed_at=?, lease_until=?
+                    WHERE operation_id=?""",
+                    (phase or request['phase'], json.dumps(plan if plan is not None else request['plan']),
+                     json.dumps(resolutions if resolutions is not None else request['resolutions']),
+                     result if result is not None else request['result_text'],
+                     json.dumps(resolutions) if phase == 'completed' else request['completed_receipt_json'],
+                     'completed' if phase == 'completed' else 'pending',
+                     now_iso() if phase == 'completed' else request['completed_at'],
+                     time.time() + _S4_LEASE_SECONDS, context['operation_id']))
+
+    @guarded_mutation("trace_request_release")
+    def _release_trace_request(self, context):
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            conn.execute("""UPDATE ob_s4_requests SET owner_instance=NULL,lease_until=0
+                WHERE operation_id=? AND owner_instance=? AND epoch=?""",
+                (context['operation_id'], context['owner'], context['epoch']))
+
+    async def _trace_heartbeat(self, context):
+        while True:
+            await asyncio.sleep(_S4_LEASE_SECONDS / 3)
+            self._trace_checkpoint(context)
+
+    def _trace_child_key(self, operation_id, step):
+        serialized = json.dumps([
+            "s4-child-v1", str(Path(self.base_dir).resolve()), "trace", operation_id, step],
+            ensure_ascii=False, separators=(',', ':'))
+        return "s4:" + hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+    def _trace_preimage_guard(self, plan):
+        path = self._find_bucket_file(plan['target'])
+        if not path or hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan['preimage_digest']:
+            raise BucketIdempotencyError("operation_state_conflict")
+
+    @staticmethod
+    def _trace_alias_value(value, aliases):
+        if isinstance(value, str):
+            for source, target in aliases:
+                value = value.replace(source, target)
+        elif isinstance(value, list):
+            value = [BucketManager._trace_alias_value(item, aliases) for item in value]
+        return value
+
+    @guarded_mutation("trace_request_plan")
+    def _plan_trace_request(self, context, planner):
+        with bucket_write_scope(self.base_dir):
+            request = self._trace_fence(context)
+            target = request['payload']['bucket_id']
+            path = self._find_bucket_file(target)
+            if not path:
+                raise BucketIdempotencyError("target_bucket_missing")
+            post = frontmatter.load(path)
+            updates, response = planner({"content": post.content, "metadata": copy.deepcopy(post.metadata)})
+            updates = copy.deepcopy(updates)
+            aliases = request['normalization_context']['aliases']
+            history_type = updates.pop('_history_change_type', 'replace')
+            if 'content' in updates:
+                updates['content'] = self._trace_alias_value(updates['content'], aliases)
+            if 'todos' in updates:
+                updates['todos'] = self._trace_alias_value(canonicalize_todos(updates['todos']), aliases)
+                updates['todo_provenance'] = prepare_todo_provenance(
+                    updates['todos'], updates.get('todo_provenance'),
+                    previous_todos=post.get('todos'), previous_provenance=post.get('todo_provenance'),
+                    references_only=updates.pop('_todo_references_only', False))
+            for field in ('tags', 'domain'):
+                if field in updates:
+                    updates[field] = self._trace_alias_value(updates[field], aliases)
+            if 'name' in updates:
+                updates['name'] = sanitize_name(self._trace_alias_value(updates['name'], aliases))
+            delta = []
+            if 'content' in updates and updates['content'] != post.content:
+                delta.append(['content_updated', {}])
+            old_todos, new_todos = canonicalize_todos(post.get('todos')), updates.get('todos', canonicalize_todos(post.get('todos')))
+            if new_todos != old_todos:
+                delta.append(['todos_updated', {'closed_count': len(set(old_todos)-set(new_todos)),
+                                               'opened_count': len(set(new_todos)-set(old_todos))}])
+            relation = {'source': target, 'add': request['payload']['related'],
+                        'remove': request['payload']['unrelate'], 'origin': 'explicit'}
+            if relation['add'] or relation['remove']:
+                self.preview_related(target, add=relation['add'], remove=relation['remove'], origin=relation['origin'])
+            plan = {'target': target, 'preimage_digest': hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                    'updates': updates, 'logical_time': now_iso(), 'history_type': history_type,
+                    'old_content': post.content, 'delta': delta, 'relation': relation,
+                    'response': response, 'embedding_input': updates.get('content'),
+                    'embedding_model': getattr(self.embedding_engine, 'model', ''),
+                    'keys': {step: self._trace_child_key(context['operation_id'], step)
+                             for step in ('memory', 'embedding', 'relation')}}
+            if request['payload'].get('todo_items') is not None:
+                plan['response'] += '\n' + '\n'.join(
+                    f"- {r['text']} | todo_id:{r['id']}" for r in updates.get('todo_provenance', []))
+            self._trace_checkpoint(context, 'planned', plan=plan)
+
+    @guarded_mutation("trace_effect_commit")
+    def _trace_effect_commit(self, context, step):
+        """History/delta INSERT and child receipt share one SQLite transaction."""
+        with bucket_write_scope(self.base_dir):
+            plan = self._trace_fence(context)['plan']
+            child = self._ensure_import_operation(plan['keys']['memory'], operation_kind='update',
+                target_bucket_id=plan['target'], payload={'kwargs': plan['updates']})
+            if step == 'history' and child['status'] != 'applied':
+                self._trace_preimage_guard(plan)
+            with sqlite3.connect(self.history_db_path) as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute('SELECT effects_json FROM ob_import_operations WHERE operation_key=?',
+                                   (plan['keys']['memory'],)).fetchone()
+                effects = json.loads(row[0] or '{}')
+                if step in effects:
+                    return effects[step]
+                if step == 'history':
+                    receipt = {'outcome': 'not_requested'}
+                    if 'content' in plan['updates']:
+                        receipt = {'history_id': conn.execute("""INSERT INTO bucket_history
+                            (bucket_id,old_content,changed_at,change_type) VALUES(?,?,?,?)""",
+                            (plan['target'], plan['old_content'], plan['logical_time'], plan['history_type'])).lastrowid}
+                elif step == 'delta':
+                    receipt = {'event_ids': [self._insert_boot_delta_event(conn, plan['target'], kind,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
+                        for kind, payload in plan['delta']]}
+                else:
+                    raise ValueError('trace_effect_invalid')
+                effects[step] = receipt
+                conn.execute('UPDATE ob_import_operations SET effects_json=? WHERE operation_key=?',
+                             (json.dumps(effects), plan['keys']['memory']))
+                return receipt
+
+    @guarded_mutation("trace_embedding_commit")
+    def _commit_trace_embedding(self, context, candidate):
+        with bucket_write_scope(self.base_dir):
+            plan = self._trace_fence(context)['plan']
+            engine = self.embedding_engine
+            receipt = engine.trace_embedding_receipt(plan['keys']['embedding'])
+            if receipt is not None:
+                return receipt
+            path = self._find_bucket_file(plan['target'])
+            post = frontmatter.load(path) if path else None
+            if (post is None or _is_sealed_bucket(post) or post.content != plan['embedding_input']
+                    or post.get('last_active') != plan['logical_time']):
+                return {'outcome': 'superseded_before_refresh'}
+            return engine.store_trace_embedding(plan['keys']['embedding'], plan['target'], candidate,
+                hashlib.sha256(plan['embedding_input'].encode()).hexdigest(),
+                plan['embedding_model'], plan['logical_time'])
+
+    @guarded_mutation("trace_relation_commit")
+    def _commit_trace_relation(self, context):
+        with bucket_write_scope(self.base_dir):
+            plan = self._trace_fence(context)['plan']
+            request = plan['relation']
+            if not request['add'] and not request['remove']:
+                return {'status': 'not_requested'}
+            return self.relation_store.commit(lambda inv: plan_mutation(inv, request['source'],
+                add=request['add'], remove=request['remove'], origin=request['origin']),
+                operation_key=plan['keys']['relation'], request_digest=related_digest(request))
+
+    @guarded_async_mutation("trace_request_execute")
+    async def execute_trace_request(self, operation_id, payload, normalization_context, planner):
+        """Finite trace-only runner. No provider await holds the storage mutex."""
+        self.validate_trace_operation_id(operation_id)
+        lock_key = (os.getpid(), asyncio.get_running_loop(), str(Path(self.base_dir).resolve()), operation_id)
+        lock = _S4_LOCKS.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            owner = uuid4().hex
+            while (context := self._claim_trace_request(operation_id, payload, normalization_context, owner)) is None:
+                await asyncio.sleep(.05)
+            if 'replay' in context:
+                return context['replay']
+            heartbeat = asyncio.create_task(self._trace_heartbeat(context))
+            try:
+                request = self.inspect_trace_request(operation_id)
+                if request['phase'] == 'accepted':
+                    self._plan_trace_request(context, planner)
+                request = self.inspect_trace_request(operation_id)
+                plan, resolutions = request['plan'], request['resolutions']
+                phases = ('planned', 'history_committed', 'memory_applied', 'embedding_resolved',
+                          'delta_resolved', 'relation_resolved', 'completed')
+                phase = phases.index(request['phase'])
+                if phase < 1:
+                    resolutions['history'] = self._trace_effect_commit(context, 'history')
+                    self._trace_checkpoint(context, 'history_committed', resolutions=resolutions)
+                if phase < 2:
+                    if plan['updates']:
+                        await self.apply_import_operation(plan['keys']['memory'], _s4_context=context)
+                    resolutions['memory'] = {'outcome': 'applied' if plan['updates'] else 'not_requested'}
+                    self._trace_checkpoint(context, 'memory_applied', resolutions=resolutions)
+                if phase < 3:
+                    engine = self.embedding_engine
+                    receipt = engine.trace_embedding_receipt(plan['keys']['embedding']) if engine else None
+                    if receipt is None:
+                        if plan['embedding_input'] is None:
+                            receipt = {'outcome': 'not_requested'}
+                        elif not engine or not engine.enabled:
+                            receipt = {'outcome': 'disabled'}
+                        else:
+                            candidate = resolutions.get('embedding_candidate')
+                            if candidate is None:
+                                try:
+                                    candidate = await engine._generate_embedding(plan['embedding_input'], model=plan['embedding_model'])
+                                except Exception:
+                                    candidate = []
+                                resolutions['embedding_candidate'] = candidate
+                                self._trace_checkpoint(context, resolutions=resolutions)
+                            try:
+                                receipt = self._commit_trace_embedding(context, candidate) if candidate else {'outcome': 'failed'}
+                            except BucketIdempotencyError:
+                                raise
+                            except Exception:
+                                # An ambiguous storage error is resolved by durable evidence.
+                                # If that read also fails, leave the request pending.
+                                receipt = engine.trace_embedding_receipt(plan['keys']['embedding']) or {'outcome': 'failed'}
+                    resolutions['embedding'] = receipt
+                    self._trace_checkpoint(context, 'embedding_resolved', resolutions=resolutions)
+                if phase < 4:
+                    resolutions['delta'] = self._trace_effect_commit(context, 'delta')
+                    self._trace_checkpoint(context, 'delta_resolved', resolutions=resolutions)
+                if phase < 5:
+                    resolutions['relation'] = self._commit_trace_relation(context)
+                    self._trace_checkpoint(context, 'relation_resolved', resolutions=resolutions)
+                relation = resolutions['relation']['status']
+                result = plan['response']
+                for field, ids in (('related', plan['relation']['add']), ('unrelate', plan['relation']['remove'])):
+                    if ids:
+                        result += f", {field}={','.join(ids)} ({relation})"
+                self._trace_checkpoint(context, 'completed', resolutions=resolutions, result=result)
+                return result
+            finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._release_trace_request(context)
 
     def inspect_import_operation(self, operation_key: str) -> dict[str, Any] | None:
         """Inspect an O5B operation and its hidden atomic marker read-only."""
@@ -2474,6 +2808,7 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
+        s4_context = kwargs.pop('_s4_context', None)
         relation_requested = "related_buckets" in kwargs
         paired_supersession = kwargs.pop("_supersession_reverse", False)
         relation_value = kwargs.pop("related_buckets", None)
@@ -2485,6 +2820,8 @@ class BucketManager:
                 self.mutate_related(bucket_id, replace=relation_value)
                 return True
         with bucket_write_scope(self.base_dir):
+            if s4_context is not None:
+                s4_plan = self._trace_fence(s4_context)['plan']
             history_change_type = kwargs.pop("_history_change_type", "replace")
             o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
             o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
@@ -2532,6 +2869,9 @@ class BucketManager:
                 if operation["status"] == "applied":
                     raise BucketIdempotencyError("operation_marker_missing")
 
+            if s4_context is not None:
+                self._trace_preimage_guard(s4_plan)
+
         embedding_cleanup_done = False
         preliminary_sealed = int(kwargs.get("sealed", post.get("sealed", 0)) or 0) == 1
         if preliminary_sealed and (not _is_sealed_bucket(post) or "content" in kwargs):
@@ -2543,6 +2883,8 @@ class BucketManager:
                 return False
 
         with bucket_write_scope(self.base_dir):
+            if s4_context is not None:
+                self._trace_fence(s4_context)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return False
@@ -2562,6 +2904,9 @@ class BucketManager:
                     return True
                 if operation["status"] == "applied":
                     raise BucketIdempotencyError("operation_marker_missing")
+
+            if s4_context is not None:
+                self._trace_preimage_guard(s4_plan)
 
             reverse_updates = []
             supersession_original = None
@@ -2603,7 +2948,8 @@ class BucketManager:
             prepared_provenance = None
             if "todos" in kwargs or "todo_provenance" in kwargs:
                 prepared_todos = (
-                    apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"]))
+                    (canonicalize_todos(kwargs["todos"]) if s4_context is not None else
+                     apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"])))
                     if "todos" in kwargs else previous_todos
                 )
                 try:
@@ -2675,14 +3021,18 @@ class BucketManager:
             # --- Update only fields that were passed in / 只改传入的字段 ---
             if "content" in kwargs:
                 try:
-                    self.record_history(bucket_id, post.content, history_change_type)
+                    if s4_context is None:
+                        self.record_history(bucket_id, post.content, history_change_type)
+                    elif 'history' not in json.loads(operation.get('effects_json') or '{}'):
+                        raise BucketIdempotencyError('operation_history_missing')
                 except Exception as e:
                     logger.error(
                         f"Refusing content update because history capture failed "
                         f"for {bucket_id}: {e}"
                     )
                     return False
-                kwargs["content"] = apply_display_aliases(kwargs["content"])
+                if s4_context is None:
+                    kwargs["content"] = apply_display_aliases(kwargs["content"])
                 post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
             # A body rewrite invalidates any previous provenance claim unless the
             # caller deliberately provides a replacement classification.
@@ -2691,7 +3041,8 @@ class BucketManager:
             elif content_changed:
                 post["provenance_kind"] = "unknown"
             if "tags" in kwargs:
-                kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
+                if s4_context is None:
+                    kwargs["tags"] = apply_display_aliases_to_value(kwargs["tags"])
                 post["tags"] = kwargs["tags"]
             if prepared_todos is not None:
                 post["todos"] = prepared_todos
@@ -2702,14 +3053,16 @@ class BucketManager:
             if "importance" in kwargs:
                 post["importance"] = max(1, min(10, int(kwargs["importance"])))
             if "domain" in kwargs:
-                kwargs["domain"] = apply_display_aliases_to_value(kwargs["domain"])
+                if s4_context is None:
+                    kwargs["domain"] = apply_display_aliases_to_value(kwargs["domain"])
                 post["domain"] = kwargs["domain"]
             if "valence" in kwargs:
                 post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
             if "arousal" in kwargs:
                 post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
             if "name" in kwargs:
-                kwargs["name"] = apply_display_aliases(kwargs["name"])
+                if s4_context is None:
+                    kwargs["name"] = apply_display_aliases(kwargs["name"])
                 post["name"] = sanitize_name(kwargs["name"])
             if "resolved" in kwargs:
                 post["resolved"] = bool(kwargs["resolved"])
@@ -2759,8 +3112,8 @@ class BucketManager:
                 post["sealed"] = 1 if int(kwargs["sealed"]) == 1 else 0
 
             # --- Auto-refresh activation time / 自动刷新激活时间 ---
-            post["last_active"] = now_iso()
-            post["updated_at"] = _date_only()
+            post["last_active"] = s4_plan['logical_time'] if s4_context is not None else now_iso()
+            post["updated_at"] = _date_only(s4_plan['logical_time']) if s4_context is not None else _date_only()
 
             applied_supersession = []
             try:
@@ -2812,6 +3165,9 @@ class BucketManager:
                         restore_file.write(original_file_bytes)
                     logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
                     return False
+
+        if s4_context is not None:
+            return True
 
         if (
             not next_sealed

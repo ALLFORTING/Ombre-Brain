@@ -105,6 +105,15 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "apply_related_plan": "guarded_caller_only",
         "plan_import_operation": "guarded_mutation",
         "apply_import_operation": "guarded_async_mutation",
+        "_ensure_trace_request_table": "guarded_caller_only",
+        "_claim_trace_request": "guarded_mutation",
+        "_trace_checkpoint": "guarded_mutation",
+        "_release_trace_request": "guarded_mutation",
+        "_plan_trace_request": "guarded_mutation",
+        "_trace_effect_commit": "guarded_mutation",
+        "_commit_trace_embedding": "guarded_mutation",
+        "_commit_trace_relation": "guarded_mutation",
+        "execute_trace_request": "guarded_async_mutation",
         "write_digest_operation": "guarded_mutation",
         "read_digest_operations": "dynamic_sql_read_only",
         "write_merge_operation": "guarded_mutation",
@@ -270,6 +279,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
     },
     "embedding_engine.py": {
         "store_archive_embedding": "guarded_mutation",
+        "store_trace_embedding": "guarded_mutation",
         "_init_db": "startup_initialization",
         "_store_embedding": "guarded_mutation_after_network",
         "delete_embedding": "guarded_mutation",
@@ -406,6 +416,8 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
 # expected occurrence count.  AST line numbers remain diagnostic-only, so
 # comments or unrelated statements cannot invalidate an audited boundary.
 NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
+    ("server.py", "aliases", "text.replace", "string_normalization"),
+    ("bucket_manager.py", "_trace_alias_value", "value.replace", "string_alias_replacement"),
     ("asset_dashboard.py", "resolve_image", "Image.open", "pillow_image_read"),
     ("asset_migration_state.py", "_now", "value.replace", "datetime_timezone"),
     ("asset_migration_state.py", "inspect_existing_migration_state", "now.replace", "datetime_timezone"),

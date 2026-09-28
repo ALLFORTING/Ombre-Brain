@@ -1662,6 +1662,13 @@
             ],
             "default": null
           },
+          "operation_id": {
+            "anyOf": [
+              {"type": "string", "minLength": 1, "maxLength": 128},
+              {"type": "null"}
+            ],
+            "default": null
+          },
           "trigger_date": {
             "default": "",
             "type": "string"

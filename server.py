@@ -110,6 +110,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from bucket_manager import (
     BucketManager,
+    BucketIdempotencyError,
     SupersessionError,
     automatic_todo_provenance,
     active_todo_projection,
@@ -463,6 +464,10 @@ async def _fire_webhook(event: str, payload: dict) -> None:
 # stdio mode ignores host (no network)
 def _todo_drop_argument_error(arguments: dict) -> str | None:
     """Check explicit drop arguments before SDK defaults are expanded."""
+    if arguments.get('operation_id') is not None and 'todo_drop' in arguments:
+        return 'unsupported_combination: operation_id supports ordinary single-bucket trace only.'
+    # Explicit None has exactly the legacy meaning, including raw presence checks.
+    arguments = {key: value for key, value in arguments.items() if key != 'operation_id'}
     if "todo_drop" not in arguments:
         return None
     if set(arguments) - {"bucket_id", "todo_drop", "confirm_token"}:
@@ -10236,6 +10241,121 @@ def _trace_todo_drop(bucket_id: str, todo_id: str, confirm_token: str) -> str:
             f"dropped_at={outcome['dropped_at']}; history preserved; bucket resolved unchanged.")
 
 
+async def _trace_keyed(operation_id, values):
+    """Normalize an ordinary trace and freeze its bucket-dependent choices once."""
+    try:
+        bucket_mgr.validate_trace_operation_id(operation_id)
+        if (values['delete'] or values['merge'] or values['todo_done'] is not None
+                or values['todo_drop'] is not None or values['superseded_by'] is not None
+                or values['pinned'] != -1 or values['permanent'] != -1 or values['sealed'] != -1
+                or values['confirm_token']):
+            return 'unsupported_combination: operation_id supports ordinary single-bucket trace only.'
+        targets = list(dict.fromkeys(_parse_csv_ids(values['bucket_id'])))
+        if len(targets) != 1:
+            return 'unsupported_combination: operation_id requires one bucket.'
+        if values['importance'] != -1 and not 1 <= values['importance'] <= 10:
+            return 'importance must be -1 or within 1-10.'
+        for field in ('valence', 'arousal'):
+            if values[field] != -1 and not 0 <= values[field] <= 1:
+                return f'{field} must be -1 or within 0.0-1.0.'
+        for field in ('resolved', 'digested', 'dormant'):
+            if values[field] not in (-1, 0, 1):
+                return f'{field} must be -1, 0, or 1.'
+        if values['todos'] is not None and values['todo_items'] is not None:
+            return 'todos 与 todo_items 不能同时使用。'
+        existing = bucket_mgr.inspect_trace_request(operation_id)
+        normalization = existing['normalization_context'] if existing else {
+            'version': 1, 'aliases': list(DISPLAY_ALIASES.items())}
+
+        def aliases(text):
+            for source, target in normalization['aliases']:
+                text = text.replace(source, target)
+            return text
+
+        payload = {key: values[key] for key in (
+            'valence', 'arousal', 'importance', 'resolved', 'digested', 'dormant', 'append')}
+        for field in ('valence', 'arousal'):
+            payload[field] = float(payload[field])
+        payload.update(kind='trace', bucket_id=targets[0],
+            name=aliases(values['name']), content=aliases(values['content']),
+            domain=[aliases(v) for v in _parse_csv_ids(values['domain'])],
+            tags=[aliases(v) for v in _parse_csv_ids(values['tags'])],
+            related=list(dict.fromkeys(_parse_csv_ids(values['related']))),
+            unrelate=list(dict.fromkeys(_parse_csv_ids(values['unrelate']))),
+            provenance_kind=_parse_explicit_provenance_kind(values['provenance_kind']))
+        if payload['related'] and payload['unrelate']:
+            return 'related 与 unrelate 不能同时使用。'
+        trigger = values['trigger_date']
+        payload['trigger_date'] = ('none' if trigger.strip().lower() == 'none' else
+                                   (_parse_optional_date(trigger, 'trigger_date') or ''))
+        payload['todos'] = ([aliases(v) for v in _canonical_todos(values['todos'])]
+                            if values['todos'] is not None else None)
+        payload['todo_items'] = None
+        if values['todo_items'] is not None:
+            texts, records = _structured_todo_items(values['todo_items'])
+            payload['todo_items'] = [{**record, 'text': aliases(text)} for text, record in zip(texts, records)]
+
+        def planner(bucket):
+            metadata = bucket['metadata']
+            if _is_sealed(bucket):
+                raise BucketIdempotencyError('unsupported_combination: sealed target')
+            if payload['content'] and metadata.get('protected'):
+                raise BucketIdempotencyError('content_protected')
+            updates = {}
+            for field in ('name', 'domain', 'tags'):
+                if payload[field]:
+                    updates[field] = payload[field]
+            for field in ('valence', 'arousal'):
+                if payload[field] != -1:
+                    updates[field] = payload[field]
+            protected = (payload['importance'] != -1 and (metadata.get('pinned') or metadata.get('protected')))
+            if payload['importance'] != -1 and not protected:
+                updates['importance'] = payload['importance']
+            if payload['todo_items'] is not None:
+                records = payload['todo_items']
+                updates.update(todos=[r['text'] for r in records], todo_provenance=records,
+                               _todo_references_only=True)
+            elif payload['todos'] is not None:
+                updates['todos'] = payload['todos']
+            for field in ('resolved', 'digested', 'dormant'):
+                if payload[field] != -1:
+                    updates[field] = bool(payload[field])
+            if payload['trigger_date']:
+                updates.update(trigger_date='' if payload['trigger_date'] == 'none' else payload['trigger_date'],
+                               trigger_last_seen='')
+            if payload['content']:
+                updates['content'] = (f"{bucket['content']}\n\n{payload['content']}"
+                    if payload['append'] and bucket['content'] else payload['content'])
+                updates['_history_change_type'] = 'append' if payload['append'] else 'replace'
+            if payload['provenance_kind'] is not None:
+                updates['provenance_kind'] = payload['provenance_kind']
+            if 'valence' in updates or 'arousal' in updates:
+                updates['emotion_history'] = _append_emotion_history(metadata,
+                    updates.get('valence', metadata.get('valence', .5)),
+                    updates.get('arousal', metadata.get('arousal', .3)))
+            changed = ', '.join(f'{k}={v}' for k, v in updates.items()
+                if k not in ('content', '_history_change_type', '_todo_references_only', 'provenance_kind'))
+            labels = [changed] if changed else []
+            if 'content' in updates:
+                labels.append('content=已追加' if payload['append'] else 'content=已替换')
+            if payload['provenance_kind'] is not None or 'content' in updates:
+                labels.append(f"provenance_kind={normalize_provenance_kind(metadata.get('provenance_kind'))}->"
+                              f"{payload['provenance_kind'] or 'unknown'}")
+            if 'resolved' in updates:
+                labels.append('→ 已沉底，只在关键词触发时重新浮现' if updates['resolved'] else '→ 已重新激活，将参与浮现排序')
+            if 'digested' in updates:
+                labels.append('→ 已隐藏，保留但不再浮现' if updates['digested'] else '→ 已取消隐藏，重新参与浮现')
+            if protected:
+                labels.append('importance 未修改：受到 pinned/protected protection，importance 锁定为 10')
+            response = (f"已修改记忆桶 {payload['bucket_id']}: {', '.join(labels)}"
+                        if labels or payload['related'] or payload['unrelate'] else '没有任何字段需要修改。')
+            return updates, response
+
+        return await bucket_mgr.execute_trace_request(operation_id, payload, normalization, planner)
+    except (BucketIdempotencyError, RelatedError, ValueError) as exc:
+        return str(exc)
+
+
 @_guard_todo_drop_presence
 @mcp.tool()
 async def trace(
@@ -10276,9 +10396,16 @@ async def trace(
     confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
     todo_done: Annotated[str | None, Field(description="Use only when Ting explicitly says the task is completed. Complete one stable todo ID using preview then confirm_token. Call alone with bucket_id; never resolves the bucket; dropped todos cannot be completed.")] = None,
     todo_drop: Annotated[str | None, Field(description="Use only when Ting explicitly cancels, abandons, or says the task will not be done; never infer abandonment from age, importance, or inactivity. Drop one stable todo ID using preview then confirm_token. Only bucket_id, todo_drop, confirm_token may be supplied. Preserves history, is not completion, never resolves the bucket; completed todos cannot be dropped.")] = None,
+    operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
+        description="Opaque caller retry identity for ordinary single-bucket trace. Preserved verbatim; reuse only with the same payload. None preserves legacy behavior.")] | None = None,
 ) -> str:
     # MCP schema note: related and superseded_by stay in the signature for relations.
     """Mixed memory operation: metadata/content, relations, merge, seal, delete, and confirmed todo completion/abandonment driven by Ting's explicit intent; no MCP undo command."""
+
+    if operation_id is not None:
+        return await _trace_keyed(operation_id, {
+            key: value for key, value in locals().items() if key != 'operation_id'
+        })
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"

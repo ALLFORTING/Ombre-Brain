@@ -267,6 +267,36 @@ class EmbeddingEngine:
                 (bucket_id, json.dumps(vector), model, created_at, input_digest),
             )
 
+    def trace_embedding_receipt(self, effect_key):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_s4_embedding_effects'").fetchone():
+                return None
+            row = conn.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',
+                               (effect_key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @guarded_mutation("trace_embedding_store")
+    def store_trace_embedding(self, effect_key, bucket_id, vector, input_digest, model, logical_time):
+        """Caller holds root mutex and has revalidated its epoch and current body."""
+        if not self._valid_archive_vector(vector):
+            raise ValueError('trace_embedding_invalid')
+        serialized = json.dumps(vector)
+        receipt = {'outcome': 'applied', 'bucket_id': bucket_id, 'input_digest': input_digest,
+                   'model': model, 'vector_digest': hashlib.sha256(serialized.encode()).hexdigest()}
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute('''CREATE TABLE IF NOT EXISTS ob_s4_embedding_effects (
+                effect_key TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)''')
+            row = conn.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',
+                               (effect_key,)).fetchone()
+            if row:
+                return json.loads(row[0])
+            conn.execute('''INSERT OR REPLACE INTO embeddings
+                (bucket_id,embedding,model,updated_at) VALUES(?,?,?,?)''',
+                (bucket_id, serialized, model, logical_time))
+            conn.execute('INSERT INTO ob_s4_embedding_effects VALUES(?,?)', (effect_key, json.dumps(receipt)))
+        return receipt
+
     @guarded_mutation("bucket_embedding_delete")
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted."""

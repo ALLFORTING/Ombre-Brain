@@ -149,6 +149,43 @@ def test_flag_and_shared_entrypoints(ob, monkeypatch, value, enabled):
 
 
 @pytest.mark.asyncio
+async def test_s4_keyed_trace_disconnect_resume_and_schema_validation(ob, monkeypatch):
+    from embedding_engine import EmbeddingEngine
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
+    left = await ob.bucket_mgr.create("original left")
+    right = await ob.bucket_mgr.create("original right")
+    engine = EmbeddingEngine({"buckets_dir": ob.config["buckets_dir"], "embedding": {"enabled": False}})
+    engine.enabled = True
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    async def provider(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+    engine._generate_embedding = provider
+    ob.bucket_mgr.embedding_engine = engine
+    payload = {"bucket_id": left, "content": "keyed fragment", "append": True,
+               "related": right, "operation_id": "http-retry"}
+    async with live(ob) as client:
+        await initialize(client)
+        for invalid in ("", "x" * 129, 123):
+            rejected = await call(client, "trace", {**payload, "operation_id": invalid})
+            assert result(rejected)["isError"]
+        assert (await ob.bucket_mgr.get(left))["content"] == "original left"
+        await disconnect_call(client, "trace", payload, started)
+        await wait(cancelled)
+        assert ob.bucket_mgr.inspect_trace_request("http-retry")["phase"] == "memory_applied"
+        engine._generate_embedding = AsyncMock(return_value=[.1, .2])
+        resumed = text(await call(client, "trace", payload))
+        assert text(await call(client, "trace", payload)) == resumed
+        assert (await ob.bucket_mgr.get(left))["content"].count("keyed fragment") == 1
+        assert right in (await ob.bucket_mgr.get(left))["metadata"]["related_buckets"]
+        assert left in (await ob.bucket_mgr.get(right))["metadata"]["related_buckets"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stateless", [False, True])
 async def test_protocol_and_diagnostic_privacy(ob, monkeypatch, caplog, stateless):
     monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
