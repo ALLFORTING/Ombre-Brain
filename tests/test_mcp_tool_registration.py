@@ -331,3 +331,36 @@ def test_flag_parsing_ignores_case_and_surrounding_whitespace(value):
 
 def test_diagnostic_inventory_matches_manifest_and_central_registration_list():
     assert server.DIAGNOSTIC_TOOL_NAMES == DIAGNOSTIC_TOOLS
+
+
+def test_w16_tool_descriptions_and_unchanged_public_parameters(tmp_path):
+    tools = {tool["name"]: tool for tool in _registered_surface(tmp_path)["tools"]}
+    breath = tools["breath"]
+    properties = breath["input_schema"]["properties"]
+    expected = {
+        "query": ("Directed", "Empty query", "as_of requires query"),
+        "max_results": ("1-50", "dynamic candidates", "pinned/protected", "additional", "Remaining"),
+        "max_tokens": ("20000", "token budget", "Mailbox"),
+        "resonance": ("valence,arousal", "0-1", "reorders matches", "without query", "session/feel/as_of/mailbox"),
+        "cursor": ("without tags_filter", "historical query", "remaining is nonzero"),
+        "date_from": ("Inclusive YYYY-MM-DD", "last_active/created", "as_of/mailbox"),
+        "date_to": ("Inclusive YYYY-MM-DD", "date_from", "as_of/mailbox"),
+    }
+    for name, phrases in expected.items():
+        for phrase in phrases:
+            assert phrase in properties[name]["description"]
+    assert "Related buckets are result annotations" in breath["description"]
+    assert "lazy runtime initialization can still write storage" in breath["description"]
+    assert "touch=False keeps maintenance retrieval read-only" not in breath["description"]
+    confirmation = tools["trace"]["input_schema"]["properties"]["confirm_token"]["description"]
+    for phrase in ("delete (including batch)", "merge", "already pinned", "permanent-to-dynamic",
+                   "todo_done", "todo_drop", "preview", "short-lived", "one-shot", "same operation and plan"):
+        assert phrase in confirmation
+    boot = tools["boot"]["description"]
+    for phrase in ("Stateful", "background decay", "profile delta checkpoint", "trigger_last_seen",
+                   "boot_delivered_at", "pending notes may be skipped", "without marking seen", "Repeated boot"):
+        assert phrase in boot
+    assert "preview" not in tools["boot"]["input_schema"]["properties"]
+    assert "touch" not in tools["dream"]["input_schema"]["properties"]
+    for name in ("boot", "dream", "breath", "trace", "todos"):
+        assert _normalize_schema(tools[name]["input_schema"]) == _normalize_schema(TOOL_SCHEMA_CONTRACTS[name])

@@ -1845,6 +1845,11 @@ def _structured_metadata_values(metadata: dict, field: str) -> list[str]:
     return [item for item in raw if isinstance(item, str)]
 
 
+def _is_test_bucket(bucket: dict) -> bool:
+    """Use the existing exact tag identity only at delivery entry points."""
+    return "test" in _structured_metadata_values(bucket.get("metadata", {}), "tags")
+
+
 def _matches_any_structured_filter(
     bucket: dict,
     field: str,
@@ -2966,8 +2971,13 @@ def _extract_session_summary(content: str, max_chars: int | None = 700) -> str:
     return text[:max_chars].strip() if max_chars is not None else text
 
 
-def _format_mailbox(limit: int = 1, include_sealed: bool = False) -> str:
-    letters = bucket_mgr.get_letters(limit, include_sealed=include_sealed)
+def _format_mailbox(
+    limit: int = 1, include_sealed: bool = False, *, exclude_session_ids: set[str] | None = None,
+) -> str:
+    letters = bucket_mgr.get_letters(
+        limit, include_sealed=include_sealed,
+        **({"exclude_session_ids": exclude_session_ids} if exclude_session_ids else {}),
+    )
     if not letters:
         return "=== 信箱 ===\n（暂无信件）"
     parts = ["=== 信箱 ==="]
@@ -3148,6 +3158,7 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
         bucket for bucket in active_buckets
         if bucket.get("metadata", {}).get("type") == "feel"
         and not _is_sealed(bucket)
+        and not _is_test_bucket(bucket)
     ]
     if not feels:
         return "=== boot: 回声 ===\n（暂无可见 feel）"
@@ -9497,21 +9508,21 @@ async def related_backfill(
 
 @mcp.tool()
 async def breath(
-    query: str = "",
-    max_tokens: int = 10000,
+    query: Annotated[str, Field(description="Directed keyword/semantic retrieval in ordinary mode; session/feel use substring matching and recency order. Empty query uses the selected mailbox/session/feel, resonance, tags or importance listing, otherwise default emergence. as_of requires query.")] = "",
+    max_tokens: Annotated[int, Field(description="Approximate output token budget, capped at 20000; metadata and attachments share this budget. Budget limits can emit fewer than max_results. Mailbox rejects a non-default value.")] = 10000,
     domain: Annotated[str, Field(description="Comma-separated normal domains are exact metadata filters (OR), never a fallback to all buckets. Pure session/feel selects that mode; reserved and normal domains cannot be mixed.")] = "",
     valence: Annotated[float, Field(description="-1 disables this coordinate. With arousal, 0.0-1.0 participates in existing query emotion ranking. Valence alone is summary presentation only for ordinary query or tags-only; unsupported in full/session/feel. Historical query requires both coordinates.")] = -1,
     arousal: Annotated[float, Field(description="-1 disables this coordinate. A 0.0-1.0 value requires valence and participates only in ordinary/historical query emotion ranking; it is not a metadata filter.")] = -1,
-    max_results: int = 5,
+    max_results: Annotated[int, Field(description="Result limit clamped to 1-50. In default emergence this limits dynamic candidates; pinned/protected items are additional and share the token budget. Query and fixed listings count pinned/protected within the limit. Remaining counts do not guarantee pagination; only supported query routes return a cursor.")] = 5,
     importance_min: Annotated[int, Field(description="-1 disables the stored bucket importance filter; 1-10 intersects with the selected bucket candidates. Only without another selector, retain importance-descending listing. Unsupported with as_of/mailbox.")] = -1,
     mode: Annotated[str, Field(description="summary/full control ordinary query and default emergence (full retains legacy dehydration). Session full requires query; feel full requires query plus tags_filter. Fixed listings/mailbox reject full. as_of always renders historical body for either mode, and cursors bind the requested mode.")] = "summary",
     recent_days: Annotated[int, Field(description="-1 disables recency; 0 means the service-local current calendar day; positive N retains the inclusive date cutoff today minus N. Values below -1 are invalid. Query cursors freeze the first-page window; pinned/protected emergence retains its exception. Unsupported with as_of/mailbox.")] = -1,
     emotion_trend: bool = False,
     include_dormant: Annotated[bool, Field(description="Include dormant ordinary/historical candidates. Session/feel retain their existing eligibility and reject True; pinned/protected emergence retains its eligibility exception.")] = False,
     include_sealed: bool = False,
-    date_from: str = "",
-    date_to: str = "",
-    resonance: str = "",
+    date_from: Annotated[str, Field(description="Inclusive YYYY-MM-DD lower bound on the bucket updated_at date, falling back to last_active/created. Empty disables it; must not exceed date_to. Unsupported with as_of/mailbox.")] = "",
+    date_to: Annotated[str, Field(description="Inclusive YYYY-MM-DD upper bound using the same bucket date as date_from. Empty disables it. Unsupported with as_of/mailbox.")] = "",
+    resonance: Annotated[str, Field(description="Optional valence,arousal pair, each 0-1, for emotional-distance ordering. With ordinary query it reorders matches; without query it selects a distance-ordered listing. Compatible metadata filters still intersect. Unsupported for session/feel/as_of/mailbox; it is not a related-bucket selector.")] = "",
     mailbox: Annotated[bool, Field(description="Independent letter selector. Only mailbox_limit and include_sealed may vary; non-default bucket retrieval arguments are rejected.")] = False,
     mailbox_limit: Annotated[int, Field(description="Mailbox letter limit, clamped to 1-50. Outside mailbox only the default 1 is accepted.")] = 1,
     feels: Annotated[bool, Field(description="Explicit feel selector; compatible only with empty or pure feel domain. Conflicts with topic_filter, mailbox, as_of and resonance.")] = False,
@@ -9562,13 +9573,19 @@ async def breath(
         str,
         Field(
             description=(
-                "Process-local opaque cursor for untagged ordinary query or historical query. "
+                "Process-local opaque cursor only for ordinary query without tags_filter or historical query. Other selectors do not support pagination, even when remaining is nonzero. "
                 "Reuse the same selector, query, filters, mode, touch and wake_dormant; recency stays frozen. max_results/max_tokens may change."
             )
         ),
     ] = "",
 ) -> str:
-    """Retrieval-oriented memory search; touch=False keeps maintenance retrieval read-only."""
+    """Retrieve directed memories with query, or use the selected listing/default emergence.
+
+    Related buckets are result annotations, not a search parameter. Remaining
+    reports undisplayed results; pagination exists only when a query cursor is
+    returned. touch=False skips activation updates, waking, decay startup and
+    dehydration cache writes; lazy runtime initialization can still write storage.
+    """
     arguments = locals().copy()
     try:
         request = _prepare_breath_request(**arguments)
@@ -10256,7 +10273,7 @@ async def trace(
     append: bool = False,
     trigger_date: str = "",
     delete: bool = False,
-    confirm_token: str = "",
+    confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
     todo_done: Annotated[str | None, Field(description="Use only when Ting explicitly says the task is completed. Complete one stable todo ID using preview then confirm_token. Call alone with bucket_id; never resolves the bucket; dropped todos cannot be completed.")] = None,
     todo_drop: Annotated[str | None, Field(description="Use only when Ting explicitly cancels, abandons, or says the task will not be done; never infer abandonment from age, importance, or inactivity. Drop one stable todo ID using preview then confirm_token. Only bucket_id, todo_drop, confirm_token may be supplied. Preserves history, is not completion, never resolves the bucket; completed todos cannot be dropped.")] = None,
 ) -> str:
@@ -10744,7 +10761,7 @@ async def todos(
         ),
     ] = False,
 ) -> str:
-    """Return unresolved todos; provenance output is an explicit opt-in."""
+    """Return unresolved todos excluding exact test-tagged buckets; provenance is opt-in."""
     await decay_engine.ensure_started()
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=True)
@@ -10761,7 +10778,7 @@ async def todos(
     }
     for bucket in all_buckets:
         meta = bucket.get("metadata", {})
-        if _is_sealed(bucket):
+        if _is_sealed(bucket) or _is_test_bucket(bucket):
             continue
         if meta.get("resolved", False):
             continue
@@ -10823,7 +10840,16 @@ async def boot(
     max_tokens: Annotated[int, Field(ge=1000, le=16000)] = 16000,
     profile: Annotated[Literal["talk", "code", "tg"], Field(description="Boot context profile: talk, code, or tg.")] = "talk",
 ) -> str:
-    """Recommended startup context for the selected talk, code, or TG profile."""
+    """Stateful startup context for the selected talk, code, or TG profile.
+
+    Starts background decay. Advances the selected profile delta checkpoint only
+    over the safe consumed range of the fully emitted delta. Fully emitted
+    triggers update shared trigger_last_seen. Fully delivered latest eligible
+    notes receive boot_delivered_at; older eligible pending notes may be skipped.
+    Mailbox/letters are read without marking seen. Repeated boot calls can change
+    later delta, note and same-day trigger output. Exact test-tagged buckets and
+    their associated letters are excluded from this delivery output.
+    """
     if not isinstance(profile, str) or profile not in BOOT_PROFILE_NAMES:
         return "profile 必须是 talk、code 或 tg。"
     await decay_engine.ensure_started()
@@ -10843,6 +10869,12 @@ async def boot(
     except Exception as exc:
         logger.error("Boot failed to list buckets: %s", exc)
         return _with_response_seal("boot 暂时无法读取记忆库。")
+
+    test_bucket_ids = {
+        str(bucket["id"]) for bucket in archive_buckets if _is_test_bucket(bucket)
+    }
+    active_buckets = [bucket for bucket in active_buckets if not _is_test_bucket(bucket)]
+    archive_buckets = [bucket for bucket in archive_buckets if not _is_test_bucket(bucket)]
 
     try:
         todo_display = todo_page(active_display_candidates(archive_buckets), profile, shanghai_date())
@@ -10911,7 +10943,7 @@ async def boot(
         "\n---\n".join(pinned_lines) if pinned_lines else "（暂无可见钉选桶）"
     )
 
-    mailbox_text = _format_mailbox(1).replace("=== 信箱 ===", "=== boot: 最新信箱 ===", 1)
+    mailbox_text = _format_mailbox(1, exclude_session_ids=test_bucket_ids).replace("=== 信箱 ===", "=== boot: 最新信箱 ===", 1)
     echo_text = _format_feel_echo(active_buckets)
 
     sessions = [

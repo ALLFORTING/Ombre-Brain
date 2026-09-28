@@ -1510,8 +1510,11 @@ class BucketManager:
             (content, created_at, session_id, 1 if sealed else 0),
         ).lastrowid
 
-    def get_letters(self, limit: int = 1, include_sealed: bool = False) -> list[dict]:
-        """Return latest handoff letters, newest first."""
+    def get_letters(
+        self, limit: int = 1, include_sealed: bool = False, *,
+        exclude_session_ids: set[str] | None = None,
+    ) -> list[dict]:
+        """Return latest handoff letters; internal delivery exclusions precede limit."""
         limit = max(1, min(int(limit or 1), 50))
         where = "" if include_sealed else "WHERE sealed = 0"
         with sqlite3.connect(self.history_db_path) as conn:
@@ -1522,11 +1525,18 @@ class BucketManager:
                 FROM letters
                 {where}
                 ORDER BY id DESC
-                LIMIT ?
+                {"" if exclude_session_ids else "LIMIT ?"}
                 """,
-                (limit,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+                () if exclude_session_ids else (limit,),
+            )
+            letters = []
+            for row in rows:
+                if exclude_session_ids and row["session_id"] in exclude_session_ids:
+                    continue
+                letters.append(dict(row))
+                if len(letters) == limit:
+                    break
+        return letters
 
     def get_letter(self, letter_id: int, include_sealed: bool = False) -> Optional[dict]:
         """Return one handoff letter by exact id, respecting sealed visibility."""

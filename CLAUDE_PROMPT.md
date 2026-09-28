@@ -21,7 +21,7 @@
 
 | 能力 | 推荐用法 |
 |------|-----------|
-| `boot` | 推荐的一次性启动上下文；读取 trigger 时可能更新 bounded trigger-observation metadata |
+| `boot` | 推荐的有状态启动上下文；启动 decay，推进所选 profile checkpoint，完整递送后记录 trigger/note 状态；重复调用可能改变后续输出 |
 | `breath` | 浮现或定向检索记忆；retrieval-oriented，命中/排序可能更新 activation metadata。`mailbox=True` 只适合读取最近 N 封信 |
 | `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认不返回 sealed letter，只有明确需要时才传 `include_sealed=True` |
 | `leave_note` | 逐字创建一封可选的婷留言；它不是 bucket，不进入记忆检索、embedding、digest 或 decay |
@@ -57,12 +57,19 @@
 - `include_archive` 和 `include_sealed` 仍分别控制归档桶和 sealed 桶可见性；分页不会改变 pinned/protected/dormant/sealed 的原有语义。
 - 维护、验收或探针列表使用 `pulse(..., touch=False)`；它不启动衰减引擎，也不标记 dormant。
 
+boot 默认排除完整 `test` tag 的桶、todo、feel 回声，以及关联 test session 的 letter；专用 todos 同样排除 test 桶。标签按现有完整精确匹配读取，支持 list/逗号字符串，不按桶名或正文推断。dream、breath、pulse、history 保留原可见范围。
+
+boot 的完整 trigger 更新共享 `trigger_last_seen`；完整最新 eligible note 写 `boot_delivered_at`，更早 eligible pending notes 可能被标记 skipped。mailbox/letter 不因 boot 写 seen。
+
+`breath.max_results` 钳制为 1–50；默认浮现的 pinned/protected 另计且共享 token 预算。`remaining` 是未显示计数；cursor 仅支持无 tags_filter 的 ordinary query 或 historical query。resonance 仅用于 ordinary query 重排或无 query 情绪距离列表，不能用于 session/feel/as_of/mailbox；related 不是 breath 输入参数。
+
 ## `trace` 的安全语义
 
 - `resolved=1` 表示这件事已经处理/可以沉底：降低后续浮现优先级；`resolved=0` 重新激活。它不是 dormant，也不是删除。
 - `dormant=1` 表示自动或手动沉底的休眠状态，主要影响列表/浮现；`trace` 修改不会自动唤醒它；要唤醒请显式传 `dormant=0`。它不是“已解决”。
 - `merge` 会把源桶并入目标桶，并移除源桶；这是高影响维护动作。
 - `merge` 会重连所有指向源桶的 `superseded_by` 并清理旧 reverse IDs；merge 不会唤醒原本 dormant 的目标桶。
+- confirm_token 也用于 merge、取消已有 pinned、permanent→dynamic、todo_done、todo_drop。先无 token 预览，再回传与同一操作/计划绑定的短时一次性 token；不能跨操作复用或越过保护检查。
 - `delete=True` 若发现其他桶的 `superseded_by` 指向待删桶会优先拒绝；先用 `trace(superseded_by="")` 撤销或改指向。其他 delete 一律先返回目标摘要和短时一次性 `confirm_token`，只有带同一 token 的第二次调用才执行。
 - `append=False` 时正文替换，`append=True` 时追加。
 - 归档后的 session bucket 仍可通过 `trace` 修改：未 sealed 时可以修改或追加正文；sealed 时正文修改受保护。
