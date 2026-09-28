@@ -516,6 +516,8 @@ boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未
 
 `pulse(show_all=False)` 先组合 pinned/protected 与非 dormant 的 dynamic 桶 Top15（缺失 `type` 按 dynamic），再对最终列表应用 `limit`/`offset`。默认模式两组各按 `(score, updated_at)` 降序排列：高分优先，同分时较新的日期优先；日期缺失时沿用 `last_active`、`created` 回退。末尾的 `固化 N / feel M 个未列入当前输出` 统计当前可见范围内、实际未显示在本次输出中的桶，已显示的 pinned/protected 桶不重复计入。默认模式 `还有更多:是` 表示当前可见范围仍有未显示桶，使用 `show_all=True` 查看完整范围；不能仅靠增加默认模式的 `offset` 枚举 Top15 以外的桶。`pulse(show_all=True, limit=50, offset=0)` 保持原有排序并返回 bounded page，可按 `还有更多` 继续翻页。`limit` 最大 50，`offset` 从 0 开始。superseded 桶的列表行以 `⊘` 前缀标记；`include_archive`、`include_sealed` 和 pinned/protected/dormant 语义不变。维护、验收或探针列表使用 `touch=False`，它不启动衰减引擎，也不标记 dormant。
 
+`pulse` 顶部的 permanent/dynamic/archive 数量与 `/health`、`/api/status` 的对应值来自目录中的原始 `.md` 文件计数，可能包含 sealed、dormant、superseded 或不可读文件；它们不是下方 parsed/visible 列表的分母。`pulse(health=True, touch=False)` 的 maintenance health 则对当前 `include_archive` 范围内、成功解析且未 sealed 的完整集合计数，不受列表 `limit`/`offset` 影响；supersession problems 是至少命中一个问题的不同桶数，各内部类别可能重叠。该报告继续只返回计数，不返回 sealed、不可读或 orphan ID。
+
 #### `archive_session`
 
 `archive_session(summary, highlights="", mood="", valence=-1, arousal=-1, letter="", sealed=False, topics=None, operation_id=None)` 会创建 `session_YYYY-MM-DD_序号` 归档桶，`domain=["session"]`。传入 `letter` 时，会额外写入独立信箱表 `letters`，下一次 `boot()` 自动带出最新一封。`topics` 是可选的结构化主题标签列表；有帮助时可提供大约 3–8 个适度范围的标签。
@@ -534,7 +536,9 @@ The only required argument remains `summary`. Generate the optional case-sensiti
 
 #### `digest` 与 `related_backfill`
 
-- `digest(dry_run=True, max_groups=10)` 默认只预览，不改数据。消化与 importance rebalance 分别提供一次性、5 分钟有效的 `confirm_token` / `rebalance_confirm_token`；一次确认只执行对应计划。`limit` 只限制 rebalance 预览显示，确认仍执行提示的全部候选；`type=permanent` 不参与自动 rebalance。执行失败会返回 `operation_id` 与 `resume_confirm_token`，步骤状态存于 digest 专用记录，重试识别已写入的桶和元数据标记。进程重启后可再次 dry-run 取得续做 token。消化调用需要 `OMBRE_DIGEST_API_KEY`；仅 rebalance 不需要 provider。 / The two mutation plans have separate one-shot, five-minute tokens. `limit` caps displayed rebalance rows, not execution. A failed operation returns a resumable operation ID; a new dry-run after restart issues a fresh resume token.
+- `digest(dry_run=True, max_groups=10)` 默认只预览，不改数据。`max_groups` 只限制 maintenance consolidation 本轮选择的主题组，不限制 importance rebalance；输出分别报告主题组总数、选中数和省略数，既有 `max_groups <= 0` 的有效下限 1 语义保持不变。候选桶保持低 importance 优先，并依次用最老的可解析 activity/created 时间、`bucket_id` 打破平局；主题组按最小 importance、最老成员时间、domain 排序。每个选中组最多计划 20 个源桶，确认 payload、provider 输入、digest `source_bucket` 与最终 `digested` 标记严格使用同一集合；余项保持未消化，可在后续运行继续选择。消化与 importance rebalance 分别提供一次性、5 分钟有效的 `confirm_token` / `rebalance_confirm_token`；一次确认只执行对应计划。`limit` 只限制 rebalance 预览显示，确认仍执行提示的全部候选；`type=permanent` 不参与自动 rebalance。执行失败会返回 `operation_id` 与 `resume_confirm_token`，步骤状态存于 digest 专用记录，重试识别已写入的桶和元数据标记。进程重启后可再次 dry-run 取得续做 token。消化调用需要 `OMBRE_DIGEST_API_KEY`；仅 rebalance 不需要 provider。 / `max_groups` applies only to maintenance consolidation. Each selected group plans at most 20 identical sources across confirmation, provider input, linkage, and marking; deferred sources remain eligible. The two mutation plans have separate one-shot, five-minute tokens. `limit` caps displayed rebalance rows, not execution. A failed operation returns a resumable operation ID; a new dry-run after restart issues a fresh resume token.
+
+- `digest(mode="dedupe")` 的 `M` 是所选目录中的原始 `.md` 文件数，`N` 是关联到范围内未 sealed 桶、且当前模型 JSON 为有限非空一维向量的可用行数；`K=M-N` 只是两个不同口径的算术差，不表示“缺失 embedding”。archive 是否纳入由 `include_archive` 决定；sealed、无效、元数据不可读与 orphan 行分别计数，orphan 只报数量而不输出 ID。
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
 
 #### `hold` similarity and conflict warnings
@@ -781,6 +785,8 @@ Supports any OpenAI-compatible API. Just change `base_url` and `model` in `confi
 > python backfill_embeddings.py --batch-size 20
 > ```
 > Docker 用户：`docker exec -e OMBRE_BUCKETS_DIR=/data ombre-brain python3 backfill_embeddings.py --batch-size 20`
+>
+> Backfill 的 `total_buckets` 是含 archive 的成功解析桶数；eligible 只含未 sealed 且正文非空的桶。为兼容保留的 `empty_skipped` 同时聚合 sealed 与空正文桶，名称不能解释为仅“空桶”。`indexed_total`/`remaining` 使用当前模型行能否解析为 JSON 的既有判定，不等同于 `digest(mode="dedupe")` 的严格可用向量数。
 >
 > **Embedding support**: Built-in dual-channel search: keyword + vector semantic. Embeddings are auto-generated on each `hold`/`grow` and stored in `embeddings.db` (SQLite). Recommended: **Google AI Studio `gemini-embedding-001`** (free, 1500 req/day, 3072-dim). Configure in `config.yaml` under `embedding`. Without it, falls back to fuzzy matching. For existing buckets, run `backfill_embeddings.py`.
 

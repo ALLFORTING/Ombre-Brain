@@ -94,6 +94,7 @@ _BREATH_CURSOR_MAX_STATES = 256
 _BREATH_CURSOR_STATES: dict[str, dict] = {}
 _MUTATION_CONFIRM_TTL_SECONDS = 5 * 60
 _MUTATION_CONFIRM_MAX_TOKENS = 256
+_DIGEST_SOURCE_LIMIT_PER_GROUP = 20
 _mutation_confirm_tokens: dict[str, dict] = {}
 _mutation_confirm_lock = threading.Lock()
 _merge_running_operations: set[str] = set()
@@ -3638,7 +3639,7 @@ async def _digest_candidates() -> list[dict]:
         if _days_since(meta.get("last_active") or meta.get("created")) < cutoff_days:
             continue
         candidates.append(bucket)
-    candidates.sort(key=lambda b: int(b.get("metadata", {}).get("importance", 0) or 0))
+    candidates.sort(key=_digest_bucket_order_key)
     return candidates
 
 
@@ -3682,6 +3683,53 @@ def _digest_bucket_state(bucket: dict) -> dict:
     }
 
 
+def _digest_timestamp_sort_key(bucket: dict) -> tuple[int, tuple[int, ...]]:
+    """Sort parseable activity/creation timestamps oldest-first, then missing values."""
+    metadata = bucket.get("metadata", {})
+    for field in ("last_active", "created", "created_at"):
+        value = metadata.get(field)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc)
+        return 0, (
+            parsed.year,
+            parsed.month,
+            parsed.day,
+            parsed.hour,
+            parsed.minute,
+            parsed.second,
+            parsed.microsecond,
+        )
+    return 1, ()
+
+
+def _digest_bucket_order_key(
+    bucket: dict,
+) -> tuple[int, tuple[int, tuple[int, ...]], str]:
+    metadata = bucket.get("metadata", {})
+    return (
+        int(metadata.get("importance", 0) or 0),
+        _digest_timestamp_sort_key(bucket),
+        str(bucket.get("id", "")),
+    )
+
+
+def _digest_group_order_key(
+    item: tuple[str, list[dict]],
+) -> tuple[int, tuple[int, tuple[int, ...]], str]:
+    domain, buckets = item
+    return (
+        min(int(bucket.get("metadata", {}).get("importance", 0) or 0) for bucket in buckets),
+        min(_digest_timestamp_sort_key(bucket) for bucket in buckets),
+        str(domain),
+    )
+
+
 def _digest_confirmation_payload(selected: list[tuple[str, list[dict]]], rebalance_candidates: list[dict]) -> dict:
     """Retain the prior plan shape while issuing a token for each kind separately."""
     return {
@@ -3699,6 +3747,8 @@ def _group_digest_candidates(candidates: list[dict]) -> dict[str, list[dict]]:
         domains = bucket.get("metadata", {}).get("domain", []) or ["未分类"]
         domain = str(domains[0] if isinstance(domains, list) and domains else domains)
         groups.setdefault(domain, []).append(bucket)
+    for buckets in groups.values():
+        buckets.sort(key=_digest_bucket_order_key)
     return groups
 
 
@@ -3707,7 +3757,7 @@ async def _call_digest_api(domain: str, buckets: list[dict]) -> str:
     if not api_key:
         raise RuntimeError("OMBRE_DIGEST_API_KEY is not configured")
     excerpts = []
-    for bucket in buckets[:20]:
+    for bucket in buckets[:_DIGEST_SOURCE_LIMIT_PER_GROUP]:
         meta = bucket.get("metadata", {})
         excerpts.append(
             f"[{bucket['id']}] {meta.get('name', bucket['id'])} "
@@ -3769,8 +3819,14 @@ def _digest_planned_steps(kind: str, plan: dict) -> list[str]:
         return [f"rebalance:{state['bucket_id']}" for state in plan["importance_rebalance"]]
     steps = []
     for index, group in enumerate(plan["groups"]):
-        steps.extend([f"g{index}:create", f"g{index}:link"])
-        steps.extend(f"g{index}:source:{state['bucket_id']}" for state in group["sources"])
+        states = group["sources"][:_DIGEST_SOURCE_LIMIT_PER_GROUP]
+        link_step = (
+            f"g{index}:link:w14-limit{_DIGEST_SOURCE_LIMIT_PER_GROUP}"
+            if len(group["sources"]) > _DIGEST_SOURCE_LIMIT_PER_GROUP
+            else f"g{index}:link"
+        )
+        steps.extend([f"g{index}:create", link_step])
+        steps.extend(f"g{index}:source:{state['bucket_id']}" for state in states)
     return [*steps, "log:create"]
 
 
@@ -3848,7 +3904,30 @@ async def _execute_digest_operation(operation: dict) -> str:
             digested_total = 0
             log_entries = []
             for index, group in enumerate(plan["groups"]):
-                domain, states = group["domain"], group["sources"]
+                domain = group["domain"]
+                all_states = group["sources"]
+                states = all_states[:_DIGEST_SOURCE_LIMIT_PER_GROUP]
+                legacy_omitted = all_states[_DIGEST_SOURCE_LIMIT_PER_GROUP:]
+                if legacy_omitted:
+                    unsafe_steps = [
+                        f"g{index}:source:{state['bucket_id']}"
+                        for state in legacy_omitted
+                    ]
+                    for unsafe_step in unsafe_steps:
+                        marker = bucket_mgr.inspect_import_operation(
+                            _digest_step_key(operation_id, unsafe_step)
+                        )
+                        if unsafe_step in operation["completed"] or (marker and marker["marker"]):
+                            raise RuntimeError(
+                                "legacy digest plan already marked a source beyond the safe per-group limit"
+                            )
+                    logger.warning(
+                        "Digest operation %s group %s has %s legacy sources; limiting execution to %s",
+                        operation_id,
+                        index,
+                        len(all_states),
+                        _DIGEST_SOURCE_LIMIT_PER_GROUP,
+                    )
                 source_ids = [state["bucket_id"] for state in states]
                 digest_step = f"g{index}:create"
                 buckets = [await _digest_require_source(state, f"g{index}:source:{state['bucket_id']}", operation)
@@ -3868,7 +3947,12 @@ async def _execute_digest_operation(operation: dict) -> str:
                     "arousal": 0.3, "provenance_kind": "summary",
                     "name": f"digest_{domain}_{plan['date']}",
                 })
-                await _digest_apply_step(operation, f"g{index}:link", "update",
+                link_step = (
+                    f"g{index}:link:w14-limit{_DIGEST_SOURCE_LIMIT_PER_GROUP}"
+                    if legacy_omitted
+                    else f"g{index}:link"
+                )
+                await _digest_apply_step(operation, link_step, "update",
                                          {"kwargs": {"source_bucket": ",".join(source_ids)}}, digest_id)
                 for state in states:
                     source_id = state["bucket_id"]
@@ -3938,10 +4022,29 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
     candidates = await _digest_candidates()
     rebalance_candidates = await _importance_rebalance_candidates()
     groups = _group_digest_candidates(candidates)
-    selected = list(groups.items())[:max(1, max_groups)]
-    lines = ["=== 自动消化 dry-run ===", f"候选桶数: {len(candidates)}", f"主题组数: {len(groups)}"]
-    for domain, buckets in selected:
-        lines.append(f"- {domain}: {len(buckets)} 个桶 -> {', '.join(bucket['id'] for bucket in buckets)}")
+    effective_group_limit = max(1, max_groups)
+    ordered_groups = sorted(groups.items(), key=_digest_group_order_key)
+    selected_groups = ordered_groups[:effective_group_limit]
+    selected = [
+        (domain, buckets[:_DIGEST_SOURCE_LIMIT_PER_GROUP])
+        for domain, buckets in selected_groups
+    ]
+    omitted_groups = len(ordered_groups) - len(selected_groups)
+    lines = [
+        "=== 自动消化 dry-run ===",
+        f"候选桶数（全部 maintenance consolidation 候选）: {len(candidates)}",
+        (
+            f"主题组: 总数 {len(ordered_groups)} / 选中 {len(selected_groups)} / "
+            f"因 max_groups={max_groups} 省略 {omitted_groups}"
+            f"（legacy 有效下限 1；仅限制 consolidation，不影响 importance rebalance）"
+        ),
+    ]
+    for (domain, all_group_buckets), (_, planned_buckets) in zip(selected_groups, selected):
+        deferred = len(all_group_buckets) - len(planned_buckets)
+        lines.append(
+            f"- {domain}: 候选 {len(all_group_buckets)} / 本次计划 {len(planned_buckets)} / "
+            f"留待后续 {deferred} -> {', '.join(bucket['id'] for bucket in planned_buckets)}"
+        )
     if rebalance_candidates:
         lines.append("=== importance rebalance dry-run ===")
         total = len(rebalance_candidates)
@@ -9359,7 +9462,7 @@ async def digest(
     include_archive: bool = False,
     limit: int = 30,
 ) -> str:
-    """Preview separate consolidation/rebalance plans; confirm one with a short-lived token. limit controls preview rows only."""
+    """Preview separate consolidation/rebalance plans; max_groups limits consolidation only, while limit controls rebalance preview rows only."""
     normalized_mode = (mode or "maintenance").strip().lower()
     if normalized_mode == "dedupe":
         try:
@@ -11131,6 +11234,7 @@ def _maintenance_health_report(
     all_buckets: list[dict],
     *,
     todo_stale_days: int,
+    include_archive: bool,
 ) -> str:
     """Format count-only, read-only maintenance health for ordinary access."""
     unnamed = 0
@@ -11167,6 +11271,15 @@ def _maintenance_health_report(
     return "\n".join(
         [
             "=== maintenance health ===",
+            (
+                f"scope: {len(visible_buckets)} parsed, unsealed buckets; "
+                f"archive {'included' if include_archive else 'excluded'}; "
+                "independent of list limit/offset"
+            ),
+            (
+                "denominators: bucket counts use this scope; supersession problems count "
+                "distinct in-scope buckets and may overlap category findings"
+            ),
             f"unnamed buckets: {unnamed}",
             f"untagged buckets: {untagged}",
             f"stale todo buckets (>{todo_stale_days}d): {stale_todos}",
@@ -11244,6 +11357,7 @@ async def pulse(
 
     status = (
         f"=== Ombre Brain 记忆系统 ===\n"
+        f"目录原始 .md 文件计数（可含 sealed/dormant/superseded/不可读文件，不等于可见桶数）\n"
         f"固化记忆桶: {stats['permanent_count']} 个\n"
         f"动态记忆桶: {stats['dynamic_count']} 个\n"
         f"归档记忆桶: {stats['archive_count']} 个\n"
@@ -11275,6 +11389,7 @@ async def pulse(
                 listable_buckets,
                 all_health_buckets,
                 todo_stale_days=todo_stale_days,
+                include_archive=include_archive,
             )
 
     if not buckets:

@@ -156,6 +156,9 @@ async def test_health_is_read_only_and_count_only(tmp_path, monkeypatch):
     server.decay_engine.ensure_started.assert_not_awaited()
     server.dehydrator.dehydrate.assert_not_awaited()
     server.embedding_engine._generate_embedding.assert_not_awaited()
+    assert "目录原始 .md 文件计数（可含 sealed/dormant/superseded/不可读文件，不等于可见桶数）" in result
+    assert "scope: 1 parsed, unsealed buckets; archive excluded; independent of list limit/offset" in section
+    assert "supersession problems count distinct in-scope buckets" in section
     assert "READ_ONLY_NAME" not in section
     assert bucket_id not in section
 

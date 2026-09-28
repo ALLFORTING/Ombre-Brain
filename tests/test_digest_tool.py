@@ -98,6 +98,151 @@ async def test_digest_live_creates_digest_and_marks_sources(tmp_path, monkeypatc
     assert log_buckets[0]["metadata"]["provenance_kind"] == "system"
 
 
+@pytest.mark.asyncio
+async def test_digest_over_20_uses_one_identical_planned_source_set(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    source_ids = []
+    for index in range(22):
+        source_id = await server.bucket_mgr.create(
+            content=f"old source {index}",
+            importance=2,
+            domain=["large-group"],
+        )
+        _age_bucket(server, source_id, days=40 + index)
+        source_ids.append(source_id)
+    expected = list(reversed(source_ids[2:]))
+    deferred = source_ids[:2]
+    provider_sources = []
+
+    async def capture_provider(domain, buckets):
+        assert domain == "large-group"
+        provider_sources.extend(bucket["id"] for bucket in buckets)
+        return "bounded digest"
+
+    server._call_digest_api = AsyncMock(side_effect=capture_provider)
+    preview = await server.digest(dry_run=True)
+
+    assert "候选 22 / 本次计划 20 / 留待后续 2" in preview
+    assert all(source_id in preview for source_id in expected)
+    assert all(source_id not in preview for source_id in deferred)
+
+    result = await server.digest(dry_run=False, confirm_token=_confirm_token(preview))
+    assert "已消化: 20 个桶" in result
+    assert provider_sources == expected
+
+    operation = next(
+        item for item in server.bucket_mgr.read_digest_operations()
+        if item["kind"] == "consolidation"
+    )
+    planned = [
+        state["bucket_id"]
+        for state in operation["plan"]["groups"][0]["sources"]
+    ]
+    assert planned == expected
+    all_buckets = await server.bucket_mgr.list_all(include_archive=False)
+    digest_bucket = next(
+        bucket for bucket in all_buckets
+        if "auto-digested" in bucket["metadata"].get("tags", [])
+    )
+    assert digest_bucket["metadata"]["source_bucket"].split(",") == expected
+    assert {
+        source_id for source_id in source_ids
+        if (await server.bucket_mgr.get(source_id))["metadata"].get("digested")
+    } == set(expected)
+
+    next_preview = await server.digest(dry_run=True)
+    assert "候选 2 / 本次计划 2 / 留待后续 0" in next_preview
+    assert all(source_id in next_preview for source_id in deferred)
+
+
+@pytest.mark.asyncio
+async def test_digest_plan_is_deterministic_and_reports_max_groups(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+
+    def candidate(bucket_id, domain, importance, last_active, created="2018-01-01"):
+        return {
+            "id": bucket_id,
+            "content": bucket_id,
+            "metadata": {
+                "type": "dynamic",
+                "importance": importance,
+                "domain": [domain],
+                "last_active": last_active,
+                "created": created,
+            },
+        }
+
+    buckets = [
+        candidate("a2", "alpha", 1, "2022-01-01"),
+        candidate("beta", "beta", 2, "2010-01-01"),
+        candidate("zeta", "zeta", 1, "2021-01-01"),
+        candidate("a1", "alpha", 1, "2022-01-01"),
+        candidate("a-old-higher", "alpha", 2, "2010-01-01"),
+    ]
+    monkeypatch.setattr(server, "_issue_mutation_confirmation", lambda operation, payload: "fixed")
+    server.bucket_mgr.list_all = AsyncMock(
+        side_effect=[list(buckets), list(buckets), list(reversed(buckets)), list(reversed(buckets))]
+    )
+
+    first = await server._run_digest(dry_run=True, max_groups=2)
+    second = await server._run_digest(dry_run=True, max_groups=2)
+
+    assert first == second
+    assert "主题组: 总数 3 / 选中 2 / 因 max_groups=2 省略 1" in first
+    assert "仅限制 consolidation，不影响 importance rebalance" in first
+    assert first.index("- alpha:") < first.index("- zeta:")
+    alpha_line = next(line for line in first.splitlines() if line.startswith("- alpha:"))
+    assert alpha_line.index("a1") < alpha_line.index("a2") < alpha_line.index("a-old-higher")
+
+    server.bucket_mgr.list_all = AsyncMock(side_effect=[list(buckets), list(buckets)])
+    legacy_zero = await server._run_digest(dry_run=True, max_groups=0)
+    assert "主题组: 总数 3 / 选中 1 / 因 max_groups=0 省略 2" in legacy_zero
+    assert "legacy 有效下限 1" in legacy_zero
+
+
+@pytest.mark.asyncio
+async def test_legacy_over_20_digest_plan_never_marks_unprovided_sources(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    source_ids = []
+    for index in range(21):
+        source_id = await server.bucket_mgr.create(
+            content=f"legacy source {index}", importance=2, domain=["legacy-large"]
+        )
+        _age_bucket(server, source_id)
+        source_ids.append(source_id)
+    states = [
+        server._digest_bucket_state(await server.bucket_mgr.get(source_id))
+        for source_id in source_ids
+    ]
+    plan = {
+        "groups": [{"domain": "legacy-large", "sources": states}],
+        "date": "2026-09-28",
+    }
+    server.bucket_mgr.write_digest_operation(
+        "legacy-over-20",
+        "consolidation",
+        plan,
+        owner=server._RM_PROCESS_BOOT_ID,
+    )
+    operation = next(
+        item for item in server.bucket_mgr.read_digest_operations(open_only=True)
+        if item["operation_id"] == "legacy-over-20"
+    )
+    server._call_digest_api = AsyncMock(return_value="legacy bounded digest")
+
+    result = await server._execute_digest_operation(operation)
+
+    assert "已消化: 20 个桶" in result
+    provider_buckets = server._call_digest_api.await_args.args[1]
+    assert [bucket["id"] for bucket in provider_buckets] == source_ids[:20]
+    digest_bucket = next(
+        bucket for bucket in await server.bucket_mgr.list_all(include_archive=False)
+        if "auto-digested" in bucket["metadata"].get("tags", [])
+    )
+    assert digest_bucket["metadata"]["source_bucket"].split(",") == source_ids[:20]
+    assert (await server.bucket_mgr.get(source_ids[20]))["metadata"].get("digested") is not True
+
+
 def _confirm_token(result):
     for line in result.splitlines():
         if line.startswith("confirm_token:"):
@@ -489,11 +634,12 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     assert server.bucket_mgr.list_all.await_count == 0
     assert server.embedding_engine._generate_embedding.await_count == 0
     assert server.dehydrator.dehydrate.await_count == 0
-    assert "向量: N=3（当前模型行=6，sealed 跳过=1，无效跳过=0）" in result
-    assert "桶: M=5（sealed=1，元数据不可读=0）" in result
-    assert "归档桶排除: 1" in result
-    assert "差额: K=M-N=2" in result
-    assert "孤儿向量行: 1" in result
+    assert "archive excluded" in result
+    assert "可用向量: N=3（当前模型行=6，sealed 跳过=1，无效跳过=0）" in result
+    assert "原始桶文件: M=5（sealed=1，元数据不可读=0）" in result
+    assert "范围外 archive 原始桶文件: 1" in result
+    assert "算术差额: K=M-N=2（M 与 N 口径不同，不等同于缺失 embedding 数）" in result
+    assert "孤儿向量行（当前模型、范围内无对应桶；仅计数不输出 ID）: 1" in result
     assert "未命名桶（name=bucket_id）: 1" in result
     assert f"- {unnamed_id}" in result
     assert "摘要来源: 缓存命中=1，正文回退=2，名称回退=1" in result
@@ -516,7 +662,8 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     assert archive_id not in result
     assert "ordinary archived memory" not in result
     assert "ARCHIVED_BODY_MUST_NOT_APPEAR_BY_DEFAULT" not in result
-    assert "归档桶排除: 0" in with_archive
+    assert "archive included" in with_archive
+    assert "范围外 archive 原始桶文件: 0" in with_archive
     assert archive_id in with_archive
     assert "ordinary archived memory" in with_archive
     assert "orphan-vector-row" not in result

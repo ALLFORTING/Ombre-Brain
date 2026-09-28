@@ -25,7 +25,13 @@ async def backfill_batch(
     engine: EmbeddingEngine,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Generate a bounded batch of missing vectors without modifying buckets."""
+    """Generate a bounded batch for parsed, unsealed, non-blank buckets.
+
+    The legacy ``empty_skipped`` field is preserved and aggregates both sealed
+    and blank parsed buckets. ``indexed_total`` and ``remaining`` use
+    ``get_embedding`` presence for the current model; they are not the strict
+    usable-vector count reported by digest dedupe.
+    """
     if not engine.enabled:
         raise RuntimeError("Embedding engine is not enabled")
 
@@ -81,7 +87,7 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
         return
 
     all_buckets = await bucket_mgr.list_all(include_archive=True)
-    print(f"Total buckets: {len(all_buckets)}")
+    print(f"Parsed buckets (archive included): {len(all_buckets)}")
 
     # get_embedding only returns vectors for the currently configured model.
     eligible = [
@@ -96,7 +102,10 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
         if emb is None:
             missing.append(b)
 
-    print(f"Missing embeddings: {len(missing)}")
+    print(
+        "Eligible unsealed non-blank buckets missing a current-model embedding: "
+        f"{len(missing)}"
+    )
 
     if dry_run:
         for b in missing[:10]:
@@ -119,7 +128,8 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
             print(
                 f"\n=== Done: {success} newly indexed, {failed} failed, "
                 f"{result['indexed_total']} indexed total, "
-                f"{result['empty_skipped']} empty skipped ==="
+                f"legacy empty_skipped={result['empty_skipped']} "
+                "(sealed or blank parsed buckets) ==="
             )
             break
         await asyncio.sleep(2)

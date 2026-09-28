@@ -316,11 +316,19 @@ def run_dedupe_scan(
     lines = [
         "=== digest embedding 查重（只读）===",
         f"当前模型: {model}",
-        f"向量: N={len(usable_entries)}（当前模型行={len(embedding_rows)}，sealed 跳过={sealed_vector_rows}，无效跳过={invalid_vector_rows}）",
-        f"桶: M={bucket_counts['buckets']}（sealed={bucket_counts['sealed']}，元数据不可读={bucket_counts['metadata_unreadable']}）",
-        f"归档桶排除: {excluded_archive_counts['buckets']}",
-        f"差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}",
-        f"孤儿向量行: {orphan_rows}",
+        (
+            "扫描范围: 调用选定目录中的原始 .md 文件；"
+            f"archive {'excluded' if excluded_archive_roots else 'included'}；"
+            "只有元数据可读、未 sealed 且当前模型向量严格有效的桶进入成对比较"
+        ),
+        f"可用向量: N={len(usable_entries)}（当前模型行={len(embedding_rows)}，sealed 跳过={sealed_vector_rows}，无效跳过={invalid_vector_rows}）",
+        f"原始桶文件: M={bucket_counts['buckets']}（sealed={bucket_counts['sealed']}，元数据不可读={bucket_counts['metadata_unreadable']}）",
+        f"范围外 archive 原始桶文件: {excluded_archive_counts['buckets']}",
+        (
+            f"算术差额: K=M-N={bucket_counts['buckets'] - len(usable_entries)}"
+            "（M 与 N 口径不同，不等同于缺失 embedding 数）"
+        ),
+        f"孤儿向量行（当前模型、范围内无对应桶；仅计数不输出 ID）: {orphan_rows}",
         f"未命名桶（name=bucket_id）: {len(unnamed_bucket_ids)}",
         "未命名桶 ID 清单:",
     ]
