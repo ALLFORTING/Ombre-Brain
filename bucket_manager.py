@@ -1172,9 +1172,9 @@ class BucketManager:
     def _ensure_trace_request_table(self):
         self._ensure_import_operation_table()
         with sqlite3.connect(self.history_db_path) as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS ob_s4_requests (
+            schema = """CREATE TABLE IF NOT EXISTS ob_s4_requests (
                 operation_id TEXT PRIMARY KEY COLLATE BINARY,
-                kind TEXT NOT NULL CHECK(kind='trace'), schema_version INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('trace','hold','grow')), schema_version INTEGER NOT NULL,
                 root_binding TEXT NOT NULL, payload_json TEXT NOT NULL,
                 payload_digest TEXT NOT NULL, normalization_context_json TEXT NOT NULL,
                 phase TEXT NOT NULL, status TEXT NOT NULL,
@@ -1182,7 +1182,21 @@ class BucketManager:
                 result_text TEXT, completed_receipt_json TEXT,
                 owner_instance TEXT, epoch INTEGER NOT NULL DEFAULT 0,
                 lease_until REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
-                completed_at TEXT, last_error_code TEXT)""")
+                completed_at TEXT, last_error_code TEXT)"""
+            conn.execute('BEGIN IMMEDIATE')
+            old = conn.execute("SELECT sql FROM sqlite_master WHERE name='ob_s4_requests'").fetchone()
+            if old and "CHECK(kind='trace')" in ''.join(old[0].split()):
+                # SQLite cannot ALTER a CHECK. Keep all original values inside
+                # one transaction; a crash rolls the entire replacement back.
+                before = conn.execute('SELECT * FROM ob_s4_requests ORDER BY operation_id').fetchall()
+                conn.execute('ALTER TABLE ob_s4_requests RENAME TO ob_s4_requests_v1')
+                conn.execute(schema)
+                conn.execute('INSERT INTO ob_s4_requests SELECT * FROM ob_s4_requests_v1')
+                if conn.execute('SELECT * FROM ob_s4_requests ORDER BY operation_id').fetchall() != before:
+                    raise BucketIdempotencyError('operation_schema_conflict')
+                conn.execute('DROP TABLE ob_s4_requests_v1')
+            else:
+                conn.execute(schema)
             columns = {r[1] for r in conn.execute("PRAGMA table_info(ob_import_operations)")}
             if "effects_json" not in columns:
                 conn.execute("ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT")
@@ -1190,6 +1204,14 @@ class BucketManager:
     @guarded_mutation("trace_request_claim")
     def _claim_trace_request(self, operation_id, payload, normalization_context, owner):
         if payload.get('kind') != 'trace':
+            raise BucketIdempotencyError('operation_id_conflict')
+        return self._claim_s4_request(operation_id, payload, normalization_context, owner)
+
+    @guarded_mutation("s4_request_claim")
+    def _claim_s4_request(self, operation_id, payload, normalization_context, owner):
+        self.validate_trace_operation_id(operation_id)
+        kind = payload.get('kind')
+        if kind not in ('trace', 'hold', 'grow'):
             raise BucketIdempotencyError('operation_id_conflict')
         serialized, digest = self._canonical_import_payload(payload)
         root = str(Path(self.base_dir).resolve())
@@ -1200,21 +1222,23 @@ class BucketManager:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute("SELECT * FROM ob_s4_requests WHERE operation_id=?", (operation_id,)).fetchone()
                 if row is None:
-                    path = self._find_bucket_file(payload['bucket_id'])
-                    if not path:
-                        raise BucketIdempotencyError('target_bucket_missing')
-                    post = frontmatter.load(path)
-                    if _is_sealed_bucket(post):
-                        raise BucketIdempotencyError('unsupported_combination: sealed target')
-                    if payload['content'] and post.get('protected'):
-                        raise BucketIdempotencyError('content_protected')
+                    if kind == 'trace':
+                        path = self._find_bucket_file(payload['bucket_id'])
+                        if not path:
+                            raise BucketIdempotencyError('target_bucket_missing')
+                        post = frontmatter.load(path)
+                        if _is_sealed_bucket(post):
+                            raise BucketIdempotencyError('unsupported_combination: sealed target')
+                        if payload['content'] and post.get('protected'):
+                            raise BucketIdempotencyError('content_protected')
                     conn.execute("""INSERT INTO ob_s4_requests
                         (operation_id,kind,schema_version,root_binding,payload_json,payload_digest,
                          normalization_context_json,phase,status,created_at)
-                        VALUES (?,'trace',1,?,?,?,?,'accepted','pending',?)""",
-                        (operation_id, root, serialized, digest, json.dumps(normalization_context), now_iso()))
+                        VALUES (?,?,?, ?,?,?,?,'accepted','pending',?)""",
+                        (operation_id, kind, 1 if kind == 'trace' else 2, root, serialized, digest,
+                         json.dumps(normalization_context), now_iso()))
                 else:
-                    if row['kind'] != 'trace' or row['payload_digest'] != digest:
+                    if row['kind'] != kind or row['payload_digest'] != digest:
                         raise BucketIdempotencyError("operation_id_conflict")
                     if row['root_binding'] != root:
                         raise BucketIdempotencyError("operation_root_conflict")
@@ -1262,9 +1286,9 @@ class BucketManager:
             await asyncio.sleep(_S4_LEASE_SECONDS / 3)
             self._trace_checkpoint(context)
 
-    def _trace_child_key(self, operation_id, step):
+    def _trace_child_key(self, operation_id, step, *, kind='trace'):
         serialized = json.dumps([
-            "s4-child-v1", str(Path(self.base_dir).resolve()), "trace", operation_id, step],
+            "s4-child-v1", str(Path(self.base_dir).resolve()), kind, operation_id, step],
             ensure_ascii=False, separators=(',', ':'))
         return "s4:" + hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
@@ -1470,6 +1494,199 @@ class BucketManager:
                     pass
                 finally:
                     self._release_trace_request(context)
+
+    @guarded_mutation('hold_grow_item_plan')
+    def plan_hold_grow_item(self, context, ordinal, values, candidate=None):
+        """Freeze only the current hold/grow item, before its first effect."""
+        with bucket_write_scope(self.base_dir):
+            request = self._trace_fence(context)
+            parent = request['plan']
+            entry = parent['items'][ordinal]
+            if entry.get('plan') is not None:
+                return entry['plan']
+            keys = {step: self._trace_child_key(context['operation_id'], f'{ordinal}:{step}',
+                                              kind=request['kind'])
+                    for step in ('memory', 'embedding', 'relation', 'trigger', 'source', 'emotion')}
+            aliases = request['normalization_context']['aliases']
+            values = copy.deepcopy(values)
+            todos = list(dict.fromkeys(self._trace_alias_value(canonicalize_todos(values.get('todos')), aliases)))
+            provenance = automatic_todo_provenance(todos)
+            logical_time = now_iso()
+            updates, delta, preimage = {}, [], None
+            reused = candidate is not None
+            if reused:
+                target = candidate['id']
+                path = self._find_bucket_file(target)
+                if not path:
+                    raise BucketIdempotencyError('target_bucket_missing')
+                post = frontmatter.load(path)
+                if (_is_sealed_bucket(post) or post.get('type') == 'feel'
+                        or post.get('pinned') or post.get('protected')
+                        or self._normalize_search_text(post.content) != self._normalize_search_text(values['content'])):
+                    raise BucketIdempotencyError('operation_state_conflict')
+                date = values.get('trigger_date', '')
+                old_date = str(post.get('trigger_date', '') or '').strip()
+                if date and old_date and old_date != date:
+                    raise ValueError(f"duplicate bucket {target} has trigger_date={old_date}; requested {date} was rejected without writing")
+                if date and old_date != date:
+                    updates.update(trigger_date=date, trigger_last_seen='')
+                old_todos = canonicalize_todos(post.get('todos'))
+                if todos:
+                    merged, records = merge_todo_provenance(old_todos, post.get('todo_provenance'), todos, provenance)
+                    if merged != old_todos or not isinstance(post.get('todos'), list):
+                        updates['todos'] = merged
+                    if records != reconcile_todo_provenance(old_todos, post.get('todo_provenance')):
+                        updates['todo_provenance'] = records
+                    if merged != old_todos:
+                        delta.append(['todos_updated', {'closed_count': len(set(old_todos)-set(merged)),
+                                                        'opened_count': len(set(merged)-set(old_todos))}])
+                written = sorted(updates)
+                # Assign identities only when legacy reuse would actually write
+                # todos/provenance. An unchanged old sidecar is not a backfill.
+                if 'todos' in updates or 'todo_provenance' in updates:
+                    updates['todo_provenance'] = prepare_todo_provenance(
+                        updates.get('todos', old_todos), updates.get('todo_provenance', post.get('todo_provenance')),
+                        previous_todos=old_todos, previous_provenance=post.get('todo_provenance'))
+                preimage = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                child_payload = {'kwargs': updates}
+                relative_path, file_text = None, None
+                result_name = post.get('name', target)
+                ignored = ['tags', 'importance', 'domain', 'valence', 'arousal', 'name', 'provenance_kind']
+            else:
+                target = self._operation_result_id(keys['memory'])
+                post = self._build_bucket_post(target, values['content'], tags=values.get('tags'),
+                    importance=values.get('importance', 5), domain=values.get('domain'),
+                    valence=values.get('valence', .5), arousal=values.get('arousal', .3),
+                    bucket_type=values.get('bucket_type', 'dynamic'), name=values.get('name'),
+                    pinned=values.get('pinned', False), todos=todos, todo_provenance=provenance,
+                    provenance_kind=values.get('provenance_kind'), created=logical_time,
+                    last_active=logical_time, created_date=_date_only(logical_time), _aliases=aliases)
+                child_payload = {'content': post.content, 'metadata': copy.deepcopy(post.metadata)}
+                _, child_digest = self._canonical_import_payload(child_payload)
+                self._append_operation_marker(post, operation_key=keys['memory'],
+                                              operation_kind='create', payload_digest=child_digest)
+                type_dir = self.feel_dir if post['type'] == 'feel' else (
+                    self.permanent_dir if post['type'] == 'permanent' else self.dynamic_dir)
+                domain = '沉淀物' if post['type'] == 'feel' else sanitize_name(post['domain'][0])
+                filename = f"{post['name']}_{target}.md" if post['name'] != target else f'{target}.md'
+                relative_path = str(Path(safe_path(os.path.join(type_dir, domain), filename)).relative_to(self.base_dir))
+                file_text = frontmatter.dumps(post)
+                result_name = target
+                delta = [['created', {}]]
+                written = ['content', 'tags', 'importance', 'domain', 'valence', 'arousal', 'name', 'todos',
+                           *(['todo_provenance'] if provenance else []),
+                           *(['trigger_date'] if values.get('trigger_date') else [])]
+                ignored = []
+            _, child_digest = self._canonical_import_payload(child_payload)
+            item_plan = dict(target=target, reused=reused, values=values, keys=keys,
+                logical_time=logical_time, updates=updates, preimage_digest=preimage,
+                child_payload=child_payload, child_digest=child_digest, relative_path=relative_path,
+                file_text=file_text, metadata=copy.deepcopy(post.metadata), result_name=result_name,
+                written_fields=written, ignored_fields=ignored, delta=delta,
+                embedding_input=None if reused else post.content,
+                embedding_model=getattr(self.embedding_engine, 'model', ''),
+                related_threshold=float(os.environ.get('OMBRE_RELATED_THRESHOLD', '.75') or '.75'),
+                related_top_k=3)
+            entry['plan'] = item_plan
+            self._trace_checkpoint(context, 'items_running', plan=parent)
+            return item_plan
+
+    @guarded_mutation('hold_grow_memory_commit')
+    def commit_hold_grow_memory(self, context, ordinal):
+        with bucket_write_scope(self.base_dir):
+            plan = self._trace_fence(context)['plan']['items'][ordinal]['plan']
+            child = self._ensure_import_operation(plan['keys']['memory'],
+                operation_kind='update' if plan['reused'] else 'create',
+                target_bucket_id=plan['target'] if plan['reused'] else None,
+                payload=plan['child_payload'], payload_digest=plan['child_digest'])
+            path = self._find_bucket_file(plan['target'])
+            post = frontmatter.load(path) if path else None
+            marker = self._operation_marker(post, plan['keys']['memory']) if post is not None else None
+            if marker:
+                if marker['payload_digest'] != plan['child_digest']:
+                    raise BucketIdempotencyError('operation_payload_conflict')
+                self._sync_directory(os.path.dirname(path))
+                self._mark_import_operation_applied(plan['keys']['memory'])
+                return {'outcome': 'applied'}
+            if child['status'] == 'applied':
+                raise BucketIdempotencyError('operation_marker_missing')
+            if plan['reused']:
+                self._trace_preimage_guard(plan)
+                if not plan['updates']:
+                    return {'outcome': 'not_requested'}
+                post.metadata.update(copy.deepcopy(plan['updates']))
+                post['last_active'], post['updated_at'] = plan['logical_time'], _date_only(plan['logical_time'])
+                self._append_operation_marker(post, operation_key=plan['keys']['memory'],
+                                              operation_kind='update', payload_digest=plan['child_digest'])
+                payload = frontmatter.dumps(post).encode('utf-8')
+            else:
+                if path:
+                    raise BucketIdempotencyError('idempotency_conflict')
+                path = safe_path(self.base_dir, plan['relative_path'])
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                payload = plan['file_text'].encode('utf-8')
+            self._trace_fence(context)
+            self._write_bytes_atomic(path, payload)
+            if Path(path).read_bytes() != payload:
+                raise BucketIdempotencyError('operation_state_conflict')
+            self._mark_import_operation_applied(plan['keys']['memory'])
+            return {'outcome': 'applied'}
+
+    @guarded_mutation('hold_grow_delta_commit')
+    def commit_hold_grow_delta(self, context, ordinal):
+        with bucket_write_scope(self.base_dir):
+            plan = self._trace_fence(context)['plan']['items'][ordinal]['plan']
+            with sqlite3.connect(self.history_db_path) as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute('SELECT effects_json FROM ob_import_operations WHERE operation_key=?',
+                                   (plan['keys']['memory'],)).fetchone()
+                effects = json.loads(row[0] or '{}')
+                if 'delta' not in effects:
+                    effects['delta'] = {'event_ids': [self._insert_boot_delta_event(conn, plan['target'],
+                        kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
+                        for kind, payload in plan['delta']]}
+                    conn.execute('UPDATE ob_import_operations SET effects_json=? WHERE operation_key=?',
+                                 (json.dumps(effects), plan['keys']['memory']))
+                return effects['delta']
+
+    @guarded_mutation('hold_grow_trigger_commit')
+    def commit_hold_grow_trigger(self, context, ordinal):
+        with bucket_write_scope(self.base_dir):
+            request = self._trace_fence(context)
+            plan = request['plan']['items'][ordinal]['plan']
+            date = plan['values'].get('trigger_date', '')
+            if plan['reused'] or not date:
+                return {'outcome': 'not_requested'}
+            key = plan['keys']['trigger']
+            payload = {'kwargs': {'trigger_date': date, 'trigger_last_seen': ''}}
+            _, digest = self._canonical_import_payload(payload)
+            child = self._ensure_import_operation(key, operation_kind='update', target_bucket_id=plan['target'],
+                                                 payload=payload, payload_digest=digest)
+            path = self._find_bucket_file(plan['target'])
+            if not path:
+                raise BucketIdempotencyError('target_bucket_missing')
+            post = frontmatter.load(path)
+            marker = self._operation_marker(post, key)
+            if marker:
+                if marker['payload_digest'] != digest:
+                    raise BucketIdempotencyError('operation_payload_conflict')
+                self._sync_directory(os.path.dirname(path))
+                self._mark_import_operation_applied(key)
+                return {'outcome': 'applied'}
+            if child['status'] == 'applied':
+                raise BucketIdempotencyError('operation_marker_missing')
+            if _is_sealed_bucket(post) or str(post.get('trigger_date') or '') not in ('', date):
+                raise BucketIdempotencyError('operation_state_conflict')
+            post.metadata.update(payload['kwargs'])
+            post['last_active'], post['updated_at'] = plan['logical_time'], _date_only(plan['logical_time'])
+            self._append_operation_marker(post, operation_key=key, operation_kind='update', payload_digest=digest)
+            self._trace_fence(context)
+            frozen = frontmatter.dumps(post).encode('utf-8')
+            self._write_bytes_atomic(path, frozen)
+            if Path(path).read_bytes() != frozen:
+                raise BucketIdempotencyError('operation_state_conflict')
+            self._mark_import_operation_applied(key)
+            return {'outcome': 'applied'}
 
     def inspect_import_operation(self, operation_key: str) -> dict[str, Any] | None:
         """Inspect an O5B operation and its hidden atomic marker read-only."""
@@ -2156,7 +2373,7 @@ class BucketManager:
         valence=0.5, arousal=0.3, bucket_type="dynamic", name=None,
         pinned=False, protected=False, sealed=False, topics=None, todos=None,
         todo_provenance=None, provenance_kind=None, created=None,
-        last_active=None, created_date=None,
+        last_active=None, created_date=None, _aliases=None,
     ):
         """Pure, shared construction; no storage, index, or operation writes."""
         canonical_todos = canonicalize_todos(todos)
@@ -2167,15 +2384,17 @@ class BucketManager:
         canonical_todo_provenance = reconcile_todo_provenance(
             canonical_todos, todo_provenance, strict=todo_provenance is not None,
         )
-        content = apply_display_aliases(content)
-        name = apply_display_aliases(name) if name else name
-        tags = apply_display_aliases_to_value(tags or [])
-        domain = apply_display_aliases_to_value(domain) if domain else domain
-        todos = apply_display_aliases_to_value(canonical_todos)
+        alias_text = apply_display_aliases if _aliases is None else lambda value: BucketManager._trace_alias_value(value, _aliases)
+        alias = apply_display_aliases_to_value if _aliases is None else lambda value: BucketManager._trace_alias_value(value, _aliases)
+        content = alias_text(content)
+        name = alias_text(name) if name else name
+        tags = alias(tags or [])
+        domain = alias(domain) if domain else domain
+        todos = alias(canonical_todos)
         todo_provenance = prepare_todo_provenance(
             todos,
             [
-                {**record, "text": apply_display_aliases(record["text"])}
+                {**record, "text": alias_text(record["text"])}
                 for record in canonical_todo_provenance
             ],
         )
@@ -2646,12 +2865,22 @@ class BucketManager:
             return {"status": "source_identity_ambiguous"}
 
     @guarded_mutation("bucket_feel_source_mark")
-    def mark_feel_source(self, source_id, *, model_valence=None):
+    def mark_feel_source(self, source_id, *, model_valence=None, _s4_effect=None):
         """Publish and verify one marking from fresh locked state; no rollback."""
         attempted = False
         try:
             with bucket_write_scope(self.base_dir):
+                if _s4_effect is not None:
+                    self._trace_fence(_s4_effect['context'])
                 path, current = self._resolve_feel_source_locked(source_id)
+                if _s4_effect is not None:
+                    _, effect_digest = self._canonical_import_payload({'source_id': source_id, 'model_valence': model_valence})
+                    marker = self._operation_marker(current, _s4_effect['key'])
+                    if marker:
+                        if marker['payload_digest'] != effect_digest:
+                            raise BucketIdempotencyError('operation_payload_conflict')
+                        self._sync_directory(os.path.dirname(path))
+                        return {'status': 'marked', 'mode': 'replayed'}
                 already_satisfied = current.get("digested") is True and (
                     model_valence is None or current.get("model_valence") == model_valence
                 )
@@ -2663,6 +2892,12 @@ class BucketManager:
                     draft["model_valence"] = model_valence
                 draft["last_active"] = now_iso()
                 draft["updated_at"] = _date_only()
+                if _s4_effect is not None:
+                    draft['last_active'] = _s4_effect['logical_time']
+                    draft['updated_at'] = _date_only(_s4_effect['logical_time'])
+                    self._append_operation_marker(draft, operation_key=_s4_effect['key'],
+                                                  operation_kind='update', payload_digest=effect_digest)
+                    self._trace_fence(_s4_effect['context'])
                 payload = frontmatter.dumps(draft).encode("utf-8")
                 previous_payload = Path(path).read_bytes()
                 attempted = True
@@ -2694,6 +2929,8 @@ class BucketManager:
                             "mode": "already_satisfied" if already_satisfied else "updated"}
                 except Exception:
                     return {"status": "write_outcome_unknown"}
+        except BucketIdempotencyError:
+            raise
         except _FeelSourceError as exc:
             return {"status": "write_outcome_unknown" if attempted else exc.code}
         except Exception:

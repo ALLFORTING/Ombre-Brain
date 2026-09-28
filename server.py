@@ -147,7 +147,7 @@ from archive_session_operations import (
     validate_operation_id, short_step, execute_archive_operation,
 )
 from related_integrity import (RelatedError, parse_related, scan_relation_store,
-                               automatic_eligible, digest as related_digest)
+                               automatic_eligible, digest as related_digest, plan_mutation, read_vectors)
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
 from import_memory import ImportEngine
@@ -2052,6 +2052,7 @@ def _load_emotion_timeline() -> list[dict]:
 def _record_emotion_snapshot(
     valence: float, arousal: float, source: str, bucket_id: str = "",
     *, _expected_entry: dict | None = None, _strict: bool = False, _verify_only: bool = False,
+    _effect_key: str | None = None, _s4_context: dict | None = None,
 ) -> None:
     if not (0 <= valence <= 1 and 0 <= arousal <= 1):
         return
@@ -2063,10 +2064,21 @@ def _record_emotion_snapshot(
     }
     if bucket_id:
         entry["bucket_id"] = bucket_id
+    if _effect_key is not None:
+        entry['_s4_effect'] = _effect_key
     path = _emotion_timeline_path()
     try:
         with bucket_write_scope(config["buckets_dir"]):
+            if _s4_context is not None:
+                bucket_mgr._trace_fence(_s4_context)
             timeline = _read_emotion_timeline_for_write(path)
+            if _effect_key is not None:
+                existing = [item for item in timeline if item.get('_s4_effect') == _effect_key]
+                if existing:
+                    if existing != [entry]:
+                        raise BucketIdempotencyError('operation_emotion_conflict')
+                    BucketManager._sync_directory(os.path.dirname(path))
+                    return
             if source == "archive" and bucket_id:
                 existing = [item for item in timeline if item.get("source") == source
                             and item.get("bucket_id") == bucket_id]
@@ -2082,6 +2094,8 @@ def _record_emotion_snapshot(
             BucketManager._write_bytes_atomic(path, payload)
             if _read_emotion_timeline_for_write(path) != timeline:
                 raise ArchiveSessionError("archive_emotion_evidence_conflict")
+    except BucketIdempotencyError:
+        raise
     except (OSError, ValueError) as exc:
         if _strict:
             if isinstance(exc, ArchiveSessionError):
@@ -2138,7 +2152,7 @@ def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) ->
                     visibility[bucket_id] = False
             if not visibility[bucket_id]:
                 continue
-        visible.append(item)
+        visible.append({key: value for key, value in item.items() if key != '_s4_effect'})
     timeline = sorted(
         visible,
         key=lambda item: str(item.get("timestamp", "")),
@@ -9673,6 +9687,362 @@ def _format_hold_feel_source_receipt(bucket_id: str, source_id: str, error: str)
         f"source_mark_error={error}"
     )
 
+_S4_HOLD_GROW_RUNNERS = {}
+
+
+async def _hold_grow_keyed(operation_id, kind, values):
+    """The HTTP caller is a waiter; cancellation never cancels its owned runner.
+
+    S-4B safe surface excludes keyed supersedes_id, before get/update/startup.
+    None is dispatched by the public tools directly to their original bodies.
+    """
+    try:
+        BucketManager.validate_trace_operation_id(operation_id)
+        if kind == 'hold' and values['supersedes_id'].strip():
+            return 'unsupported_combination: operation_id does not support supersedes_id.'
+        content = values['content']
+        if not content or not content.strip():
+            return '内容为空，无法存储。' if kind == 'hold' else '内容为空，无法整理。'
+        if kind == 'hold':
+            if not 1 <= values['importance'] <= 10:
+                return 'importance must be within 1-10.'
+            for field in ('valence', 'arousal'):
+                if values[field] != -1 and not 0 <= values[field] <= 1:
+                    return f'{field} must be -1 or within 0.0-1.0.'
+        manager = bucket_mgr
+        existing = manager.inspect_trace_request(operation_id)
+        normalization = existing['normalization_context'] if existing else {
+            'version': 1, 'aliases': list(DISPLAY_ALIASES.items())}
+        payload = {'kind': kind, 'content': BucketManager._trace_alias_value(content, normalization['aliases'])}
+        if kind == 'hold':
+            payload.update({field: values[field] for field in ('importance', 'pinned', 'feel')})
+            payload.update(tags=_parse_csv_ids(values['tags']), source_bucket=values['source_bucket'].strip(),
+                supersedes_id=values['supersedes_id'].strip(), valence=float(values['valence']),
+                arousal=float(values['arousal']), trigger_date=_parse_optional_date(values['trigger_date'], 'trigger_date') or '',
+                provenance_kind=_parse_explicit_provenance_kind(values['provenance_kind']))
+        _, digest = manager._canonical_import_payload(payload)
+        if existing and (existing['kind'] != kind or existing['payload_digest'] != digest):
+            return 'operation_id_conflict'
+        key = (os.getpid(), asyncio.get_running_loop(), str(Path(manager.base_dir).resolve()), operation_id)
+        active = _S4_HOLD_GROW_RUNNERS.get(key)
+        if active is None:
+            task = asyncio.create_task(_run_hold_grow_request(manager, operation_id, payload, normalization))
+            active = (digest, task)
+            _S4_HOLD_GROW_RUNNERS[key] = active
+            def finished(done):
+                if _S4_HOLD_GROW_RUNNERS.get(key) == active:
+                    _S4_HOLD_GROW_RUNNERS.pop(key, None)
+                # Retrieve failures even when the last HTTP waiter disconnected.
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(finished)
+        if active[0] != digest:
+            return 'operation_id_conflict'
+        return await asyncio.shield(active[1])
+    except (BucketIdempotencyError, RelatedError, ValueError) as exc:
+        return str(exc)
+
+
+@guarded_async_mutation('hold_grow_request_execute')
+async def _run_hold_grow_request(manager, operation_id, payload, normalization):
+    owner = secrets.token_hex(16)
+    while (context := manager._claim_s4_request(operation_id, payload, normalization, owner)) is None:
+        await asyncio.sleep(.05)
+    if 'replay' in context:
+        return context['replay']
+    heartbeat = asyncio.create_task(manager._trace_heartbeat(context))
+    try:
+        await decay_engine.ensure_started()
+        request = manager._trace_fence(context)
+        parent = request['plan']
+        if 'items' not in parent:
+            if payload['kind'] == 'hold':
+                for field, provider in (('similarity', _similarity_doorbell), ('conflict', _detect_conflict_warning)):
+                    if field not in parent:
+                        parent[field] = await provider(payload['content'])
+                        manager._trace_checkpoint(context, plan=parent)
+                if payload['feel'] and payload['source_bucket'] and 'source_preflight' not in parent:
+                    parent['source_preflight'] = manager.preview_feel_source(payload['source_bucket'])['status']
+                    manager._trace_checkpoint(context, plan=parent)
+                if parent.get('source_preflight', 'valid') != 'valid':
+                    error = parent['source_preflight']
+                    result = f'feel 未创建；source 校验失败（{error}）。\n' + _format_hold_feel_source_receipt('', payload['source_bucket'], error)
+                    manager._trace_checkpoint(context, 'completed', result=result, resolutions={})
+                    return result
+                parent['mode'] = 'feel' if payload['feel'] else 'pinned' if payload['pinned'] else 'ordinary'
+            else:
+                parent['mode'] = 'short' if len(payload['content'].strip()) < 30 else 'digest'
+                if parent['mode'] == 'short' and 'conflict' not in parent:
+                    parent['conflict'] = await _detect_conflict_warning(payload['content'])
+                    manager._trace_checkpoint(context, plan=parent)
+            if parent['mode'] == 'digest':
+                # A process death before this checkpoint may repeat the provider.
+                # HTTP cancellation cannot: it only cancels the shielded waiter.
+                try:
+                    items = await dehydrator.digest(payload['content'])
+                except Exception as exc:
+                    result = f'日记整理失败。 reason={_provider_failure_category(exc)}'
+                    manager._trace_checkpoint(context, 'completed', plan=parent, result=result, resolutions={})
+                    return result
+                if not items:
+                    result = '日记整理失败。 reason=parse_error'
+                    manager._trace_checkpoint(context, 'completed', plan=parent, result=result, resolutions={})
+                    return result
+            else:
+                if 'analysis' not in parent:
+                    failure = ''
+                    try:
+                        analysis = await dehydrator.analyze(payload['content'])
+                    except Exception as exc:
+                        failure = _provider_failure_category(exc)
+                        analysis = {'tags': []} if parent['mode'] == 'feel' else {
+                            'domain': ['未分类'], 'valence': .5, 'arousal': .3,
+                            'tags': [], 'suggested_name': '', 'todos': []}
+                    parent.update(analysis=analysis, analysis_failure=failure)
+                    manager._trace_checkpoint(context, plan=parent)
+                items = [parent['analysis']]
+            parent['items'] = [{'ordinal': i, 'identity': manager._trace_child_key(operation_id, f'item:{i}', kind=payload['kind']),
+                                'item': item, 'plan': None} for i, item in enumerate(items)]
+            manager._trace_checkpoint(context, 'items_frozen', plan=parent)
+        # Refresh after every checkpoint; no completed item is planned/executed again.
+        for ordinal in range(len(parent['items'])):
+            request = manager._trace_fence(context)
+            parent, resolutions = request['plan'], request['resolutions']
+            current = resolutions.setdefault('items', {}).setdefault(str(ordinal), {})
+            if 'result' in current:
+                continue
+            entry = parent['items'][ordinal]
+            if entry['plan'] is None:
+                if parent['mode'] == 'digest' and 'conflict' not in entry:
+                    entry['conflict'] = await _detect_conflict_warning(entry['item']['content'])
+                    manager._trace_checkpoint(context, plan=parent)
+                values = _hold_grow_item_values(payload, parent, entry)
+                candidate = None
+                if parent['mode'] not in ('feel', 'pinned'):
+                    try:
+                        found = await manager.search(values['content'], limit=1,
+                            domain_filter=values['domain'] or None, include_sealed=False)
+                    except Exception:
+                        found = []
+                    if found:
+                        first = found[0]
+                        meta = first.get('metadata', {})
+                        if (not _is_sealed(first) and meta.get('type') != 'feel'
+                                and not (meta.get('pinned') or meta.get('protected'))
+                                and BucketManager._normalize_search_text(first.get('content')) == BucketManager._normalize_search_text(values['content'])):
+                            candidate = first
+                manager.plan_hold_grow_item(context, ordinal, values, candidate)
+            await _execute_hold_grow_item(manager, context, ordinal)
+            request = manager._trace_fence(context)
+            resolutions = request['resolutions']
+            resolutions['items'][str(ordinal)]['result'] = _hold_grow_item_response(payload, request['plan'], ordinal, resolutions)
+            manager._trace_checkpoint(context, resolutions=resolutions)
+        request = manager._trace_fence(context)
+        parent, resolutions = request['plan'], request['resolutions']
+        texts = [resolutions['items'][str(i)]['result'] for i in range(len(parent['items']))]
+        result = texts[0]
+        if parent['mode'] == 'digest':
+            reused = sum(entry['plan']['reused'] for entry in parent['items'])
+            result = f"{len(texts)}条|新建{len(texts)-reused}/复用{reused}\n" + '\n'.join(texts)
+            conflicts = [f"{entry['item'].get('name', entry['plan']['result_name'])}: {entry['conflict']}"
+                         for entry in parent['items'] if entry.get('conflict')]
+            if conflicts:
+                result += '\nconflict: ' + '；'.join(conflicts)
+        manager._trace_checkpoint(context, 'completed', resolutions=resolutions, result=result)
+        return result
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+        finally:
+            manager._release_trace_request(context)
+
+
+def _hold_grow_item_values(payload, parent, entry):
+    analysis, mode = entry['item'], parent['mode']
+    content = payload['content'] if mode != 'digest' else analysis['content']
+    if mode == 'short':
+        content = content.strip()
+    values = dict(content=content, tags=analysis.get('tags', []), importance=analysis.get('importance', 5),
+        domain=analysis.get('domain', ['未分类']), valence=analysis.get('valence', .5),
+        arousal=analysis.get('arousal', .3), name=analysis.get('name') or analysis.get('suggested_name') or _canonical_body_name(content),
+        todos=_canonical_todos(analysis.get('todos')), provenance_kind='summary' if mode == 'digest' else None)
+    if payload['kind'] == 'hold':
+        values.update(importance=payload['importance'], provenance_kind=payload['provenance_kind'], trigger_date=payload['trigger_date'])
+        values['tags'] = list(dict.fromkeys(analysis.get('tags', []) + payload['tags']))
+        for field in ('valence', 'arousal'):
+            if payload[field] != -1:
+                values[field] = payload[field]
+        if mode == 'feel':
+            values.update(tags=analysis.get('tags', []), importance=5, domain=[], todos=[],
+                valence=payload['valence'] if payload['valence'] != -1 else .5,
+                arousal=payload['arousal'] if payload['arousal'] != -1 else .3,
+                name=_canonical_body_name(content.strip().replace('\n', ' ')) or None,
+                bucket_type='feel', provenance_kind=payload['provenance_kind'] or 'inference')
+        elif mode == 'pinned':
+            values.update(importance=10, bucket_type='permanent', pinned=True)
+    elif mode == 'short' and not isinstance(values['importance'], int):
+        values['importance'] = 5
+    return values
+
+
+@guarded_mutation('hold_grow_related_commit')
+def _hold_grow_related(manager, context, ordinal):
+    with bucket_write_scope(manager.base_dir):
+        request = manager._trace_fence(context)
+        plan, resolutions = request['plan']['items'][ordinal]['plan'], request['resolutions']
+        current = resolutions['items'][str(ordinal)]
+        if 'selection' not in current:
+            engine, selected = manager.embedding_engine, []
+            if engine and engine.enabled:
+                inventory = scan_relation_store(manager.base_dir)
+                vectors = read_vectors(engine.db_path, plan['embedding_model'])
+                target = plan['target']
+                if automatic_eligible(inventory, target) and target in vectors:
+                    for other in inventory.order:
+                        if other != target and automatic_eligible(inventory, other) and other in vectors:
+                            score = engine._cosine_similarity(vectors[target], vectors[other])
+                            if score >= plan['related_threshold']:
+                                selected.append((other, score))
+                    selected.sort(key=lambda pair: pair[1], reverse=True)
+                    selected = selected[:plan['related_top_k']]
+            current['selection'] = selected
+            manager._trace_checkpoint(context, resolutions=resolutions)
+        selected = current['selection']
+        if not selected:
+            return {'status': 'not_requested'}
+        manager._trace_fence(context)
+        relation = {'source': plan['target'], 'add': [pair[0] for pair in selected], 'remove': [], 'origin': 'inferred'}
+        return manager.relation_store.commit(lambda inv: plan_mutation(inv, relation['source'],
+            add=relation['add'], origin='inferred'), operation_key=plan['keys']['relation'],
+            request_digest=related_digest(relation))
+
+
+async def _hold_grow_embedding(manager, context, ordinal):
+    request = manager._trace_fence(context)
+    plan, resolutions = request['plan']['items'][ordinal]['plan'], request['resolutions']
+    current = resolutions['items'][str(ordinal)]
+    engine = manager.embedding_engine
+    if plan['reused']:
+        return {'outcome': 'not_requested'}
+    receipt = engine.trace_embedding_receipt(plan['keys']['embedding']) if engine else None
+    if receipt is not None:
+        return receipt
+    if not engine or not engine.enabled:
+        return {'outcome': 'disabled'}
+    if 'embedding_candidate' not in current:
+        try:
+            current['embedding_candidate'] = await engine._generate_embedding(plan['embedding_input'], model=plan['embedding_model'])
+        except Exception:
+            current['embedding_candidate'] = []
+        manager._trace_checkpoint(context, resolutions=resolutions)
+    with bucket_write_scope(manager.base_dir):
+        manager._trace_fence(context)
+        candidate = current['embedding_candidate']
+        if not candidate:
+            return {'outcome': 'failed'}
+        path = manager._find_bucket_file(plan['target'])
+        post = frontmatter.load(path) if path else None
+        if (post is None or _is_sealed({'metadata': post.metadata}) or post.content != plan['embedding_input']
+                or post.get('last_active') != plan['logical_time']):
+            return {'outcome': 'superseded_before_refresh'}
+        return engine.store_trace_embedding(plan['keys']['embedding'], plan['target'], candidate,
+            hashlib.sha256(plan['embedding_input'].encode()).hexdigest(), plan['embedding_model'], plan['logical_time'])
+
+
+@guarded_async_mutation('hold_grow_item_execute')
+async def _execute_hold_grow_item(manager, context, ordinal):
+    request = manager._trace_fence(context)
+    mode, payload = request['plan']['mode'], request['payload']
+    plan = request['plan']['items'][ordinal]['plan']
+    tail = ['trigger', 'related'] if mode in ('feel', 'pinned') else ['related', 'trigger']
+    steps = ['memory', 'delta', 'embedding']
+    if mode in ('feel', 'pinned'):
+        steps += ['emotion', *tail]
+    else:
+        steps += tail + ['emotion']
+    steps += ['source']
+    for step in steps:
+        request = manager._trace_fence(context)
+        resolutions = request['resolutions']
+        current = resolutions.setdefault('items', {}).setdefault(str(ordinal), {})
+        if step in current:
+            continue
+        if step == 'memory':
+            receipt = manager.commit_hold_grow_memory(context, ordinal)
+        elif step == 'delta':
+            receipt = manager.commit_hold_grow_delta(context, ordinal)
+        elif step == 'embedding':
+            receipt = await _hold_grow_embedding(manager, context, ordinal)
+        elif step == 'trigger':
+            receipt = manager.commit_hold_grow_trigger(context, ordinal)
+        elif step == 'related':
+            receipt = {'status': 'not_requested'} if plan['reused'] else _hold_grow_related(manager, context, ordinal)
+        elif step == 'emotion':
+            receipt = {'outcome': 'not_requested'}
+            if payload['kind'] == 'hold' and payload['valence'] != -1 and payload['arousal'] != -1:
+                entry = dict(timestamp=plan['logical_time'], valence=round(payload['valence'], 3),
+                             arousal=round(payload['arousal'], 3), source='hold', bucket_id=plan['target'])
+                _record_emotion_snapshot(payload['valence'], payload['arousal'], 'hold', plan['target'],
+                    _expected_entry=entry, _strict=True, _effect_key=plan['keys']['emotion'], _s4_context=context)
+                receipt = {'outcome': 'applied'}
+        else:
+            receipt = {'status': 'not_requested'}
+            if mode == 'feel' and payload['source_bucket']:
+                receipt = manager.mark_feel_source(payload['source_bucket'],
+                    model_valence=plan['values']['valence'] if payload['valence'] != -1 else None,
+                    _s4_effect={'context': context, 'key': plan['keys']['source'], 'logical_time': plan['logical_time']})
+                if receipt['status'] != 'marked':
+                    raise BucketIdempotencyError('operation_source_' + receipt['status'])
+        # Selection/candidate helpers may have checkpointed extra resolutions.
+        resolutions = manager._trace_fence(context)['resolutions']
+        resolutions.setdefault('items', {}).setdefault(str(ordinal), {})[step] = receipt
+        manager._trace_checkpoint(context, resolutions=resolutions)
+
+
+def _hold_grow_item_response(payload, parent, ordinal, resolutions):
+    entry = parent['items'][ordinal]
+    plan, mode = entry['plan'], parent['mode']
+    target, reused, name = plan['target'], plan['reused'], plan['result_name']
+    values, meta = plan['values'], plan['metadata']
+    conflict = entry.get('conflict', parent.get('conflict', ''))
+    if mode == 'digest':
+        result = (f'📎复用了已匹配到的相同内容桶，未新建：{name} | bucket_id={target} reused=true' if reused else
+                  f"📝新建：{entry['item'].get('name') or _canonical_body_name(entry['item']['content'])} | bucket_id={target} reused=false")
+        if entry['item'].get('_metadata_failure'):
+            result += '\n自动打标失败；原因=parse_error；已使用默认 metadata'
+        return result
+    if mode == 'short':
+        action = '复用了已匹配到的相同内容桶，未新建' if reused else '新建'
+        analysis = parent['analysis']
+        result = (f"{action} → {name} | bucket_id={target} reused={str(reused).lower()} | "
+                  f"{','.join(analysis.get('domain', []))} V{analysis.get('valence', .5):.1f}/A{analysis.get('arousal', .3):.1f}")
+    elif reused:
+        ignored = [*plan['ignored_fields'], *(['source_bucket'] if payload['source_bucket'] else [])]
+        result = (f"复用了已匹配到的相同内容桶，未新建：{name} {','.join(values['domain'])}\n"
+                  f"bucket_id={target} reused=true written_fields={plan['written_fields']} ignored_fields={ignored}")
+    else:
+        result = (f"新建 {target} | {meta['name']} | importance={meta['importance']} | "
+                  f"tags=[{', '.join(meta['tags'])}] | domain=[{', '.join(meta['domain'])}]")
+        if mode == 'feel':
+            result = '🫧feel→' + result
+        elif mode == 'pinned':
+            result = '📌' + result
+        else:
+            result += f"\nbucket_id={target} reused=false written_fields={plan['written_fields']} ignored_fields={plan['ignored_fields']}"
+    if mode not in ('short',) and not reused and parent.get('similarity'):
+        result += '\nsimilarity: ' + parent['similarity']
+    if conflict:
+        result += '\nconflict: ' + conflict
+    if parent.get('analysis_failure'):
+        result += f"\n自动打标失败；原因={parent['analysis_failure']}；已使用默认 metadata"
+    if mode == 'feel' and payload['source_bucket']:
+        result += '\n' + _format_hold_feel_source_receipt(target, payload['source_bucket'], 'none')
+    return result
+
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -9686,8 +10056,13 @@ async def hold(
     trigger_date: str = "",
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
+    operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
+        description="Opaque retry identity shared with trace/grow. Preserved verbatim; keyed supersedes_id is unsupported. None preserves legacy behavior.")] | None = None,
 ) -> str:
     """存储单条记忆并自动打标；匹配到规范化正文相同的可复用桶时复用，未新建，不做语义合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
+    if operation_id is not None:
+        return await _hold_grow_keyed(operation_id, 'hold', {
+            key: value for key, value in locals().items() if key != 'operation_id'})
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -9915,8 +10290,11 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str) -> str:
+async def grow(content: str, operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
+    description="Opaque retry identity shared with trace/hold. Frozen ordered digest items resume without another digest. None preserves legacy behavior.")] | None = None) -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
+    if operation_id is not None:
+        return await _hold_grow_keyed(operation_id, 'grow', {'content': content})
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
