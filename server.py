@@ -150,7 +150,7 @@ from related_integrity import (RelatedError, parse_related, scan_relation_store,
                                automatic_eligible, digest as related_digest, plan_mutation, read_vectors)
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
-from import_memory import ImportEngine
+from import_memory import ImportEngine, ImportState
 from maintenance_write_gate import (
     MaintenanceWriteError,
     guarded_async_mutation,
@@ -13426,6 +13426,8 @@ async def api_host_vault_set(request):
 # 导入 API — 对话历史导入
 # =============================================================
 
+_IMPORT_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
 @mcp.custom_route("/api/import/upload", methods=["POST"])
 @guarded_http_mutation("dashboard_import_start", methods=("POST",))
 async def api_import_upload(request):
@@ -13433,9 +13435,6 @@ async def api_import_upload(request):
     from starlette.responses import JSONResponse
     err = _require_dashboard_write(request, "/api/import/upload")
     if err: return err
-
-    if import_engine.is_running:
-        return JSONResponse({"error": "Import already running"}, status_code=409)
 
     content_type = request.headers.get("content-type", "")
     filename = ""
@@ -13450,6 +13449,21 @@ async def api_import_upload(request):
         )
     except Exception:
         return JSONResponse({"error": "invalid_raw_evidence_capture"}, status_code=400)
+
+    resume = request.query_params.get("resume", "").lower() in ("1", "true")
+    legacy_saved = None
+    if not raw_evidence_capture and resume:
+        try:
+            legacy_saved = ImportState(config['buckets_dir']).resume_preflight()
+        except BucketIdempotencyError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=409)
+        except OSError:
+            return JSONResponse({'error': 'import_failed'}, status_code=500)
+    if raw_evidence_capture:
+        # Both upload modes share this file; do not overwrite an accepted legacy run.
+        active, _ = ImportState(config['buckets_dir']).read_legacy()
+        if (ImportState.is_v2(active) and active['status'] != 'completed') or import_engine.is_running:
+            return JSONResponse({"error": "Import already running"}, status_code=409)
 
     try:
         if "multipart/form-data" in content_type:
@@ -13485,7 +13499,32 @@ async def api_import_upload(request):
 
     except Exception: logger.exception("Dashboard import upload read failed"); return JSONResponse({"error": "upload_read_failed"}, status_code=400)
 
-    # Start import in background
+    # Legacy acceptance is durable before creating a task or acknowledging started.
+    accepted = None
+    if not raw_evidence_capture:
+        try:
+            if ImportState.v1_completed(legacy_saved):
+                if legacy_saved.get('source_hash') != hashlib.sha256(raw_content.encode()).hexdigest()[:16]:
+                    return JSONResponse({'error': 'legacy_source_conflict'}, status_code=409)
+                accepted = {'replay': ImportState.public_status(legacy_saved)}
+            elif ImportState.is_v2(legacy_saved) and legacy_saved['status'] == 'completed':
+                if (legacy_saved['root_binding'] != str(Path(config['buckets_dir']).resolve())
+                        or legacy_saved['source_digest'] != hashlib.sha256(raw_content.encode()).hexdigest()
+                        or legacy_saved['source_file'] != filename
+                        or legacy_saved['preserve_raw'] != preserve_raw):
+                    return JSONResponse({'error': 'legacy_source_conflict'}, status_code=409)
+                accepted = {'replay': ImportState.public_status(legacy_saved)}
+            else:
+                accepted = import_engine.accept_legacy(raw_content, filename, preserve_raw, resume)
+        except BucketIdempotencyError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=409)
+        except MaintenanceWriteError:
+            raise
+        except Exception:
+            logger.exception('Legacy import acceptance failed')
+            return JSONResponse({'error': 'import_failed'}, status_code=500)
+
+    # Keep a strong reference independent of the HTTP caller's lifetime.
     async def _run_import():
         try:
             if raw_evidence_capture:
@@ -13497,11 +13536,18 @@ async def api_import_upload(request):
                     media_type,
                 )
             else:
-                await import_engine.start(raw_content, filename, preserve_raw, resume)
+                await import_engine.run_legacy(accepted)
         except Exception as e:
             logger.error(f"Import failed: {e}")
 
-    asyncio.create_task(_run_import())
+    if raw_evidence_capture or 'replay' not in accepted:
+        task = asyncio.create_task(_run_import())
+        _IMPORT_BACKGROUND_TASKS.add(task)
+        def finished(done):
+            _IMPORT_BACKGROUND_TASKS.discard(done)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(finished)
 
     return JSONResponse({
         "status": "started",
@@ -13516,7 +13562,9 @@ async def api_import_status(request):
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
-    return JSONResponse(import_engine.get_status())
+    state = ImportState(config['buckets_dir'])
+    saved, _ = state.read_legacy()
+    return JSONResponse(state.public_status(saved))
 
 
 @mcp.custom_route("/api/import/pause", methods=["POST"])
@@ -13526,6 +13574,13 @@ async def api_import_pause(request):
     from starlette.responses import JSONResponse
     err = _require_dashboard_write(request, "/api/import/pause")
     if err: return err
+    state = ImportState(config['buckets_dir'])
+    saved, _ = state.read_legacy()
+    if state.is_v2(saved):
+        if saved['status'] != 'running':
+            return JSONResponse({"error": "No import running"}, status_code=400)
+        state.request_pause()
+        return JSONResponse({"status": "pause_requested"})
     if not import_engine.is_running:
         return JSONResponse({"error": "No import running"}, status_code=400)
     import_engine.pause()

@@ -192,6 +192,7 @@ def test_import_status_redacts_persisted_exception_details(tmp_path, monkeypatch
     server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setattr(server, "_require_auth", lambda request: None)
     server.import_engine.state.data["errors"] = [INJECTED]
+    server.import_engine.state.save()
 
     response = asyncio.run(
         server.api_import_status(_request("GET", "/api/import/status"))

@@ -778,6 +778,7 @@ class BucketManager:
                     result_id TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('planned', 'applied')),
                     memory_mutation_id TEXT,
+                    effects_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -1106,12 +1107,15 @@ class BucketManager:
         payload_digest: str | None = None,
         memory_mutation_id: str | None = None,
         _s4_context: dict | None = None,
+        _legacy_import_context: dict | None = None,
     ) -> dict[str, Any]:
         """Apply or replay one durable import memory operation."""
 
-        with bucket_write_scope(self.base_dir) if _s4_context is not None else nullcontext():
+        with bucket_write_scope(self.base_dir) if (_s4_context is not None or _legacy_import_context is not None) else nullcontext():
             if _s4_context is not None:
                 self._trace_fence(_s4_context)
+            if _legacy_import_context is not None:
+                self._legacy_import_plan(_legacy_import_context)
             operation = self._ensure_import_operation(
                 operation_key,
                 operation_kind=operation_kind,
@@ -1127,6 +1131,7 @@ class BucketManager:
                 _o5b_operation_key=operation_key,
                 _o5b_payload_digest=operation["payload_digest"],
                 _o5c_memory_mutation_id=operation.get("memory_mutation_id"),
+                **({'_legacy_import_context': _legacy_import_context} if _legacy_import_context is not None else {}),
             )
             return {"operation_key": operation_key, "result_id": bucket_id, "kind": "create"}
 
@@ -1143,10 +1148,141 @@ class BucketManager:
             _o5b_payload_digest=operation["payload_digest"],
             _o5c_memory_mutation_id=operation.get("memory_mutation_id"),
             **({"_s4_context": _s4_context} if _s4_context is not None else {}),
+            **({'_legacy_import_context': _legacy_import_context} if _legacy_import_context is not None else {}),
         )
         if not applied:
             raise BucketIdempotencyError("target_bucket_missing")
         return {"operation_key": operation_key, "result_id": bucket_id, "kind": "update"}
+
+    def _legacy_import_plan(self, context):
+        state = context['state']
+        if state.root != str(Path(self.base_dir).resolve()):
+            raise BucketIdempotencyError('operation_root_conflict')
+        saved = state.fence(context['claim'])
+        return saved['chunks'][context['chunk']]['items'][context['item']]['plan']
+
+    def plan_legacy_import_item(self, item, candidate, preserve, *, memory_key, embedding_key, aliases):
+        """Pure legacy planning, called under the existing root mutex."""
+        logical_time = now_iso()
+        incoming = canonicalize_todos(self._trace_alias_value(item.get('todos'), aliases))
+        preimage, updates, delta = None, {}, []
+        if candidate is not None:
+            path = self._find_bucket_file(candidate)
+            if not path:
+                raise BucketIdempotencyError('target_bucket_missing')
+            post = frontmatter.load(path)
+            if (_is_sealed_bucket(post) or post.get('type') == 'feel' or post.get('pinned') or post.get('protected')
+                    or self._normalize_search_text(post.content) != self._normalize_search_text(item['content'])):
+                raise BucketIdempotencyError('operation_state_conflict')
+            old_todos = canonicalize_todos(post.get('todos'))
+            old_provenance = reconcile_todo_provenance(old_todos, post.get('todo_provenance'))
+            if incoming:
+                merged, records = merge_todo_provenance(old_todos, old_provenance, incoming,
+                                                       automatic_todo_provenance(incoming))
+                if merged != old_todos or records != old_provenance or not isinstance(post.get('todos'), list):
+                    updates = dict(todos=merged, todo_provenance=prepare_todo_provenance(
+                        merged, records, previous_todos=old_todos, previous_provenance=post.get('todo_provenance')))
+                if merged != old_todos:
+                    delta = [['todos_updated', dict(closed_count=len(set(old_todos)-set(merged)),
+                                                    opened_count=len(set(merged)-set(old_todos)))]]
+            target = candidate
+            payload = {'kwargs': updates}
+            preimage = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        else:
+            target = self._operation_result_id(memory_key)
+            post = self._build_bucket_post(target, item['content'], tags=item.get('tags', []),
+                importance=item.get('importance', 5), domain=item.get('domain', ['未分类']),
+                valence=item.get('valence', .5), arousal=item.get('arousal', .3), name=item.get('name') or None,
+                todos=canonicalize_todos(item.get('todos')),
+                todo_provenance=automatic_todo_provenance(item.get('todos')),
+                created=logical_time, last_active=logical_time, created_date=_date_only(logical_time), _aliases=aliases)
+            payload = dict(content=post.content, tags=post['tags'], importance=post['importance'],
+                domain=post['domain'], valence=post['valence'], arousal=post['arousal'], name=post['name'],
+                todos=post['todos'], todo_provenance=post.get('todo_provenance', []))
+            delta = [['created', {}]]
+        _, digest = self._canonical_import_payload(payload)
+        return dict(decision='reuse' if candidate is not None else 'create', preserve_raw=bool(preserve),
+            target=target, memory_key=memory_key, embedding_key=embedding_key,
+            memory_requested=candidate is None or bool(updates), payload=payload, payload_digest=digest,
+            logical_time=logical_time, preimage_digest=preimage,
+            body_digest=hashlib.sha256(post.content.encode()).hexdigest(), delta=delta,
+            embedding_model=getattr(self.embedding_engine, 'model', ''))
+
+    def legacy_import_receipts_available(self):
+        """Pure capability check for an existing journal; never migrate it."""
+        with sqlite3.connect(self.history_db_path) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_import_operations'").fetchone():
+                return True
+            return 'effects_json' in {row[1] for row in conn.execute('PRAGMA table_info(ob_import_operations)')}
+
+    @guarded_mutation('legacy_import_child_plan')
+    def ensure_legacy_import_operation(self, context):
+        with bucket_write_scope(self.base_dir):
+            plan = self._legacy_import_plan(context)
+            if not self.legacy_import_receipts_available():
+                raise BucketIdempotencyError('legacy_effect_receipts_unavailable')
+            operation = self.inspect_import_operation(plan['memory_key'])
+            if operation is None:
+                if 'payload' not in plan:
+                    raise BucketIdempotencyError('operation_plan_missing')
+                operation = self.plan_import_operation(plan['memory_key'],
+                    operation_kind='create' if plan['decision'] == 'create' else 'update',
+                    target_bucket_id=plan['target'] if plan['decision'] == 'reuse' else None,
+                    payload=plan['payload'])
+            if operation['payload_digest'] != plan['payload_digest'] or operation['result_id'] != plan['target']:
+                raise BucketIdempotencyError('operation_payload_conflict')
+            return operation
+
+    def validate_legacy_import_target(self, context, *, before_memory=False):
+        with bucket_write_scope(self.base_dir):
+            plan = self._legacy_import_plan(context)
+            path = self._find_bucket_file(plan['target'])
+            if not path:
+                raise BucketIdempotencyError('target_bucket_missing')
+            post = frontmatter.load(path)
+            if (_is_sealed_bucket(post) or (plan['decision'] == 'reuse' and (
+                    post.get('type') == 'feel' or post.get('pinned') or post.get('protected')))
+                    or hashlib.sha256(post.content.encode()).hexdigest() != plan['body_digest']):
+                raise BucketIdempotencyError('operation_state_conflict')
+            marker = self._operation_marker(post, plan['memory_key'])
+            if before_memory and marker is None:
+                self._trace_preimage_guard(dict(target=plan['target'], preimage_digest=plan['preimage_digest']))
+            return post
+
+    @guarded_mutation('legacy_import_delta_commit')
+    def commit_legacy_import_delta(self, context):
+        with bucket_write_scope(self.base_dir):
+            plan = self._legacy_import_plan(context)
+            if not plan['memory_requested']:
+                return {'outcome': 'not_requested'}
+            with sqlite3.connect(self.history_db_path) as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute('SELECT effects_json FROM ob_import_operations WHERE operation_key=?',
+                                   (plan['memory_key'],)).fetchone()
+                effects = json.loads(row[0] or '{}')
+                if 'delta' not in effects:
+                    self.validate_legacy_import_target(context)
+                    effects['delta'] = {'outcome': 'applied' if plan['delta'] else 'not_requested',
+                        'event_ids': [self._insert_boot_delta_event(conn, plan['target'], kind,
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
+                            for kind, payload in plan['delta']]}
+                    conn.execute('UPDATE ob_import_operations SET effects_json=? WHERE operation_key=?',
+                                 (json.dumps(effects), plan['memory_key']))
+                return effects['delta']
+
+    @guarded_mutation('legacy_import_embedding_commit')
+    def commit_legacy_import_embedding(self, context, engine, candidate):
+        with bucket_write_scope(self.base_dir):
+            plan = self._legacy_import_plan(context)
+            receipt = engine.trace_embedding_receipt(plan['embedding_key'])
+            if receipt is not None:
+                return receipt
+            post = self.validate_legacy_import_target(context)
+            if post.get('last_active') != plan['logical_time']:
+                raise BucketIdempotencyError('operation_state_conflict')
+            return engine.store_trace_embedding(plan['embedding_key'], plan['target'], candidate,
+                plan['body_digest'],
+                plan['embedding_model'], plan['logical_time'])
 
     @staticmethod
     def validate_trace_operation_id(operation_id):
@@ -2475,6 +2611,7 @@ class BucketManager:
         _o5b_operation_key: str | None = None,
         _o5b_payload_digest: str | None = None,
         _o5c_memory_mutation_id: str | None = None,
+        _legacy_import_context: dict | None = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -2512,13 +2649,10 @@ class BucketManager:
                 operation_payload["provenance_kind"] = normalized_provenance_kind
             if todo_provenance is not None:
                 operation_payload["todo_provenance"] = canonical_todo_provenance
-            operation = self._ensure_import_operation(
-                _o5b_operation_key,
-                operation_kind="create",
-                payload=operation_payload,
-                payload_digest=_o5b_payload_digest,
-                memory_mutation_id=_o5c_memory_mutation_id,
-            )
+            operation = (self.ensure_legacy_import_operation(_legacy_import_context)
+                         if _legacy_import_context is not None else self._ensure_import_operation(
+                             _o5b_operation_key, operation_kind="create", payload=operation_payload,
+                             payload_digest=_o5b_payload_digest, memory_mutation_id=_o5c_memory_mutation_id))
             if operation["operation_kind"] != "create":
                 raise BucketIdempotencyError("operation_kind_conflict")
             bucket_id = operation["result_id"]
@@ -2528,6 +2662,8 @@ class BucketManager:
         else:
             bucket_id = generate_bucket_id()
         with bucket_write_scope(self.base_dir):
+            if _legacy_import_context is not None:
+                legacy_plan = self._legacy_import_plan(_legacy_import_context)
             if operation is not None:
                 existing_path = self._find_bucket_file(bucket_id)
                 if existing_path:
@@ -2557,6 +2693,9 @@ class BucketManager:
             pinned=pinned, protected=protected, sealed=sealed, topics=topics,
             todos=canonical_todos, todo_provenance=canonical_todo_provenance,
             provenance_kind=provenance_kind,
+            **(dict(created=legacy_plan['logical_time'], last_active=legacy_plan['logical_time'],
+                    created_date=_date_only(legacy_plan['logical_time']), _aliases=[])
+               if _legacy_import_context is not None else {}),
         )
         content, bucket_name, domain = post.content, post["name"], post["domain"]
         if operation is not None:
@@ -2605,6 +2744,8 @@ class BucketManager:
                 raise RuntimeError("sealed_embedding_cleanup_failed") from exc
 
         with bucket_write_scope(self.base_dir):
+            if _legacy_import_context is not None:
+                self._legacy_import_plan(_legacy_import_context)
             existing_path = self._find_bucket_file(bucket_id)
             if existing_path:
                 if operation is None:
@@ -2632,6 +2773,8 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        if _legacy_import_context is not None:
+            return bucket_id
         self._record_boot_delta_event(bucket_id, "created")
         if not sealed:
             await self._refresh_ordinary_embedding_best_effort(bucket_id, content)
@@ -3046,6 +3189,10 @@ class BucketManager:
         更新桶的内容或元数据字段。
         """
         s4_context = kwargs.pop('_s4_context', None)
+        legacy_context = kwargs.pop('_legacy_import_context', None)
+        if legacy_context is not None and set(kwargs) - {
+                'todos', 'todo_provenance', '_o5b_operation_key', '_o5b_payload_digest', '_o5c_memory_mutation_id'}:
+            raise BucketIdempotencyError('legacy_update_fields_invalid')
         relation_requested = "related_buckets" in kwargs
         paired_supersession = kwargs.pop("_supersession_reverse", False)
         relation_value = kwargs.pop("related_buckets", None)
@@ -3059,6 +3206,9 @@ class BucketManager:
         with bucket_write_scope(self.base_dir):
             if s4_context is not None:
                 s4_plan = self._trace_fence(s4_context)['plan']
+            if legacy_context is not None:
+                legacy_plan = self._legacy_import_plan(legacy_context)
+                self.validate_legacy_import_target(legacy_context, before_memory=True)
             history_change_type = kwargs.pop("_history_change_type", "replace")
             o5b_operation_key = kwargs.pop("_o5b_operation_key", None)
             o5b_payload_digest = kwargs.pop("_o5b_payload_digest", None)
@@ -3122,6 +3272,9 @@ class BucketManager:
         with bucket_write_scope(self.base_dir):
             if s4_context is not None:
                 self._trace_fence(s4_context)
+            if legacy_context is not None:
+                legacy_plan = self._legacy_import_plan(legacy_context)
+                self.validate_legacy_import_target(legacy_context, before_memory=True)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return False
@@ -3185,7 +3338,7 @@ class BucketManager:
             prepared_provenance = None
             if "todos" in kwargs or "todo_provenance" in kwargs:
                 prepared_todos = (
-                    (canonicalize_todos(kwargs["todos"]) if s4_context is not None else
+                    (canonicalize_todos(kwargs["todos"]) if s4_context is not None or legacy_context is not None else
                      apply_display_aliases_to_value(canonicalize_todos(kwargs["todos"])))
                     if "todos" in kwargs else previous_todos
                 )
@@ -3351,6 +3504,9 @@ class BucketManager:
             # --- Auto-refresh activation time / 自动刷新激活时间 ---
             post["last_active"] = s4_plan['logical_time'] if s4_context is not None else now_iso()
             post["updated_at"] = _date_only(s4_plan['logical_time']) if s4_context is not None else _date_only()
+            if legacy_context is not None:
+                post['last_active'] = legacy_plan['logical_time']
+                post['updated_at'] = _date_only(legacy_plan['logical_time'])
 
             applied_supersession = []
             try:
@@ -3403,7 +3559,7 @@ class BucketManager:
                     logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
                     return False
 
-        if s4_context is not None:
+        if s4_context is not None or legacy_context is not None:
             return True
 
         if (

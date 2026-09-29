@@ -16,6 +16,13 @@
 # ============================================================
 
 import os
+import asyncio
+import copy
+import inspect
+import sys
+import tempfile
+import time
+from uuid import uuid4
 import json
 import hashlib
 import logging
@@ -23,16 +30,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils import apply_display_aliases_to_value, count_tokens_approx, now_iso
+from utils import DISPLAY_ALIASES, apply_display_aliases_to_value, count_tokens_approx, now_iso
 from bucket_manager import (
+    BucketManager,
+    BucketIdempotencyError,
     automatic_todo_provenance,
     canonicalize_todos,
     merge_todo_provenance,
     reconcile_todo_provenance,
 )
-from maintenance_write_gate import guarded_mutation
+from bucket_write_lock import bucket_write_scope
+from maintenance_write_gate import guarded_mutation, guarded_async_mutation, MaintenanceWriteError
 
 logger = logging.getLogger("ombre_brain.import")
+_LEGACY_RUN_LOCKS = {}
+_LEGACY_LEASE_SECONDS = 60.0
+_IMPORT_PUBLIC_FIELDS = (
+    "source_file", "source_hash", "total_chunks", "processed", "api_calls",
+    "memories_created", "memories_merged", "memories_raw", "errors", "status",
+    "started_at", "updated_at",
+)
 
 
 # ============================================================
@@ -340,6 +357,168 @@ class ImportState:
     def to_dict(self) -> dict:
         return dict(self.data)
 
+    @property
+    def root(self):
+        return str(Path(self.state_file).parent.resolve())
+
+    def read_legacy(self):
+        """Pure read: malformed old bytes are evidence, never a fresh run."""
+        try:
+            raw = Path(self.state_file).read_bytes()
+        except FileNotFoundError:
+            return None, None
+        try:
+            saved = json.loads(raw)
+            if not isinstance(saved, dict):
+                saved = {}
+        except (ValueError, UnicodeError):
+            saved = {}
+        return saved, raw
+
+    @staticmethod
+    def is_v2(saved):
+        return bool(saved and saved.get('schema_version') == 2 and saved.get('mode') == 'legacy')
+
+    @staticmethod
+    def v1_completed(saved):
+        return bool(saved and not saved.get('schema_version') and not saved.get('raw_evidence_capture')
+                    and saved.get('status') == 'completed'
+                    and type(saved.get('processed')) is int
+                    and type(saved.get('total_chunks')) is int
+                    and saved['processed'] == saved['total_chunks'] and saved['processed'] >= 0)
+
+    def resume_preflight(self):
+        """Must run before lazy runtime construction, locks or DB initialization."""
+        saved, raw = self.read_legacy()
+        if raw is not None and not self.is_v2(saved) and not self.v1_completed(saved):
+            raise BucketIdempotencyError('legacy_resume_unverifiable')
+        return saved
+
+    @staticmethod
+    def public_status(saved):
+        if not saved:
+            return {field: ('' if field in ('source_file', 'source_hash', 'started_at', 'updated_at')
+                            else [] if field == 'errors' else 'idle' if field == 'status' else 0)
+                    for field in _IMPORT_PUBLIC_FIELDS}
+        if ImportState.is_v2(saved) and saved.get('status') == 'completed':
+            return copy.deepcopy(saved['completed_receipt'])
+        status = {field: copy.deepcopy(saved.get(field)) for field in _IMPORT_PUBLIC_FIELDS}
+        status['errors'] = ['import_failed'] * len(saved.get('errors', []))
+        if saved.get('raw_evidence_capture'):
+            status['raw_evidence_capture'] = True
+        return status
+
+    @guarded_mutation('legacy_import_v1_snapshot')
+    def preserve_v1(self, raw):
+        """Publish a digest-named opaque snapshot without replacing any winner."""
+        parent = Path(self.state_file).parent
+        path = parent / ('import_state.v1.' + hashlib.sha256(raw).hexdigest() + '.json')
+        if path.exists():
+            if path.read_bytes() != raw:
+                raise BucketIdempotencyError('legacy_snapshot_conflict')
+            BucketManager._sync_directory(str(parent))
+            return
+        fd, temporary = tempfile.mkstemp(prefix='.import-state-v1-', suffix='.tmp', dir=parent)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != raw:
+                    raise BucketIdempotencyError('legacy_snapshot_conflict')
+            BucketManager._sync_directory(str(parent))
+        finally:
+            os.unlink(temporary)
+            BucketManager._sync_directory(str(parent))
+
+    @staticmethod
+    def project_counters(saved):
+        chunks = saved['chunks']
+        saved['total_chunks'] = len(chunks)
+        saved['processed'] = sum(c['status'] == 'completed' for c in chunks)
+        saved['api_calls'] = sum(c.get('api_calls', 0) for c in chunks)
+        done = [item for chunk in chunks for item in (chunk.get('items') or [])
+                if item['status'] == 'completed']
+        saved['memories_created'] = sum(item['plan']['decision'] == 'create' for item in done)
+        saved['memories_merged'] = sum(item['plan']['decision'] == 'reuse' for item in done)
+        saved['memories_raw'] = sum(item['plan']['preserve_raw'] for item in done)
+
+    @guarded_mutation('legacy_import_state_publish')
+    def publish(self, saved, *, ownership_only=False):
+        if not ownership_only:
+            saved['updated_at'] = now_iso()
+            self.project_counters(saved)
+        if saved['phase'] == 'run.completed' and not ownership_only:
+            saved['completed_receipt'] = {
+                field: copy.deepcopy(saved[field]) for field in _IMPORT_PUBLIC_FIELDS}
+            saved['completed_receipt']['errors'] = ['import_failed'] * len(saved['errors'])
+        BucketManager._write_bytes_atomic(self.state_file,
+            json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
+        self.data = copy.deepcopy(saved)
+
+    def fence(self, claim):
+        saved, _ = self.read_legacy()
+        if (not self.is_v2(saved) or saved.get('root_binding') != self.root
+                or saved.get('run_id') != claim['run_id'] or saved.get('owner') != claim['owner']
+                or saved.get('epoch') != claim['epoch'] or saved.get('lease_until', 0) <= time.time()):
+            raise BucketIdempotencyError('operation_claim_stale')
+        return saved
+
+    @guarded_mutation('legacy_import_claim')
+    def claim(self, run_id, owner):
+        with bucket_write_scope(self.root):
+            saved, _ = self.read_legacy()
+            if (not self.is_v2(saved) or saved['root_binding'] != self.root or saved['run_id'] != run_id):
+                raise BucketIdempotencyError('operation_claim_stale')
+            if saved['status'] == 'completed':
+                return {'replay': self.public_status(saved)}
+            if saved.get('owner') and saved['lease_until'] > time.time():
+                return None
+            saved.update(owner=owner, epoch=saved['epoch'] + 1,
+                         lease_until=time.time() + _LEGACY_LEASE_SECONDS, status='running')
+            self.publish(saved)
+            return {'run_id': run_id, 'owner': owner, 'epoch': saved['epoch']}
+
+    @guarded_mutation('legacy_import_checkpoint')
+    def checkpoint(self, claim, phase=None, change=None):
+        with bucket_write_scope(self.root):
+            saved = self.fence(claim)
+            if change is not None:
+                change(saved)
+            if phase is not None:
+                saved['phase'] = phase
+            self.publish(saved)
+            return saved
+
+    @guarded_mutation('legacy_import_heartbeat')
+    def heartbeat(self, claim):
+        with bucket_write_scope(self.root):
+            saved = self.fence(claim)
+            saved['lease_until'] = time.time() + _LEGACY_LEASE_SECONDS
+            self.publish(saved, ownership_only=True)
+
+    @guarded_mutation('legacy_import_release')
+    def release(self, claim):
+        with bucket_write_scope(self.root):
+            saved, _ = self.read_legacy()
+            if (self.is_v2(saved) and saved['run_id'] == claim['run_id']
+                    and saved['owner'] == claim['owner'] and saved['epoch'] == claim['epoch']):
+                saved.update(owner=None, lease_until=0)
+                if saved['status'] == 'running':
+                    saved['status'] = 'paused'
+                self.publish(saved, ownership_only=saved['status'] == 'completed')
+
+    @guarded_mutation('legacy_import_pause')
+    def request_pause(self):
+        with bucket_write_scope(self.root):
+            saved, _ = self.read_legacy()
+            if self.is_v2(saved) and saved['status'] != 'completed':
+                saved['pause_requested'] = True
+                self.publish(saved)
+
 
 # ============================================================
 # Import extraction prompt
@@ -420,10 +599,14 @@ class ImportEngine:
     def pause(self):
         """Request pause — will stop after current chunk finishes."""
         self._paused = True
+        saved, _ = self.state.read_legacy()
+        if self.state.is_v2(saved):
+            self.state.request_pause()
 
     def get_status(self) -> dict:
         """Get current import status."""
-        status = self.state.to_dict(); status["errors"] = ["import_failed"] * len(status.get("errors", [])); return status
+        saved, raw = self.state.read_legacy()
+        return self.state.public_status(saved if raw is not None else self.state.data)
 
     async def start(
         self,
@@ -436,52 +619,314 @@ class ImportEngine:
         Start or resume an import.
         开始或恢复导入。
         """
-        if self._running:
-            return {"error": "Import already running"}
-
-        self._running = True
-        self._paused = False
-
         try:
-            source_hash = hashlib.sha256(raw_content.encode()).hexdigest()[:16]
+            accepted = self.accept_legacy(raw_content, filename, preserve_raw, resume)
+        except BucketIdempotencyError as exc:
+            return {'error': str(exc)}
+        return await self.run_legacy(accepted)
 
-            # Check for resume
-            if resume and self.state.load() and self.state.can_resume:
-                if self.state.data["source_hash"] == source_hash:
-                    logger.info(f"Resuming import from chunk {self.state.data['processed']}/{self.state.data['total_chunks']}")
-                    # Re-parse and re-chunk to get the same chunks
-                    turns = detect_and_parse(raw_content, filename)
-                    self._chunks = chunk_turns(turns)
-                    self.state.data["status"] = "running"
-                    self.state.save()
-                    return await self._process_chunks(preserve_raw)
-                else:
-                    logger.warning("Source file changed, starting fresh import")
+    @staticmethod
+    def _legacy_digest(value):
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
-            # Fresh import
-            turns = detect_and_parse(raw_content, filename)
-            if not turns:
-                self._running = False
-                return {"error": "No conversation turns found in file"}
+    def _legacy_pipeline(self):
+        functions = (_parse_claude_json, _parse_chatgpt_json, _parse_markdown, detect_and_parse,
+                     chunk_turns, ImportEngine._parse_extraction)
+        return dict(version=1, parser_chunker_digest=self._legacy_digest(
+                        [inspect.getsource(function) for function in functions]),
+                    target_tokens=10000, extractor_version=1,
+                    prompt_digest=hashlib.sha256(IMPORT_EXTRACT_PROMPT.encode()).hexdigest(),
+                    model=getattr(self.dehydrator, 'model', ''), input_chars=12000,
+                    max_tokens=2048, temperature=0.0,
+                    aliases=[[source, target] for source, target in DISPLAY_ALIASES.items()])
 
-            self._chunks = chunk_turns(turns)
-            if not self._chunks:
-                self._running = False
-                return {"error": "No processable chunks after splitting"}
+    @staticmethod
+    def _legacy_chunk_descriptor(chunk, ordinal):
+        return dict(ordinal=ordinal, digest=ImportEngine._legacy_digest(chunk),
+                    timestamp_start=chunk.get('timestamp_start', ''),
+                    timestamp_end=chunk.get('timestamp_end', ''), turn_count=chunk['turn_count'])
 
-            self.state.reset(filename, source_hash, len(self._chunks))
-            self.state.save()
+    @guarded_mutation('legacy_import_accept')
+    def accept_legacy(self, raw_content, filename='', preserve_raw=False, resume=False):
+        """Durably bind one active run before HTTP acknowledges or schedules it."""
+        saved = self.state.resume_preflight() if resume else self.state.read_legacy()[0]
+        digest = hashlib.sha256(raw_content.encode()).hexdigest()
+        if resume and self.state.v1_completed(saved):
+            if saved.get('source_hash') != digest[:16]:
+                raise BucketIdempotencyError('legacy_source_conflict')
+            return {'replay': self.state.public_status(saved)}
+        if resume and self.state.is_v2(saved) and saved['status'] == 'completed':
+            self._validate_legacy_binding(saved, digest, filename, preserve_raw)
+            return {'replay': self.state.public_status(saved)}
+        turns = detect_and_parse(raw_content, filename)
+        if not turns:
+            raise BucketIdempotencyError('No conversation turns found in file')
+        chunks = chunk_turns(turns)
+        if not chunks:
+            raise BucketIdempotencyError('No processable chunks after splitting')
+        descriptors = [self._legacy_chunk_descriptor(c, i) for i, c in enumerate(chunks)]
+        pipeline = self._legacy_pipeline()
+        with bucket_write_scope(self.state.root):
+            saved, old_bytes = self.state.read_legacy()
+            if resume:
+                # Recheck after acquiring the root mutex: another acceptance may have won.
+                if not self.state.is_v2(saved):
+                    if self.state.v1_completed(saved) and saved.get('source_hash') == digest[:16]:
+                        return {'replay': self.state.public_status(saved)}
+                    raise BucketIdempotencyError('legacy_resume_unverifiable')
+                self._validate_legacy_binding(saved, digest, filename, preserve_raw)
+                if saved['status'] == 'completed':
+                    return {'replay': self.state.public_status(saved)}
+                if (saved['pipeline'] != pipeline or len(descriptors) != len(saved['chunks']) or descriptors != [
+                        {key: c[key] for key in descriptors[i]} for i, c in enumerate(saved['chunks'])]):
+                    raise BucketIdempotencyError('legacy_pipeline_conflict')
+                if not saved.get('owner') or saved['lease_until'] <= time.time():
+                    saved['pause_requested'] = False
+                    self.state.publish(saved)
+            else:
+                if self.state.is_v2(saved) and saved['status'] != 'completed':
+                    raise BucketIdempotencyError('Import already running')
+                if saved and saved.get('raw_evidence_capture') and saved.get('status') != 'completed':
+                    raise BucketIdempotencyError('Import already running')
+                if self._running:
+                    raise BucketIdempotencyError('Import already running')
+                if not self.bucket_mgr.legacy_import_receipts_available():
+                    raise BucketIdempotencyError('legacy_effect_receipts_unavailable')
+                if old_bytes is not None and not self.state.is_v2(saved):
+                    self.state.preserve_v1(old_bytes)
+                saved = dict(schema_version=2, mode='legacy', run_id=uuid4().hex,
+                    root_binding=self.state.root, source_digest=digest, source_hash=digest[:16],
+                    source_file=filename, preserve_raw=preserve_raw, pipeline=pipeline,
+                    phase='run.accepted', status='running', errors=[], last_error_code=None,
+                    started_at=now_iso(), updated_at='', pause_requested=False,
+                    owner=None, epoch=0, lease_until=0, completed_receipt=None,
+                    chunks=[dict(d, status='extraction_pending', items=None, outcome=None, api_calls=0)
+                            for d in descriptors])
+                self.state.publish(saved)
+        return {'run_id': saved['run_id'], 'chunks': chunks}
 
-            logger.info(f"Starting import: {len(turns)} turns → {len(self._chunks)} chunks")
-            return await self._process_chunks(preserve_raw)
+    def _validate_legacy_binding(self, saved, digest, filename, preserve_raw):
+        if (saved['root_binding'] != self.state.root or saved['source_digest'] != digest
+                or saved['source_file'] != filename or saved['preserve_raw'] != preserve_raw):
+            raise BucketIdempotencyError('legacy_source_conflict')
 
+    async def _legacy_heartbeat(self, claim):
+        while True:
+            await asyncio.sleep(_LEGACY_LEASE_SECONDS / 3)
+            self.state.heartbeat(claim)
+
+    @guarded_async_mutation('legacy_import_execute')
+    async def run_legacy(self, accepted):
+        if 'replay' in accepted:
+            return accepted['replay']
+        key = (os.getpid(), asyncio.get_running_loop(), self.state.root, accepted['run_id'])
+        lock = _LEGACY_RUN_LOCKS.setdefault(key, asyncio.Lock())
+        async with lock:
+            claim = None
+            heartbeat = None
+            self._running = True
+            self._paused = False
+            try:
+                while (claim := self.state.claim(accepted['run_id'], uuid4().hex)) is None:
+                    await asyncio.sleep(.05)
+                if 'replay' in claim:
+                    return claim['replay']
+                heartbeat = asyncio.create_task(self._legacy_heartbeat(claim))
+                for ordinal, chunk in enumerate(accepted['chunks']):
+                    saved = self.state.fence(claim)
+                    if saved['chunks'][ordinal]['status'] == 'completed':
+                        continue
+                    if saved['pause_requested']:
+                        self.state.checkpoint(claim, change=lambda s: s.update(status='paused'))
+                        return self.get_status()
+                    await self._legacy_process_chunk(claim, ordinal, chunk)
+                self.state.checkpoint(claim, 'run.completed', lambda s: s.update(status='completed'))
+                return self.get_status()
+            except (BucketIdempotencyError, MaintenanceWriteError, OSError):
+                # Storage/fencing failures are never ordinary extraction outcomes.
+                self._legacy_record_error(claim)
+                raise
+            except Exception:
+                self._legacy_record_error(claim)
+                raise
+            finally:
+                try:
+                    if heartbeat is not None:
+                        heartbeat.cancel()
+                        try:
+                            await heartbeat
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            logger.exception('Legacy import heartbeat failed')
+                finally:
+                    self._running = False
+                    if claim is not None and 'replay' not in claim:
+                        try:
+                            self.state.release(claim)
+                        except Exception:
+                            logger.exception('Legacy import claim release failed; lease will expire')
+
+    def _legacy_record_error(self, claim):
+        if claim is None or 'replay' in claim:
+            return
+        error = sys.exc_info()[1]
+        try:
+            def failed(saved):
+                saved['status'] = 'error'
+                saved['last_error_code'] = str(error) if isinstance(error, BucketIdempotencyError) else 'import_failed'
+                if len(saved['errors']) < 100:
+                    saved['errors'].append('import_failed')
+            self.state.checkpoint(claim, change=failed)
         except Exception:
-            self.state.data["status"] = "error"
-            logger.exception("Import failed")
-            self.state.data["errors"].append("import_failed")
-            self.state.save()
-            self._running = False
-            raise
+            logger.exception('Legacy import failure checkpoint unavailable')
+
+    def _legacy_child_key(self, claim, chunk, item, effect):
+        return 's4c:' + self._legacy_digest(
+            ['legacy-item-v1', self.state.root, claim['run_id'], chunk, item, effect])
+
+    async def _legacy_process_chunk(self, claim, ordinal, chunk):
+        saved = self.state.fence(claim)
+        if saved['chunks'][ordinal]['digest'] != self._legacy_digest(chunk):
+            raise BucketIdempotencyError('legacy_chunk_conflict')
+        if saved['chunks'][ordinal]['items'] is None:
+            self.state.checkpoint(claim, 'chunk.extraction_pending')
+            try:
+                items = await self._extract_memories(chunk['content']) if chunk['content'].strip() else []
+                outcome = 'extracted'
+            except (BucketIdempotencyError, MaintenanceWriteError, OSError):
+                raise
+            except Exception:
+                logger.exception('Legacy extraction failed index=%d', ordinal)
+                items, outcome = [], 'provider_failed'
+            def freeze(state):
+                current = state['chunks'][ordinal]
+                current.update(status='extraction_frozen', outcome=outcome, api_calls=1,
+                    items=[dict(ordinal=i, digest=self._legacy_digest(item), extraction=copy.deepcopy(item),
+                                status='extraction_frozen', plan=None, resolutions={})
+                           for i, item in enumerate(items)])
+            self.state.checkpoint(claim, 'chunk.extraction_frozen', freeze)
+        for item_ordinal in range(len(self.state.fence(claim)['chunks'][ordinal]['items'])):
+            context = dict(state=self.state, claim=claim, chunk=ordinal, item=item_ordinal)
+            current = self.state.fence(claim)['chunks'][ordinal]['items'][item_ordinal]
+            if current['status'] == 'completed':
+                continue
+            if current['ordinal'] != item_ordinal or current['digest'] != self._legacy_digest(current['extraction']):
+                raise BucketIdempotencyError('legacy_item_conflict')
+            if current['plan'] is None:
+                item = current['extraction']
+                preserve = self.state.fence(claim)['preserve_raw'] or item.get('preserve_raw', False)
+                candidate = None
+                if not preserve:
+                    try:
+                        existing = await self.bucket_mgr.search(item['content'], limit=1,
+                                                               domain_filter=item.get('domain', ['未分类']) or None)
+                    except (BucketIdempotencyError, MaintenanceWriteError, OSError):
+                        raise
+                    except Exception:
+                        existing = []
+                    if existing:
+                        meta = existing[0].get('metadata', {})
+                        if (not meta.get('sealed') and meta.get('type') != 'feel'
+                                and not (meta.get('pinned') or meta.get('protected'))
+                                and self.bucket_mgr._normalize_search_text(existing[0].get('content', ''))
+                                == self.bucket_mgr._normalize_search_text(item['content'])):
+                            candidate = existing[0]['id']
+                self._legacy_plan_item(context, item, candidate, preserve)
+            await self._legacy_execute_item(context)
+        def complete(state):
+            current = state['chunks'][ordinal]
+            if not all(i['status'] == 'completed' for i in current['items']):
+                raise BucketIdempotencyError('legacy_item_incomplete')
+            current['status'] = 'completed'
+        self.state.checkpoint(claim, 'chunk.completed', complete)
+
+    @guarded_mutation('legacy_import_item_plan')
+    def _legacy_plan_item(self, context, item, candidate, preserve):
+        with bucket_write_scope(self.state.root):
+            saved = self.state.fence(context['claim'])
+            current = saved['chunks'][context['chunk']]['items'][context['item']]
+            if current['plan'] is not None:
+                return
+            memory_key = self._legacy_child_key(context['claim'], context['chunk'], context['item'], 'memory')
+            plan = self.bucket_mgr.plan_legacy_import_item(item, candidate, preserve,
+                memory_key=memory_key, embedding_key=self._legacy_child_key(
+                    context['claim'], context['chunk'], context['item'], 'embedding'),
+                aliases=saved['pipeline']['aliases'])
+            def freeze(state):
+                entry = state['chunks'][context['chunk']]['items'][context['item']]
+                entry.update(plan=plan, status='planned')
+            self.state.checkpoint(context['claim'], 'item.planned', freeze)
+
+    def _legacy_item_checkpoint(self, context, phase, resolution=None):
+        def change(saved):
+            item = saved['chunks'][context['chunk']]['items'][context['item']]
+            item['status'] = phase.removeprefix('item.')
+            if resolution:
+                item['resolutions'].update(resolution)
+        return self.state.checkpoint(context['claim'], phase, change)
+
+    async def _legacy_execute_item(self, context):
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        plan = current['plan']
+        if 'memory' not in current['resolutions']:
+            if plan['decision'] == 'reuse' and not plan['memory_requested']:
+                self.bucket_mgr.validate_legacy_import_target(context)
+                outcome = 'not_requested'
+            else:
+                # A draft exists only until the existing child journal owns the payload.
+                self.bucket_mgr.ensure_legacy_import_operation(context)
+                def journal_owned(saved):
+                    entry = saved['chunks'][context['chunk']]['items'][context['item']]
+                    entry['plan'].pop('payload', None)
+                self.state.checkpoint(context['claim'], change=journal_owned)
+                await self.bucket_mgr.apply_import_operation(plan['memory_key'], _legacy_import_context=context)
+                outcome = 'applied'
+            self._legacy_item_checkpoint(context, 'item.memory_applied', {'memory': outcome})
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        if 'delta' not in current['resolutions']:
+            receipt = self.bucket_mgr.commit_legacy_import_delta(context)
+            self._legacy_item_checkpoint(context, 'item.memory_applied', {'delta': receipt['outcome']})
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        if 'embedding' not in current['resolutions']:
+            receipt = await self._legacy_embedding(context)
+            self._legacy_item_checkpoint(context, 'item.memory_applied', {'embedding': receipt['outcome']})
+        self._legacy_item_checkpoint(context, 'item.effects_resolved')
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        if not all(step in current['resolutions'] for step in ('memory', 'delta', 'embedding')):
+            raise BucketIdempotencyError('legacy_effect_incomplete')
+        self._legacy_item_checkpoint(context, 'item.completed')
+
+    async def _legacy_embedding(self, context):
+        plan = self.bucket_mgr._legacy_import_plan(context)
+        if plan['decision'] == 'reuse':
+            return {'outcome': 'not_requested'}
+        operation = self.bucket_mgr.inspect_import_operation(plan['memory_key'])
+        embedding_input = operation['payload']['content']
+        if hashlib.sha256(embedding_input.encode()).hexdigest() != plan['body_digest']:
+            raise BucketIdempotencyError('operation_payload_conflict')
+        if not embedding_input.strip():
+            return {'outcome': 'not_requested'}
+        engine = self.embedding_engine or self.bucket_mgr.embedding_engine
+        if not engine or not engine.enabled:
+            return {'outcome': 'disabled'}
+        receipt = engine.trace_embedding_receipt(plan['embedding_key'])
+        if receipt is not None:
+            return receipt
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        candidate = current['resolutions'].get('embedding_candidate')
+        if candidate is None:
+            try:
+                candidate = await engine._generate_embedding(embedding_input, model=plan['embedding_model'])
+            except (BucketIdempotencyError, MaintenanceWriteError, OSError):
+                raise
+            except Exception:
+                candidate = []
+            self._legacy_item_checkpoint(context, 'item.memory_applied', {'embedding_candidate': candidate})
+        if not candidate:
+            return {'outcome': 'failed'}
+        return self.bucket_mgr.commit_legacy_import_embedding(context, engine, candidate)
 
     async def start_raw_evidence(
         self,
