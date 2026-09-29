@@ -12,6 +12,7 @@ import os
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import re
 import shutil
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 
 def _resolve_vault_dir() -> str:
@@ -89,6 +90,13 @@ def migrate():
     for filename in sorted(files):
         with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
             old_path = os.path.join(DYNAMIC_DIR, filename)
+            admission = DurableDeleteAdmission(os.path.dirname(DYNAMIC_DIR))
+            try:
+                identity,guard = admission.capture_path(old_path)
+                admission.admit(identity,expected_source=guard,kind='move')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {filename}: {exc.code}')
+                continue
             try:
                 meta = parse_frontmatter(old_path)
             except Exception as e:
@@ -116,6 +124,11 @@ def migrate():
             new_path = os.path.join(domain_dir, new_filename)
 
             # 移动
+            try:
+                admission.admit(identity,expected_source=guard,kind='move')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {filename}: {exc.code}')
+                continue
             shutil.move(old_path, new_path)
             print(f"  ✓ {filename}")
             print(f"    → {primary_domain}/{new_filename}")

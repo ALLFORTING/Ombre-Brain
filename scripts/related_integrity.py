@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bucket_write_lock import initialize_bucket_write_lock
 from related_integrity import RelatedError, RelationStore, plan_repair, scan_relation_store
+from confirmed_delete_admission import DurableDeleteAdmission
 
 
 def main():
@@ -30,7 +31,7 @@ def main():
     try:
         if args.command == 'apply':
             plan = json.loads(args.plan.read_text(encoding='utf-8'))
-            store = RelationStore(root)
+            store = RelationStore(root,admission_resolver=DurableDeleteAdmission(root).relation)
             receipt = store.lookup('repair:' + str(plan.get('plan_id')))
             if not receipt:
                 expected = plan_repair(scan_relation_store(root))

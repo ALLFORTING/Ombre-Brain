@@ -2056,6 +2056,7 @@ def _record_emotion_snapshot(
     valence: float, arousal: float, source: str, bucket_id: str = "",
     *, _expected_entry: dict | None = None, _strict: bool = False, _verify_only: bool = False,
     _effect_key: str | None = None, _s4_context: dict | None = None,
+    _expected_source: dict | None = None,
 ) -> None:
     if not (0 <= valence <= 1 and 0 <= arousal <= 1):
         return
@@ -2074,6 +2075,13 @@ def _record_emotion_snapshot(
         with bucket_write_scope(config["buckets_dir"]):
             if _s4_context is not None:
                 bucket_mgr._trace_fence(_s4_context)
+            if bucket_id and not _verify_only:
+                from confirmed_delete_admission import DeleteAdmissionError
+                try:
+                    bucket_mgr.delete_admission.admit(bucket_id,expected_source=_expected_source,
+                        kind='emotion',allow_missing=_expected_source is None)
+                except DeleteAdmissionError as exc:
+                    raise BucketIdempotencyError(exc.code) from exc
             timeline = _read_emotion_timeline_for_write(path)
             if _effect_key is not None:
                 existing = [item for item in timeline if item.get('_s4_effect') == _effect_key]
@@ -9929,8 +9937,11 @@ async def _run_hold_grow_request(manager, operation_id, payload, normalization):
                         parent[field] = await provider(payload['content'])
                         manager._trace_checkpoint(context, plan=parent)
                 if payload['feel'] and payload['source_bucket'] and 'source_preflight' not in parent:
-                    parent['source_preflight'] = manager.preview_feel_source(payload['source_bucket'])['status']
-                    manager._trace_checkpoint(context, plan=parent)
+                    with bucket_write_scope(manager.base_dir):
+                        parent['source_preflight'] = manager.preview_feel_source(payload['source_bucket'])['status']
+                        if parent['source_preflight'] == 'valid':
+                            parent['feel_source_guard'] = manager.delete_admission.capture(payload['source_bucket'])
+                        manager._trace_checkpoint(context, plan=parent)
                 if parent.get('source_preflight', 'valid') != 'valid':
                     error = parent['source_preflight']
                     result = f'feel 未创建；source 校验失败（{error}）。\n' + _format_hold_feel_source_receipt('', payload['source_bucket'], error)
@@ -10082,9 +10093,29 @@ def _hold_grow_related(manager, context, ordinal):
             return {'status': 'not_requested'}
         manager._trace_fence(context)
         relation = {'source': plan['target'], 'add': [pair[0] for pair in selected], 'remove': [], 'origin': 'inferred'}
-        return manager.relation_store.commit(lambda inv: plan_mutation(inv, relation['source'],
+        source = request['payload'].get('source_bucket') if request['plan']['mode'] == 'feel' else None
+        guard = request['plan'].get('feel_source_guard')
+        existing = manager.relation_store.lookup(plan['keys']['relation'])
+        if source in relation['add']:
+            # An existing own intent may already have published the reciprocal
+            # edge. No deletion since capture plus its unchanged non-relation
+            # preimage proves that this is the same source for that receipt.
+            if existing:
+                manager.admit_delayed_effect(source,guard,'receipt_event')
+                current_source = manager.delete_admission.capture(source)
+                if not guard or current_source['non_relation_hash'] != guard.get('non_relation_hash'):
+                    raise BucketIdempotencyError('confirmed_delete_source_changed')
+            else:
+                manager.admit_delayed_effect(source,guard,'hold_grow_related_source')
+        receipt = manager.relation_store.commit(lambda inv: plan_mutation(inv, relation['source'],
             add=relation['add'], origin='inferred'), operation_key=plan['keys']['relation'],
             request_digest=related_digest(relation))
+        if source in relation['add']:
+            manager.admit_delayed_effect(source,guard,'receipt_event')
+            parent = manager._trace_fence(context)['plan']
+            parent['feel_source_guard'] = manager.delete_admission.capture(source)
+            manager._trace_checkpoint(context,plan=parent)
+        return receipt
 
 
 async def _hold_grow_embedding(manager, context, ordinal):
@@ -10115,8 +10146,52 @@ async def _hold_grow_embedding(manager, context, ordinal):
         if (post is None or _is_sealed({'metadata': post.metadata}) or post.content != plan['embedding_input']
                 or post.get('last_active') != plan['logical_time']):
             return {'outcome': 'superseded_before_refresh'}
+        manager.admit_delayed_effect(plan['target'],current.get('source_guard'),'hold_grow_embedding')
         return engine.store_trace_embedding(plan['keys']['embedding'], plan['target'], candidate,
-            hashlib.sha256(plan['embedding_input'].encode()).hexdigest(), plan['embedding_model'], plan['logical_time'])
+            hashlib.sha256(plan['embedding_input'].encode()).hexdigest(), plan['embedding_model'], plan['logical_time'],
+            expected_source=current.get('source_guard'))
+
+
+def _hold_grow_admit_effect(manager, context, ordinal, kind):
+    """Reconcile this request's publish-before-guard-checkpoint effects only."""
+    request = manager._trace_fence(context)
+    plan = request['plan']['items'][ordinal]['plan']
+    current = request['resolutions']['items'][str(ordinal)]
+    guard = current.get('source_guard')
+    try:
+        return manager.admit_delayed_effect(plan['target'],guard,kind)
+    except BucketIdempotencyError as exc:
+        if exc.code != 'confirmed_delete_source_changed':
+            raise
+        # This check forbids reconciliation across any accepted/completed delete.
+        fresh = manager.admit_delayed_effect(plan['target'],guard,'receipt_event')
+        own_effect = False
+        journal = manager.relation_store.lookup(plan['keys']['relation'])
+        relation = {'source':plan['target'],'add':[pair[0] for pair in current.get('selection',[])],
+                    'remove':[],'origin':'inferred'}
+        if (journal and journal['status'] in ('pending','complete')
+                and journal['plan']['root'] == str(Path(manager.base_dir).resolve())
+                and journal['request_digest'] == related_digest(relation)
+                and fresh['non_relation_hash'] == (guard or {}).get('non_relation_hash')):
+            endpoint = scan_relation_store(manager.base_dir).endpoint(plan['target'])
+            own_effect = any(step['id']==plan['target'] and step.get('after')==endpoint.related.fingerprint
+                             for step in journal['plan']['steps'])
+        date = plan['values'].get('trigger_date','')
+        if not own_effect and not plan['reused'] and date:
+            post = frontmatter.load(manager._find_bucket_file(plan['target']))
+            marker = manager._operation_marker(post,plan['keys']['trigger'])
+            _, expected_digest = manager._canonical_import_payload({'kwargs':{'trigger_date':date,'trigger_last_seen':''}})
+            omitted = {'related_buckets','last_active','updated_at','trigger_date','trigger_last_seen','_ob_import_operations'}
+            own_effect = (marker is not None and marker['payload_digest']==expected_digest
+                and post.get('trigger_date')==date and post.get('trigger_last_seen')==''
+                and post.content==plan['embedding_input']
+                and {k:v for k,v in post.metadata.items() if k not in omitted}
+                    == {k:v for k,v in plan['metadata'].items() if k not in omitted})
+        if not own_effect:
+            raise exc
+        request['resolutions']['items'][str(ordinal)]['source_guard'] = fresh
+        manager._trace_checkpoint(context,resolutions=request['resolutions'])
+        return fresh
 
 
 @guarded_async_mutation('hold_grow_item_execute')
@@ -10142,24 +10217,41 @@ async def _execute_hold_grow_item(manager, context, ordinal):
         elif step == 'delta':
             receipt = manager.commit_hold_grow_delta(context, ordinal)
         elif step == 'embedding':
+            with bucket_write_scope(manager.base_dir):
+                source_guard = current.get('source_guard') or manager.delete_admission.capture(plan['target'])
+                manager.admit_delayed_effect(plan['target'],source_guard,'hold_grow_effect')
+                resolutions.setdefault('items',{}).setdefault(str(ordinal),{}).setdefault('source_guard',source_guard)
+                manager._trace_checkpoint(context,resolutions=resolutions)
             receipt = await _hold_grow_embedding(manager, context, ordinal)
         elif step == 'trigger':
-            receipt = manager.commit_hold_grow_trigger(context, ordinal)
+            with bucket_write_scope(manager.base_dir):
+                _hold_grow_admit_effect(manager,context,ordinal,'hold_grow_trigger')
+                receipt = manager.commit_hold_grow_trigger(context, ordinal)
+                latest = manager._trace_fence(context)['resolutions']
+                latest['items'][str(ordinal)]['source_guard'] = manager.delete_admission.capture(plan['target'])
+                manager._trace_checkpoint(context,resolutions=latest)
         elif step == 'related':
-            receipt = {'status': 'not_requested'} if plan['reused'] else _hold_grow_related(manager, context, ordinal)
+            with bucket_write_scope(manager.base_dir):
+                _hold_grow_admit_effect(manager,context,ordinal,'hold_grow_related')
+                receipt = {'status': 'not_requested'} if plan['reused'] else _hold_grow_related(manager, context, ordinal)
+                latest = manager._trace_fence(context)['resolutions']
+                latest['items'][str(ordinal)]['source_guard'] = manager.delete_admission.capture(plan['target'])
+                manager._trace_checkpoint(context,resolutions=latest)
         elif step == 'emotion':
             receipt = {'outcome': 'not_requested'}
             if payload['kind'] == 'hold' and payload['valence'] != -1 and payload['arousal'] != -1:
                 entry = dict(timestamp=plan['logical_time'], valence=round(payload['valence'], 3),
                              arousal=round(payload['arousal'], 3), source='hold', bucket_id=plan['target'])
                 _record_emotion_snapshot(payload['valence'], payload['arousal'], 'hold', plan['target'],
-                    _expected_entry=entry, _strict=True, _effect_key=plan['keys']['emotion'], _s4_context=context)
+                    _expected_entry=entry, _strict=True, _effect_key=plan['keys']['emotion'], _s4_context=context,
+                    _expected_source=current.get('source_guard'))
                 receipt = {'outcome': 'applied'}
         else:
             receipt = {'status': 'not_requested'}
             if mode == 'feel' and payload['source_bucket']:
                 receipt = manager.mark_feel_source(payload['source_bucket'],
                     model_valence=plan['values']['valence'] if payload['valence'] != -1 else None,
+                    _expected_source=request['plan'].get('feel_source_guard'),
                     _s4_effect={'context': context, 'key': plan['keys']['source'], 'logical_time': plan['logical_time']})
                 if receipt['status'] != 'marked':
                     raise BucketIdempotencyError('operation_source_' + receipt['status'])

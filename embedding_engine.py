@@ -131,10 +131,19 @@ class EmbeddingEngine:
             return False
 
         try:
+            capture = getattr(self,'source_capture',None)
+            expected_source = None
+            if capture is not None:
+                with bucket_write_scope(os.path.dirname(self.db_path)):
+                    expected_source = capture(bucket_id)
+                    self.write_admission(bucket_id,expected_source=expected_source)
             embedding = await self._generate_embedding(content)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            if expected_source is None:
+                self._store_embedding(bucket_id, embedding)
+            else:
+                self._store_embedding(bucket_id, embedding, expected_source=expected_source)
             self.last_error = ""
             self.last_error_details = {}
             return True
@@ -207,12 +216,15 @@ class EmbeddingEngine:
         }
 
     @guarded_mutation("bucket_embedding_store")
-    def _store_embedding(self, bucket_id: str, embedding: list[float]):
+    def _store_embedding(self, bucket_id: str, embedding: list[float], *, expected_source=None):
         """Store embedding in SQLite."""
         with bucket_write_scope(os.path.dirname(self.db_path)):
             admission = getattr(self, "write_admission", None)
             if admission is not None:
-                admission(bucket_id)
+                if expected_source is None:
+                    admission(bucket_id)
+                else:
+                    admission(bucket_id,expected_source=expected_source)
             from utils import now_iso
             conn = sqlite3.connect(self.db_path)
             conn.execute(
@@ -286,12 +298,15 @@ class EmbeddingEngine:
         return json.loads(row[0]) if row else None
 
     @guarded_mutation("trace_embedding_store")
-    def store_trace_embedding(self, effect_key, bucket_id, vector, input_digest, model, logical_time):
+    def store_trace_embedding(self, effect_key, bucket_id, vector, input_digest, model, logical_time, *, expected_source=None):
         """Caller holds root mutex and has revalidated its epoch and current body."""
         with bucket_write_scope(os.path.dirname(self.db_path)):
             admission = getattr(self, "write_admission", None)
             if admission is not None:
-                admission(bucket_id)
+                if expected_source is None:
+                    admission(bucket_id)
+                else:
+                    admission(bucket_id,expected_source=expected_source)
             if not self._valid_archive_vector(vector):
                 raise ValueError('trace_embedding_invalid')
             serialized = json.dumps(vector)

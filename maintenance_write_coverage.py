@@ -16,6 +16,7 @@ COVERAGE_SCHEMA_VERSION = 3
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
+    "confirmed_delete_admission.py": {"rows": "dynamic_sql_read_only"},
     "archive_session_operations.py": {
         "lookup_or_plan": "guarded_mutation",
         "_sealed_cleanup": "guarded_caller_only",

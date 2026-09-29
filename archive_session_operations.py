@@ -18,6 +18,7 @@ from bucket_manager import BucketManager
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock, BucketWriteLockError
 from maintenance_write_gate import guarded_mutation
 from utils import generate_bucket_id
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 
 TABLE = "ob_archive_session_operations"
@@ -77,6 +78,15 @@ class ArchiveSessionOperations:
     def __init__(self, root):
         self.root = Path(root).resolve()
         self.db = self.root / "bucket_history.sqlite3"
+        self.delete_admission = DurableDeleteAdmission(self.root)
+
+    def _admit_source(self, plan, kind, *, allow_missing=False):
+        try:
+            return self.delete_admission.admit(plan['bucket_id'],root_binding=self.root,
+                expected_source={'path':plan['relative_path'],'file_hash':plan['file_digest']},
+                kind=kind,allow_missing=allow_missing)
+        except DeleteAdmissionError as exc:
+            raise ArchiveSessionError('archive_'+exc.code) from exc
 
     def checkpoint(self, boundary, operation):
         """Synchronous fault-injection seam; production does no work."""
@@ -302,7 +312,9 @@ class ArchiveSessionOperations:
                     raise ArchiveSessionError("archive_sealed_embedding_conflict")
 
     def _publish(self, plan, *, previously_published=False):
-        if self._verify_bucket(plan, missing_ok=not previously_published):
+        verified = self._verify_bucket(plan, missing_ok=not previously_published)
+        self._admit_source(plan,'archive_publication',allow_missing=not previously_published)
+        if verified:
             # The preceding executor may have stopped between replace and fsync.
             BucketManager._sync_directory(str(self.root / "archive"))
             BucketManager._sync_directory(str((self.root / plan["relative_path"]).parent))
@@ -314,7 +326,8 @@ class ArchiveSessionOperations:
         BucketManager._sync_directory(str(self.root))
         BucketManager._sync_directory(str(directory.parent))
         BucketManager._write_bytes_atomic(str(self.root / plan["relative_path"]),
-                                         plan["file_text"].encode("utf-8"))
+            plan["file_text"].encode("utf-8"),before_publish=lambda:
+                self._admit_source(plan,'archive_publication',allow_missing=not previously_published))
         self._verify_bucket(plan)
 
     @guarded_mutation("archive_session_legacy_publish")
@@ -352,6 +365,7 @@ class ArchiveSessionOperations:
                 return
             self._verify_bucket(op["plan"])
             if op["boot_event_id"] is None:
+                self._admit_source(op['plan'],'archive_boot_event')
                 event_id = BucketManager._insert_boot_delta_event(
                     conn, op["bucket_id"], "created", "{}", op["created_at"])
                 self.checkpoint("before_boot_commit", op)
@@ -389,6 +403,7 @@ class ArchiveSessionOperations:
                 letter_id = None
                 content = op["plan"]["payload"]["letter"]
                 if content:
+                    self._admit_source(op['plan'],'archive_letter')
                     letter_id = BucketManager._insert_letter(
                         conn, content, op["bucket_id"], op["plan"]["payload"]["sealed"], op["created_at"])
                 resolution = {"outcome": "written" if content else "not_requested"}
@@ -406,6 +421,7 @@ class ArchiveSessionOperations:
             if op["status"] == "completed":
                 return False
             p = op["plan"]
+            self._admit_source(p,'archive_embedding')
             self._verify_bucket(p)
             if op["embedding_resolution"] is not None:
                 self._verify_embedding(op, engine)
@@ -478,6 +494,7 @@ class ArchiveSessionOperations:
             if op["emotion_resolution"] is not None and op["emotion_resolution"] != expected:
                 raise ArchiveSessionError("archive_emotion_receipt_conflict")
             if entry is not None:
+                self._admit_source(op['plan'],'archive_emotion')
                 snapshot_writer(entry, verify_only=op["emotion_resolution"] is not None)
                 self.checkpoint("after_emotion_replace", op)
             conn.execute("UPDATE ob_archive_session_operations SET emotion_resolution_json=? WHERE operation_id=?",

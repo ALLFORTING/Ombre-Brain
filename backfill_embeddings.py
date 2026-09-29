@@ -79,8 +79,8 @@ async def backfill_batch(
 
 async def backfill(batch_size: int = 20, dry_run: bool = False):
     config = load_config()
-    bucket_mgr = BucketManager(config)
     engine = EmbeddingEngine(config)
+    bucket_mgr = BucketManager(config,embedding_engine=engine)
 
     if not engine.enabled:
         print("ERROR: Embedding engine not enabled (missing API key?)")

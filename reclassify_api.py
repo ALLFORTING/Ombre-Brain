@@ -12,6 +12,7 @@ import re
 
 from openai import AsyncOpenAI
 import frontmatter
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 ANALYZE_PROMPT = (
     "你是一个内容分析器。请分析以下文本，输出结构化的元数据。\n\n"
@@ -67,11 +68,19 @@ async def reclassify():
     print(f"找到 {len(files)} 个未分类文件\n")
 
     initialize_bucket_write_lock(os.path.dirname(DATA_DIR))
+    admission = DurableDeleteAdmission(os.path.dirname(DATA_DIR))
     for fpath in files:
         basename = os.path.basename(fpath)
-        post = frontmatter.load(fpath)
-        content = post.content.strip()
-        name = post.metadata.get("name", "")
+        try:
+            with bucket_write_scope(os.path.dirname(DATA_DIR)):
+                identity,guard = admission.capture_path(fpath)
+                admission.admit(identity,expected_source=guard,kind='reclassify')
+                post = frontmatter.load(fpath)
+                content = post.content.strip()
+                name = post.metadata.get("name", "")
+        except DeleteAdmissionError as exc:
+            print(f'skipped {basename}: {exc.code}')
+            continue
         full_text = f"{name}\n{content}" if name else content
 
         try:
@@ -99,10 +108,15 @@ async def reclassify():
         new_arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
 
         with bucket_write_scope(os.path.dirname(DATA_DIR)):
-            # Re-read after the API await, retaining current todos/provenance.
-            if not os.path.isfile(fpath):
+            try:
+                admission.admit(identity,expected_source=guard,kind='reclassify')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {basename}: {exc.code}')
                 continue
             post = frontmatter.load(fpath)
+            if post.metadata.get('name','') != name:
+                print(f'skipped {basename}: confirmed_delete_source_changed')
+                continue
             post.metadata["domain"] = new_domain
             post.metadata["tags"] = new_tags
             post.metadata["valence"] = new_valence
@@ -111,6 +125,11 @@ async def reclassify():
                 post.metadata["name"] = new_name
 
             # 写回文件
+            try:
+                admission.admit(identity,expected_source=guard,kind='reclassify')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {basename}: {exc.code}')
+                continue
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
 
@@ -124,6 +143,7 @@ async def reclassify():
             dest = os.path.join(target_dir, new_filename)
 
             if dest != fpath:
+                admission.admit(identity,expected_source=admission.capture(identity),kind='move')
                 os.rename(fpath, dest)
 
         print(f"  OK {basename}")

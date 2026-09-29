@@ -11,6 +11,10 @@ import os
 import uuid
 import argparse
 from datetime import datetime
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
+from related_integrity import parse_related
+import frontmatter
 
 
 def _resolve_dynamic_dir() -> str:
@@ -77,8 +81,20 @@ valence: {valence}
 
     path = os.path.join(VAULT_DIR, f"{mid}.md")
     os.makedirs(VAULT_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
+    root = os.path.dirname(VAULT_DIR)
+    initialize_bucket_write_lock(root)
+    with bucket_write_scope(root):
+        post = frontmatter.loads(md)
+        if post.get('id') != mid:
+            raise DeleteAdmissionError('confirmed_delete_publication_identity_conflict')
+        refs = list(parse_related(post.metadata).ids)
+        reverse = post.get('supersedes',[]) or []
+        refs += reverse.split(',') if isinstance(reverse,str) else reverse
+        refs = [str(value).strip() for value in refs]
+        if post.get('superseded_by'): refs.append(post['superseded_by'])
+        DurableDeleteAdmission(root).admit(mid,kind='publication',references=refs,allow_missing=True)
+        with open(path, "x", encoding="utf-8") as f:
+            f.write(md)
 
     print(f"✓ 已写入: {path}")
     print(f"  ID: {mid} | 名称: {name}")

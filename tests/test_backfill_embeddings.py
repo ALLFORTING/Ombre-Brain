@@ -86,7 +86,7 @@ async def test_backfill_cli_explains_parsed_scope_and_legacy_empty_skipped(
         last_error_details={},
     )
     monkeypatch.setattr(backfill_embeddings, "load_config", lambda: {})
-    monkeypatch.setattr(backfill_embeddings, "BucketManager", lambda config: bucket_mgr)
+    monkeypatch.setattr(backfill_embeddings, "BucketManager", lambda config, **kwargs: bucket_mgr)
     monkeypatch.setattr(backfill_embeddings, "EmbeddingEngine", lambda config: engine)
 
     await backfill_embeddings.backfill(batch_size=20, dry_run=False)

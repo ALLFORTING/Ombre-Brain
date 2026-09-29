@@ -8,6 +8,7 @@ import os
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import re
 import shutil
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 
 def _resolve_vault_dir() -> str:
@@ -119,10 +120,17 @@ def classify(body, old_domains):
     return old_domains  # 匹配不上就保留旧的
 
 
-def update_domain_in_file(filepath, new_domains):
+def update_domain_in_file(filepath, new_domains, *, expected_source=None):
     """更新文件中 frontmatter 的 domain 字段。"""
     initialize_bucket_write_lock(os.path.dirname(DYNAMIC_DIR))
     with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
+        admission = DurableDeleteAdmission(os.path.dirname(DYNAMIC_DIR))
+        try:
+            identity,guard = admission.capture_path(filepath)
+            admission.admit(identity,expected_source=expected_source or guard,kind='reclassify')
+        except DeleteAdmissionError as exc:
+            print(f'skipped {filepath}: {exc.code}')
+            return False
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
 
@@ -136,6 +144,7 @@ def update_domain_in_file(filepath, new_domains):
         )
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
+        return True
 
 
 def reclassify():
@@ -159,6 +168,13 @@ def reclassify():
     initialize_bucket_write_lock(os.path.dirname(DYNAMIC_DIR))
     for filepath in sorted(all_files):
         with bucket_write_scope(os.path.dirname(DYNAMIC_DIR)):
+            admission = DurableDeleteAdmission(os.path.dirname(DYNAMIC_DIR))
+            try:
+                identity,guard = admission.capture_path(filepath)
+                admission.admit(identity,expected_source=guard,kind='reclassify')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {filepath}: {exc.code}')
+                continue
             meta, yaml_text, body = parse_md(filepath)
             if not meta:
                 print(f"  ✗ 无法解析: {os.path.basename(filepath)}")
@@ -184,9 +200,11 @@ def reclassify():
 
             if changed:
                 # 更新 frontmatter
-                update_domain_in_file(filepath, new_domains)
+                if not update_domain_in_file(filepath, new_domains,expected_source=guard):
+                    continue
                 # 移动文件
                 if filepath != new_path:
+                    admission.admit(identity,expected_source=admission.capture(identity),kind='move')
                     shutil.move(filepath, new_path)
                 print(f"  ✓ {name}")
                 print(f"    {','.join(old_domains)} → {','.join(new_domains)}")

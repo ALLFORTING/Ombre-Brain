@@ -923,6 +923,10 @@ class ImportEngine:
         current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
         candidate = current['resolutions'].get('embedding_candidate')
         if candidate is None:
+            with bucket_write_scope(self.bucket_mgr.base_dir):
+                guard = current['resolutions'].get('source_guard') or self.bucket_mgr.delete_admission.capture(plan['target'])
+                self.bucket_mgr.admit_delayed_effect(plan['target'],guard,'legacy_import_embedding')
+                self._legacy_item_checkpoint(context,'item.memory_applied',{'source_guard':guard})
             try:
                 candidate = await engine._generate_embedding(embedding_input, model=plan['embedding_model'])
             except (BucketIdempotencyError, MaintenanceWriteError, OSError):
@@ -932,6 +936,8 @@ class ImportEngine:
             self._legacy_item_checkpoint(context, 'item.memory_applied', {'embedding_candidate': candidate})
         if not candidate:
             return {'outcome': 'failed'}
+        current = self.state.fence(context['claim'])['chunks'][context['chunk']]['items'][context['item']]
+        context = dict(context,source_guard=current['resolutions'].get('source_guard'))
         return self.bucket_mgr.commit_legacy_import_embedding(context, engine, candidate)
 
     async def start_raw_evidence(

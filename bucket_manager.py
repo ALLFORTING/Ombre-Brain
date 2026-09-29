@@ -42,6 +42,7 @@ from contextlib import nullcontext, closing
 from related_integrity import (RelationStore, RelatedError, RelatedAdmissionDeferred, plan_mutation, scan_relation_store,
                                plan_delete, parse_related, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
+from confirmed_delete_admission import DeleteAdmissionError
 from uuid import UUID, uuid4
 from datetime import datetime
 from pathlib import Path
@@ -598,9 +599,12 @@ class BucketManager:
         self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
+        from confirmed_delete_admission import DurableDeleteAdmission
+        self.delete_admission = DurableDeleteAdmission(self.base_dir)
         self.embedding_engine = embedding_engine
         if embedding_engine is not None:
             embedding_engine.write_admission = self._confirmed_embedding_admission
+            embedding_engine.source_capture = self.delete_admission.capture
         self._init_history_db()
         initialize_bucket_write_lock(self.base_dir)
         self.relation_store = RelationStore(self.base_dir, self.write_coordinator,
@@ -648,51 +652,44 @@ class BucketManager:
         return related_digest(['confirmed-delete-token-v1', str(Path(self.base_dir).resolve()), token])
 
     def assert_confirmed_delete_writable(self, bucket_id, references=()):
-        protected = {row['bucket_id'] for row in self.confirmed_delete_rows(active=True)}
-        if bucket_id in protected or protected.intersection(references):
-            raise BucketIdempotencyError('confirmed_delete_source_pending')
+        from confirmed_delete_admission import DeleteAdmissionError
+        try:
+            self.delete_admission.active(bucket_id,references)
+        except DeleteAdmissionError as exc:
+            raise BucketIdempotencyError(exc.code) from exc
 
     def _confirmed_update_admission(self, bucket_id, references, kwargs):
         self.assert_confirmed_delete_writable(bucket_id,references)
         if 'supersedes' in kwargs:
             path = self._find_bucket_file(bucket_id)
             before = set(_supersedes_for_mutation(frontmatter.load(path).metadata)) if path else set()
-            after = {str(value).strip() for value in kwargs.get('supersedes') or [] if str(value).strip()}
+            after = set(_supersedes_for_mutation({'supersedes': kwargs['supersedes']}))
             # Preserving a pending reverse ID while changing unrelated IDs is
             # allowed. Adding or removing that pending ID belongs to its child.
             self.assert_confirmed_delete_writable(bucket_id,before.symmetric_difference(after))
 
-    def _confirmed_embedding_admission(self, bucket_id, *, require_source=True):
+    def _confirmed_embedding_admission(self, bucket_id, *, require_source=True, expected_source=None):
         self.assert_confirmed_delete_writable(bucket_id)
+        if expected_source is not None:
+            self.admit_delayed_effect(bucket_id,expected_source,'embedding')
+        elif require_source and any(row['status']=='completed' for row in self.delete_admission.rows(bucket_id)):
+            self.admit_delayed_effect(bucket_id,None,'embedding')
         if (require_source and not self._find_bucket_file(bucket_id)
                 and any(row['bucket_id']==bucket_id for row in self.confirmed_delete_rows())):
             raise BucketIdempotencyError('confirmed_delete_embedding_source_missing')
 
+    def admit_delayed_effect(self, bucket_id, expected_source, kind, *, allow_missing=False):
+        from confirmed_delete_admission import DeleteAdmissionError
+        try:
+            return self.delete_admission.admit(bucket_id,expected_source=expected_source,kind=kind,
+                                               allow_missing=allow_missing)
+        except DeleteAdmissionError as exc:
+            raise BucketIdempotencyError(exc.code) from exc
+
     def _confirmed_relation_admission(self, operation, capability, boundary, step=None):
         guard = operation.get('execution_guard')
         if guard is None:
-            plan = operation['plan']
-            touched = {item['id'] for item in plan['steps']}
-            references = {identity for item in plan['steps'] for identity in item.get('desired', [])}
-            request = plan['request']
-            references.update(request.get('add', [])); references.update(request.get('remove', []))
-            if request.get('source'):
-                touched.add(request['source'])
-            if request.get('target'):
-                references.add(request['target'])
-            if self.confirmed_delete_rows(active=True):
-                inventory = scan_relation_store(self.base_dir)
-                inventory.require_complete()
-                for identity in touched:
-                    endpoint = inventory.endpoints.get(identity)
-                    if endpoint:
-                        references.update(endpoint.related.ids)
-            try:
-                for identity in touched:
-                    self.assert_confirmed_delete_writable(identity, references)
-            except BucketIdempotencyError as exc:
-                raise RelatedAdmissionDeferred(exc.code,operation.get('id')) from exc
-            return
+            return self.delete_admission.relation(operation,capability,boundary,step)
         if not isinstance(guard, dict) or guard.get('type') != 'confirmed-delete' or guard.get('version') != 1:
             raise RelatedError('related_execution_guard_conflict')
         if not isinstance(capability, dict):
@@ -1755,6 +1752,7 @@ class BucketManager:
             target=target, memory_key=memory_key, embedding_key=embedding_key,
             memory_requested=candidate is None or bool(updates), payload=payload, payload_digest=digest,
             logical_time=logical_time, preimage_digest=preimage,
+            source_guard=self.delete_admission.capture(target) if candidate is not None else None,
             body_digest=hashlib.sha256(post.content.encode()).hexdigest(), delta=delta,
             embedding_model=getattr(self.embedding_engine, 'model', ''))
 
@@ -1796,7 +1794,8 @@ class BucketManager:
                 raise BucketIdempotencyError('operation_state_conflict')
             marker = self._operation_marker(post, plan['memory_key'])
             if before_memory and marker is None:
-                self._trace_preimage_guard(dict(target=plan['target'], preimage_digest=plan['preimage_digest']))
+                self._trace_preimage_guard(dict(target=plan['target'], preimage_digest=plan['preimage_digest'],
+                                               source_guard=plan.get('source_guard')))
             return post
 
     @guarded_mutation('legacy_import_delta_commit')
@@ -1813,6 +1812,7 @@ class BucketManager:
                 effects = json.loads(row[0] or '{}')
                 if 'delta' not in effects:
                     self.validate_legacy_import_target(context)
+                    self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
                     effects['delta'] = {'outcome': 'applied' if plan['delta'] else 'not_requested',
                         'event_ids': [self._insert_boot_delta_event(conn, plan['target'], kind,
                             json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
@@ -1829,11 +1829,13 @@ class BucketManager:
             if receipt is not None:
                 return receipt
             post = self.validate_legacy_import_target(context)
+            guard = context.get('source_guard')
+            self.admit_delayed_effect(plan['target'],guard,'legacy_import_embedding')
             if post.get('last_active') != plan['logical_time']:
                 raise BucketIdempotencyError('operation_state_conflict')
             return engine.store_trace_embedding(plan['embedding_key'], plan['target'], candidate,
                 plan['body_digest'],
-                plan['embedding_model'], plan['logical_time'])
+                plan['embedding_model'], plan['logical_time'],expected_source=guard)
 
     @staticmethod
     def validate_trace_operation_id(operation_id):
@@ -1981,6 +1983,7 @@ class BucketManager:
         path = self._find_bucket_file(plan['target'])
         if not path or hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan['preimage_digest']:
             raise BucketIdempotencyError("operation_state_conflict")
+        self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'mutation')
 
     @staticmethod
     def _trace_alias_value(value, aliases):
@@ -2029,6 +2032,7 @@ class BucketManager:
             if relation['add'] or relation['remove']:
                 self.preview_related(target, add=relation['add'], remove=relation['remove'], origin=relation['origin'])
             plan = {'target': target, 'preimage_digest': hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                    'source_guard': self.delete_admission.capture(target),
                     'updates': updates, 'logical_time': now_iso(), 'history_type': history_type,
                     'old_content': post.content, 'delta': delta, 'relation': relation,
                     'response': response, 'embedding_input': updates.get('content'),
@@ -2044,8 +2048,11 @@ class BucketManager:
     def _trace_effect_commit(self, context, step):
         """History/delta INSERT and child receipt share one SQLite transaction."""
         with bucket_write_scope(self.base_dir):
-            plan = self._trace_fence(context)['plan']
+            request = self._trace_fence(context)
+            plan = request['plan']
             self.assert_confirmed_delete_writable(plan['target'])
+            if step == 'delta':
+                self.admit_delayed_effect(plan['target'],request['resolutions'].get('source_guard'),'receipt_event')
             child = self._ensure_import_operation(plan['keys']['memory'], operation_kind='update',
                 target_bucket_id=plan['target'], payload={'kwargs': plan['updates']})
             if step == 'history' and child['status'] != 'applied':
@@ -2058,6 +2065,8 @@ class BucketManager:
                 if step in effects:
                     return effects[step]
                 if step == 'history':
+                    if child['status'] == 'applied':
+                        self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
                     receipt = {'outcome': 'not_requested'}
                     if 'content' in plan['updates']:
                         receipt = {'history_id': conn.execute("""INSERT INTO bucket_history
@@ -2077,7 +2086,8 @@ class BucketManager:
     @guarded_mutation("trace_embedding_commit")
     def _commit_trace_embedding(self, context, candidate):
         with bucket_write_scope(self.base_dir):
-            plan = self._trace_fence(context)['plan']
+            request = self._trace_fence(context)
+            plan = request['plan']
             self.assert_confirmed_delete_writable(plan['target'])
             engine = self.embedding_engine
             receipt = engine.trace_embedding_receipt(plan['keys']['embedding'])
@@ -2088,9 +2098,11 @@ class BucketManager:
             if (post is None or _is_sealed_bucket(post) or post.content != plan['embedding_input']
                     or post.get('last_active') != plan['logical_time']):
                 return {'outcome': 'superseded_before_refresh'}
+            guard = request['resolutions'].get('source_guard')
+            self.admit_delayed_effect(plan['target'],guard,'trace_embedding')
             return engine.store_trace_embedding(plan['keys']['embedding'], plan['target'], candidate,
                 hashlib.sha256(plan['embedding_input'].encode()).hexdigest(),
-                plan['embedding_model'], plan['logical_time'])
+                plan['embedding_model'], plan['logical_time'],expected_source=guard)
 
     @guarded_mutation("trace_relation_commit")
     def _commit_trace_relation(self, context):
@@ -2144,6 +2156,11 @@ class BucketManager:
                         else:
                             candidate = resolutions.get('embedding_candidate')
                             if candidate is None:
+                                with bucket_write_scope(self.base_dir):
+                                    guard = resolutions.get('source_guard') or self.delete_admission.capture(plan['target'])
+                                    self.admit_delayed_effect(plan['target'],guard,'trace_embedding')
+                                    resolutions['source_guard'] = guard
+                                    self._trace_checkpoint(context,resolutions=resolutions)
                                 try:
                                     candidate = await engine._generate_embedding(plan['embedding_input'], model=plan['embedding_model'])
                                 except Exception:
@@ -2267,6 +2284,7 @@ class BucketManager:
             _, child_digest = self._canonical_import_payload(child_payload)
             item_plan = dict(target=target, reused=reused, values=values, keys=keys,
                 logical_time=logical_time, updates=updates, preimage_digest=preimage,
+                source_guard=self.delete_admission.capture(target) if reused else None,
                 child_payload=child_payload, child_digest=child_digest, relative_path=relative_path,
                 file_text=file_text, metadata=copy.deepcopy(post.metadata), result_name=result_name,
                 written_fields=written, ignored_fields=ignored, delta=delta,
@@ -2310,6 +2328,10 @@ class BucketManager:
             else:
                 if path:
                     raise BucketIdempotencyError('idempotency_conflict')
+                try:
+                    self.delete_admission.admit(plan['target'], kind='publication', allow_missing=True)
+                except DeleteAdmissionError as exc:
+                    raise BucketIdempotencyError(exc.code) from exc
                 path = safe_path(self.base_dir, plan['relative_path'])
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 payload = plan['file_text'].encode('utf-8')
@@ -2331,6 +2353,7 @@ class BucketManager:
                                    (plan['keys']['memory'],)).fetchone()
                 effects = json.loads(row[0] or '{}')
                 if 'delta' not in effects:
+                    self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
                     effects['delta'] = {'event_ids': [self._insert_boot_delta_event(conn, plan['target'],
                         kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
                         for kind, payload in plan['delta']]}
@@ -2541,10 +2564,11 @@ class BucketManager:
         ]
 
     @guarded_mutation("bucket_history_write")
-    def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
+    def record_history(self, bucket_id: str, old_content: str, change_type: str, *, _expected_source=None) -> None:
         """Persist the old content before a destructive content change."""
         with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
             self.assert_confirmed_delete_writable(bucket_id)
+            self.admit_delayed_effect(bucket_id, _expected_source, 'history',allow_missing=_expected_source is None)
             conn.execute(
                 """
                 INSERT INTO bucket_history
@@ -2560,11 +2584,13 @@ class BucketManager:
         bucket_id: str,
         event_type: str,
         payload: dict[str, Any] | None = None,
+        *, _expected_source=None,
     ) -> None:
         """Record a compact business change for the next successful boot."""
         serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
             self.assert_confirmed_delete_writable(bucket_id)
+            self.admit_delayed_effect(bucket_id, _expected_source, 'receipt_event',allow_missing=_expected_source is None)
             self._insert_boot_delta_event(conn, bucket_id, event_type, serialized, now_iso())
 
     @staticmethod
@@ -2740,7 +2766,9 @@ class BucketManager:
         """Persist an inter-window handoff letter outside normal memory buckets."""
         if not content or not content.strip():
             return
-        with sqlite3.connect(self.history_db_path) as conn:
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            if session_id:
+                self.delete_admission.admit(session_id,kind='letter',allow_missing=True)
             self._insert_letter(conn, content.strip(), session_id or "", sealed, now_iso())
 
     @staticmethod
@@ -3243,6 +3271,10 @@ class BucketManager:
                     return bucket_id
                 if operation["status"] == "applied":
                     raise BucketIdempotencyError("target_bucket_missing")
+            try:
+                self.delete_admission.admit(bucket_id, kind='publication', allow_missing=True)
+            except DeleteAdmissionError as exc:
+                raise BucketIdempotencyError(exc.code) from exc
 
         post = self._build_bucket_post(
             bucket_id, content, tags=tags, importance=importance, domain=domain,
@@ -3317,6 +3349,10 @@ class BucketManager:
                 self._mark_import_operation_applied(_o5b_operation_key)
                 return bucket_id
             try:
+                self.delete_admission.admit(bucket_id, kind='publication', allow_missing=True)
+            except DeleteAdmissionError as exc:
+                raise BucketIdempotencyError(exc.code) from exc
+            try:
                 if operation is not None:
                     self._write_post_atomic(file_path, post)
                     self._mark_import_operation_applied(_o5b_operation_key)
@@ -3326,6 +3362,7 @@ class BucketManager:
             except OSError as e:
                 logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
                 raise
+            published_source = self.delete_admission.capture(bucket_id)
 
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
@@ -3333,7 +3370,7 @@ class BucketManager:
         )
         if _legacy_import_context is not None:
             return bucket_id
-        self._record_boot_delta_event(bucket_id, "created")
+        self._record_boot_delta_event(bucket_id, "created", _expected_source=published_source)
         if not sealed:
             await self._refresh_ordinary_embedding_best_effort(bucket_id, content)
         return bucket_id
@@ -3569,7 +3606,7 @@ class BucketManager:
             return {"status": "source_identity_ambiguous"}
 
     @guarded_mutation("bucket_feel_source_mark")
-    def mark_feel_source(self, source_id, *, model_valence=None, _s4_effect=None):
+    def mark_feel_source(self, source_id, *, model_valence=None, _s4_effect=None, _expected_source=None):
         """Publish and verify one marking from fresh locked state; no rollback."""
         attempted = False
         try:
@@ -3584,8 +3621,10 @@ class BucketManager:
                     if marker:
                         if marker['payload_digest'] != effect_digest:
                             raise BucketIdempotencyError('operation_payload_conflict')
+                        self.admit_delayed_effect(source_id, _expected_source, 'receipt_event')
                         self._sync_directory(os.path.dirname(path))
                         return {'status': 'marked', 'mode': 'replayed'}
+                self.admit_delayed_effect(source_id, _expected_source, 'feel_source')
                 already_satisfied = current.get("digested") is True and (
                     model_valence is None or current.get("model_valence") == model_valence
                 )
@@ -3825,6 +3864,8 @@ class BucketManager:
 
             if s4_context is not None:
                 self._trace_preimage_guard(s4_plan)
+            elif operation is not None and legacy_context is None:
+                self.admit_delayed_effect(bucket_id, None, 'stable_update')
 
         embedding_cleanup_done = False
         preliminary_sealed = int(kwargs.get("sealed", post.get("sealed", 0)) or 0) == 1
@@ -3865,6 +3906,8 @@ class BucketManager:
 
             if s4_context is not None:
                 self._trace_preimage_guard(s4_plan)
+            elif operation is not None and legacy_context is None:
+                self.admit_delayed_effect(bucket_id, None, 'stable_update')
 
             reverse_updates = []
             supersession_original = None
@@ -3982,7 +4025,8 @@ class BucketManager:
             if "content" in kwargs:
                 try:
                     if s4_context is None:
-                        self.record_history(bucket_id, post.content, history_change_type)
+                        self.record_history(bucket_id, post.content, history_change_type,
+                                            _expected_source=self.delete_admission.capture(bucket_id))
                     elif 'history' not in json.loads(operation.get('effects_json') or '{}'):
                         raise BucketIdempotencyError('operation_history_missing')
                 except Exception as e:
@@ -4129,6 +4173,14 @@ class BucketManager:
                         restore_file.write(original_file_bytes)
                     logger.error("Failed to move bucket lifecycle type %s: %s", bucket_id, exc)
                     return False
+            # Capture only for the effects this call will publish. Clearing a
+            # supersession remains possible when unrelated downstream files
+            # are corrupt, as W-9 requires; that clear emits no derived effect.
+            needs_effect = (content_changed or canonicalize_todos(post.get('todos')) != previous_todos
+                            or (post.get('superseded_by') != previous_superseded_by
+                                and str(post.get('superseded_by') or '').strip() not in ('', 'none')))
+            published_source = (self.delete_admission.capture(bucket_id)
+                                if needs_effect and s4_context is None and legacy_context is None else None)
 
         if s4_context is not None or legacy_context is not None:
             return True
@@ -4143,7 +4195,7 @@ class BucketManager:
             )
 
         if content_changed and str(post.content or "") != previous_content:
-            self._record_boot_delta_event(bucket_id, "content_updated")
+            self._record_boot_delta_event(bucket_id, "content_updated", _expected_source=published_source)
         current_todos = canonicalize_todos(post.get("todos"))
         # Boot deltas intentionally track todo text only.  Provenance-only
         # sidecar changes are metadata refinements and do not create a new
@@ -4156,6 +4208,7 @@ class BucketManager:
                     "closed_count": len(set(previous_todos) - set(current_todos)),
                     "opened_count": len(set(current_todos) - set(previous_todos)),
                 },
+                _expected_source=published_source,
             )
         current_superseded_by = post.get("superseded_by")
         if (
@@ -4166,6 +4219,7 @@ class BucketManager:
                 bucket_id,
                 "superseded",
                 {"mode": str(current_superseded_by).strip()},
+                _expected_source=published_source,
             )
 
         if relation_requested:
@@ -4307,7 +4361,8 @@ class BucketManager:
                         bucket_id,
                     )
                     return False
-                self.record_history(bucket_id, post.content, "delete")
+                self.record_history(bucket_id, post.content, "delete",
+                                    _expected_source=self.delete_admission.capture(bucket_id))
             except Exception as exc:
                 logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")
                 return False

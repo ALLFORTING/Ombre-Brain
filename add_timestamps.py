@@ -3,6 +3,7 @@ from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from datetime import datetime
 
 import frontmatter
+from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -24,9 +25,16 @@ def main() -> int:
     initialize_bucket_write_lock(BUCKETS_DIR)
     updated = 0
     scanned = 0
+    admission = DurableDeleteAdmission(BUCKETS_DIR)
     for path in _iter_markdown_files(BUCKETS_DIR):
         scanned += 1
         with bucket_write_scope(BUCKETS_DIR):
+            try:
+                identity,guard = admission.capture_path(path)
+                admission.admit(identity,expected_source=guard,kind='timestamps')
+            except DeleteAdmissionError as exc:
+                print(f'skipped {path}: {exc.code}')
+                continue
             post = frontmatter.load(path)
             changed = False
             if not post.get("created_at"):
@@ -36,6 +44,11 @@ def main() -> int:
                 post["updated_at"] = _date_from_epoch(os.path.getmtime(path))
                 changed = True
             if changed:
+                try:
+                    admission.admit(identity,expected_source=guard,kind='timestamps')
+                except DeleteAdmissionError as exc:
+                    print(f'skipped {path}: {exc.code}')
+                    continue
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(frontmatter.dumps(post))
                 updated += 1
