@@ -38,9 +38,9 @@ import copy
 import asyncio
 import time
 import weakref
-from contextlib import nullcontext
-from related_integrity import (RelationStore, RelatedError, plan_mutation, scan_relation_store,
-                               plan_delete, digest as related_digest)
+from contextlib import nullcontext, closing
+from related_integrity import (RelationStore, RelatedError, RelatedAdmissionDeferred, plan_mutation, scan_relation_store,
+                               plan_delete, parse_related, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from uuid import UUID, uuid4
 from datetime import datetime
@@ -599,10 +599,536 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+        if embedding_engine is not None:
+            embedding_engine.write_admission = self._confirmed_embedding_admission
         self._init_history_db()
         initialize_bucket_write_lock(self.base_dir)
-        self.relation_store = RelationStore(self.base_dir, self.write_coordinator)
+        self.relation_store = RelationStore(self.base_dir, self.write_coordinator,
+                                            admission_resolver=self._confirmed_relation_admission)
         self.recover_related_operations()
+        self.recover_confirmed_deletes()
+
+    def confirmed_delete_rows(self, *, token_hash=None, delete_id=None, active=False):
+        """Receipt lookup never creates a table or initializes another subsystem."""
+        path = Path(self.history_db_path).resolve()
+        if not path.exists():
+            return []
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_confirmed_delete_operations'").fetchone():
+                return []
+            clauses, args = ['root_binding=?'], [str(Path(self.base_dir).resolve())]
+            if token_hash is not None:
+                clauses.append('token_receipt_hash=?'); args.append(token_hash)
+            if delete_id is not None:
+                clauses.append('delete_id=?'); args.append(delete_id)
+            if active:
+                clauses.append("status<>'completed'")
+            rows = conn.execute('SELECT * FROM ob_confirmed_delete_operations WHERE ' +
+                                ' AND '.join(clauses) + ' ORDER BY ordinal', args).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for field in ('requested_ids', 'plan', 'receipts'):
+                item[field] = json.loads(item.pop(field + '_json'))
+            result.append(item)
+        return result
+
+    def _confirmed_row(self, delete_id):
+        rows = self.confirmed_delete_rows(delete_id=delete_id)
+        if not rows:
+            raise BucketIdempotencyError('confirmed_delete_evidence_missing')
+        return rows[0]
+
+    @staticmethod
+    def confirmed_delete_key(delete_id, effect):
+        return 's4e:' + related_digest([delete_id, effect])
+
+    def confirmed_token_hash(self, token):
+        return related_digest(['confirmed-delete-token-v1', str(Path(self.base_dir).resolve()), token])
+
+    def assert_confirmed_delete_writable(self, bucket_id, references=()):
+        protected = {row['bucket_id'] for row in self.confirmed_delete_rows(active=True)}
+        if bucket_id in protected or protected.intersection(references):
+            raise BucketIdempotencyError('confirmed_delete_source_pending')
+
+    def _confirmed_update_admission(self, bucket_id, references, kwargs):
+        self.assert_confirmed_delete_writable(bucket_id,references)
+        if 'supersedes' in kwargs:
+            path = self._find_bucket_file(bucket_id)
+            before = set(_supersedes_for_mutation(frontmatter.load(path).metadata)) if path else set()
+            after = {str(value).strip() for value in kwargs.get('supersedes') or [] if str(value).strip()}
+            # Preserving a pending reverse ID while changing unrelated IDs is
+            # allowed. Adding or removing that pending ID belongs to its child.
+            self.assert_confirmed_delete_writable(bucket_id,before.symmetric_difference(after))
+
+    def _confirmed_embedding_admission(self, bucket_id, *, require_source=True):
+        self.assert_confirmed_delete_writable(bucket_id)
+        if (require_source and not self._find_bucket_file(bucket_id)
+                and any(row['bucket_id']==bucket_id for row in self.confirmed_delete_rows())):
+            raise BucketIdempotencyError('confirmed_delete_embedding_source_missing')
+
+    def _confirmed_relation_admission(self, operation, capability, boundary, step=None):
+        guard = operation.get('execution_guard')
+        if guard is None:
+            plan = operation['plan']
+            touched = {item['id'] for item in plan['steps']}
+            references = {identity for item in plan['steps'] for identity in item.get('desired', [])}
+            request = plan['request']
+            references.update(request.get('add', [])); references.update(request.get('remove', []))
+            if request.get('source'):
+                touched.add(request['source'])
+            if request.get('target'):
+                references.add(request['target'])
+            if self.confirmed_delete_rows(active=True):
+                inventory = scan_relation_store(self.base_dir)
+                inventory.require_complete()
+                for identity in touched:
+                    endpoint = inventory.endpoints.get(identity)
+                    if endpoint:
+                        references.update(endpoint.related.ids)
+            try:
+                for identity in touched:
+                    self.assert_confirmed_delete_writable(identity, references)
+            except BucketIdempotencyError as exc:
+                raise RelatedAdmissionDeferred(exc.code,operation.get('id')) from exc
+            return
+        if not isinstance(guard, dict) or guard.get('type') != 'confirmed-delete' or guard.get('version') != 1:
+            raise RelatedError('related_execution_guard_conflict')
+        if not isinstance(capability, dict):
+            raise RelatedError('related_execution_deferred')
+        context = {'delete_id': guard['delete_id'], 'owner': capability.get('owner'),
+                   'epoch': capability.get('epoch')}
+        row = self._confirmed_fence(context)
+        expected = self.confirmed_delete_capability(context)
+        if capability != expected or guard != self._confirmed_descriptor(row):
+            raise RelatedError('related_execution_guard_conflict')
+        if (operation.get('key') != row['plan']['relation_key']
+                or operation['plan'] != row['plan']['relation_plan']
+                or operation['request_digest'] != related_digest(operation['plan'])):
+            raise RelatedError('related_execution_guard_conflict')
+        if boundary != 'replay' or operation['status'] != 'complete':
+            if row['phase'] != 'history_vector_resolved' or not {'history','vector'} <= row['receipts'].keys():
+                raise RelatedError('confirmed_delete_relation_phase_conflict')
+            with closing(sqlite3.connect(Path(self.history_db_path).resolve().as_uri()+'?mode=ro',uri=True)) as conn:
+                self._confirmed_verify_history_vector(row,row['receipts'],conn)
+            self._confirmed_validate(row, relation_operation=operation)
+
+    @guarded_mutation('confirmed_delete_accept')
+    def accept_confirmed_delete(self, token_hash, payload_digest, requested_ids, ordinal, plan):
+        root = str(Path(self.base_dir).resolve())
+        attempt = related_digest(['confirmed-delete-attempt-v1', root, token_hash])
+        delete_id = related_digest([attempt, ordinal, requested_ids[ordinal]])
+        plan = copy.deepcopy(plan)
+        plan['relation_key'] = self.confirmed_delete_key(delete_id, 'related-delete')
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("""CREATE TABLE IF NOT EXISTS ob_confirmed_delete_operations (
+                delete_id TEXT PRIMARY KEY COLLATE BINARY, schema_version INTEGER NOT NULL CHECK(schema_version=1),
+                root_binding TEXT NOT NULL, attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+                bucket_id TEXT NOT NULL, confirmation_payload_digest TEXT NOT NULL, token_receipt_hash TEXT NOT NULL,
+                requested_ids_json TEXT NOT NULL, plan_json TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('accepted','history_vector_resolved','relation_delete_complete',
+                    'successor_cleanup_complete','completed')),
+                status TEXT NOT NULL CHECK(status IN ('pending','blocked','completed')),
+                receipts_json TEXT NOT NULL DEFAULT '{}', result_text TEXT,
+                owner_instance TEXT, epoch INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+                accepted_at TEXT NOT NULL, completed_at TEXT, last_error_code TEXT,
+                UNIQUE(root_binding,attempt_id,ordinal), UNIQUE(root_binding,attempt_id,bucket_id))""")
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_confirmed_delete_token ON ob_confirmed_delete_operations(root_binding,token_receipt_hash,ordinal)')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_confirmed_delete_recovery ON ob_confirmed_delete_operations(root_binding,status,lease_until,accepted_at) WHERE status<>'completed'")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_confirmed_delete_active_source ON ob_confirmed_delete_operations(root_binding,bucket_id) WHERE status<>'completed'")
+            conn.execute("""INSERT INTO ob_confirmed_delete_operations
+                (delete_id,schema_version,root_binding,attempt_id,ordinal,bucket_id,confirmation_payload_digest,
+                 token_receipt_hash,requested_ids_json,plan_json,phase,status,accepted_at)
+                VALUES (?,1,?,?,?,?,?,?,?,?,'accepted','pending',?)""",
+                (delete_id,root,attempt,ordinal,requested_ids[ordinal],payload_digest,token_hash,
+                 json.dumps(requested_ids),json.dumps(plan),now_iso()))
+            self.confirmed_delete_checkpoint('before_accept_commit', {'delete_id': delete_id})
+            conn.commit()
+        self.confirmed_delete_checkpoint('after_accept_commit', {'delete_id': delete_id})
+        return delete_id
+
+    def confirmed_delete_checkpoint(self, boundary, context):
+        """Synchronous failure-injection seam; never await under the root mutex."""
+
+    async def confirmed_delete_pause(self, boundary, context):
+        """Cancellation may suspend between durable phases, outside the mutex."""
+        await asyncio.sleep(0)
+
+    def _confirmed_file_guard(self, path):
+        absolute = Path(self.base_dir)/path
+        stat = absolute.stat()
+        return {'path':path,'file_hash':hashlib.sha256(absolute.read_bytes()).hexdigest(),
+                'incarnation':[stat.st_dev,stat.st_ino,stat.st_ctime_ns]}
+
+    def freeze_confirmed_delete(self, inventory, bucket_id, incarnations):
+        endpoint = inventory.endpoint(bucket_id)
+        successor = endpoint.metadata.get('superseded_by','') or ''
+        successor = successor.strip() if isinstance(successor,str) else ''
+        target = inventory.endpoints.get(successor)
+        return {'source_guard':{'path':endpoint.path,'file_hash':endpoint.file_hash,
+                               'incarnation':incarnations[bucket_id]},
+                'successor_id':successor if successor != 'none' else '',
+                'successor_path':target.path if target else None,
+                'relation_plan':plan_delete(inventory,bucket_id)}
+
+    def project_confirmed_delete(self, inventory, incarnations, row):
+        """Pure projection of an authorized snapshot using completed effect receipts."""
+        from related_integrity import _HEADER
+        if row['status'] != 'completed':
+            raise RelatedError('confirmed_delete_projection_unproven')
+        for step in row['plan']['relation_plan']['steps']:
+            if step['kind'] == 'delete':
+                inventory.endpoints.pop(step['id'],None); incarnations.pop(step['id'],None)
+                continue
+            endpoint = inventory.endpoints[step['id']]
+            endpoint.metadata['related_buckets'] = ','.join(step['desired'])
+            raw = b'---\n'+yaml.safe_dump(endpoint.metadata,allow_unicode=True,sort_keys=True).encode()+b'---\n'+endpoint.body
+            evidence = row['receipts']['relation']['publications'][step['id']]
+            if hashlib.sha256(raw).hexdigest() != evidence['file_hash']:
+                raise RelatedError('confirmed_delete_projection_unproven')
+            endpoint.file_hash = evidence['file_hash']; endpoint.related = parse_related(endpoint.metadata)
+            incarnations[step['id']] = evidence['incarnation']
+        target = row['plan']['successor_id']
+        if target and target in inventory.endpoints:
+            endpoint = inventory.endpoints[target]
+            post = frontmatter.loads((b'---\n'+yaml.safe_dump(endpoint.metadata,allow_unicode=True,sort_keys=True).encode()+b'---\n'+endpoint.body).decode())
+            post['supersedes'] = [i for i in _supersedes_for_mutation(post.metadata) if i != row['bucket_id']]
+            key = self.confirmed_delete_key(row['delete_id'],'successor-cleanup')
+            effect_digest = related_digest({'remove_supersedes':row['bucket_id'],'successor':target})
+            self._append_operation_marker(post,operation_key=key,payload_digest=effect_digest,operation_kind='update')
+            raw = b'---\n'+yaml.safe_dump(post.metadata,allow_unicode=True,sort_keys=True).encode()+b'---\n'+endpoint.body
+            evidence = row['receipts']['successor']['publication']
+            if hashlib.sha256(raw).hexdigest() != evidence['file_hash']:
+                raise RelatedError('confirmed_delete_projection_unproven')
+            endpoint.metadata = post.metadata; endpoint.body = raw[_HEADER.match(raw).end():]
+            endpoint.file_hash = evidence['file_hash']; endpoint.related = parse_related(endpoint.metadata)
+            incarnations[target] = evidence['incarnation']
+        inventory.order = [i for i in inventory.order if i in inventory.endpoints]
+
+    def _confirmed_descriptor(self, row):
+        return {'type': 'confirmed-delete', 'version': 1, 'delete_id': row['delete_id'],
+                'root_binding': row['root_binding'], 'request_digest': row['confirmation_payload_digest'],
+                'plan_digest': related_digest(row['plan'])}
+
+    @guarded_mutation('confirmed_delete_claim')
+    def claim_confirmed_delete(self, delete_id, owner):
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            row = self._confirmed_row(delete_id)
+            if row['status'] == 'completed':
+                return {'replay': row['result_text']}
+            if row['owner_instance'] and row['lease_until'] > time.time():
+                return None
+            conn.execute('PRAGMA synchronous=FULL'); conn.execute('BEGIN IMMEDIATE')
+            conn.execute('UPDATE ob_confirmed_delete_operations SET owner_instance=?,epoch=epoch+1,lease_until=? WHERE delete_id=?',
+                         (owner,time.time()+_S4_LEASE_SECONDS,delete_id))
+            epoch = conn.execute('SELECT epoch FROM ob_confirmed_delete_operations WHERE delete_id=?',(delete_id,)).fetchone()[0]
+        return {'delete_id':delete_id,'owner':owner,'epoch':epoch}
+
+    def _confirmed_fence(self, context):
+        row = self._confirmed_row(context['delete_id'])
+        if (row['root_binding'] != str(Path(self.base_dir).resolve()) or row['owner_instance'] != context['owner']
+                or row['epoch'] != context['epoch'] or row['lease_until'] <= time.time()):
+            raise BucketIdempotencyError('operation_claim_stale')
+        return row
+
+    def confirmed_delete_capability(self, context):
+        row = self._confirmed_fence(context)
+        return {'root_binding':row['root_binding'],'delete_id':row['delete_id'],'owner':context['owner'],
+                'epoch':context['epoch'],'lease_until':row['lease_until'],
+                'request_digest':row['confirmation_payload_digest'],'plan_digest':related_digest(row['plan'])}
+
+    def _confirmed_validate(self, row, *, relation_operation=None):
+        if row['plan'].get('projection_error'):
+            raise RelatedError(row['plan']['projection_error'])
+        inventory = scan_relation_store(self.base_dir); inventory.require_complete()
+        source = inventory.endpoints.get(row['bucket_id'])
+        plan = row['plan']; frozen = plan['source_guard']
+        journal = relation_operation or self.relation_store.lookup(plan['relation_key'])
+        if journal and (journal['plan'] != plan['relation_plan'] or journal['request_digest'] != related_digest(plan['relation_plan'])
+                        or journal.get('execution_guard') != self._confirmed_descriptor(row)):
+            raise RelatedError('related_execution_guard_conflict')
+        if source:
+            if journal and journal['status'] == 'complete':
+                raise RelatedError('confirmed_delete_source_recreated')
+            stat = (Path(self.base_dir)/source.path).stat()
+            if (source.path != frozen['path'] or source.file_hash != frozen['file_hash']
+                    or [stat.st_dev,stat.st_ino,stat.st_ctime_ns] != frozen['incarnation']):
+                raise RelatedError('confirmed_delete_source_changed')
+            if source.metadata.get('sealed') or source.metadata.get('pinned') or source.metadata.get('protected'):
+                raise RelatedError('confirmed_delete_source_protected')
+        elif journal is None:
+            raise RelatedError('confirmed_delete_source_missing_without_journal')
+        # The related inventory is authoritative over all formal locations.
+        approved_related = {step['id']:step for step in plan['relation_plan']['steps'] if step['kind']=='set_related'}
+        for endpoint in inventory.endpoints.values():
+            if endpoint.id != row['bucket_id'] and row['bucket_id'] in endpoint.related.ids:
+                approved = approved_related.get(endpoint.id)
+                if not approved or endpoint.related.fingerprint not in (approved['before'],approved['after']):
+                    raise RelatedError('confirmed_delete_incoming_related')
+        self.confirmed_delete_supersession_guard(inventory,row['bucket_id'],plan['successor_id'])
+        return inventory
+
+    def confirmed_delete_supersession_guard(self, inventory, bucket_id, successor_id):
+        """A complete scan is required before admission and every guarded effect."""
+        inventory.require_complete()
+        for endpoint in inventory.endpoints.values():
+            value = endpoint.metadata.get('superseded_by', '')
+            if value is not None and not isinstance(value, str):
+                raise RelatedError('confirmed_delete_supersession_scan_incomplete')
+            if isinstance(value,str) and value.strip() == bucket_id:
+                raise RelatedError('confirmed_delete_incoming_supersession')
+            reverse = endpoint.metadata.get('supersedes',[])
+            if reverse is not None and not isinstance(reverse,(str,list)):
+                raise RelatedError('confirmed_delete_supersession_scan_incomplete')
+            if isinstance(reverse,list) and any(not isinstance(i,str) for i in reverse):
+                raise RelatedError('confirmed_delete_supersession_scan_incomplete')
+            if bucket_id in _supersedes_for_mutation(endpoint.metadata) and endpoint.id != successor_id:
+                raise RelatedError('confirmed_delete_incoming_supersession')
+
+    def _confirmed_verify_history_vector(self, row, receipts, conn):
+        history = receipts['history']
+        snapshot = conn.execute('SELECT bucket_id,old_content,change_type FROM bucket_history WHERE id=?',
+                                (history['history_id'],)).fetchone()
+        if (not snapshot or snapshot[0] != row['bucket_id'] or snapshot[2] != 'delete'
+                or hashlib.sha256(snapshot[1].encode()).hexdigest() != history['snapshot_digest']
+                or history['effect_key'] != self.confirmed_delete_key(row['delete_id'],'history')):
+            raise RelatedError('confirmed_delete_history_receipt_conflict')
+        vector = receipts['vector']
+        vector_key = self.confirmed_delete_key(row['delete_id'],'vector-delete')
+        if vector['effect_key'] != vector_key:
+            raise RelatedError('confirmed_delete_vector_receipt_conflict')
+        if vector['outcome'] != 'unconfigured':
+            path = self.embedding_engine.db_path if self.embedding_engine else str(Path(self.base_dir)/'embeddings.db')
+            with closing(sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)) as vectors:
+                receipt = vectors.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',(vector_key,)).fetchone()
+                if (not receipt or json.loads(receipt[0]) != vector
+                        or vectors.execute('SELECT 1 FROM embeddings WHERE bucket_id=?',(row['bucket_id'],)).fetchone()):
+                    raise RelatedError('confirmed_delete_vector_receipt_conflict')
+    def _confirmed_verify_receipts(self, row, receipts, conn):
+        self._confirmed_verify_history_vector(row,receipts,conn)
+        journal = self.relation_store.lookup(row['plan']['relation_key'])
+        if (not journal or journal['status'] != 'complete' or receipts['relation']['operation_id'] != journal['id']
+                or receipts['relation']['plan_digest'] != related_digest(row['plan']['relation_plan'])):
+            raise RelatedError('confirmed_delete_relation_receipt_conflict')
+        successor = receipts['successor']
+        key = self.confirmed_delete_key(row['delete_id'],'successor-cleanup')
+        if successor['effect_key'] != key:
+            raise RelatedError('confirmed_delete_successor_receipt_conflict')
+        if successor['outcome'] == 'resolved':
+            effect = conn.execute('SELECT status,payload_digest FROM ob_import_operations WHERE operation_key=?',(key,)).fetchone()
+            expected = related_digest({'remove_supersedes':row['bucket_id'],'successor':row['plan']['successor_id']})
+            path = self._find_bucket_file(row['plan']['successor_id'])
+            marker = self._operation_marker(frontmatter.load(path),key) if path else None
+            if not effect or effect != ('applied',expected) or (path and (not marker or marker['payload_digest'] != expected)):
+                raise RelatedError('confirmed_delete_successor_receipt_conflict')
+
+    @guarded_mutation('confirmed_delete_checkpoint')
+    def _confirmed_checkpoint(self, context, *, phase=None, receipt=None, error=None, heartbeat=False):
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            row = self._confirmed_fence(context)
+            if error is None and not heartbeat:
+                self._confirmed_validate(row)
+            receipts = row['receipts']
+            if receipt:
+                receipts.update(receipt)
+            next_phase = phase or row['phase']
+            completed = next_phase == 'completed'
+            if next_phase == 'history_vector_resolved' and error is None:
+                self._confirmed_verify_history_vector(row,receipts,conn)
+            if completed:
+                if set(receipts) != {'history','vector','relation','successor'}:
+                    raise RelatedError('confirmed_delete_receipts_incomplete')
+                self._confirmed_verify_receipts(row,receipts,conn)
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute("""UPDATE ob_confirmed_delete_operations SET phase=?,status=?,receipts_json=?,result_text=?,
+                completed_at=?,last_error_code=?,lease_until=? WHERE delete_id=? AND owner_instance=? AND epoch=?""",
+                (next_phase,'completed' if completed else 'blocked' if error else 'pending',json.dumps(receipts),
+                 '已遗忘记忆桶: '+row['bucket_id'] if completed else row['result_text'],
+                 now_iso() if completed else row['completed_at'],error,time.time()+_S4_LEASE_SECONDS,
+                 context['delete_id'],context['owner'],context['epoch']))
+            self._confirmed_fence(context)
+            conn.commit()
+        self.confirmed_delete_checkpoint('child.'+next_phase, context)
+
+    @guarded_mutation('confirmed_delete_release')
+    def release_confirmed_delete(self, context):
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            conn.execute('UPDATE ob_confirmed_delete_operations SET owner_instance=NULL,lease_until=0 WHERE delete_id=? AND owner_instance=? AND epoch=?',
+                         (context['delete_id'],context['owner'],context['epoch']))
+
+    async def _confirmed_heartbeat(self, context):
+        while True:
+            await asyncio.sleep(_S4_LEASE_SECONDS/3)
+            self._confirmed_checkpoint(context, heartbeat=True)
+
+    @guarded_mutation('confirmed_delete_history')
+    def _confirmed_history(self, context):
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            row = self._confirmed_fence(context); inventory = self._confirmed_validate(row)
+            if 'history' in row['receipts']:
+                return
+            source = inventory.endpoint(row['bucket_id'])
+            conn.execute('PRAGMA synchronous=FULL'); conn.execute('BEGIN IMMEDIATE')
+            receipts = row['receipts']
+            history_id = conn.execute('INSERT INTO bucket_history(bucket_id,old_content,changed_at,change_type) VALUES(?,?,?,?)',
+                (row['bucket_id'],frontmatter.load(Path(self.base_dir)/source.path).content,row['accepted_at'],'delete')).lastrowid
+            receipts['history'] = {'history_id':history_id,'effect_key':self.confirmed_delete_key(row['delete_id'],'history'),
+                'snapshot_digest':hashlib.sha256(frontmatter.load(Path(self.base_dir)/source.path).content.encode()).hexdigest()}
+            self._confirmed_fence(context); self._confirmed_validate(row)
+            conn.execute('UPDATE ob_confirmed_delete_operations SET receipts_json=? WHERE delete_id=?',(json.dumps(receipts),row['delete_id']))
+            self.confirmed_delete_checkpoint('before_history_commit',context)
+            self._confirmed_validate(self._confirmed_fence(context))
+            conn.commit()
+        self.confirmed_delete_checkpoint('after_history_commit',context)
+
+    @guarded_mutation('confirmed_delete_vector')
+    def _confirmed_vector(self, context):
+        with bucket_write_scope(self.base_dir):
+            row = self._confirmed_fence(context); self._confirmed_validate(row)
+            if 'vector' in row['receipts']:
+                return
+            key = self.confirmed_delete_key(row['delete_id'],'vector-delete')
+            engine = self.embedding_engine
+            if engine is None and (Path(self.base_dir)/'embeddings.db').exists():
+                from embedding_engine import EmbeddingEngine
+                engine = EmbeddingEngine({'buckets_dir':self.base_dir},self.write_coordinator)
+            if engine is None:
+                receipt = {'outcome':'unconfigured','effect_key':key}
+            else:
+                receipt = engine.delete_confirmed_embedding(key,row['bucket_id'],
+                    admission=lambda:self._confirmed_validate(self._confirmed_fence(context)))
+            self.confirmed_delete_checkpoint('after_vector_commit',context)
+            self._confirmed_checkpoint(context,receipt={'vector':receipt})
+
+    @guarded_mutation('confirmed_delete_relation')
+    def _confirmed_relation(self, context):
+        with bucket_write_scope(self.base_dir):
+            row = self._confirmed_fence(context); inventory = self._confirmed_validate(row)
+            plan = row['plan']['relation_plan']
+            def frozen_planner(current):
+                # Acceptance freezes the plan. Admission and journal anchors
+                # revalidate its effects without replanning unrelated state.
+                self._confirmed_validate(row)
+                return plan
+            result = self.relation_store.commit(frozen_planner,operation_key=row['plan']['relation_key'],
+                request_digest=related_digest(plan),execution_guard=self._confirmed_descriptor(row),
+                capability=self.confirmed_delete_capability(context))
+            journal = self.relation_store.lookup(row['plan']['relation_key'])
+            if not journal or journal['status'] != 'complete':
+                raise RelatedError('related_operation_pending')
+            self.confirmed_delete_checkpoint('after_relation_commit',context)
+            self._confirmed_checkpoint(context,phase='relation_delete_complete',
+                receipt={'relation':{'operation_id':result['operation_id'],'plan_digest':related_digest(plan),
+                    'publications':{step['id']:self._confirmed_file_guard(step['path'])
+                                    for step in plan['steps'] if step['kind']=='set_related'}}})
+
+    @guarded_mutation('confirmed_delete_successor')
+    def _confirmed_successor(self, context):
+        with bucket_write_scope(self.base_dir):
+            row = self._confirmed_fence(context); inventory = self._confirmed_validate(row)
+            target = row['plan']['successor_id']
+            key = self.confirmed_delete_key(row['delete_id'],'successor-cleanup')
+            endpoint = inventory.endpoints.get(target) if target else None
+            if not endpoint:
+                receipt = {'outcome':'absent' if target else 'not_requested','effect_key':key}
+            else:
+                if endpoint.path != row['plan']['successor_path']:
+                    raise RelatedError('confirmed_delete_successor_changed')
+                self.assert_confirmed_delete_writable(target)
+                path = Path(self.base_dir)/endpoint.path; post = frontmatter.load(path)
+                effect_payload = {'remove_supersedes':row['bucket_id'],'successor':target}
+                effect_digest = related_digest(effect_payload)
+                operation = self._ensure_import_operation(key,operation_kind='update',target_bucket_id=target,
+                                                          payload=effect_payload,payload_digest=effect_digest)
+                marker = self._operation_marker(post,key)
+                if marker:
+                    if marker['payload_digest'] != effect_digest or row['bucket_id'] in _supersedes_for_mutation(post.metadata):
+                        raise RelatedError('confirmed_delete_successor_conflict')
+                    self._sync_directory(str(path.parent))
+                else:
+                    if operation['status'] == 'applied':
+                        raise RelatedError('confirmed_delete_successor_marker_missing')
+                    post['supersedes'] = [i for i in _supersedes_for_mutation(post.metadata) if i != row['bucket_id']]
+                    self._append_operation_marker(post,operation_key=key,payload_digest=effect_digest,operation_kind='update')
+                    self._confirmed_fence(context); self._confirmed_validate(row)
+                    self.confirmed_delete_checkpoint('before_successor_publish',context)
+                    self._confirmed_fence(context); self._confirmed_validate(row)
+                    def admit_publication():
+                        self._confirmed_validate(self._confirmed_fence(context))
+                        if hashlib.sha256(path.read_bytes()).hexdigest() != endpoint.file_hash:
+                            raise RelatedError('confirmed_delete_successor_changed')
+                    payload = b'---\n'+yaml.safe_dump(post.metadata,allow_unicode=True,sort_keys=True).encode()+b'---\n'+endpoint.body
+                    self._write_bytes_atomic(str(path),payload,before_publish=admit_publication)
+                    self.confirmed_delete_checkpoint('after_successor_publish',context)
+                self._confirmed_fence(context)
+                self._mark_import_operation_applied(key)
+                receipt = {'outcome':'resolved','effect_key':key,'after_hash':hashlib.sha256(path.read_bytes()).hexdigest(),
+                           'publication':self._confirmed_file_guard(endpoint.path)}
+            self._confirmed_checkpoint(context,phase='successor_cleanup_complete',receipt={'successor':receipt})
+
+    def _confirmed_step(self, context):
+        row = self._confirmed_fence(context)
+        if row['phase'] == 'accepted':
+            self._confirmed_history(context); self._confirmed_vector(context)
+            self._confirmed_checkpoint(context,phase='history_vector_resolved')
+        elif row['phase'] == 'history_vector_resolved':
+            self._confirmed_relation(context)
+        elif row['phase'] == 'relation_delete_complete':
+            self._confirmed_successor(context)
+        elif row['phase'] == 'successor_cleanup_complete':
+            self._confirmed_checkpoint(context,phase='completed')
+        return self._confirmed_row(context['delete_id'])['phase'] == 'completed'
+
+    @guarded_async_mutation('confirmed_delete_execute')
+    async def execute_confirmed_delete(self, delete_id):
+        lock_key = (os.getpid(),asyncio.get_running_loop(),str(Path(self.base_dir).resolve()),'s4e',delete_id)
+        lock = _S4_LOCKS.setdefault(lock_key,asyncio.Lock())
+        async with lock:
+            owner = uuid4().hex
+            while (context := self.claim_confirmed_delete(delete_id,owner)) is None:
+                await asyncio.sleep(.05)
+            if 'replay' in context:
+                return context['replay']
+            heartbeat = asyncio.create_task(self._confirmed_heartbeat(context))
+            try:
+                while True:
+                    await self.confirmed_delete_pause('before_step',context)
+                    if self._confirmed_step(context):
+                        return self._confirmed_row(delete_id)['result_text']
+            except Exception as exc:
+                completed = self._confirmed_row(delete_id)
+                if completed['status'] == 'completed':
+                    return completed['result_text']
+                self._confirmed_checkpoint(context,error=getattr(exc,'code','confirmed_delete_effect_pending'))
+                return '删除失败：delete pending/blocked: '+self._confirmed_row(delete_id)['last_error_code']
+            finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self.release_confirmed_delete(context)
+
+    @guarded_mutation('confirmed_delete_recovery')
+    def recover_confirmed_deletes(self):
+        for row in self.confirmed_delete_rows(active=True):
+            context = self.claim_confirmed_delete(row['delete_id'],uuid4().hex)
+            if context is None or 'replay' in context:
+                continue
+            try:
+                while not self._confirmed_step(context):
+                    pass
+            except Exception as exc:
+                try:
+                    self._confirmed_checkpoint(context,error=getattr(exc,'code','confirmed_delete_effect_pending'))
+                except BucketIdempotencyError:
+                    pass
+            finally:
+                self.release_confirmed_delete(context)
 
     def preview_related(self, source_id, **kwargs):
         return self.relation_store.preview(source_id, **kwargs)
@@ -1057,12 +1583,16 @@ class BucketManager:
         return True
 
     @staticmethod
-    def _write_post_atomic(file_path: str, post: frontmatter.Post) -> None:
+    def _write_post_atomic(file_path: str, post: frontmatter.Post, *, before_publish=None) -> None:
         """Atomically publish an O5B-marked memory file."""
-        BucketManager._write_bytes_atomic(file_path, frontmatter.dumps(post).encode("utf-8"))
+        payload = frontmatter.dumps(post).encode("utf-8")
+        if before_publish is None:
+            BucketManager._write_bytes_atomic(file_path, payload)
+        else:
+            BucketManager._write_bytes_atomic(file_path, payload, before_publish=before_publish)
 
     @staticmethod
-    def _write_bytes_atomic(file_path: str, payload: bytes) -> None:
+    def _write_bytes_atomic(file_path: str, payload: bytes, *, before_publish=None) -> None:
         """Publish frozen bytes with file and directory persistence barriers."""
         parent = os.path.dirname(file_path)
         fd, temporary = tempfile.mkstemp(
@@ -1075,6 +1605,8 @@ class BucketManager:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if before_publish is not None:
+                before_publish()
             os.replace(temporary, file_path)
             BucketManager._sync_directory(parent)
         except Exception:
@@ -1271,6 +1803,7 @@ class BucketManager:
     def commit_legacy_import_delta(self, context):
         with bucket_write_scope(self.base_dir):
             plan = self._legacy_import_plan(context)
+            self.assert_confirmed_delete_writable(plan['target'])
             if not plan['memory_requested']:
                 return {'outcome': 'not_requested'}
             with sqlite3.connect(self.history_db_path) as conn:
@@ -1444,6 +1977,7 @@ class BucketManager:
         return "s4:" + hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
     def _trace_preimage_guard(self, plan):
+        self.assert_confirmed_delete_writable(plan['target'])
         path = self._find_bucket_file(plan['target'])
         if not path or hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan['preimage_digest']:
             raise BucketIdempotencyError("operation_state_conflict")
@@ -1511,6 +2045,7 @@ class BucketManager:
         """History/delta INSERT and child receipt share one SQLite transaction."""
         with bucket_write_scope(self.base_dir):
             plan = self._trace_fence(context)['plan']
+            self.assert_confirmed_delete_writable(plan['target'])
             child = self._ensure_import_operation(plan['keys']['memory'], operation_kind='update',
                 target_bucket_id=plan['target'], payload={'kwargs': plan['updates']})
             if step == 'history' and child['status'] != 'applied':
@@ -1543,6 +2078,7 @@ class BucketManager:
     def _commit_trace_embedding(self, context, candidate):
         with bucket_write_scope(self.base_dir):
             plan = self._trace_fence(context)['plan']
+            self.assert_confirmed_delete_writable(plan['target'])
             engine = self.embedding_engine
             receipt = engine.trace_embedding_receipt(plan['keys']['embedding'])
             if receipt is not None:
@@ -1746,6 +2282,7 @@ class BucketManager:
     def commit_hold_grow_memory(self, context, ordinal):
         with bucket_write_scope(self.base_dir):
             plan = self._trace_fence(context)['plan']['items'][ordinal]['plan']
+            self.assert_confirmed_delete_writable(plan['target'])
             child = self._ensure_import_operation(plan['keys']['memory'],
                 operation_kind='update' if plan['reused'] else 'create',
                 target_bucket_id=plan['target'] if plan['reused'] else None,
@@ -1787,6 +2324,7 @@ class BucketManager:
     def commit_hold_grow_delta(self, context, ordinal):
         with bucket_write_scope(self.base_dir):
             plan = self._trace_fence(context)['plan']['items'][ordinal]['plan']
+            self.assert_confirmed_delete_writable(plan['target'])
             with sqlite3.connect(self.history_db_path) as conn:
                 conn.execute('BEGIN IMMEDIATE')
                 row = conn.execute('SELECT effects_json FROM ob_import_operations WHERE operation_key=?',
@@ -1805,6 +2343,7 @@ class BucketManager:
         with bucket_write_scope(self.base_dir):
             request = self._trace_fence(context)
             plan = request['plan']['items'][ordinal]['plan']
+            self.assert_confirmed_delete_writable(plan['target'])
             date = plan['values'].get('trigger_date', '')
             if plan['reused'] or not date:
                 return {'outcome': 'not_requested'}
@@ -2004,7 +2543,8 @@ class BucketManager:
     @guarded_mutation("bucket_history_write")
     def record_history(self, bucket_id: str, old_content: str, change_type: str) -> None:
         """Persist the old content before a destructive content change."""
-        with sqlite3.connect(self.history_db_path) as conn:
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            self.assert_confirmed_delete_writable(bucket_id)
             conn.execute(
                 """
                 INSERT INTO bucket_history
@@ -2023,7 +2563,8 @@ class BucketManager:
     ) -> None:
         """Record a compact business change for the next successful boot."""
         serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
-        with sqlite3.connect(self.history_db_path) as conn:
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            self.assert_confirmed_delete_writable(bucket_id)
             self._insert_boot_delta_event(conn, bucket_id, event_type, serialized, now_iso())
 
     @staticmethod
@@ -2677,6 +3218,7 @@ class BucketManager:
         else:
             bucket_id = generate_bucket_id()
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             if _legacy_import_context is not None:
                 legacy_plan = self._legacy_import_plan(_legacy_import_context)
             if operation is not None:
@@ -2759,6 +3301,7 @@ class BucketManager:
                 raise RuntimeError("sealed_embedding_cleanup_failed") from exc
 
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             if _legacy_import_context is not None:
                 self._legacy_import_plan(_legacy_import_context)
             existing_path = self._find_bucket_file(bucket_id)
@@ -2824,6 +3367,7 @@ class BucketManager:
     @guarded_mutation("bucket_todo_complete")
     def complete_todo(self, bucket_id: str, todo_id: str, authorize) -> dict:
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             path = self._find_bucket_file(bucket_id)
             if not path:
                 raise ValueError("bucket not found")
@@ -2859,6 +3403,7 @@ class BucketManager:
     @guarded_mutation("bucket_todo_drop")
     def drop_todo(self, bucket_id: str, todo_id: str, authorize) -> dict:
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             path = self._find_bucket_file(bucket_id)
             if not path:
                 raise ValueError("bucket not found")
@@ -2893,6 +3438,7 @@ class BucketManager:
         Returns new file path.
         """
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(frontmatter.load(file_path).get('id'))
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             target_dir = os.path.join(target_type_dir, primary_domain)
             os.makedirs(target_dir, exist_ok=True)
@@ -3028,6 +3574,7 @@ class BucketManager:
         attempted = False
         try:
             with bucket_write_scope(self.base_dir):
+                self.assert_confirmed_delete_writable(source_id)
                 if _s4_effect is not None:
                     self._trace_fence(_s4_effect['context'])
                 path, current = self._resolve_feel_source_locked(source_id)
@@ -3123,6 +3670,7 @@ class BucketManager:
             catalog = self._supersession_catalog_locked()
         source = self._resolve_supersession_locked(catalog, source_id)
         requested = _successor_id_strict(value)
+        self.assert_confirmed_delete_writable(source_id, [requested])
         if requested in ("", "none"):
             return catalog, source
         if requested == source_id:
@@ -3218,7 +3766,11 @@ class BucketManager:
             if not kwargs:
                 self.mutate_related(bucket_id, replace=relation_value)
                 return True
+        references = list(parse_related({'related_buckets': relation_value}).require_safe()) if relation_requested else []
+        if kwargs.get('superseded_by') not in (None, '', 'none'):
+            references.append(str(kwargs['superseded_by']).strip())
         with bucket_write_scope(self.base_dir):
+            self._confirmed_update_admission(bucket_id,references,kwargs)
             if s4_context is not None:
                 s4_plan = self._trace_fence(s4_context)['plan']
             if legacy_context is not None:
@@ -3285,6 +3837,7 @@ class BucketManager:
                 return False
 
         with bucket_write_scope(self.base_dir):
+            self._confirmed_update_admission(bucket_id,references,kwargs)
             if s4_context is not None:
                 self._trace_fence(s4_context)
             if legacy_context is not None:
@@ -3328,6 +3881,8 @@ class BucketManager:
                     supersession_original = copy.deepcopy(post)
                     reverse_updates = self._plan_supersession_reverse_locked(
                         catalog, bucket_id, post, kwargs["superseded_by"])
+                    for neighbor_path, _, original in reverse_updates:
+                        self.assert_confirmed_delete_writable(original.get('id',Path(neighbor_path).stem))
 
             requested_permanent = kwargs.pop("permanent", None)
             if requested_permanent is not None:
@@ -3535,6 +4090,7 @@ class BucketManager:
                 if supersession_original is not None:
                     applied_supersession.append((bucket_id, file_path, supersession_original))
                 for neighbor_path, draft, original in reverse_updates:
+                    self.assert_confirmed_delete_writable(original.get('id',Path(neighbor_path).stem))
                     self._write_post_atomic(neighbor_path, draft)
                     applied_supersession.append((original.get("id", Path(neighbor_path).stem),
                                                   neighbor_path, original))
@@ -3639,6 +4195,7 @@ class BucketManager:
     ) -> tuple[str, str]:
         """Store a TG summary only when the source body still has the expected hash."""
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return "missing", ""
@@ -3731,6 +4288,7 @@ class BucketManager:
             return False
 
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return False
@@ -3796,6 +4354,12 @@ class BucketManager:
         """
         try:
             with bucket_write_scope(self.base_dir):
+                try:
+                    self.assert_confirmed_delete_writable(bucket_id)
+                except BucketIdempotencyError as exc:
+                    if exc.code == 'confirmed_delete_source_pending':
+                        return
+                    raise
                 file_path = self._find_bucket_file(bucket_id)
                 if not file_path:
                     return
@@ -3825,6 +4389,7 @@ class BucketManager:
     async def set_dormant(self, bucket_id: str, dormant: bool = True) -> bool:
         """Set dormant without refreshing last_active or updated_at."""
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return False
@@ -3877,6 +4442,12 @@ class BucketManager:
             if delta_hours <= hours:
                 # Boost activation_count by 0.3 (fractional), don't change last_active
                 with bucket_write_scope(self.base_dir):
+                    try:
+                        self.assert_confirmed_delete_writable(bucket["id"])
+                    except BucketIdempotencyError as exc:
+                        if exc.code == 'confirmed_delete_source_pending':
+                            continue
+                        raise
                     file_path = self._find_bucket_file(bucket["id"])
                     if not file_path:
                         continue
@@ -4459,6 +5030,7 @@ class BucketManager:
         将指定桶移入归档目录（保留域子目录结构）。
         """
         with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
                 return False
@@ -4594,6 +5166,7 @@ class BucketManager:
 
                         if _is_sealed_bucket(post):
                             continue
+                        self.assert_confirmed_delete_writable(str(post.get('id',Path(path).stem)))
 
                         original_content = post.content
                         original_name = post.get("name")

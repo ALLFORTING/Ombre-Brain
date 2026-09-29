@@ -167,7 +167,7 @@ async def test_delete_history_capture_failure_does_not_delete_or_report_not_foun
 ):
     server = _load_server(tmp_path, monkeypatch)
     bucket_id = await server.bucket_mgr.create(content="delete history failure")
-    server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
+    server.bucket_mgr._confirmed_history = Mock(side_effect=RuntimeError("history unavailable"))
 
     preview = await server.trace(bucket_id, delete=True)
     result = await server.trace(bucket_id, delete=True, confirm_token=_confirm_token(preview))
@@ -181,7 +181,7 @@ async def test_delete_history_capture_failure_does_not_delete_or_report_not_foun
 async def test_delete_execution_failure_is_not_reported_as_not_found(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket_id = await server.bucket_mgr.create(content="delete execution failure")
-    server.bucket_mgr.delete = AsyncMock(return_value=False)
+    server.bucket_mgr._confirmed_relation = Mock(side_effect=RuntimeError("relation unavailable"))
 
     preview = await server.trace(bucket_id, delete=True)
     result = await server.trace(bucket_id, delete=True, confirm_token=_confirm_token(preview))

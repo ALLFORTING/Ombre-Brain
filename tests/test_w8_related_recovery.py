@@ -312,9 +312,9 @@ async def test_delete_pre_intent_failure_preserves_r5_supersession_cleanup(tmp_p
     def fail(point,*args):
         if point=='before_intent':raise OSError('journal unavailable')
     monkeypatch.setattr(server.bucket_mgr.relation_store,'checkpoint',fail)
-    bucket=await server.bucket_mgr.get(source)
-    ok,response=await server._execute_trace_delete(bucket)
-    assert not ok and 'related_commit_failed' in response
+    preview=await server._delete_with_confirmation([source],'')
+    result=await server._delete_with_confirmation([source],preview['confirm_token'])
+    assert result['status']=='incomplete'
     assert (await server.bucket_mgr.get(successor))['metadata'].get('supersedes')==prior
     assert await server.bucket_mgr.get(source)
     assert server.bucket_mgr.relation_store.operations()==[]
@@ -350,11 +350,14 @@ async def test_delete_committed_intent_ack_loss_never_restores_supersession(tmp_
         original(operation)
         raise OSError('acknowledgment lost')
     monkeypatch.setattr(journal,'_save',lose_ack)
-    ok,response=await server._execute_trace_delete(await server.bucket_mgr.get(source))
-    assert not ok and 'related_intent_unconfirmed' in response
-    assert source not in (await server.bucket_mgr.get(successor))['metadata'].get('supersedes',[])
+    preview=await server._delete_with_confirmation([source],'')
+    result=await server._delete_with_confirmation([source],preview['confirm_token'])
+    assert result['status']=='incomplete' and 'related_intent_unconfirmed' in result['message']
+    assert source in (await server.bucket_mgr.get(successor))['metadata'].get('supersedes',[])
     monkeypatch.setattr(journal,'_save',original)
     server.bucket_mgr.recover_related_operations()
+    assert await server.bucket_mgr.get(source) is not None
+    server.bucket_mgr.recover_confirmed_deletes()
     assert await server.bucket_mgr.get(source) is None
     assert source not in (await server.bucket_mgr.get(successor))['metadata'].get('supersedes',[])
 

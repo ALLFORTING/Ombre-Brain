@@ -34,6 +34,10 @@ class RelatedError(ValueError):
         super().__init__(code + (f"; operation_id={operation_id}" if operation_id else ""))
 
 
+class RelatedAdmissionDeferred(RelatedError):
+    """An injected resolver deferred execution without changing journal state."""
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                     separators=(",", ":"), default=str).encode()).hexdigest()
@@ -399,7 +403,8 @@ def _readonly_connection(path):
 
 
 class RelationStore:
-    def __init__(self, root, write_coordinator=None):
+    def __init__(self, root, write_coordinator=None, *, admission_resolver=None):
+        self.admission_resolver = admission_resolver
         self.root = Path(root).resolve()
         self.db = self.root / 'bucket_history.sqlite3'
         self.write_coordinator = write_coordinator or DEFAULT_WRITE_COORDINATOR
@@ -427,6 +432,19 @@ class RelationStore:
     def lookup(self, key):
         return next((op for op in self.operations() if op['key'] == key), None)
 
+    def _admit(self, operation, capability, boundary, step=None):
+        """Optional synchronous owner admission. No business-store knowledge here."""
+        guard = operation.get('execution_guard')
+        if guard is not None:
+            expected = digest({'request_digest': operation['request_digest'],
+                               'plan': operation['plan'], 'execution_guard': guard})
+            if operation.get('execution_digest') != expected:
+                raise RelatedError('related_execution_guard_conflict', operation.get('id'))
+            if self.admission_resolver is None or capability is None:
+                raise RelatedAdmissionDeferred('related_execution_deferred', operation.get('id'))
+        if self.admission_resolver is not None:
+            self.admission_resolver(operation, capability, boundary, step)
+
     def checkpoint(self, boundary, operation, step=None):
         """Synchronous failure-injection seam; production does no work here."""
 
@@ -448,7 +466,7 @@ class RelationStore:
                 os.close(fd)
 
     @guarded_mutation('related_publish')
-    def _publish(self, endpoint, step, *, recovering):
+    def _publish(self, endpoint, step, *, recovering, admission=None):
         before = dict(endpoint.metadata)
         after = dict(before)
         after['related_buckets'] = ','.join(step['desired'])
@@ -469,6 +487,10 @@ class RelationStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            if admission is not None:
+                admission()
+            if _read_endpoint(self.root,step['path']).file_hash != endpoint.file_hash:
+                raise RelatedError('related_recovery_conflict')
             os.replace(temporary, path)
             self._sync_directory(path.parent)
         finally:
@@ -476,8 +498,9 @@ class RelationStore:
                 os.unlink(temporary)
 
     @guarded_mutation('related_roll_forward')
-    def _execute(self, operation, *, recovering):
+    def _execute(self, operation, *, recovering, capability=None):
         try:
+            self._admit(operation, capability, 'execute')
             if operation.get('version') != 1 or operation['plan']['root'] != str(self.root):
                 raise RelatedError('related_recovery_conflict')
             inventory = scan_relation_store(self.root)
@@ -495,12 +518,25 @@ class RelationStore:
             if operation['plan']['kind'] in ('delete', 'merge', 'repair'):
                 inventory.require_complete()
             # Validate every deletion guard before touching any neighbor.
-            for step in operation['plan']['steps']:
+            recorded_progress = operation['progress']
+            for index, step in enumerate(operation['plan']['steps']):
                 if step['kind'] == 'delete' and (self.root / step['path']).exists():
+                    if index < recorded_progress:
+                        raise RelatedError('related_recovery_conflict')
                     if _read_endpoint(self.root, step['path']).file_hash != step['file_hash']:
                         raise RelatedError('related_recovery_conflict')
             for index, step in enumerate(operation['plan']['steps']):
                 path = self.root / step['path']
+                if index < recorded_progress:
+                    # A durably finished effect is verified, never executed again.
+                    if step['kind'] == 'delete':
+                        if path.exists():
+                            raise RelatedError('related_recovery_conflict')
+                    else:
+                        endpoint = _read_endpoint(self.root, step['path'])
+                        if endpoint.id != step['id'] or endpoint.related.fingerprint != step['after']:
+                            raise RelatedError('related_recovery_conflict')
+                    continue
                 if step['kind'] == 'delete' and not path.exists():
                     pass
                 else:
@@ -518,6 +554,7 @@ class RelationStore:
                         if endpoint.file_hash != step['file_hash']:
                             raise RelatedError('related_recovery_conflict')
                         self.checkpoint('before_delete', operation, step)
+                        self._admit(operation, capability, 'unlink', step)
                         os.unlink(path)
                         self._sync_directory(path.parent)
                         self.checkpoint('after_delete', operation, step)
@@ -525,10 +562,13 @@ class RelationStore:
                         pass
                     elif endpoint.related.fingerprint == step['before']:
                         self.checkpoint('before_publish', operation, step)
-                        self._publish(endpoint, step, recovering=recovering)
+                        self._admit(operation, capability, 'publish', step)
+                        self._publish(endpoint, step, recovering=recovering,
+                            admission=lambda:self._admit(operation,capability,'publish',step))
                         self.checkpoint('after_publish', operation, step)
                     else:
                         raise RelatedError('related_recovery_conflict')
+                self._admit(operation, capability, 'progress', step)
                 operation['progress'] = index + 1
                 self._save(operation)
                 self.checkpoint('after_progress', operation, step)
@@ -562,13 +602,18 @@ class RelationStore:
             operation['status'] = 'complete'
             operation['completed_at'] = datetime.now(timezone.utc).isoformat()
             self.checkpoint('before_complete', operation)
+            self._admit(operation, capability, 'complete')
             self._save(operation)
             self.checkpoint('after_complete', operation)
             return {'changed': True, 'operation_id': operation['id'], 'status': 'complete'}
         except BaseException as exc:
+            if isinstance(exc, RelatedAdmissionDeferred):
+                raise
             if isinstance(exc, RelatedError) and exc.code in ('related_recovery_conflict', 'related_scan_incomplete'):
                 operation['status'] = 'blocked'
                 operation['error'] = exc.code
+                # A stale capability must not checkpoint even a failure.
+                self._admit(operation, capability, 'blocked')
                 self._save(operation)
             if isinstance(exc, Exception):
                 raise RelatedError(getattr(exc, 'code', 'related_operation_pending'), operation['id']) from exc
@@ -576,27 +621,35 @@ class RelationStore:
 
     def _recover(self):
         for operation in self.operations():
-            if operation['status'] != 'complete':
-                self._execute(operation, recovering=True)
+            if operation['status'] != 'complete' and operation.get('execution_guard') is None:
+                try:
+                    self._execute(operation, recovering=True)
+                except RelatedAdmissionDeferred:
+                    continue
 
     @guarded_mutation('related_recovery')
     def recover(self):
         # Pure first-use check: no mutex initialization or schema creation.
-        if not any(op['status'] != 'complete' for op in self.operations()):
+        if not any(op['status'] != 'complete' and op.get('execution_guard') is None
+                   for op in self.operations()):
             return
         with bucket_write_scope(self.root):
             self._recover()
 
     @guarded_mutation('related_commit')
-    def commit(self, planner, *, operation_key=None, request_digest=None, repair=False):
+    def commit(self, planner, *, operation_key=None, request_digest=None, repair=False,
+               execution_guard=None, capability=None):
         with bucket_write_scope(self.root):
             existing = self.lookup(operation_key) if operation_key else None
             if existing:
-                if request_digest != existing['request_digest']:
+                if (request_digest != existing['request_digest']
+                        or execution_guard != existing.get('execution_guard')):
                     raise RelatedError('related_operation_key_conflict')
+                if existing.get('execution_guard') is not None:
+                    self._admit(existing, capability, 'replay')
                 if existing['status'] == 'complete':
                     return {'changed': False, 'operation_id': existing['id'], 'status': 'unchanged'}
-                return self._execute(existing, recovering=True)
+                return self._execute(existing, recovering=True, capability=capability)
             if repair and any(op['status'] != 'complete' for op in self.operations()):
                 raise RelatedError('related_operation_pending')
             self._recover()
@@ -608,7 +661,13 @@ class RelationStore:
                          'request_digest': request_digest or digest(plan['request']),
                          'plan': plan, 'status': 'pending', 'progress': 0,
                          'created_at': datetime.now(timezone.utc).isoformat()}
+            if execution_guard is not None:
+                operation['execution_guard'] = execution_guard
+                operation['execution_digest'] = digest({'request_digest': operation['request_digest'],
+                    'plan': plan, 'execution_guard': execution_guard})
+            self._admit(operation, capability, 'intent')
             self.checkpoint('before_intent', operation)
+            self._admit(operation, capability, 'intent')
             try:
                 self._save(operation)
             except Exception as exc:
@@ -620,7 +679,7 @@ class RelationStore:
                 self.checkpoint('after_intent', operation)
             except Exception as exc:
                 raise RelatedError('related_operation_pending', operation['id']) from exc
-            return self._execute(operation, recovering=False)
+            return self._execute(operation, recovering=False, capability=capability)
 
     def preview(self, source_id, **kwargs):
         return plan_mutation(scan_relation_store(self.root), source_id, **kwargs)

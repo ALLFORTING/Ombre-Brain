@@ -302,7 +302,7 @@ def test_dashboard_bucket_patch_history_failure_is_fail_closed(tmp_path, monkeyp
 def test_dashboard_bucket_delete_history_failure_is_fail_closed(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket_id = asyncio.run(server.bucket_mgr.create(content="delete history authority"))
-    server.bucket_mgr.record_history = Mock(side_effect=RuntimeError("history unavailable"))
+    server.bucket_mgr._confirmed_history = Mock(side_effect=RuntimeError("history unavailable"))
     client = _authenticated_client(server)
 
     token = _delete_preview(client, bucket_id)["confirm_token"]
@@ -310,8 +310,9 @@ def test_dashboard_bucket_delete_history_failure_is_fail_closed(tmp_path, monkey
         f"/api/bucket/{bucket_id}", json={"confirm_token": token}
     )
 
-    assert response.status_code == 500
-    assert response.json()["error"] == "bucket_delete_failed"
+    assert response.status_code == 409
+    assert response.json()["status"] == "incomplete"
+    assert response.json()["blocked"][0]["accepted"] is True
     assert response.json()["deleted"] is False
     assert (asyncio.run(server.bucket_mgr.get(bucket_id)))["content"] == (
         "delete history authority"
@@ -341,7 +342,7 @@ def test_dashboard_delete_token_is_once_only_expires_and_rejects_state_change(
     assert third not in server._mutation_confirm_tokens
     assert client.request("DELETE",
         f"/api/bucket/{target}", json={"confirm_token": third}
-    ).status_code == 404
+    ).status_code == 200
 
 
 def test_dashboard_delete_rechecks_incoming_supersession_and_cleans_outgoing(
@@ -439,3 +440,43 @@ def test_dashboard_bucket_patch_keeps_auth_csrf_and_origin_protection(
         )
         assert response.status_code == 403
         assert response.json() == {"error": "same_origin_required"}
+
+
+def test_s4e_dashboard_completed_replay_security_precedes_lookup(tmp_path,monkeypatch):
+    server=_load_server(tmp_path,monkeypatch)
+    client=_authenticated_client(server)
+    identity=asyncio.run(server.bucket_mgr.create('receipt replay security'))
+    token=_delete_preview(client,identity)['confirm_token']
+    path=f'/api/bucket/{identity}'
+    assert client.request('DELETE',path,json={'confirm_token':token}).json()=={'id':identity,'deleted':True}
+    assert client.request('DELETE',path,json={'confirm_token':token}).json()=={'id':identity,'deleted':True}
+    lookup=server.bucket_mgr.confirmed_delete_rows
+    mock=Mock(side_effect=lookup)
+    server.bucket_mgr.confirmed_delete_rows=mock
+    assert _client(server).request('DELETE',path,json={'confirm_token':token}).status_code in (401,403)
+    assert client.request('DELETE',path,headers={'X-Ombre-CSRF':'wrong'},json={'confirm_token':token}).status_code==403
+    assert client.request('DELETE',path,headers={'Origin':'https://foreign.example'},json={'confirm_token':token}).status_code==403
+    assert client.request('DELETE',path,json={'confirm_token':123}).status_code==400
+    assert client.request('DELETE',path,content='{').status_code==400
+    assert mock.call_count==0
+    assert client.request('DELETE',path,json={'confirm_token':'unknown'}).status_code==404
+    review=client.post('/api/import/review',json={'decisions':[{'bucket_id':identity,'action':'delete','confirm_token':token}]})
+    assert review.json()=={'id':identity,'deleted':True,'applied':1,'errors':0}
+    assert len(server.bucket_mgr.get_history(identity))==1
+
+
+def test_s4e_dashboard_incomplete_projection_and_recovery(tmp_path,monkeypatch):
+    server=_load_server(tmp_path,monkeypatch)
+    client=_authenticated_client(server)
+    identity=asyncio.run(server.bucket_mgr.create('pending dashboard'))
+    token=_delete_preview(client,identity)['confirm_token']
+    old=server.bucket_mgr._confirmed_history
+    server.bucket_mgr._confirmed_history=Mock(side_effect=RuntimeError('synthetic failure'))
+    response=client.request('DELETE',f'/api/bucket/{identity}',json={'confirm_token':token})
+    assert response.status_code==409
+    value=response.json()
+    assert value['started_ids']==[identity] and value['completed_ids']==[] and value['not_started_ids']==[]
+    assert value['blocked'][0]['accepted'] is True
+    server.bucket_mgr._confirmed_history=old
+    response=client.post('/api/import/review',json={'decisions':[{'bucket_id':identity,'action':'delete','confirm_token':token}]})
+    assert response.json()=={'id':identity,'deleted':True,'applied':1,'errors':0}

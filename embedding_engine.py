@@ -14,6 +14,7 @@
 import os
 import json
 import math
+from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 import sqlite3
 import logging
 import re
@@ -100,6 +101,7 @@ class EmbeddingEngine:
     def _init_db(self):
         """Create embeddings table if not exists."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        initialize_bucket_write_lock(os.path.dirname(self.db_path))
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -207,18 +209,22 @@ class EmbeddingEngine:
     @guarded_mutation("bucket_embedding_store")
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         """Store embedding in SQLite."""
-        from utils import now_iso
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO embeddings
-                (bucket_id, embedding, model, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (bucket_id, json.dumps(embedding), self.model, now_iso()),
-        )
-        conn.commit()
-        conn.close()
+        with bucket_write_scope(os.path.dirname(self.db_path)):
+            admission = getattr(self, "write_admission", None)
+            if admission is not None:
+                admission(bucket_id)
+            from utils import now_iso
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO embeddings
+                    (bucket_id, embedding, model, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (bucket_id, json.dumps(embedding), self.model, now_iso()),
+            )
+            conn.commit()
+            conn.close()
 
     def archive_embedding_evidence(self, bucket_id, input_digest, model):
         """Read legacy schemas without migration; only bound, valid rows prove input."""
@@ -254,18 +260,22 @@ class EmbeddingEngine:
     @guarded_mutation("archive_embedding_store")
     def store_archive_embedding(self, bucket_id, vector, input_digest, model, created_at):
         """Called only under the archive root mutex after winner revalidation."""
-        if not self._valid_archive_vector(vector):
-            raise ValueError("archive_embedding_invalid")
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
-            if "input_digest" not in columns:
-                conn.execute("ALTER TABLE embeddings ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''")
-            conn.execute(
-                "INSERT OR REPLACE INTO embeddings "
-                "(bucket_id,embedding,model,updated_at,input_digest) VALUES(?,?,?,?,?)",
-                (bucket_id, json.dumps(vector), model, created_at, input_digest),
-            )
+        with bucket_write_scope(os.path.dirname(self.db_path)):
+            admission = getattr(self, "write_admission", None)
+            if admission is not None:
+                admission(bucket_id)
+            if not self._valid_archive_vector(vector):
+                raise ValueError("archive_embedding_invalid")
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+                if "input_digest" not in columns:
+                    conn.execute("ALTER TABLE embeddings ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''")
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings "
+                    "(bucket_id,embedding,model,updated_at,input_digest) VALUES(?,?,?,?,?)",
+                    (bucket_id, json.dumps(vector), model, created_at, input_digest),
+                )
 
     def trace_embedding_receipt(self, effect_key):
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -278,32 +288,69 @@ class EmbeddingEngine:
     @guarded_mutation("trace_embedding_store")
     def store_trace_embedding(self, effect_key, bucket_id, vector, input_digest, model, logical_time):
         """Caller holds root mutex and has revalidated its epoch and current body."""
-        if not self._valid_archive_vector(vector):
-            raise ValueError('trace_embedding_invalid')
-        serialized = json.dumps(vector)
-        receipt = {'outcome': 'applied', 'bucket_id': bucket_id, 'input_digest': input_digest,
-                   'model': model, 'vector_digest': hashlib.sha256(serialized.encode()).hexdigest()}
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
-            conn.execute('''CREATE TABLE IF NOT EXISTS ob_s4_embedding_effects (
-                effect_key TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)''')
-            row = conn.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',
-                               (effect_key,)).fetchone()
-            if row:
-                return json.loads(row[0])
-            conn.execute('''INSERT OR REPLACE INTO embeddings
-                (bucket_id,embedding,model,updated_at) VALUES(?,?,?,?)''',
-                (bucket_id, serialized, model, logical_time))
-            conn.execute('INSERT INTO ob_s4_embedding_effects VALUES(?,?)', (effect_key, json.dumps(receipt)))
-        return receipt
+        with bucket_write_scope(os.path.dirname(self.db_path)):
+            admission = getattr(self, "write_admission", None)
+            if admission is not None:
+                admission(bucket_id)
+            if not self._valid_archive_vector(vector):
+                raise ValueError('trace_embedding_invalid')
+            serialized = json.dumps(vector)
+            receipt = {'outcome': 'applied', 'bucket_id': bucket_id, 'input_digest': input_digest,
+                       'model': model, 'vector_digest': hashlib.sha256(serialized.encode()).hexdigest()}
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute('''CREATE TABLE IF NOT EXISTS ob_s4_embedding_effects (
+                    effect_key TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)''')
+                row = conn.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',
+                                   (effect_key,)).fetchone()
+                if row:
+                    return json.loads(row[0])
+                conn.execute('''INSERT OR REPLACE INTO embeddings
+                    (bucket_id,embedding,model,updated_at) VALUES(?,?,?,?)''',
+                    (bucket_id, serialized, model, logical_time))
+                conn.execute('INSERT INTO ob_s4_embedding_effects VALUES(?,?)', (effect_key, json.dumps(receipt)))
+            return receipt
 
     @guarded_mutation("bucket_embedding_delete")
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted."""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
-        conn.commit()
-        conn.close()
+        with bucket_write_scope(os.path.dirname(self.db_path)):
+            admission = getattr(self, "write_admission", None)
+            if admission is not None:
+                admission(bucket_id, require_source=False)
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
+            conn.commit()
+            conn.close()
+
+    @guarded_mutation("confirmed_embedding_delete")
+    def delete_confirmed_embedding(self, effect_key, bucket_id, *, admission=None):
+        """DELETE and its existing S-4 effect receipt share one durable transaction."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("CREATE TABLE IF NOT EXISTS ob_s4_embedding_effects (effect_key TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)")
+            row = conn.execute('SELECT receipt_json FROM ob_s4_embedding_effects WHERE effect_key=?',(effect_key,)).fetchone()
+            if row:
+                receipt = json.loads(row[0])
+                if receipt.get('bucket_id') != bucket_id or receipt.get('kind') != 'delete':
+                    raise ValueError('confirmed_embedding_effect_conflict')
+                return receipt
+            self.embedding_effect_checkpoint('before_delete',effect_key)
+            if admission is not None:
+                admission()
+            count = conn.execute('DELETE FROM embeddings WHERE bucket_id=?',(bucket_id,)).rowcount
+            receipt = {'kind':'delete','bucket_id':bucket_id,'effect_key':effect_key,
+                       'outcome':'deleted' if count else 'already_absent'}
+            conn.execute('INSERT INTO ob_s4_embedding_effects VALUES(?,?)',(effect_key,json.dumps(receipt)))
+            self.embedding_effect_checkpoint('before_commit',effect_key)
+            if admission is not None:
+                admission()
+            conn.commit()
+            return receipt
+
+    def embedding_effect_checkpoint(self, boundary, effect_key):
+        """Synchronous transaction failure-injection seam."""
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         """Retrieve stored embedding for a bucket. Returns None if not found."""

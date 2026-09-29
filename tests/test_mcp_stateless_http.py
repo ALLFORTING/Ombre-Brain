@@ -685,3 +685,61 @@ async def test_stateless_real_breath_cursor_pages_and_binding(ob, monkeypatch):
         expired = text(await call(client, "breath", {**arguments, "cursor": cursor}))
         assert "无效、已过期或与当前检索条件不匹配" in expired
         assert not ob.mcp.session_manager._server_instances
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stateless',[False,True])
+@pytest.mark.parametrize('loss',['accepted','completed'])
+async def test_s4e_confirmed_delete_tcp_disconnect_and_stable_replay(ob,monkeypatch,stateless,loss):
+    monkeypatch.setenv('OMBRE_MCP_STATELESS_HTTP',str(stateless))
+    identity=await ob.bucket_mgr.create('S4E isolated HTTP delete')
+    preview=await ob._delete_with_confirmation([identity],'')
+    arguments={'bucket_id':identity,'delete':True,'confirm_token':preview['confirm_token']}
+    started,release,cancelled,finished=[asyncio.Event() for _ in range(4)]
+    first=True
+    observed=[]
+    original_pause=ob.bucket_mgr.confirmed_delete_pause
+    async def pause(point,context):
+        nonlocal first
+        if loss=='accepted' and first and point=='child_accepted':
+            first=False;started.set()
+            try:await release.wait()
+            except asyncio.CancelledError:cancelled.set();raise
+            finally:finished.set()
+        return await original_pause(point,context)
+    monkeypatch.setattr(ob.bucket_mgr,'confirmed_delete_pause',pause)
+    original_trace=ob.mcp._tool_manager.get_tool("trace").fn
+    async def wrapped(**kwargs):
+        nonlocal first
+        output=await original_trace(**kwargs)
+        observed.append(output)
+        if loss=='completed' and first:
+            first=False;started.set()
+            try:await release.wait()
+            except asyncio.CancelledError:cancelled.set();raise
+            finally:finished.set()
+        return output
+    monkeypatch.setattr(ob.mcp._tool_manager.get_tool('trace'),'fn',wrapped)
+    async with live(ob) as client:
+        session=await initialize(client)
+        assert bool(session) is not stateless
+        assert await disconnect_call(client,'trace',arguments,started)
+        if stateless:await wait(cancelled)
+        else:release.set()
+        await wait(finished)
+        rows=ob.bucket_mgr.confirmed_delete_rows()
+        assert len(rows)==1,observed
+        if stateless and loss=='accepted':assert rows[0]['phase']=='accepted'
+        output=text(await call(client,'trace',arguments))
+        assert output=='已遗忘记忆桶: '+identity
+        assert text(await call(client,'trace',arguments))==output
+        assert len(ob.bucket_mgr.get_history(identity))==1
+        assert len(ob.bucket_mgr.relation_store.operations())==1
+        assert ob.bucket_mgr.confirmed_delete_rows()[0]['status']=='completed'
+
+
+@pytest.mark.asyncio
+async def test_s4e_stateless_stays_default_off(ob,monkeypatch):
+    monkeypatch.delenv('OMBRE_MCP_STATELESS_HTTP',raising=False)
+    async with live(ob) as client:
+        assert await initialize(client)

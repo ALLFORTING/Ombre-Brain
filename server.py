@@ -41,6 +41,8 @@ import io
 import random
 import logging
 import asyncio
+import weakref
+import copy
 import hashlib
 import hmac
 import html
@@ -97,6 +99,7 @@ _MUTATION_CONFIRM_MAX_TOKENS = 256
 _DIGEST_SOURCE_LIMIT_PER_GROUP = 20
 _mutation_confirm_tokens: dict[str, dict] = {}
 _mutation_confirm_lock = threading.Lock()
+_confirmed_delete_locks = weakref.WeakValueDictionary()
 _merge_running_operations: set[str] = set()
 _digest_running_operations: set[str] = set()
 
@@ -2836,6 +2839,10 @@ async def _prepare_trace_delete(
         bucket = await bucket_mgr.get(bucket_id)
         if not bucket:
             return None, f"未找到记忆桶: {bucket_id}", plans
+        try:
+            bucket_mgr.assert_confirmed_delete_writable(bucket_id)
+        except BucketIdempotencyError as exc:
+            return None, 'delete blocked: '+exc.code, plans
         metadata = bucket.get("metadata", {})
         protections = [
             name for name, active in (
@@ -2875,76 +2882,158 @@ async def _prepare_trace_delete(
                 f"删除失败：记忆桶 {bucket_id} 仍被以下作废关系引用: {inbound_ids}。"
                 "请先用 trace(superseded_by='') 解除或改指向。"
             ), plans
+        try:
+            bucket_mgr.confirmed_delete_supersession_guard(inventory,bucket_id,_superseded_by_id(metadata))
+        except RelatedError as exc:
+            return None,'delete blocked: '+exc.code,plans
         buckets.append(bucket)
     return buckets, "", plans
 
 
-async def _execute_trace_delete(bucket: dict) -> tuple[bool, str]:
-    """Delete one already-confirmed, freshly validated bucket and clean its reverse link."""
-    bucket_id = str(bucket["id"])
-    metadata = bucket.get("metadata", {})
-    successor_id = _superseded_by_id(metadata)
-    successor = (
-        await bucket_mgr.get(successor_id)
-        if successor_id and successor_id != "none"
-        else None
-    )
-    successor_restore = None
-    if successor:
-        successor_meta = successor.get("metadata", {})
-        successor_restore = _metadata_restore_value(successor_meta, "supersedes")
-        cleaned = await _clear_outgoing_supersession_for_delete(bucket)
-        if not cleaned:
-            return False, "删除失败：无法清理 superseded_by 反向关系。"
-    try:
-        success = await bucket_mgr.delete(bucket_id)
-    except Exception as exc:
-        # Preserve R-5's pre-intent restore. An accepted deletion must instead
-        # roll forward, so its supersession cleanup is never rolled back.
-        if getattr(exc, 'operation_id', None) is None and successor:
-            await bucket_mgr.update(successor_id, supersedes=successor_restore)
-        detail = str(exc) if isinstance(exc, RelatedError) else 'related_commit_failed'
-        return False, f"delete pending/blocked: {detail}; retry after recovery."
-    if not success and successor:
-        await bucket_mgr.update(successor_id, supersedes=successor_restore)
-    return success, (
-        f"已遗忘记忆桶: {bucket_id}"
-        if success
-        else f"删除失败：记忆桶 {bucket_id} 存在，但删除未完成。"
-    )
+async def _execute_trace_delete(delete_id: str) -> tuple[bool, str]:
+    """Only a durably accepted child may execute this destructive path."""
+    if not isinstance(delete_id,str):
+        raise RelatedError('confirmed_delete_evidence_missing')
+    message = await bucket_mgr.execute_confirmed_delete(delete_id)
+    return bucket_mgr._confirmed_row(delete_id)['status'] == 'completed', message
+
+
+def _confirmed_delete_projection(bucket_ids, rows, admission_error=None):
+    completed = [r['bucket_id'] for r in rows if r['status']=='completed']
+    started = [r['bucket_id'] for r in rows]
+    not_started = [i for i in bucket_ids if i not in started]
+    inventory = scan_relation_store(config['buckets_dir'])
+    remaining = None if inventory.blockers else [i for i in bucket_ids if i in inventory.endpoints]
+    blocked = [{'bucket_id':r['bucket_id'],'error_code':r['last_error_code'],'accepted':True}
+               for r in rows if r['status']=='blocked']
+    if admission_error:
+        blocked.append({'bucket_id':not_started[0] if not_started else '',
+                        'error_code':admission_error,'accepted':False})
+    projection = {'attempt_id':rows[0]['attempt_id'] if rows else None,'requested_ids':bucket_ids,
+                  'started_ids':started,'completed_ids':completed,
+                  'pending_ids':[r['bucket_id'] for r in rows if r['status']=='pending'],
+                  'blocked':blocked,'not_started_ids':not_started,'remaining_existing_ids':remaining,
+                  'absent_without_completion_evidence_ids':None if remaining is None else
+                    [i for i in bucket_ids if i not in remaining and i not in completed],
+                  'fresh_confirmation_required':bool(not_started)}
+    if len(completed)==len(bucket_ids):
+        return {'status':'deleted','message':'\n'.join(r['result_text'] for r in rows),'plan':[],
+                'deleted_ids':completed}
+    message = '删除失败：delete incomplete; accepted children only.\n'+_json_lib.dumps(projection,ensure_ascii=False,sort_keys=True)
+    if not_started:
+        message += '\nRemaining items require a fresh preview and confirmation token.'
+    return {'status':'incomplete','message':message,'plan':[],'deleted_ids':completed,**projection}
+
+
+def _confirmed_delete_token_entry(token):
+    with _mutation_confirm_lock:
+        entry = _mutation_confirm_tokens.get(token)
+        if (not entry or entry['operation'] != 'trace.delete' or entry['expires_at'] <= time.monotonic()):
+            return None
+        return entry
 
 
 async def _delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> dict:
-    """One delete plan and confirmation flow shared by MCP and Dashboard routes."""
-    buckets, error, plans = await _prepare_trace_delete(bucket_ids)
+    """One-shot admission; consumed tokens can locate existing children only."""
+    supplied = (confirm_token or '').strip()
+    invalid = {'status':'invalid','message':'删除确认无效、已过期或与当前目标不匹配；请重新预览后确认。','plan':[]}
+    token_hash = bucket_mgr.confirmed_token_hash(supplied) if supplied else None
+    if supplied:
+        lock_key = (os.getpid(),asyncio.get_running_loop(),'s4e-attempt',str(Path(config['buckets_dir']).resolve()),token_hash)
+        lock = _confirmed_delete_locks.setdefault(lock_key,asyncio.Lock())
+        async with lock:
+            return await _confirmed_delete_confirm(bucket_ids,supplied,token_hash,invalid)
+    buckets,error,plans = await _prepare_trace_delete(bucket_ids)
     if buckets is None:
-        return {"status": "blocked", "message": error, "plan": plans}
-    payload = _delete_confirmation_payload(buckets, plans)
-    supplied = (confirm_token or "").strip()
-    if not supplied:
-        token = _issue_mutation_confirmation("trace.delete", payload)
-        return {
-            "status": "preview",
-            "message": _format_delete_confirmation(buckets, plans, token),
-            "plan": plans,
-            "confirm_token": token,
-            "expires_in_seconds": _MUTATION_CONFIRM_TTL_SECONDS,
-        }
-    if not _consume_mutation_confirmation("trace.delete", payload, supplied):
-        return {
-            "status": "invalid",
-            "message": "删除确认无效、已过期或与当前目标不匹配；请重新预览后确认。",
-            "plan": plans,
-        }
-    results = [await _execute_trace_delete(bucket) for bucket in buckets]
-    return {
-        "status": "deleted" if all(ok for ok, _ in results) else "failed",
-        "message": "\n".join(message for _, message in results),
-        "plan": plans,
-        "deleted_ids": [
-            bucket["id"] for bucket, (ok, _) in zip(buckets, results) if ok
-        ],
-    }
+        return {'status':'blocked','message':error,'plan':plans}
+    payload = _delete_confirmation_payload(buckets,plans)
+    with bucket_write_scope(config['buckets_dir']):
+        inventory = scan_relation_store(config['buckets_dir']); inventory.require_complete()
+        incarnations = {i:bucket_mgr._confirmed_file_guard(e.path)['incarnation'] for i,e in inventory.endpoints.items()}
+        frozen = [bucket_mgr.freeze_confirmed_delete(inventory,i,incarnations) for i in bucket_ids]
+        if any(related_digest(p['relation_plan']) != shown['related_plan_digest'] for p,shown in zip(frozen,plans)):
+            return invalid
+        current = [bucket_mgr._load_bucket(str(Path(config['buckets_dir'])/inventory.endpoint(i).path)) for i in bucket_ids]
+        if _delete_confirmation_payload(current,plans) != payload:
+            return invalid
+        token = _issue_mutation_confirmation('trace.delete',payload)
+        with _mutation_confirm_lock:
+            _mutation_confirm_tokens[token].update(delete_inventory=copy.deepcopy(inventory),
+                delete_incarnations=incarnations,delete_frozen=frozen,delete_requested=list(bucket_ids))
+    return {'status':'preview','message':_format_delete_confirmation(buckets,plans,token),'plan':plans,
+            'confirm_token':token,'expires_in_seconds':_MUTATION_CONFIRM_TTL_SECONDS}
+
+
+async def _confirmed_delete_confirm(bucket_ids,supplied,token_hash,invalid):
+    with bucket_write_scope(config['buckets_dir']):
+        rows = bucket_mgr.confirmed_delete_rows(token_hash=token_hash)
+    if rows:
+        digest = rows[0]['confirmation_payload_digest']
+        if any(r['requested_ids'] != bucket_ids or r['confirmation_payload_digest'] != digest
+               or r['bucket_id'] != bucket_ids[r['ordinal']] for r in rows):
+            return invalid
+        for row in rows:
+            if row['status'] != 'completed':
+                await _execute_trace_delete(row['delete_id'])
+        return _confirmed_delete_projection(bucket_ids,bucket_mgr.confirmed_delete_rows(token_hash=token_hash))
+    entry = _confirmed_delete_token_entry(supplied)
+    if entry is None or entry.get('delete_requested') != bucket_ids:
+        return invalid
+    buckets,error,plans = await _prepare_trace_delete(bucket_ids)
+    if buckets is None:
+        return {'status':'blocked','message':error,'plan':plans}
+    payload = _delete_confirmation_payload(buckets,plans)
+    if entry['payload_digest'] != _confirmation_payload_digest(payload):
+        return invalid
+    inventory = copy.deepcopy(entry['delete_inventory'])
+    incarnations = copy.deepcopy(entry['delete_incarnations'])
+    first = entry['delete_frozen'][0]
+    # No await or business effect between final guard checks, consumption and acceptance.
+    with bucket_write_scope(config['buckets_dir']):
+        live = scan_relation_store(config['buckets_dir']); live.require_complete()
+        if live.fingerprint() != inventory.fingerprint():
+            return invalid
+        for identity in bucket_ids:
+            endpoint = live.endpoint(identity)
+            guard = bucket_mgr._confirmed_file_guard(endpoint.path)
+            if guard['file_hash'] != inventory.endpoint(identity).file_hash or guard['incarnation'] != incarnations[identity]:
+                return invalid
+            bucket_mgr.assert_confirmed_delete_writable(identity)
+            try:
+                bucket_mgr.confirmed_delete_supersession_guard(live,identity,entry['delete_frozen'][bucket_ids.index(identity)]['successor_id'])
+            except RelatedError:
+                return invalid
+        if not _consume_mutation_confirmation('trace.delete',payload,supplied):
+            return invalid
+        bucket_mgr.confirmed_delete_checkpoint('token_consumed',{})
+        try:
+            delete_id = bucket_mgr.accept_confirmed_delete(token_hash,entry['payload_digest'],bucket_ids,0,first)
+        except Exception:
+            accepted = bucket_mgr.confirmed_delete_rows(token_hash=token_hash)
+            if not accepted:
+                return _confirmed_delete_projection(bucket_ids,[], 'confirmed_delete_authorization_lost')
+            delete_id = accepted[0]['delete_id']
+    for ordinal,identity in enumerate(bucket_ids):
+        if ordinal:
+            plan = bucket_mgr.freeze_confirmed_delete(inventory,identity,incarnations)
+            try:
+                delete_id = bucket_mgr.accept_confirmed_delete(token_hash,entry['payload_digest'],bucket_ids,ordinal,plan)
+            except Exception:
+                return _confirmed_delete_projection(bucket_ids,bucket_mgr.confirmed_delete_rows(token_hash=token_hash),
+                                                    'confirmed_delete_accept_pending')
+        await bucket_mgr.confirmed_delete_pause('child_accepted',{'delete_id':delete_id})
+        ok,_ = await _execute_trace_delete(delete_id)
+        if not ok:
+            break
+        row = bucket_mgr._confirmed_row(delete_id)
+        try:
+            bucket_mgr.project_confirmed_delete(inventory,incarnations,row)
+        except RelatedError:
+            # The current call cannot prove a later child plan; it admits no later item.
+            return _confirmed_delete_projection(bucket_ids,bucket_mgr.confirmed_delete_rows(token_hash=token_hash),
+                                                'confirmed_delete_projection_unproven')
+        await bucket_mgr.confirmed_delete_pause('between_children',{'delete_id':delete_id})
+    return _confirmed_delete_projection(bucket_ids,bucket_mgr.confirmed_delete_rows(token_hash=token_hash))
 
 
 async def _trace_delete_with_confirmation(bucket_ids: list[str], confirm_token: str) -> str:
@@ -2969,6 +3058,10 @@ def _dashboard_delete_response(bucket_id: str, outcome: dict, *, review: bool = 
         "plan": outcome.get("plan", []),
         "message": outcome["message"],
     }
+    if status == "incomplete":
+        for key in ('attempt_id','requested_ids','started_ids','completed_ids','pending_ids','blocked',
+                    'not_started_ids','remaining_existing_ids','absent_without_completion_evidence_ids','fresh_confirmation_required'):
+            body[key] = outcome[key]
     if status == "preview":
         body["confirm_token"] = outcome["confirm_token"]
         body["expires_in_seconds"] = outcome["expires_in_seconds"]
@@ -12598,6 +12691,24 @@ async def api_bucket_detail(request):
     if err:
         return err
     bucket_id = request.path_params["bucket_id"]
+    if method == "DELETE":
+        try:
+            raw_body = await request.body()
+            body = _json_lib.loads(raw_body) if raw_body else {}
+        except (UnicodeDecodeError, ValueError):
+            return _dashboard_write_error(route,400,"invalid_json")
+        if not isinstance(body,dict) or set(body)-{"confirm_token"} or not isinstance(body.get("confirm_token",""),str):
+            return _dashboard_write_error(route,400,"invalid_delete_request")
+        token = body.get("confirm_token","")
+        exists = await bucket_mgr.get(bucket_id)
+        rows = bucket_mgr.confirmed_delete_rows(token_hash=bucket_mgr.confirmed_token_hash(token.strip())) if token else []
+        if not exists and not rows:
+            return JSONResponse({"error":"not found"},status_code=404)
+        try:
+            outcome = await _delete_with_confirmation([bucket_id],token)
+        except Exception:
+            return _dashboard_write_error(route,500,"bucket_delete_failed")
+        return _dashboard_delete_response(bucket_id,outcome)
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -12630,26 +12741,6 @@ async def api_bucket_detail(request):
         bucket = await bucket_mgr.get(bucket_id) or bucket
         meta = bucket.get("metadata", {})
 
-    if method == "DELETE":
-        try:
-            raw_body = await request.body()
-            body = _json_lib.loads(raw_body) if raw_body else {}
-        except (UnicodeDecodeError, ValueError):
-            return _dashboard_write_error(route, 400, "invalid_json")
-        if not isinstance(body, dict) or set(body) - {"confirm_token"}:
-            return _dashboard_write_error(route, 400, "invalid_delete_request")
-        confirm_token = body.get("confirm_token", "")
-        if not isinstance(confirm_token, str):
-            return _dashboard_write_error(route, 400, "invalid_delete_request")
-        try:
-            outcome = await _delete_with_confirmation([bucket_id], confirm_token)
-        except Exception:
-            logger.error(
-                "Dashboard bucket delete failed route=%s code=bucket_delete_failed",
-                route,
-            )
-            return _dashboard_write_error(route, 500, "bucket_delete_failed")
-        return _dashboard_delete_response(bucket_id, outcome)
 
     response = {
         "id": bucket["id"],
