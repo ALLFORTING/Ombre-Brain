@@ -30,13 +30,12 @@ def server(tmp_path, monkeypatch):
 
 
 def receipts(response):
-    return {
-        bucket_id: (state, source_hash)
-        for bucket_id, state, source_hash in re.findall(
-            r"^- ([0-9a-f]{12}) \[(missing|stale|fresh), source_hash:([0-9a-f]{64})\]$",
-            response, re.MULTILINE,
-        )
-    }
+    matches = re.findall(
+        r"^- ([0-9a-f]{12}) \[(missing|stale|fresh), source_hash:([0-9a-f]{64})\]$",
+        response, re.MULTILINE,
+    )
+    assert len(matches) == len({item[0] for item in matches}), "Duplicate receipt in raw output"
+    return {bucket_id: (state, source_hash) for bucket_id, state, source_hash in matches}
 
 
 def stored_post(server, bucket_id):
@@ -170,7 +169,7 @@ def test_receipt_reservation_registers_new_omissions_until_stable(server, monkey
         )
         expected = {bid for bid, _, _, end in items if end > len(emitted.get("pinned", ""))}
         assert set(receipts(body)) == expected
-        assert server.count_tokens_approx(server._with_response_seal(f"boot profile: tg\n\n{body}")) <= budget
+        assert server.count_tokens_approx(body) <= budget
         cascade_found |= any(a < b for a, b in zip(histories, histories[1:]))
         prefix = emitted.get("pinned", "")
         partial_found |= bool(prefix) and any(f"[bucket_id:{bid}]" in prefix for bid in expected)
@@ -195,7 +194,12 @@ def test_omission_count_uses_exact_item_end_at_boundary(server):
 
 
 @pytest.mark.asyncio
-async def test_receipts_over_4000_emit_every_hash_without_consuming_ordinary_sections(server):
+@pytest.mark.parametrize("long_seal", [False, True])
+async def test_receipts_over_4000_emit_every_hash_without_consuming_ordinary_sections(
+    server, monkeypatch, long_seal,
+):
+    if long_seal:
+        monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "\u9a8c" * 3000)
     await server.boot(profile="tg")
     checkpoint_before = server.bucket_mgr.get_boot_delta_checkpoint(profile="tg")
     await server.leave_note("R17_PENDING_NOTE")
@@ -221,6 +225,8 @@ async def test_receipts_over_4000_emit_every_hash_without_consuming_ordinary_sec
     assert server.count_tokens_approx(result) > 4000
     assert server.TG_RECOVERY_OVER_BUDGET in result
     assert result.startswith("boot profile: tg\n\n" + server.TG_RECOVERY_HEADER)
+    assert result.endswith("seal: " + server._response_seal())
+    assert result.count(server.TG_RECOVERY_OVER_BUDGET) == 1
     for marker in ("R17_PENDING_NOTE", "R17_PENDING_LETTER", "R17_PENDING_TODO", "=== boot: 增量摘要 ==="):
         assert marker not in result
     assert server.bucket_mgr.get_boot_delta_checkpoint(profile="tg") == checkpoint_before
@@ -277,19 +283,93 @@ async def test_sufficient_budget_preserves_existing_sections_and_display(server)
     assert server.count_tokens_approx(response) <= 4000
 
 
+def delivery_snapshot(server):
+    with sqlite3.connect(server.bucket_mgr.history_db_path) as conn:
+        notes = conn.execute("SELECT boot_delivered_at, skipped_at, read_at FROM notes").fetchall()
+        letters = conn.execute("SELECT * FROM letters").fetchall()
+    return server.bucket_mgr.get_boot_delta_checkpoint(profile="tg"), notes, letters
+
+
 @pytest.mark.asyncio
-async def test_envelope_and_long_seal_are_counted_and_cannot_clip_receipts(server, monkeypatch):
-    monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "验" * 200)
-    expected = {}
-    await server.archive_session("carrier", letter="挤占" * 4000)
-    for i in range(5):
-        bucket_id = await server.bucket_mgr.create("正文" * 400, pinned=True)
-        expected[bucket_id] = ("missing", source_hash(stored_post(server, bucket_id)[1]))
-    result = await server.boot(profile="tg", max_tokens=1000)
-    assert receipts(result) == expected
-    assert server.count_tokens_approx(result) <= 1000
-    assert result.endswith("seal: " + "验" * 200)
+async def test_long_seal_without_omissions_preserves_body_and_real_delivery(server, monkeypatch):
+    await server.boot(profile="tg")
+    await server.leave_note("R17_FULL_NOTE")
+    await server.archive_session("carrier", letter="R17_FULL_LETTER")
+    bucket_id = await server.bucket_mgr.create(
+        "R17_FULL_TRIGGER", pinned=True, todos=["R17_FULL_TODO"],
+    )
+    assert await server.bucket_mgr.update(bucket_id, trigger_date=date.today().isoformat())
+    _, _, letters_before = delivery_snapshot(server)
+    high_water = server.bucket_mgr.get_boot_delta_high_water()
+    monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "\u9a8c" * 3000)
+    real_fit = server._fit_sections_to_budget
+    fitted_sections = []
+
+    def capture(sections, budget, **kwargs):
+        # This is the unchanged baseline ordinary-content allowance, regardless
+        # of the runtime seal length. With no omissions the sections pass whole.
+        assert budget == 4000 - 40
+        fitted_sections.append(sections)
+        return real_fit(sections, budget, **kwargs)
+
+    monkeypatch.setattr(server, "_fit_sections_to_budget", capture)
+    result = await server.boot(profile="tg")
+
+    assert len(fitted_sections) == 1
+    expected_body = "\n\n".join(text for _, _, text in fitted_sections[0])
+    assert result == server._with_response_seal("boot profile: tg\n\n" + expected_body)
+    assert not receipts(result)
+    assert server.TG_RECOVERY_HEADER not in result
     assert server.TG_RECOVERY_OVER_BUDGET not in result
+    assert server.count_tokens_approx(expected_body) <= 4000
+    assert server.count_tokens_approx(result) > 4000
+    for marker in ("R17_FULL_NOTE", "R17_FULL_LETTER", "R17_FULL_TRIGGER", "R17_FULL_TODO"):
+        assert marker in result
+    checkpoint, notes, letters = delivery_snapshot(server)
+    assert checkpoint["last_event_id"] == high_water
+    assert notes[0][0] is not None and notes[0][1:] == (None, None)
+    assert letters == letters_before
+    bucket = await server.bucket_mgr.get(bucket_id)
+    assert bucket["metadata"]["trigger_last_seen"] == date.today().isoformat()
+    assert bucket["metadata"]["todos"] == ["R17_FULL_TODO"]
+
+
+@pytest.mark.asyncio
+async def test_seal_only_overflow_with_receipts_has_no_recovery_notice_or_false_delivery(server, monkeypatch):
+    await server.boot(profile="tg")
+    monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "\u9a8c" * 3000)
+    # The full note is eligible but cannot fit after receipt/notice reservation.
+    # Reserved later sections may still fit and must consume only if delivered.
+    await server.leave_note("R17_PENDING_NOTE" + "\u957f" * 400)
+    await server.archive_session("carrier", letter="R17_PENDING_LETTER" * 1000)
+    expected = {}
+    for i in range(5):
+        bucket_id = await server.bucket_mgr.create(
+            "\u6b63\u6587" * 400, pinned=True, todos=["R17_PENDING_TODO"],
+        )
+        expected[bucket_id] = ("missing", source_hash(stored_post(server, bucket_id)[1]))
+    trigger_id = next(iter(expected))
+    await server.bucket_mgr.update(trigger_id, trigger_date=date.today().isoformat())
+    before = delivery_snapshot(server)
+    result = await server.boot(profile="tg", max_tokens=1000)
+
+    assert receipts(result) == expected
+    assert result.endswith("seal: " + "\u9a8c" * 3000)
+    body = result.removeprefix("boot profile: tg\n\n").rsplit("\n\nseal: ", 1)[0]
+    assert server.count_tokens_approx(body) <= 1000
+    assert server.count_tokens_approx(result) > 1000
+    assert server.TG_RECOVERY_OVER_BUDGET not in result
+    checkpoint, notes, letters = delivery_snapshot(server)
+    assert (notes, letters) == before[1:]
+    if "=== boot: \u589e\u91cf\u6458\u8981 ===" in result:
+        assert checkpoint["last_event_id"] > before[0]["last_event_id"]
+    else:
+        assert checkpoint == before[0]
+    bucket = await server.bucket_mgr.get(trigger_id)
+    assert bucket["metadata"]["trigger_last_seen"] == ""
+    assert bucket["metadata"]["todos"] == ["R17_PENDING_TODO"]
+    for marker in ("R17_PENDING_NOTE", "R17_PENDING_LETTER"):
+        assert marker not in result
 
 
 @pytest.mark.asyncio
@@ -312,3 +392,97 @@ async def test_storage_final_check_rejects_change_after_refresh_precheck(server,
     assert "原文已变化" in result
     assert f"source_hash:{changed_hash}" in result
     assert "tg_summary" not in stored_post(server, bucket_id)[1]
+
+
+def test_duplicate_recovery_ids_use_first_entry_and_identical_reservation(server):
+    text, items = synthetic_pinned()
+    bid, state, current_hash, end = items[0]
+    duplicate_items = [items[0], (bid, "stale", "f" * 64, len(text)), *items[1:], items[0]]
+    unique_body, unique_emitted = server._fit_tg_boot_sections(
+        [("pinned", "pinned", text)], 200, recovery_items=items,
+        truncation_notice_tokens=100,
+    )
+    body, emitted = server._fit_tg_boot_sections(
+        [("pinned", "pinned", text)], 200, recovery_items=duplicate_items,
+        omission_item_refs={"pinned": [f"bucket_id:{item[0]}" for item in duplicate_items]},
+        omission_item_ends={"pinned": [(f"bucket_id:{item[0]}", item[3]) for item in duplicate_items]},
+        truncation_notice_tokens=100,
+    )
+    assert (body, emitted) == (unique_body, unique_emitted)
+    # Count raw lines before any dictionary conversion can hide duplicates.
+    raw_ids = re.findall(r"^- ([0-9a-f]{12}) \[", body, re.MULTILINE)
+    assert raw_ids == [item[0] for item in items]
+    assert raw_ids.count(bid) == 1
+    assert f"- {bid} [{state}, source_hash:{current_hash}]" in body
+    assert "source_hash:" + "f" * 64 not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [1000, 4000])
+async def test_boot_deduplicates_visible_pins_before_metadata_and_counts(server, monkeypatch, budget):
+    bucket_id = await server.bucket_mgr.create("\u539f\u6587" * 400, pinned=True, name="FIRST_VISIBLE")
+    real_list = server.bucket_mgr.list_all
+    real_metadata = server.bucket_mgr.get_tg_summary_metadata
+
+    async def duplicate_list(*args, **kwargs):
+        buckets = await real_list(*args, **kwargs)
+        duplicate = dict(buckets[0])
+        duplicate["metadata"] = {**duplicate["metadata"], "name": "LATER_DUPLICATE"}
+        return [*buckets, duplicate]
+
+    metadata_reads = AsyncMock(wraps=real_metadata)
+    monkeypatch.setattr(server.bucket_mgr, "list_all", duplicate_list)
+    monkeypatch.setattr(server.bucket_mgr, "get_tg_summary_metadata", metadata_reads)
+    result = await server.boot(profile="tg", max_tokens=budget)
+
+    metadata_reads.assert_awaited_once_with(bucket_id)
+    assert "LATER_DUPLICATE" not in result
+    if budget == 1000:
+        assert re.findall(r"^- " + bucket_id + r" \[", result, re.MULTILINE) == ["- " + bucket_id + " ["]
+        assert "\u539f 1 \u9879" in result
+    else:
+        assert result.count("[bucket_id:" + bucket_id + "] FIRST_VISIBLE") == 1
+        assert not receipts(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["archive", "test", "outside_tg"])
+async def test_refresh_retains_baseline_query_scope_and_raw_mismatch_hash(server, kind):
+    bucket_id = await server.bucket_mgr.create("placeholder", importance=3, tags=["test"] if kind == "test" else [])
+    path, post = stored_post(server, bucket_id)
+    post.content = "\u5a77\u6613 historic source\n[[link]]"
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    if kind == "archive":
+        assert await server.bucket_mgr.archive(bucket_id)
+    current_hash = source_hash(stored_post(server, bucket_id)[1])
+    result = await server.refresh_tg_summary(bucket_id, "summary", "0" * 64)
+    assert "source_hash:" + current_hash in result
+    assert "tg_summary" not in stored_post(server, bucket_id)[1]
+    assert "\u5df2\u5237\u65b0" in await server.refresh_tg_summary(bucket_id, "summary", current_hash)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["removed", "sealed", "read_failure"])
+async def test_refresh_metadata_unavailable_uses_existing_baseline_outcomes(server, monkeypatch, change):
+    bucket_id = await server.bucket_mgr.create("original", pinned=True)
+    current_hash = source_hash(stored_post(server, bucket_id)[1])
+
+    async def unavailable(bucket_id):
+        if change == "removed":
+            stored_post(server, bucket_id)[0].unlink()
+        elif change == "sealed":
+            assert await server.bucket_mgr.update(bucket_id, sealed=1)
+        return None
+
+    writer = AsyncMock(side_effect=AssertionError("Unavailable metadata must not reach a summary write"))
+    monkeypatch.setattr(server.bucket_mgr, "get_tg_summary_metadata", unavailable)
+    monkeypatch.setattr(server.bucket_mgr, "refresh_tg_summary", writer)
+    result = await server.refresh_tg_summary(bucket_id, "summary", current_hash)
+    expected = {
+        "removed": f"\u672a\u627e\u5230\u8bb0\u5fc6\u6876: {bucket_id}",
+        "sealed": f"\u8bb0\u5fc6\u6876\u5df2\u5c01\u5b58\uff0c\u4e0d\u80fd\u5237\u65b0 TG summary: {bucket_id}",
+        "read_failure": f"TG summary \u4fdd\u5b58\u5931\u8d25: {bucket_id}",
+    }
+    assert result == expected[change]
+    assert "source_hash:" not in result
+    writer.assert_not_awaited()

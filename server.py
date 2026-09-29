@@ -3518,11 +3518,24 @@ def _fit_tg_boot_sections(
     recovery_items: list[tuple[str, str, str, int]],
     **fit_options,
 ) -> tuple[str, dict[str, str]]:
-    """Reserve complete receipts until actual pinned-item omissions stabilize."""
-    seal = _response_seal()
+    """Reserve unique receipts within the content budget; keep the legacy envelope."""
+    unique_items = {}
+    for item in recovery_items:
+        unique_items.setdefault(item[0], item)
+    recovery_items = list(unique_items.values())
+    fit_options["omission_item_refs"] = {
+        **(fit_options.get("omission_item_refs") or {}),
+        "pinned": [f"bucket_id:{item[0]}" for item in recovery_items],
+    }
+    fit_options["omission_item_ends"] = {
+        **(fit_options.get("omission_item_ends") or {}),
+        "pinned": [(f"bucket_id:{item[0]}", item[3]) for item in recovery_items],
+    }
 
     def measure(body: str) -> int:
-        return count_tokens_approx(f"boot profile: tg\n\n{body.rstrip()}\n\nseal: {seal}")
+        # Profile/seal retain their baseline envelope semantics, independent of
+        # the ordinary content budget and any protected recovery overflow.
+        return count_tokens_approx(body)
 
     def receipts(ids: set[str]) -> str:
         lines = [
@@ -3539,7 +3552,9 @@ def _fit_tg_boot_sections(
     all_ids = {item[0] for item in recovery_items}
     while True:
         receipt_text = receipts(omitted)
-        budget = max(0, max_tokens - measure(receipt_text) - bool(receipt_text))
+        # Preserve the baseline 40-token ordinary-content margin. It is not a
+        # length limit on the response seal. Receipts share the remaining space.
+        budget = max(0, max_tokens - 40 - measure(receipt_text) - bool(receipt_text))
         body, emitted = "", {}
         if measure(receipt_text) <= max_tokens:
             while budget > 0:
@@ -11484,6 +11499,10 @@ async def boot(
     )
     tg_metadata = {}
     if profile == "tg":
+        pinned_by_id = {}
+        for bucket in pinned:
+            pinned_by_id.setdefault(str(bucket["id"]), bucket)
+        pinned = list(pinned_by_id.values())
         for bucket in pinned:
             metadata = await bucket_mgr.get_tg_summary_metadata(str(bucket["id"]))
             if metadata is not None:
@@ -11698,7 +11717,14 @@ async def refresh_tg_summary(
         return f"记忆桶已封存，不能刷新 TG summary: {normalized_id}"
     source_metadata = await bucket_mgr.get_tg_summary_metadata(normalized_id)
     if source_metadata is None:
-        return f"记忆桶当前不可用，不能刷新 TG summary: {normalized_id}"
+        # A concurrent removal/seal or read failure must use existing outcomes,
+        # rather than introducing a distinct availability/existence signal.
+        current_bucket = await bucket_mgr.get(normalized_id)
+        if not current_bucket:
+            return f"未找到记忆桶: {normalized_id}"
+        if _is_sealed(current_bucket):
+            return f"记忆桶已封存，不能刷新 TG summary: {normalized_id}"
+        return f"TG summary 保存失败: {normalized_id}"
     _, current_hash, _ = source_metadata
     if not hmac.compare_digest(normalized_hash, current_hash):
         return (
