@@ -3090,24 +3090,6 @@ def _format_boot_preview(
     return preview
 
 
-def _tg_summary_source_hash(content: str) -> str:
-    """Hash the stored bucket body; metadata-only changes must not stale TG summaries."""
-    return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
-
-
-def _tg_summary_state(bucket: dict) -> tuple[str, str, str]:
-    """Return valid, missing, or stale plus the current source hash and summary."""
-    metadata = bucket.get("metadata", {})
-    summary = metadata.get("tg_summary")
-    source_hash = _tg_summary_source_hash(bucket.get("content", ""))
-    if not isinstance(summary, str) or not summary.strip():
-        return "missing", source_hash, ""
-    stored_hash = str(metadata.get("tg_summary_source_hash", "") or "").strip()
-    if not stored_hash or not hmac.compare_digest(stored_hash, source_hash):
-        return "stale", source_hash, summary.strip()
-    return "valid", source_hash, summary.strip()
-
-
 def _format_tg_summary_refresh_notice(bucket_id: str, state: str, source_hash: str) -> str:
     """Tell the caller how to refresh a missing or stale TG summary safely."""
     label = "尚未生成" if state == "missing" else "已过期"
@@ -3323,6 +3305,7 @@ def _fit_sections_to_budget(
     minimum_chars: dict[str, int] | None = None,
     atomic_sections: set[str] | None = None,
     omission_item_refs: dict[str, list[str]] | None = None,
+    omission_item_ends: dict[str, list[tuple[str, int]]] | None = None,
     truncation_notice_tokens: int = BOOT_TRUNCATION_NOTICE_TOKENS,
     return_sections: bool = False,
     todo_display: TodoPage | None = None,
@@ -3333,6 +3316,7 @@ def _fit_sections_to_budget(
     minimum_chars = minimum_chars or {}
     atomic_sections = atomic_sections or set()
     omission_item_refs = omission_item_refs or {}
+    omission_item_ends = omission_item_ends or {}
     total_tokens = (
         count_tokens_approx("\n\n".join(text for _, _, text in sections))
         if todo_display is not None
@@ -3381,14 +3365,20 @@ def _fit_sections_to_budget(
         refs = omission_item_refs.get(key, [])
         if not refs:
             return display_name
-        emitted_refs = [ref for ref in refs if ref in emitted_text]
-        omitted_refs = [ref for ref in refs if ref not in emitted_text]
-        complete_count = len(emitted_refs)
-        if partial_output and emitted_refs:
-            last_emitted = emitted_refs[-1]
-            if last_emitted not in omitted_refs:
-                omitted_refs.append(last_emitted)
-                complete_count -= 1
+        if key in omission_item_ends:
+            ends = omission_item_ends[key]
+            emitted_refs = [ref for ref, end in ends if end <= len(emitted_text)]
+            omitted_refs = [ref for ref, end in ends if end > len(emitted_text)]
+            complete_count = len(emitted_refs)
+        else:
+            emitted_refs = [ref for ref in refs if ref in emitted_text]
+            omitted_refs = [ref for ref in refs if ref not in emitted_text]
+            complete_count = len(emitted_refs)
+            if partial_output and emitted_refs:
+                last_emitted = emitted_refs[-1]
+                if last_emitted not in omitted_refs:
+                    omitted_refs.append(last_emitted)
+                    complete_count -= 1
         omitted_label = "、".join(omitted_refs) or "正文尾部"
         continuation = ""
         if key == "mailbox":
@@ -3480,6 +3470,9 @@ def _fit_sections_to_budget(
     if count_tokens_approx(notice) > notice_budget:
         if omission_item_refs and (todo_display is None or notice_budget >= 100):
             overflow = (
+                "\n- 截断说明的 ID 清单仅列前缀；未完整输出的钉选项"
+                "另见完整 TG summary recovery receipts。"
+                if "pinned" in omission_item_ends else
                 "\n- 省略 ID 清单超出本次 TG 预算；仅列出前缀，"
                 "未列出的稳定 ID 无法在当前紧凑输出中完整列出。"
             )
@@ -3509,6 +3502,72 @@ def _fit_sections_to_budget(
         emitted_sections["todos"] = fitted.text
     body = "\n\n".join(output)
     return (body, emitted_sections) if return_sections else body
+
+
+TG_RECOVERY_HEADER = "=== boot: TG summary recovery receipts ==="
+TG_RECOVERY_OVER_BUDGET = (
+    "为了保证 TG summary 可恢复，本次响应超过了配置内容预算；"
+    "普通 boot 内容未输出，recovery receipts 不代表其他内容已经投递。"
+)
+
+
+def _fit_tg_boot_sections(
+    sections: list[tuple[str, str, str]],
+    max_tokens: int,
+    *,
+    recovery_items: list[tuple[str, str, str, int]],
+    **fit_options,
+) -> tuple[str, dict[str, str]]:
+    """Reserve complete receipts until actual pinned-item omissions stabilize."""
+    seal = _response_seal()
+
+    def measure(body: str) -> int:
+        return count_tokens_approx(f"boot profile: tg\n\n{body.rstrip()}\n\nseal: {seal}")
+
+    def receipts(ids: set[str]) -> str:
+        lines = [
+            f"- {bucket_id} [{state}, source_hash:{source_hash}]"
+            for bucket_id, state, source_hash, _ in recovery_items
+            if bucket_id in ids
+        ]
+        return TG_RECOVERY_HEADER + "\n" + "\n".join(lines) if lines else ""
+
+    def join(body: str, receipt_text: str) -> str:
+        return "\n\n".join(part for part in (body, receipt_text) if part)
+
+    omitted: set[str] = set()
+    all_ids = {item[0] for item in recovery_items}
+    while True:
+        receipt_text = receipts(omitted)
+        budget = max(0, max_tokens - measure(receipt_text) - bool(receipt_text))
+        body, emitted = "", {}
+        if measure(receipt_text) <= max_tokens:
+            while budget > 0:
+                body, emitted = _fit_sections_to_budget(
+                    sections, budget, return_sections=True, **fit_options,
+                )
+                excess = measure(join(body, receipt_text)) - max_tokens
+                if excess <= 0:
+                    break
+                budget = max(0, budget - excess)
+            else:
+                # Even the ordinary minimum (e.g. the todo summary) cannot fit.
+                # Only recovery metadata may exceed the configured budget.
+                body, emitted = "", {}
+        actual_omitted = {
+            bucket_id for bucket_id, _, _, end in recovery_items
+            if end > len(emitted.get("pinned", ""))
+        }
+        expanded = omitted | actual_omitted
+        if expanded != omitted:
+            omitted = expanded
+            continue  # At least one new ID; at most len(recovery_items) expansions.
+        receipt_text = receipts(actual_omitted)
+        if measure(receipt_text) > max_tokens:
+            # Zero ordinary output means every pinned item needs a receipt.
+            receipt_text = receipts(all_ids)
+            return join(receipt_text, TG_RECOVERY_OVER_BUDGET), {}
+        return join(body, receipt_text), emitted
 
 
 def _boot_delta_locator(bucket: dict) -> str:
@@ -11423,12 +11482,23 @@ async def boot(
         key=lambda b: _bucket_date(b["metadata"], "updated_at", "last_active", "created"),
         reverse=True,
     )
+    tg_metadata = {}
+    if profile == "tg":
+        for bucket in pinned:
+            metadata = await bucket_mgr.get_tg_summary_metadata(str(bucket["id"]))
+            if metadata is not None:
+                tg_metadata[str(bucket["id"])] = metadata
+        # A bucket removed or sealed since the visibility snapshot contributes
+        # neither ordinary text, recovery metadata, nor visible counts.
+        pinned = [bucket for bucket in pinned if str(bucket["id"]) in tg_metadata]
     pinned_lines = []
+    recovery_items = []
+    pinned_end = len("=== boot: 开机索引 ===\n")
     for bucket in pinned:
         meta = bucket.get("metadata", {})
         if profile == "tg":
-            summary_state, source_hash, summary = _tg_summary_state(bucket)
-            if summary_state == "valid":
+            summary_state, source_hash, summary = tg_metadata[str(bucket["id"])]
+            if summary_state == "fresh":
                 preview = _format_tg_summary_preview(bucket, source_hash, summary)
             else:
                 preview = _format_boot_preview(
@@ -11441,9 +11511,12 @@ async def boot(
                 )
         else:
             preview = _format_boot_preview(bucket, pinned_chars, show_truncation=True)
-        pinned_lines.append(
-            f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
-        )
+        line = f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}\n{preview}"
+        pinned_lines.append(line)
+        pinned_end += len(line)
+        if profile == "tg":
+            recovery_items.append((str(bucket["id"]), summary_state, source_hash, pinned_end))
+        pinned_end += len("\n---\n")
     pinned_text = "=== boot: 开机索引 ===\n" + (
         "\n---\n".join(pinned_lines) if pinned_lines else "（暂无可见钉选桶）"
     )
@@ -11512,9 +11585,10 @@ async def boot(
                 "pinned": [f"bucket_id:{bucket['id']}" for bucket in pinned],
             }
             truncation_notice_tokens = BOOT_TG_TRUNCATION_NOTICE_TOKENS
-        return _fit_sections_to_budget(
+        fitter = _fit_tg_boot_sections if profile == "tg" else _fit_sections_to_budget
+        return fitter(
             sections,
-            max_tokens=max_tokens - 40,
+            max_tokens=max_tokens if profile == "tg" else max_tokens - 40,
             minimum_chars={
                 **profile_config["section_minimums"],
                 "ting_note": len(ting_note_text),
@@ -11523,8 +11597,14 @@ async def boot(
             atomic_sections={"ting_note", "delta"},
             omission_item_refs=omission_item_refs,
             truncation_notice_tokens=truncation_notice_tokens,
-            return_sections=True,
             todo_display=todo_display,
+            **({
+                "recovery_items": recovery_items,
+                "omission_item_ends": {"pinned": [
+                    (f"bucket_id:{bucket_id}", end)
+                    for bucket_id, _, _, end in recovery_items
+                ]},
+            } if profile == "tg" else {"return_sections": True}),
         )
 
     for _ in range(3):
@@ -11616,7 +11696,10 @@ async def refresh_tg_summary(
         return f"未找到记忆桶: {normalized_id}"
     if _is_sealed(bucket):
         return f"记忆桶已封存，不能刷新 TG summary: {normalized_id}"
-    current_hash = _tg_summary_source_hash(bucket.get("content", ""))
+    source_metadata = await bucket_mgr.get_tg_summary_metadata(normalized_id)
+    if source_metadata is None:
+        return f"记忆桶当前不可用，不能刷新 TG summary: {normalized_id}"
+    _, current_hash, _ = source_metadata
     if not hmac.compare_digest(normalized_hash, current_hash):
         return (
             f"TG summary 未保存：原文已变化。bucket {normalized_id} 当前 source_hash:{current_hash}；"

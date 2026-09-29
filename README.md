@@ -426,6 +426,12 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 
 `boot(profile="talk" | "code" | "tg")` defaults to `talk` and identifies the selected profile at the top of its response. All profiles share the same sealed, superseded, trigger, Ting-note, and fact semantics; profiles only change displayed sections, priority, and budget. `talk` retains the full startup context. `code` uses structured domain/tags plus pinned/protected and importance metadata to focus on engineering context and global constraints. `tg` keeps core sections and high-priority items within a compact response. Delta checkpoints are independent per profile, so one scene cannot consume later changes for another. Ting-note delivery, sealed/open_at existence hiding, and trigger seen metadata retain their existing semantics. See [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) for the current defaults and bounds.
 
+TG boot 的普通内容遵循 `max_tokens`。如果钉选/保护索引项未完整输出（包括半项），会保留完整 recovery receipt：`- <bucket_id> [missing|stale|fresh, source_hash:<64位SHA-256>]`。状态与 hash 来自存储原文，展示别名和 wikilink 展示转换不参与 hash；三种状态都携带当前原文 hash。先用 `dream(detail_ids="...")` 阅读内容，再用 receipt 的 hash 调用 `refresh_tg_summary`；若原文随后变化，刷新仍会拒绝旧 hash。
+
+系统先为 receipts 缩减普通内容，并反复登记新增遗漏，直到集合稳定。receipts 自身及必要外壳超出预算时，普通内容为零，全部 receipts 仍完整输出，并明确提示响应超过配置内容预算。只有受保护恢复元数据允许这种必要超出；receipt 不代表留言、触发、delta、信箱或待办已经投递。sealed、精确 test-tag 与其他原本不在可见钉选集合中的桶不进入 receipts 或其计数。普通内容全部容纳时，维持原有格式和顺序，不添加 receipts。
+
+TG boot preserves a complete ID/status/current-source-hash receipt for every incomplete pinned/protected index item. It reduces ordinary content and registers newly omitted items until stable. If receipts and their envelope alone exceed the budget, it emits all receipts with an explicit over-budget notice and no ordinary content. Receipts never imply delivery of other sections. Source hashes use parsed storage-body UTF-8 bytes before display conversion; changed bodies still reject old refresh hashes.
+
 The recent session Summary preview remains limited to 700 characters. When that Summary is longer, boot marks the cut and points to `dream(detail_ids="...")` for the full bucket.
 
 boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未 resolved、非 sealed 桶中的活动待办（含 archive），不按年龄、importance 门槛或项目标签过滤；明确带完整 `test` tag 的桶除外。T 按展示 identity 计数：每个活动 `(bucket_id, todo_id)` 一项；同文本的不同活动 ID 分别计数；legacy 无 ID 按 `(bucket_id, canonical todo text)` 去重。completed/dropped identity 不展示，专用 `todos()` 的既有输出格式保持不变。

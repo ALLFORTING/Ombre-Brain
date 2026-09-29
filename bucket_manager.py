@@ -526,6 +526,22 @@ def _is_sealed_bucket(bucket: Any) -> bool:
         return False
 
 
+def _tg_summary_source_hash(content: str) -> str:
+    """Hash parsed storage body bytes, before any display conversion."""
+    return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+
+def _tg_summary_metadata(post) -> tuple[str, str, str]:
+    """Derive current summary state from one authoritative storage snapshot."""
+    source_hash = _tg_summary_source_hash(post.content)
+    summary = post.get("tg_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return "missing", source_hash, ""
+    stored_hash = str(post.get("tg_summary_source_hash", "") or "").strip()
+    state = "fresh" if stored_hash == source_hash else "stale"
+    return state, source_hash, summary.strip()
+
+
 class BucketManager:
     """
     Memory bucket manager — entry point for all bucket CRUD operations.
@@ -3601,6 +3617,19 @@ class BucketManager:
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
 
+    async def get_tg_summary_metadata(self, bucket_id: str) -> tuple[str, str, str] | None:
+        """Internal read of hash/status only; never return the raw storage body."""
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return None
+        try:
+            post = frontmatter.load(file_path)
+        except Exception:
+            return None
+        if _is_sealed_bucket(post):
+            return None
+        return _tg_summary_metadata(post)
+
     @guarded_async_mutation("bucket_tg_summary_refresh")
     async def refresh_tg_summary(
         self,
@@ -3625,9 +3654,7 @@ class BucketManager:
             if _is_sealed_bucket(post):
                 return "sealed", ""
 
-            current_source_sha256 = hashlib.sha256(
-                str(post.content or "").encode("utf-8")
-            ).hexdigest()
+            current_source_sha256 = _tg_summary_source_hash(post.content)
             if current_source_sha256 != source_sha256:
                 return "source_hash_mismatch", current_source_sha256
 
