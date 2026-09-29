@@ -19,6 +19,7 @@ import os
 import asyncio
 import copy
 import inspect
+import sqlite3
 import sys
 import tempfile
 import time
@@ -691,6 +692,11 @@ class ImportEngine:
                     raise BucketIdempotencyError('Import already running')
                 if self._running:
                     raise BucketIdempotencyError('Import already running')
+                try:
+                    self.bucket_mgr._ensure_import_operation_table()
+                except sqlite3.Error as exc:
+                    logger.exception('Legacy import schema upgrade failed')
+                    raise BucketIdempotencyError('legacy_import_schema_upgrade_failed') from exc
                 if not self.bucket_mgr.legacy_import_receipts_available():
                     raise BucketIdempotencyError('legacy_effect_receipts_unavailable')
                 if old_bytes is not None and not self.state.is_v2(saved):

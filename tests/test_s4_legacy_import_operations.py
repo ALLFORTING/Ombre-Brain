@@ -22,6 +22,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 import import_memory
+import bucket_manager
 import server
 from bucket_manager import BucketManager, BucketIdempotencyError
 from bucket_write_lock import bucket_write_scope
@@ -598,10 +599,240 @@ async def test_two_process_same_run(setup):
     assert counts(manager, embedding) == (1, 1, 1, 0)
 
 
-async def test_existing_journal_missing_receipts_is_not_migrated(setup):
-    engine, manager, _, _ = setup
+# Literal pre-S-4A journal at c8736ce, including the O5C nullable marker column.
+_PRE_S4A_IMPORT_SCHEMA = '''CREATE TABLE ob_import_operations (
+    operation_key TEXT PRIMARY KEY,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('create', 'update')),
+    target_bucket_id TEXT,
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    result_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('planned', 'applied')),
+    memory_mutation_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)'''
+_OLD_IMPORT_COLUMNS = ('operation_key', 'operation_kind', 'target_bucket_id', 'payload_json',
+                       'payload_digest', 'result_id', 'status', 'memory_mutation_id', 'created_at', 'updated_at')
+
+
+def seed_pre_s4a_journal(manager):
     with sqlite3.connect(manager.history_db_path) as conn:
-        conn.execute('''CREATE TABLE ob_import_operations(operation_key TEXT PRIMARY KEY)''')
+        conn.execute(_PRE_S4A_IMPORT_SCHEMA)
+        conn.execute('CREATE INDEX idx_ob_import_operations_target ON ob_import_operations(target_bucket_id)')
+        for key, status in [('pre-s4a-planned', 'planned'), ('pre-s4a-applied', 'applied')]:
+            payload, digest = manager._canonical_import_payload(dict(content='Old memory: ' + key,
+                tags=['old'], importance=5, domain=['事务'], valence=.5, arousal=.3, name='old-memory'))
+            conn.execute('INSERT INTO ob_import_operations VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (key, 'create', None, payload, digest, manager._operation_result_id(key), status,
+                 None if status == 'planned' else 'old-mutation-id', '2026-01-02T03:04:05', '2026-01-03T04:05:06'))
+    return old_import_rows(manager)
+
+
+def old_import_rows(manager):
+    with sqlite3.connect(manager.history_db_path) as conn:
+        return conn.execute('SELECT ' + ','.join(_OLD_IMPORT_COLUMNS)
+            + " FROM ob_import_operations WHERE operation_key LIKE 'pre-s4a-%' ORDER BY operation_key").fetchall()
+
+
+def import_columns(manager):
+    with sqlite3.connect(manager.history_db_path) as conn:
+        return conn.execute('PRAGMA table_info(ob_import_operations)').fetchall()
+
+
+def trace_import_sql(monkeypatch, manager, *, deny_alter=False):
+    connect, statements = sqlite3.connect, []
+    def tracked(database, *args, **kwargs):
+        conn = connect(database, *args, **kwargs)
+        if str(database) == manager.history_db_path:
+            conn.set_trace_callback(lambda sql: statements.append(' '.join(sql.split())))
+            if deny_alter:
+                conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_ALTER_TABLE else sqlite3.SQLITE_OK)
+        return conn
+    monkeypatch.setattr(bucket_manager.sqlite3, 'connect', tracked)
+    return statements
+
+
+async def test_compat_fresh_schema_and_completed_replay(setup, monkeypatch):
+    engine, manager, embedding, _ = setup
+    statements = trace_import_sql(monkeypatch, manager)
+    assert (await engine.start(SOURCE, 'source.txt'))['status'] == 'completed'
+    column = next(row for row in import_columns(manager) if row[1] == 'effects_json')
+    assert column[2:5] == ('TEXT', 0, None)
+    assert not any(sql.startswith('ALTER ') for sql in statements)
+    assert counts(manager, embedding) == (1, 1, 1, 0)
+    before = Path(manager.history_db_path).read_bytes()
+    monkeypatch.setattr(manager, '_ensure_import_operation_table', lambda: (_ for _ in ()).throw(AssertionError('completed replay must not ensure')))
+    assert (await engine.start(SOURCE, 'source.txt', resume=True))['status'] == 'completed'
+    assert Path(manager.history_db_path).read_bytes() == before
+
+
+async def test_compat_real_pre_s4a_normal_runtime_direct_acceptance(setup, monkeypatch):
+    _, manager, _, config = setup
+    old_rows = seed_pre_s4a_journal(manager)
+    statements = trace_import_sql(monkeypatch, manager)
+    monkeypatch.setenv('OMBRE_RM_RUNTIME_ENABLED', '0')
+    config = copy.deepcopy(config)
+    config['embedding'].update(enabled=False, api_key='')
+    config['dehydration']['api_key'] = ''
+    monkeypatch.setattr(server, 'config', config)
+    monkeypatch.setattr(server, '_runtime_components', None)
+    runtime = server._get_runtime_components()
+    engine, current = runtime['import_engine'], runtime['bucket_mgr']
+    assert 'effects_json' not in [row[1] for row in import_columns(current)]
+    assert old_import_rows(current) == old_rows
+    engine._extract_memories = AsyncMock(return_value=copy.deepcopy([ITEM]))
+    accepted = engine.accept_legacy(SOURCE, 'source.txt')
+    assert state_of(engine)['phase'] == 'run.accepted'
+    engine._extract_memories.assert_not_awaited()
+    assert [sql for sql in statements if sql.startswith('ALTER ')] == [
+        'ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT']
+    assert old_import_rows(current) == old_rows
+    with sqlite3.connect(current.history_db_path) as conn:
+        assert conn.execute("SELECT effects_json FROM ob_import_operations WHERE operation_key LIKE 'pre-s4a-%'").fetchall() == [(None,), (None,)]
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_s4_requests'").fetchone()
+    assert (await engine.run_legacy(accepted))['status'] == 'completed'
+    assert old_import_rows(current) == old_rows
+    with sqlite3.connect(current.history_db_path) as conn:
+        row = conn.execute('SELECT effects_json FROM ob_import_operations WHERE operation_key=?',
+                           (item_of(engine)['plan']['memory_key'],)).fetchone()
+        assert json.loads(row[0])['delta']['outcome'] == 'applied'
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_s4_requests'").fetchone()
+
+
+async def test_compat_ensure_idempotent_and_old_operation_replay(setup, monkeypatch):
+    _, manager, embedding, _ = setup
+    old_rows = seed_pre_s4a_journal(manager)
+    statements = trace_import_sql(monkeypatch, manager)
+    manager._ensure_import_operation_table()
+    assert old_import_rows(manager) == old_rows
+    column = next(row for row in import_columns(manager) if row[1] == 'effects_json')
+    assert column[2:5] == ('TEXT', 0, None)
+    before = Path(manager.history_db_path).read_bytes()
+    manager._ensure_import_operation_table()
+    assert Path(manager.history_db_path).read_bytes() == before and old_import_rows(manager) == old_rows
+    assert [sql for sql in statements if sql.startswith('ALTER ')] == [
+        'ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT']
+    original = manager.inspect_import_operation('pre-s4a-planned')
+    result = await manager.apply_import_operation('pre-s4a-planned')
+    assert await manager.apply_import_operation('pre-s4a-planned') == result
+    after = manager.inspect_import_operation('pre-s4a-planned')
+    for field in ('payload', 'payload_digest', 'result_id', 'created_at'):
+        assert after[field] == original[field]
+    assert after['effects_json'] is None and after['status'] == 'applied'
+    assert counts(manager, embedding) == (1, 1, 1, 0)
+
+
+def schema_worker(config, mode, ready, start, results):
+    manager = BucketManager(config)
+    connect, statements = sqlite3.connect, []
+    def tracked(database, *args, **kwargs):
+        conn = connect(database, *args, **kwargs)
+        if str(database) == manager.history_db_path:
+            conn.set_trace_callback(lambda sql: statements.append(' '.join(sql.split())))
+        return conn
+    sqlite3.connect = tracked
+    try:
+        ready.put('ready')
+        if not start.wait(45):
+            raise AssertionError('schema worker barrier timed out')
+        if mode == 'ensure':
+            manager._ensure_import_operation_table()
+            outcome = 'ensured'
+        else:
+            engine = ImportEngine(config, manager, SimpleNamespace(model='extract-model'))
+            try:
+                engine.accept_legacy(SOURCE, 'source.txt')
+                outcome = 'accepted'
+            except BucketIdempotencyError as exc:
+                outcome = str(exc)
+        results.put((outcome, [sql for sql in statements if sql.startswith('ALTER ')]))
+    finally:
+        sqlite3.connect = connect
+
+
+@pytest.mark.parametrize('mode', ['ensure', 'accept'])
+async def test_compat_concurrent_process_ensure_and_acceptance(setup, mode):
+    engine, manager, embedding, config = setup
+    old_rows = seed_pre_s4a_journal(manager)
+    ctx = multiprocessing.get_context('spawn')
+    ready, results, start = ctx.Queue(), ctx.Queue(), ctx.Event()
+    processes = [ctx.Process(target=schema_worker, args=(config, mode, ready, start, results)) for _ in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        for _ in processes:
+            assert await asyncio.to_thread(ready.get, True, 45) == 'ready'
+        start.set()
+        for process in processes:
+            await asyncio.to_thread(join_worker, process)
+            assert process.exitcode == 0
+        outcomes = [results.get(timeout=5) for _ in processes]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        ready.close()
+        results.close()
+    assert sorted(outcome for outcome, _ in outcomes) == (
+        ['ensured', 'ensured'] if mode == 'ensure' else ['Import already running', 'accepted'])
+    assert [sql for _, sqls in outcomes for sql in sqls] == [
+        'ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT']
+    assert manager.legacy_import_receipts_available() and old_import_rows(manager) == old_rows
+    assert (await engine.start(SOURCE, 'source.txt', resume=mode == 'accept'))['status'] == 'completed'
+    assert counts(manager, embedding) == (1, 1, 1, 0) and old_import_rows(manager) == old_rows
+
+
+@pytest.mark.parametrize('entry', ['engine', 'http'])
+async def test_compat_sqlite_ddl_failure_stops_before_acceptance(setup, monkeypatch, caplog, entry):
+    engine, manager, embedding, config = setup
+    old_rows = seed_pre_s4a_journal(manager)
+    before = Path(manager.history_db_path).read_bytes()
+    trace_import_sql(monkeypatch, manager, deny_alter=True)
+    if entry == 'engine':
+        assert await engine.start(SOURCE, 'source.txt') == {'error': 'legacy_import_schema_upgrade_failed'}
+    else:
+        monkeypatch.setattr(server, 'config', config)
+        monkeypatch.setattr(server, 'import_engine', engine)
+        monkeypatch.setattr(server, '_require_dashboard_write', lambda *args: None)
+        response = await server.api_import_upload(Request())
+        assert response.status_code == 409
+        assert json.loads(response.body) == {'error': 'legacy_import_schema_upgrade_failed'}
+    assert 'Legacy import schema upgrade failed' in caplog.text and 'not authorized' in caplog.text
+    assert Path(manager.history_db_path).read_bytes() == before and old_import_rows(manager) == old_rows
+    assert not Path(engine.state.state_file).exists() and not server._IMPORT_BACKGROUND_TASKS
+    assert not engine.is_running and counts(manager, embedding) == (0, 0, 0, 0)
+    engine._extract_memories.assert_not_awaited()
+    manager.search.assert_not_awaited()
+
+
+async def test_compat_already_keyed_upgraded_schema_and_rows_unchanged(setup, monkeypatch):
+    engine, manager, _, _ = setup
+    old_rows = seed_pre_s4a_journal(manager)
+    source = await manager.create('Keyed compatibility source')
+    monkeypatch.setattr(server, 'bucket_mgr', manager)
+    await server.trace(bucket_id=source, content='keyed addition', append=True, operation_id='compat-keyed')
+    assert manager.inspect_trace_request('compat-keyed')['status'] == 'completed'
+    assert old_import_rows(manager) == old_rows
+    with sqlite3.connect(manager.history_db_path) as conn:
+        keyed_rows = conn.execute('SELECT * FROM ob_s4_requests ORDER BY operation_id').fetchall()
+    statements = trace_import_sql(monkeypatch, manager)
+    before = Path(manager.history_db_path).read_bytes()
+    accepted = engine.accept_legacy(SOURCE, 'source.txt')
+    assert Path(manager.history_db_path).read_bytes() == before
+    assert not any(sql.startswith('ALTER ') for sql in statements)
+    assert (await engine.run_legacy(accepted))['status'] == 'completed'
+    assert old_import_rows(manager) == old_rows
+    with sqlite3.connect(manager.history_db_path) as conn:
+        assert conn.execute('SELECT * FROM ob_s4_requests ORDER BY operation_id').fetchall() == keyed_rows
+
+
+async def test_compat_capability_defense_still_stops_zero_write(setup, monkeypatch):
+    engine, manager, _, _ = setup
+    manager._ensure_import_operation_table()
+    monkeypatch.setattr(manager, 'legacy_import_receipts_available', lambda: False)
     before = Path(manager.history_db_path).read_bytes()
     assert (await engine.start(SOURCE, 'source.txt')) == {'error': 'legacy_effect_receipts_unavailable'}
     assert Path(manager.history_db_path).read_bytes() == before

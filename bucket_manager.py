@@ -764,9 +764,9 @@ class BucketManager:
                 )
 
     def _ensure_import_operation_table(self) -> None:
-        """Create the lazy O5B operation journal only when capture is used."""
+        """Lazily ensure the shared journal and nullable receipt capability."""
 
-        with sqlite3.connect(self.history_db_path) as conn:
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ob_import_operations (
@@ -795,6 +795,8 @@ class BucketManager:
                     "ALTER TABLE ob_import_operations "
                     "ADD COLUMN memory_mutation_id TEXT"
                 )
+            if "effects_json" not in columns:
+                conn.execute("ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ob_import_operations_target "
                 "ON ob_import_operations(target_bucket_id)"
@@ -1333,9 +1335,6 @@ class BucketManager:
                 conn.execute('DROP TABLE ob_s4_requests_v1')
             else:
                 conn.execute(schema)
-            columns = {r[1] for r in conn.execute("PRAGMA table_info(ob_import_operations)")}
-            if "effects_json" not in columns:
-                conn.execute("ALTER TABLE ob_import_operations ADD COLUMN effects_json TEXT")
 
     @guarded_mutation("trace_request_claim")
     def _claim_trace_request(self, operation_id, payload, normalization_context, owner):
