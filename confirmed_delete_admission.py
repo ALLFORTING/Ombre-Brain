@@ -70,32 +70,15 @@ class DurableDeleteAdmission:
             raise DeleteAdmissionError('confirmed_delete_root_conflict')
         self.active(bucket_id,references)
         completed_rows = [r for r in self.rows(bucket_id) if r['status']=='completed']
-        completed = [json.loads(row['plan_json'])['source_guard'] for row in completed_rows]
-        # A delayed caller without an incarnation cannot distinguish old work
-        # from work for a replacement. In particular, an old archive publish
-        # must not resurrect its file after its publication receipt was lost.
-        if completed and (not expected_source or 'incarnation' not in expected_source):
-            raise DeleteAdmissionError('confirmed_delete_source_identity_required')
-        if expected_source and any(g['incarnation'] == expected_source.get('incarnation') for g in completed):
-            raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
-        if expected_source and 'completed_delete_ids' in expected_source and any(
-                r['delete_id'] not in expected_source['completed_delete_ids'] for r in completed_rows):
-            raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
-        if allow_missing and expected_source is None and not completed:
+        self._check_deleted_incarnation(expected_source, completed_rows)
+        if allow_missing and expected_source is None and not completed_rows:
             return None  # Legacy non-bucket session IDs, after durable active admission.
         try:
             current = self.capture(bucket_id)
         except DeleteAdmissionError:
-            if allow_missing and not completed and not (expected_source or {}).get('incarnation'):
+            if allow_missing and not completed_rows and not (expected_source or {}).get('incarnation'):
                 return None
             raise
-        # A receipt event describes an already durably published mutation; a
-        # subsequent ordinary update does not invalidate that event. It still
-        # requires an extant source and no deletion since its captured evidence.
-        if kind == 'receipt_event' and expected_source:
-            if any(r['delete_id'] not in expected_source.get('completed_delete_ids',[]) for r in completed_rows):
-                raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
-            return current
         # The API classifier rereads current metadata after its provider await.
         # Todo metadata may be atomically replaced during the provider call.
         # The identical non-todo preimage binds its body and source identity;
@@ -108,6 +91,38 @@ class DurableDeleteAdmission:
             return current
         if expected_source and any(current.get(key) != value for key,value in expected_source.items()
                                    if key in ('path','file_hash','incarnation')):
+            raise DeleteAdmissionError('confirmed_delete_source_changed')
+        return current
+
+    @staticmethod
+    def _check_deleted_incarnation(expected_source, completed_rows):
+        completed = [json.loads(row['plan_json'])['source_guard'] for row in completed_rows]
+        # A delayed caller without an incarnation cannot distinguish old work
+        # from work for a replacement. In particular, an old archive publish
+        # must not resurrect its file after its publication receipt was lost.
+        if completed and (not expected_source or 'incarnation' not in expected_source):
+            raise DeleteAdmissionError('confirmed_delete_source_identity_required')
+        if expected_source and any(g['incarnation'] == expected_source.get('incarnation') for g in completed):
+            raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
+        if expected_source and 'completed_delete_ids' in expected_source and any(
+                r['delete_id'] not in expected_source['completed_delete_ids'] for r in completed_rows):
+            raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
+
+    def published_lineage(self, bucket_id, expected_source):
+        """Check S-4E lineage only; the caller must prove its exact durable effect.
+
+        This method does not admit a write. After verifying a keyed publication
+        receipt, callers must strictly admit the returned current source under
+        the same root mutex before any new effect or checkpoint.
+        """
+        self.active(bucket_id)
+        self._check_deleted_incarnation(expected_source,
+            [r for r in self.rows(bucket_id) if r['status']=='completed'])
+        current = self.capture(bucket_id)
+        if expected_source and (
+                not expected_source.get('incarnation')
+                or 'completed_delete_ids' not in expected_source
+                or expected_source.get('path') != current['path']):
             raise DeleteAdmissionError('confirmed_delete_source_changed')
         return current
 

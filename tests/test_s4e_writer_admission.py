@@ -351,3 +351,153 @@ def test_manual_publication_admits_actual_metadata_identity(store,monkeypatch):
         write_memory.write_memory('replacement\nid: A','stale',['x'],[])
     assert not (Path(write_memory.VAULT_DIR)/'NEW.md').exists()
     assert Path(store._find_bucket_file('A')).read_bytes()==original
+
+
+@pytest.mark.asyncio
+async def test_update_await_cannot_publish_boot_event_for_replaced_source(tmp_path,monkeypatch):
+    ob=load(tmp_path/'root',monkeypatch)
+    manager=ob.bucket_mgr
+    identity=await manager.create('before',name='ordinary source')
+    engine=manager.embedding_engine
+    engine.enabled=True
+    started,release=asyncio.Event(),asyncio.Event()
+    async def provider(*args,**kwargs):
+        started.set();await release.wait();return [.2,.8]
+    monkeypatch.setattr(engine,'_generate_embedding',provider)
+    before=manager.get_boot_delta_high_water()
+    stale=asyncio.create_task(manager.update(identity,content='first publication'))
+    await asyncio.wait_for(started.wait(),10)
+    with bucket_write_scope(manager.base_dir):incarnation_a=manager.delete_admission.capture(identity)
+    assert await manager.update(identity,tags=['intervening publication'])
+    with bucket_write_scope(manager.base_dir):incarnation_b=manager.delete_admission.capture(identity)
+    assert incarnation_a['incarnation']!=incarnation_b['incarnation']
+    release.set()
+    assert await asyncio.wait_for(stale,10)
+    assert manager._record_boot_delta_event(identity,'content_updated',_expected_source=incarnation_a) is False
+    assert manager.get_boot_delta_high_water()==before
+    with sqlite3.connect(manager.history_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='ob_confirmed_delete_operations'").fetchone()[0]==0
+        assert conn.execute("SELECT COUNT(*) FROM boot_delta_events WHERE bucket_id=? AND event_type='content_updated'",
+                            (identity,)).fetchone()[0]==0
+    monkeypatch.setattr(engine,'_generate_embedding',AsyncMock(return_value=[.2,.8]))
+    assert await manager.update(identity,content='second publication')
+    assert manager.get_boot_delta_high_water()==before+1
+
+
+@pytest.mark.asyncio
+async def test_receipt_exception_requires_exact_fenced_memory_publication(tmp_path,monkeypatch):
+    from bucket_manager import BucketIdempotencyError
+    ob=load(tmp_path/'root',monkeypatch)
+    manager=ob.bucket_mgr
+    identity=await manager.create('before',name='receipt source')
+    other=await manager.create('other',name='other source')
+    checkpoint=manager._trace_checkpoint
+    def pause(context,phase=None,**kwargs):
+        if phase=='memory_applied':raise asyncio.CancelledError()
+        return checkpoint(context,phase,**kwargs)
+    monkeypatch.setattr(manager,'_trace_checkpoint',pause)
+    with pytest.raises(asyncio.CancelledError):
+        await ob.trace(bucket_id=identity,content='after',append=True,operation_id='receipt-bound')
+    monkeypatch.setattr(manager,'_trace_checkpoint',checkpoint)
+    request=manager.inspect_trace_request('receipt-bound')
+    frozen=request['plan']['source_guard']
+    with bucket_write_scope(manager.base_dir),pytest.raises(DeleteAdmissionError,match='source_changed'):
+        manager.delete_admission.admit(identity,expected_source=frozen,kind='receipt_event')
+    context=manager._claim_trace_request('receipt-bound',request['payload'],request['normalization_context'],
+                                          'receipt-verification')
+    assert context and 'replay' not in context
+    try:
+        with bucket_write_scope(manager.base_dir):
+            current=manager.admit_published_import_memory(context,'trace')
+            assert current['incarnation']!=frozen['incarnation']
+            assert manager.admit_delayed_effect(identity,current,'new_effect')==current
+        read=manager._get_import_operation
+        monkeypatch.setattr(manager,'_get_import_operation',lambda key:None)
+        with pytest.raises(BucketIdempotencyError,match='operation_receipt_conflict'):
+            manager.admit_published_import_memory(context,'trace')
+        for field,value in [('operation_key','different-effect'),('payload_digest','wrong-digest'),('result_id',other),
+                            ('operation_kind','create'),('status','planned')]:
+            def wrong(key,field=field,value=value):
+                row=read(key)
+                if row:row=dict(row);row[field]=value
+                return row
+            monkeypatch.setattr(manager,'_get_import_operation',wrong)
+            with pytest.raises(BucketIdempotencyError,match='operation_receipt_conflict|operation_marker_conflict'):
+                manager.admit_published_import_memory(context,'trace')
+        monkeypatch.setattr(manager,'_get_import_operation',read)
+        marker_read=manager._operation_marker
+        for field,value in [('operation_key','different-effect'),('payload_digest','wrong-digest'),
+                            ('operation_kind','create')]:
+            def wrong_marker(post,key,field=field,value=value):
+                marker=marker_read(post,key)
+                if marker:marker=dict(marker);marker[field]=value
+                return marker
+            monkeypatch.setattr(manager,'_operation_marker',wrong_marker)
+            with pytest.raises(BucketIdempotencyError,match='operation_marker_conflict'):
+                manager.admit_published_import_memory(context,'trace')
+        monkeypatch.setattr(manager,'_operation_marker',marker_read)
+        with pytest.raises(BucketIdempotencyError,match='operation_receipt_kind_invalid'):
+            manager.admit_published_import_memory(context,'generic')
+        wrong_context=dict(context,operation_id='different-operation')
+        with pytest.raises(BucketIdempotencyError,match='operation_claim_stale'):
+            manager.admit_published_import_memory(wrong_context,'trace')
+        with bucket_write_scope(manager.base_dir):
+            other_guard=manager.delete_admission.capture(other)
+            with pytest.raises(DeleteAdmissionError,match='source_changed'):
+                manager.delete_admission.published_lineage(identity,other_guard)
+        source=Path(manager._find_bucket_file(identity))
+        published_bytes=source.read_bytes()
+        child=accepted(manager,identity)
+        manager.release_confirmed_delete(child)
+        with pytest.raises(BucketIdempotencyError,match='source_pending'):
+            manager.admit_published_import_memory(context,'trace')
+        finish(manager,manager.claim_confirmed_delete(child['delete_id'],'receipt-cleanup'))
+        source.parent.mkdir(parents=True,exist_ok=True)
+        source.write_bytes(published_bytes)  # isolated fixture: identical resurrection is still a new incarnation.
+        with pytest.raises(BucketIdempotencyError):
+            manager.admit_published_import_memory(context,'trace')
+    finally:
+        manager._release_trace_request(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('durable_source_progress',[False,True])
+async def test_relation_receipt_requires_durable_source_effect(tmp_path,monkeypatch,durable_source_progress):
+    from bucket_manager import BucketIdempotencyError
+    from related_integrity import digest as related_digest, plan_mutation
+
+    ob=load(tmp_path/'root',monkeypatch)
+    manager=ob.bucket_mgr
+    source=await manager.create('source',name='source')
+    target=await manager.create('target',name='target')
+    relation={'source':source,'add':[target],'remove':[],'origin':'inferred'}
+    key='exact-relation-effect'
+    with bucket_write_scope(manager.base_dir): frozen=manager.delete_admission.capture(source)
+
+    def interrupt(point,operation,step=None):
+        if not durable_source_progress and point=='after_intent':
+            raise asyncio.CancelledError()
+        if durable_source_progress and point=='after_progress' and step['id']==source:
+            raise asyncio.CancelledError()
+    monkeypatch.setattr(manager.relation_store,'checkpoint',interrupt)
+    with pytest.raises(asyncio.CancelledError):
+        manager.relation_store.commit(lambda inventory:plan_mutation(inventory,source,add=[target],origin='inferred'),
+                                      operation_key=key,request_digest=related_digest(relation))
+    journal=manager.relation_store.lookup(key)
+    assert journal['status']=='pending'
+    source_step=next(index for index,step in enumerate(journal['plan']['steps']) if step['id']==source)
+    assert (journal['progress']>source_step)==durable_source_progress
+
+    if not durable_source_progress:
+        source_path=Path(manager._find_bucket_file(source))
+        with bucket_write_scope(manager.base_dir): source_path.write_bytes(source_path.read_bytes()+b'\n')
+        with bucket_write_scope(manager.base_dir),pytest.raises(BucketIdempotencyError,
+                match='operation_relation_receipt_conflict'):
+            ob._hold_grow_relation_receipt(manager,key,relation,source,frozen)
+        assert source not in (await manager.get(target))['metadata'].get('related_buckets',[])
+        assert target not in (await manager.get(source))['metadata'].get('related_buckets',[])
+    else:
+        with bucket_write_scope(manager.base_dir):
+            current=ob._hold_grow_relation_receipt(manager,key,relation,source,frozen)
+            assert current['incarnation']!=frozen['incarnation']
+            assert manager.admit_delayed_effect(source,current,'relation_receipt')==current

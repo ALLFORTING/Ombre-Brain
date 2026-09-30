@@ -686,6 +686,48 @@ class BucketManager:
         except DeleteAdmissionError as exc:
             raise BucketIdempotencyError(exc.code) from exc
 
+    def admit_published_import_memory(self, context, origin, ordinal=None):
+        """Admit follow-up work only after this exact memory publication is durable."""
+        with bucket_write_scope(self.base_dir):
+            if origin == 'legacy':
+                plan = self._legacy_import_plan(context)
+                bucket_id, expected_source = plan['target'], plan.get('source_guard')
+                operation_key, payload_digest = plan['memory_key'], plan['payload_digest']
+                expected_kind = 'create' if plan['decision'] == 'create' else 'update'
+            elif origin == 'trace':
+                plan = self._trace_fence(context)['plan']
+                bucket_id, expected_source = plan['target'], plan.get('source_guard')
+                operation_key = plan['keys']['memory']
+                _, payload_digest = self._canonical_import_payload({'kwargs':plan['updates']})
+                expected_kind = 'update'
+            elif origin == 'hold' and ordinal is not None:
+                plan = self._trace_fence(context)['plan']['items'][ordinal]['plan']
+                bucket_id, expected_source = plan['target'], plan.get('source_guard')
+                operation_key, payload_digest = plan['keys']['memory'], plan['child_digest']
+                expected_kind = 'update' if plan['reused'] else 'create'
+            else:
+                raise BucketIdempotencyError('operation_receipt_kind_invalid')
+            child = self._get_import_operation(operation_key)
+            if (child is None or child['status'] != 'applied'
+                    or child['operation_key'] != operation_key or child['operation_kind'] != expected_kind
+                    or child['result_id'] != bucket_id or child['payload_digest'] != payload_digest):
+                raise BucketIdempotencyError('operation_receipt_conflict')
+            try:
+                current = self.delete_admission.published_lineage(bucket_id, expected_source)
+            except DeleteAdmissionError as exc:
+                raise BucketIdempotencyError(exc.code) from exc
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                raise BucketIdempotencyError('operation_marker_missing')
+            marker = self._operation_marker(frontmatter.load(path), operation_key)
+            if (marker is None or marker.get('operation_key') != operation_key
+                    or marker.get('operation_kind') != expected_kind
+                    or marker.get('payload_digest') != payload_digest):
+                raise BucketIdempotencyError('operation_marker_conflict')
+            if str(Path(path).resolve().relative_to(Path(self.base_dir).resolve()).as_posix()) != current['path']:
+                raise BucketIdempotencyError('operation_source_changed')
+            return self.admit_delayed_effect(bucket_id, current, 'memory_publication')
+
     def _confirmed_relation_admission(self, operation, capability, boundary, step=None):
         guard = operation.get('execution_guard')
         if guard is None:
@@ -1812,7 +1854,8 @@ class BucketManager:
                 effects = json.loads(row[0] or '{}')
                 if 'delta' not in effects:
                     self.validate_legacy_import_target(context)
-                    self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
+                    if plan['delta']:
+                        self.admit_published_import_memory(context,'legacy')
                     effects['delta'] = {'outcome': 'applied' if plan['delta'] else 'not_requested',
                         'event_ids': [self._insert_boot_delta_event(conn, plan['target'], kind,
                             json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
@@ -2051,8 +2094,6 @@ class BucketManager:
             request = self._trace_fence(context)
             plan = request['plan']
             self.assert_confirmed_delete_writable(plan['target'])
-            if step == 'delta':
-                self.admit_delayed_effect(plan['target'],request['resolutions'].get('source_guard'),'receipt_event')
             child = self._ensure_import_operation(plan['keys']['memory'], operation_kind='update',
                 target_bucket_id=plan['target'], payload={'kwargs': plan['updates']})
             if step == 'history' and child['status'] != 'applied':
@@ -2066,13 +2107,15 @@ class BucketManager:
                     return effects[step]
                 if step == 'history':
                     if child['status'] == 'applied':
-                        self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
+                        self.admit_published_import_memory(context,'trace')
                     receipt = {'outcome': 'not_requested'}
                     if 'content' in plan['updates']:
                         receipt = {'history_id': conn.execute("""INSERT INTO bucket_history
                             (bucket_id,old_content,changed_at,change_type) VALUES(?,?,?,?)""",
                             (plan['target'], plan['old_content'], plan['logical_time'], plan['history_type'])).lastrowid}
                 elif step == 'delta':
+                    if plan['delta']:
+                        self.admit_published_import_memory(context,'trace')
                     receipt = {'event_ids': [self._insert_boot_delta_event(conn, plan['target'], kind,
                         json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
                         for kind, payload in plan['delta']]}
@@ -2353,7 +2396,8 @@ class BucketManager:
                                    (plan['keys']['memory'],)).fetchone()
                 effects = json.loads(row[0] or '{}')
                 if 'delta' not in effects:
-                    self.admit_delayed_effect(plan['target'], plan.get('source_guard'), 'receipt_event')
+                    if plan['delta']:
+                        self.admit_published_import_memory(context,'hold',ordinal)
                     effects['delta'] = {'event_ids': [self._insert_boot_delta_event(conn, plan['target'],
                         kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), plan['logical_time'])
                         for kind, payload in plan['delta']]}
@@ -2590,8 +2634,16 @@ class BucketManager:
         serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
             self.assert_confirmed_delete_writable(bucket_id)
-            self.admit_delayed_effect(bucket_id, _expected_source, 'receipt_event',allow_missing=_expected_source is None)
+            try:
+                self.admit_delayed_effect(bucket_id, _expected_source, 'boot_delta_event',
+                                          allow_missing=_expected_source is None)
+            except BucketIdempotencyError as exc:
+                if exc.code != 'confirmed_delete_source_changed':
+                    raise
+                logger.warning('Skipped boot delta for changed source %s', bucket_id)
+                return False
             self._insert_boot_delta_event(conn, bucket_id, event_type, serialized, now_iso())
+            return True
 
     @staticmethod
     def _insert_boot_delta_event(conn, bucket_id, event_type, serialized, occurred_at):
@@ -3613,7 +3665,12 @@ class BucketManager:
             with bucket_write_scope(self.base_dir):
                 self.assert_confirmed_delete_writable(source_id)
                 if _s4_effect is not None:
-                    self._trace_fence(_s4_effect['context'])
+                    request = self._trace_fence(_s4_effect['context'])
+                    if (request['payload'].get('source_bucket') != source_id
+                            or request['plan'].get('feel_source_guard') != _expected_source
+                            or not any(item.get('plan',{}).get('keys',{}).get('source') == _s4_effect['key']
+                                       for item in request['plan'].get('items',[]))):
+                        raise BucketIdempotencyError('operation_source_receipt_conflict')
                 path, current = self._resolve_feel_source_locked(source_id)
                 if _s4_effect is not None:
                     _, effect_digest = self._canonical_import_payload({'source_id': source_id, 'model_valence': model_valence})
@@ -3621,7 +3678,11 @@ class BucketManager:
                     if marker:
                         if marker['payload_digest'] != effect_digest:
                             raise BucketIdempotencyError('operation_payload_conflict')
-                        self.admit_delayed_effect(source_id, _expected_source, 'receipt_event')
+                        try:
+                            current_guard = self.delete_admission.published_lineage(source_id,_expected_source)
+                        except DeleteAdmissionError as exc:
+                            raise BucketIdempotencyError(exc.code) from exc
+                        self.admit_delayed_effect(source_id,current_guard,'feel_source_replay')
                         self._sync_directory(os.path.dirname(path))
                         return {'status': 'marked', 'mode': 'replayed'}
                 self.admit_delayed_effect(source_id, _expected_source, 'feel_source')

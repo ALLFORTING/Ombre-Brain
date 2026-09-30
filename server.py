@@ -151,6 +151,7 @@ from archive_session_operations import (
 )
 from related_integrity import (RelatedError, parse_related, scan_relation_store,
                                automatic_eligible, digest as related_digest, plan_mutation, read_vectors)
+from confirmed_delete_admission import DeleteAdmissionError
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
 from import_memory import ImportEngine, ImportState
@@ -10097,23 +10098,24 @@ def _hold_grow_related(manager, context, ordinal):
         guard = request['plan'].get('feel_source_guard')
         existing = manager.relation_store.lookup(plan['keys']['relation'])
         if source in relation['add']:
-            # An existing own intent may already have published the reciprocal
-            # edge. No deletion since capture plus its unchanged non-relation
-            # preimage proves that this is the same source for that receipt.
-            if existing:
-                manager.admit_delayed_effect(source,guard,'receipt_event')
-                current_source = manager.delete_admission.capture(source)
+            try:
+                manager.admit_delayed_effect(source,guard,'hold_grow_related_source')
+            except BucketIdempotencyError as exc:
+                if exc.code != 'confirmed_delete_source_changed' or not existing:
+                    raise
+                current_source = _hold_grow_relation_receipt(manager,plan['keys']['relation'],relation,
+                    source,guard)
                 if not guard or current_source['non_relation_hash'] != guard.get('non_relation_hash'):
                     raise BucketIdempotencyError('confirmed_delete_source_changed')
-            else:
-                manager.admit_delayed_effect(source,guard,'hold_grow_related_source')
         receipt = manager.relation_store.commit(lambda inv: plan_mutation(inv, relation['source'],
             add=relation['add'], origin='inferred'), operation_key=plan['keys']['relation'],
             request_digest=related_digest(relation))
         if source in relation['add']:
-            manager.admit_delayed_effect(source,guard,'receipt_event')
+            current_source = _hold_grow_relation_receipt(manager,plan['keys']['relation'],relation,
+                source,guard)
+            manager.admit_delayed_effect(source,current_source,'hold_grow_related_receipt')
             parent = manager._trace_fence(context)['plan']
-            parent['feel_source_guard'] = manager.delete_admission.capture(source)
+            parent['feel_source_guard'] = current_source
             manager._trace_checkpoint(context,plan=parent)
         return receipt
 
@@ -10152,6 +10154,30 @@ async def _hold_grow_embedding(manager, context, ordinal):
             expected_source=current.get('source_guard'))
 
 
+def _hold_grow_relation_receipt(manager, key, relation, bucket_id, expected_source):
+    """Resolve only the exact journaled relation effect before refreshing a guard."""
+    try:
+        current = manager.delete_admission.published_lineage(bucket_id,expected_source)
+    except DeleteAdmissionError as exc:
+        raise BucketIdempotencyError(exc.code) from exc
+    journal = manager.relation_store.lookup(key)
+    if (journal is None or journal.get('key') != key
+            or journal['plan']['root'] != str(Path(manager.base_dir).resolve())
+            or journal['plan']['kind'] != 'relation'
+            or journal['request_digest'] != related_digest(relation)):
+        raise BucketIdempotencyError('operation_relation_receipt_conflict')
+    endpoint = scan_relation_store(manager.base_dir).endpoint(bucket_id)
+    if not any(
+            step['id']==bucket_id and step.get('after')==endpoint.related.fingerprint
+            and (journal['status']=='complete' or index < journal['progress'])
+            for index,step in enumerate(journal['plan']['steps'])):
+        raise BucketIdempotencyError('operation_relation_receipt_conflict')
+    try:
+        return manager.delete_admission.published_lineage(bucket_id,expected_source)
+    except DeleteAdmissionError as exc:
+        raise BucketIdempotencyError(exc.code) from exc
+
+
 def _hold_grow_admit_effect(manager, context, ordinal, kind):
     """Reconcile this request's publish-before-guard-checkpoint effects only."""
     request = manager._trace_fence(context)
@@ -10163,21 +10189,19 @@ def _hold_grow_admit_effect(manager, context, ordinal, kind):
     except BucketIdempotencyError as exc:
         if exc.code != 'confirmed_delete_source_changed':
             raise
-        # This check forbids reconciliation across any accepted/completed delete.
-        fresh = manager.admit_delayed_effect(plan['target'],guard,'receipt_event')
         own_effect = False
         journal = manager.relation_store.lookup(plan['keys']['relation'])
         relation = {'source':plan['target'],'add':[pair[0] for pair in current.get('selection',[])],
                     'remove':[],'origin':'inferred'}
-        if (journal and journal['status'] in ('pending','complete')
-                and journal['plan']['root'] == str(Path(manager.base_dir).resolve())
-                and journal['request_digest'] == related_digest(relation)
-                and fresh['non_relation_hash'] == (guard or {}).get('non_relation_hash')):
-            endpoint = scan_relation_store(manager.base_dir).endpoint(plan['target'])
-            own_effect = any(step['id']==plan['target'] and step.get('after')==endpoint.related.fingerprint
-                             for step in journal['plan']['steps'])
+        if journal:
+            fresh = _hold_grow_relation_receipt(manager,plan['keys']['relation'],relation,plan['target'],guard)
+            own_effect = fresh['non_relation_hash'] == (guard or {}).get('non_relation_hash')
         date = plan['values'].get('trigger_date','')
         if not own_effect and not plan['reused'] and date:
+            try:
+                fresh = manager.delete_admission.published_lineage(plan['target'],guard)
+            except DeleteAdmissionError as lineage_exc:
+                raise BucketIdempotencyError(lineage_exc.code) from lineage_exc
             post = frontmatter.load(manager._find_bucket_file(plan['target']))
             marker = manager._operation_marker(post,plan['keys']['trigger'])
             _, expected_digest = manager._canonical_import_payload({'kwargs':{'trigger_date':date,'trigger_last_seen':''}})
@@ -10189,6 +10213,7 @@ def _hold_grow_admit_effect(manager, context, ordinal, kind):
                     == {k:v for k,v in plan['metadata'].items() if k not in omitted})
         if not own_effect:
             raise exc
+        manager.admit_delayed_effect(plan['target'],fresh,'hold_grow_published_effect')
         request['resolutions']['items'][str(ordinal)]['source_guard'] = fresh
         manager._trace_checkpoint(context,resolutions=request['resolutions'])
         return fresh
