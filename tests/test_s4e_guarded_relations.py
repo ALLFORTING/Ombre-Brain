@@ -33,7 +33,7 @@ def pending_intent(manager, monkeypatch, boundary='after_intent'):
 
 def resume(manager,row,capability,guard=None):
     return manager.relation_store.commit(lambda inv: row['plan']['relation_plan'],
-        operation_key=row['plan']['relation_key'], request_digest=digest(row['plan']['relation_plan']),
+        operation_key=row['plan']['relation_key'], request_digest=digest(row['plan']['relation_plan']['request']),
         execution_guard=guard if guard is not None else manager._confirmed_descriptor(row), capability=capability)
 
 
@@ -45,7 +45,7 @@ def test_guarded_intent_without_resolver_or_capability_is_deferred(store,monkeyp
     assert plain.lookup(row['plan']['relation_key'])['status']=='pending'
     with pytest.raises(RelatedError,match='execution_deferred'):
         plain.commit(lambda inv:row['plan']['relation_plan'],operation_key=row['plan']['relation_key'],
-            request_digest=digest(row['plan']['relation_plan']),execution_guard=store._confirmed_descriptor(row))
+            request_digest=digest(row['plan']['relation_plan']['request']),execution_guard=store._confirmed_descriptor(row))
     with pytest.raises(RelatedError,match='execution_deferred'):resume(store,row,None)
     assert 'A' in graph(store)
 

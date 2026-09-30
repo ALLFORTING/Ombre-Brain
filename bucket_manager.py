@@ -39,7 +39,7 @@ import asyncio
 import time
 import weakref
 from contextlib import nullcontext, closing
-from related_integrity import (RelationStore, RelatedError, RelatedAdmissionDeferred, plan_mutation, scan_relation_store,
+from related_integrity import (RelationStore, RelatedError, RelatedAdmissionDeferred, plan_mutation, mutation_request, scan_relation_store,
                                plan_delete, parse_related, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from confirmed_delete_admission import DeleteAdmissionError
@@ -744,7 +744,9 @@ class BucketManager:
             raise RelatedError('related_execution_guard_conflict')
         if (operation.get('key') != row['plan']['relation_key']
                 or operation['plan'] != row['plan']['relation_plan']
-                or operation['request_digest'] != related_digest(operation['plan'])):
+                or related_digest(operation['plan']['request']) != related_digest(row['plan']['relation_plan']['request'])
+                or operation['request_digest'] not in (related_digest(operation['plan']['request']),
+                                                       related_digest(operation['plan']))):
             raise RelatedError('related_execution_guard_conflict')
         if boundary != 'replay' or operation['status'] != 'complete':
             if row['phase'] != 'history_vector_resolved' or not {'history','vector'} <= row['receipts'].keys():
@@ -886,7 +888,9 @@ class BucketManager:
         source = inventory.endpoints.get(row['bucket_id'])
         plan = row['plan']; frozen = plan['source_guard']
         journal = relation_operation or self.relation_store.lookup(plan['relation_key'])
-        if journal and (journal['plan'] != plan['relation_plan'] or journal['request_digest'] != related_digest(plan['relation_plan'])
+        if journal and (journal['plan'] != plan['relation_plan']
+                        or journal['request_digest'] not in (related_digest(plan['relation_plan']['request']),
+                                                             related_digest(plan['relation_plan']))
                         or journal.get('execution_guard') != self._confirmed_descriptor(row)):
             raise RelatedError('related_execution_guard_conflict')
         if source:
@@ -949,7 +953,11 @@ class BucketManager:
     def _confirmed_verify_receipts(self, row, receipts, conn):
         self._confirmed_verify_history_vector(row,receipts,conn)
         journal = self.relation_store.lookup(row['plan']['relation_key'])
-        if (not journal or journal['status'] != 'complete' or receipts['relation']['operation_id'] != journal['id']
+        if (not journal or journal['status'] != 'complete'
+                or journal['plan'] != row['plan']['relation_plan']
+                or journal['request_digest'] not in (related_digest(journal['plan']['request']),
+                                                     related_digest(journal['plan']))
+                or receipts['relation']['operation_id'] != journal['id']
                 or receipts['relation']['plan_digest'] != related_digest(row['plan']['relation_plan'])):
             raise RelatedError('confirmed_delete_relation_receipt_conflict')
         successor = receipts['successor']
@@ -957,11 +965,12 @@ class BucketManager:
         if successor['effect_key'] != key:
             raise RelatedError('confirmed_delete_successor_receipt_conflict')
         if successor['outcome'] == 'resolved':
-            effect = conn.execute('SELECT status,payload_digest FROM ob_import_operations WHERE operation_key=?',(key,)).fetchone()
+            effect = conn.execute('SELECT status,payload_digest,operation_kind,target_bucket_id FROM ob_import_operations WHERE operation_key=?',(key,)).fetchone()
             expected = related_digest({'remove_supersedes':row['bucket_id'],'successor':row['plan']['successor_id']})
             path = self._find_bucket_file(row['plan']['successor_id'])
             marker = self._operation_marker(frontmatter.load(path),key) if path else None
-            if not effect or effect != ('applied',expected) or (path and (not marker or marker['payload_digest'] != expected)):
+            if not effect or effect != ('applied',expected,'update',row['plan']['successor_id']) or (path and (not marker or marker['payload_digest'] != expected
+                    or marker.get('operation_kind') != 'update')):
                 raise RelatedError('confirmed_delete_successor_receipt_conflict')
 
     @guarded_mutation('confirmed_delete_checkpoint')
@@ -1053,7 +1062,7 @@ class BucketManager:
                 self._confirmed_validate(row)
                 return plan
             result = self.relation_store.commit(frozen_planner,operation_key=row['plan']['relation_key'],
-                request_digest=related_digest(plan),execution_guard=self._confirmed_descriptor(row),
+                request_digest=related_digest(plan['request']),execution_guard=self._confirmed_descriptor(row),
                 capability=self.confirmed_delete_capability(context))
             journal = self.relation_store.lookup(row['plan']['relation_key'])
             if not journal or journal['status'] != 'complete':
@@ -1084,7 +1093,8 @@ class BucketManager:
                                                           payload=effect_payload,payload_digest=effect_digest)
                 marker = self._operation_marker(post,key)
                 if marker:
-                    if marker['payload_digest'] != effect_digest or row['bucket_id'] in _supersedes_for_mutation(post.metadata):
+                    if (marker['payload_digest'] != effect_digest or marker.get('operation_kind') != 'update'
+                            or row['bucket_id'] in _supersedes_for_mutation(post.metadata)):
                         raise RelatedError('confirmed_delete_successor_conflict')
                     self._sync_directory(str(path.parent))
                 else:
@@ -1597,7 +1607,7 @@ class BucketManager:
     ) -> bool:
         existing = cls._operation_marker(post, operation_key)
         if existing is not None:
-            if existing.get("payload_digest") != payload_digest:
+            if existing.get("payload_digest") != payload_digest or existing.get("operation_kind") != operation_kind:
                 raise BucketIdempotencyError("operation_payload_conflict")
             if (
                 memory_mutation_id is not None
@@ -1835,6 +1845,9 @@ class BucketManager:
                     or hashlib.sha256(post.content.encode()).hexdigest() != plan['body_digest']):
                 raise BucketIdempotencyError('operation_state_conflict')
             marker = self._operation_marker(post, plan['memory_key'])
+            if marker and (marker.get('operation_kind') != ('update' if plan['decision'] == 'reuse' else 'create')
+                           or marker.get('payload_digest') != plan['payload_digest']):
+                raise BucketIdempotencyError('operation_payload_conflict')
             if before_memory and marker is None:
                 self._trace_preimage_guard(dict(target=plan['target'], preimage_digest=plan['preimage_digest'],
                                                source_guard=plan.get('source_guard')))
@@ -2156,7 +2169,8 @@ class BucketManager:
                 return {'status': 'not_requested'}
             return self.relation_store.commit(lambda inv: plan_mutation(inv, request['source'],
                 add=request['add'], remove=request['remove'], origin=request['origin']),
-                operation_key=plan['keys']['relation'], request_digest=related_digest(request))
+                operation_key=plan['keys']['relation'], request_digest=related_digest(mutation_request(
+                    request['source'], add=request['add'], remove=request['remove'], origin=request['origin'])))
 
     @guarded_async_mutation("trace_request_execute")
     async def execute_trace_request(self, operation_id, payload, normalization_context, planner):
@@ -2352,7 +2366,7 @@ class BucketManager:
             post = frontmatter.load(path) if path else None
             marker = self._operation_marker(post, plan['keys']['memory']) if post is not None else None
             if marker:
-                if marker['payload_digest'] != plan['child_digest']:
+                if marker['payload_digest'] != plan['child_digest'] or marker.get('operation_kind') != ('update' if plan['reused'] else 'create'):
                     raise BucketIdempotencyError('operation_payload_conflict')
                 self._sync_directory(os.path.dirname(path))
                 self._mark_import_operation_applied(plan['keys']['memory'])
@@ -2425,7 +2439,7 @@ class BucketManager:
             post = frontmatter.load(path)
             marker = self._operation_marker(post, key)
             if marker:
-                if marker['payload_digest'] != digest:
+                if marker['payload_digest'] != digest or marker.get('operation_kind') != 'update':
                     raise BucketIdempotencyError('operation_payload_conflict')
                 self._sync_directory(os.path.dirname(path))
                 self._mark_import_operation_applied(key)
@@ -2466,6 +2480,12 @@ class BucketManager:
                 marker = self._operation_marker(post, operation_key)
             except Exception as exc:
                 raise BucketIdempotencyError("operation_marker_invalid") from exc
+            if marker and (post.get('id') != result_id
+                    or marker.get('operation_kind') != operation['operation_kind']
+                    or marker.get('payload_digest') != operation['payload_digest']
+                    or (operation.get('memory_mutation_id') is not None
+                        and marker.get('memory_mutation_id') != operation['memory_mutation_id'])):
+                raise BucketIdempotencyError('operation_marker_conflict')
         return {
             **operation,
             "memory_exists": file_path is not None,
@@ -3312,6 +3332,7 @@ class BucketManager:
                     if (
                         marker is None
                         or marker.get("payload_digest") != operation["payload_digest"]
+                        or marker.get("operation_kind") != "create"
                         or (
                             operation.get("memory_mutation_id") is not None
                             and marker.get("memory_mutation_id")
@@ -3393,7 +3414,8 @@ class BucketManager:
                 if operation is None:
                     raise BucketIdempotencyError("idempotency_conflict")
                 marker = self._operation_marker(frontmatter.load(existing_path), _o5b_operation_key)
-                if not marker or marker.get("payload_digest") != operation["payload_digest"]:
+                if (not marker or marker.get("payload_digest") != operation["payload_digest"]
+                        or marker.get("operation_kind") != "create"):
                     raise BucketIdempotencyError("idempotency_conflict")
                 if (operation.get("memory_mutation_id") is not None
                         and marker.get("memory_mutation_id") != operation["memory_mutation_id"]):
@@ -3676,7 +3698,7 @@ class BucketManager:
                     _, effect_digest = self._canonical_import_payload({'source_id': source_id, 'model_valence': model_valence})
                     marker = self._operation_marker(current, _s4_effect['key'])
                     if marker:
-                        if marker['payload_digest'] != effect_digest:
+                        if marker['payload_digest'] != effect_digest or marker.get('operation_kind') != 'update':
                             raise BucketIdempotencyError('operation_payload_conflict')
                         try:
                             current_guard = self.delete_admission.published_lineage(source_id,_expected_source)
@@ -3910,7 +3932,8 @@ class BucketManager:
             if operation is not None:
                 marker = self._operation_marker(post, o5b_operation_key)
                 if marker is not None:
-                    if marker.get("payload_digest") != operation["payload_digest"]:
+                    if (marker.get("payload_digest") != operation["payload_digest"]
+                            or marker.get("operation_kind") != "update"):
                         raise BucketIdempotencyError("operation_payload_conflict")
                     if (
                         operation.get("memory_mutation_id") is not None
@@ -3952,7 +3975,8 @@ class BucketManager:
             if operation is not None:
                 marker = self._operation_marker(post, o5b_operation_key)
                 if marker is not None:
-                    if marker.get("payload_digest") != operation["payload_digest"]:
+                    if (marker.get("payload_digest") != operation["payload_digest"]
+                            or marker.get("operation_kind") != "update"):
                         raise BucketIdempotencyError("operation_payload_conflict")
                     if (
                         operation.get("memory_mutation_id") is not None

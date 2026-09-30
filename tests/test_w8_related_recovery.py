@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from bucket_write_lock import bucket_write_scope
 from bucket_manager import BucketManager
 from related_integrity import (RelatedError, RelationStore, plan_mutation, plan_delete,
                                plan_repair, scan_relation_store, digest)
@@ -153,9 +154,10 @@ async def test_delete_vector_failure_no_relation_intent(store):
 
 def test_operation_key_collision_response_loss_and_repair_pending_other(store,monkeypatch):
     planner=lambda i:plan_mutation(i,'A',add=['B'])
-    store.relation_store.commit(planner,operation_key='request',request_digest='one')
+    request_digest=digest(planner(scan_relation_store(store.base_dir))['request'])
+    store.relation_store.commit(planner,operation_key='request',request_digest=request_digest)
     before=snapshot(store.base_dir)
-    assert not store.relation_store.commit(planner,operation_key='request',request_digest='one')['changed']
+    assert not store.relation_store.commit(planner,operation_key='request',request_digest=request_digest)['changed']
     assert snapshot(store.base_dir)==before
     with pytest.raises(RelatedError,match='key_conflict'):
         store.relation_store.commit(planner,operation_key='request',request_digest='two')
@@ -168,6 +170,33 @@ def test_operation_key_collision_response_loss_and_repair_pending_other(store,mo
     before=snapshot(store.base_dir)
     with pytest.raises(RelatedError,match='operation_pending'):store.relation_store.apply_repair(plan)
     assert snapshot(store.base_dir)==before
+
+
+def test_keyed_commit_rejects_noncanonical_frozen_request_digest(store):
+    planner=lambda inventory:plan_mutation(inventory,'A',add=['B'])
+    before=snapshot(store.base_dir)
+    with pytest.raises(RelatedError,match='related_request_digest_conflict'):
+        store.relation_store.commit(planner,operation_key='wrong-digest',request_digest=digest({'source':'A'}))
+    assert snapshot(store.base_dir)==before
+    assert store.relation_store.lookup('wrong-digest') is None
+    expected=digest(planner(scan_relation_store(store.base_dir))['request'])
+    committed=store.relation_store.commit(planner,operation_key='right-digest',request_digest=expected)
+    assert committed['changed']
+    assert not store.relation_store.commit(planner,operation_key='right-digest',request_digest=expected)['changed']
+
+
+def test_keyed_replay_uses_frozen_request_even_for_legacy_stored_digest(store):
+    planner=lambda inventory:plan_mutation(inventory,'A',add=['B'])
+    expected=digest(planner(scan_relation_store(store.base_dir))['request'])
+    store.relation_store.commit(planner,operation_key='legacy-digest',request_digest=expected)
+    operation=store.relation_store.lookup('legacy-digest')
+    operation['request_digest']='older-caller-digest'
+    with bucket_write_scope(store.base_dir):store.relation_store._save(operation)
+    assert not store.relation_store.commit(planner,operation_key='legacy-digest',request_digest=expected)['changed']
+    operation['plan']['request']['source']='C'
+    with bucket_write_scope(store.base_dir):store.relation_store._save(operation)
+    with pytest.raises(RelatedError,match='related_operation_key_conflict'):
+        store.relation_store.commit(planner,operation_key='legacy-digest',request_digest=expected)
 
 
 @pytest.mark.asyncio

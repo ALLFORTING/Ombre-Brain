@@ -150,7 +150,7 @@ from archive_session_operations import (
     validate_operation_id, short_step, execute_archive_operation,
 )
 from related_integrity import (RelatedError, parse_related, scan_relation_store,
-                               automatic_eligible, digest as related_digest, plan_mutation, read_vectors)
+                               automatic_eligible, digest as related_digest, plan_mutation, mutation_request, read_vectors)
 from confirmed_delete_admission import DeleteAdmissionError
 from embedding_engine import EmbeddingEngine
 from digest_dedupe import run_dedupe_scan
@@ -10109,7 +10109,8 @@ def _hold_grow_related(manager, context, ordinal):
                     raise BucketIdempotencyError('confirmed_delete_source_changed')
         receipt = manager.relation_store.commit(lambda inv: plan_mutation(inv, relation['source'],
             add=relation['add'], origin='inferred'), operation_key=plan['keys']['relation'],
-            request_digest=related_digest(relation))
+            request_digest=related_digest(mutation_request(relation['source'], add=relation['add'],
+                remove=relation['remove'], origin=relation['origin'])))
         if source in relation['add']:
             current_source = _hold_grow_relation_receipt(manager,plan['keys']['relation'],relation,
                 source,guard)
@@ -10161,14 +10162,19 @@ def _hold_grow_relation_receipt(manager, key, relation, bucket_id, expected_sour
     except DeleteAdmissionError as exc:
         raise BucketIdempotencyError(exc.code) from exc
     journal = manager.relation_store.lookup(key)
+    expected_request = mutation_request(relation['source'], add=relation['add'],
+        remove=relation['remove'], origin=relation['origin'])
     if (journal is None or journal.get('key') != key
             or journal['plan']['root'] != str(Path(manager.base_dir).resolve())
             or journal['plan']['kind'] != 'relation'
-            or journal['request_digest'] != related_digest(relation)):
+            or journal['plan']['request'] != expected_request
+            or bucket_id not in (expected_request['source'], *expected_request['add'], *expected_request['remove'])
+            or journal['request_digest'] not in (related_digest(expected_request), related_digest(relation))):
         raise BucketIdempotencyError('operation_relation_receipt_conflict')
     endpoint = scan_relation_store(manager.base_dir).endpoint(bucket_id)
     if not any(
-            step['id']==bucket_id and step.get('after')==endpoint.related.fingerprint
+            step['id']==bucket_id and step.get('path')==endpoint.path
+            and step.get('after')==endpoint.related.fingerprint
             and (journal['status']=='complete' or index < journal['progress'])
             for index,step in enumerate(journal['plan']['steps'])):
         raise BucketIdempotencyError('operation_relation_receipt_conflict')
@@ -10206,7 +10212,8 @@ def _hold_grow_admit_effect(manager, context, ordinal, kind):
             marker = manager._operation_marker(post,plan['keys']['trigger'])
             _, expected_digest = manager._canonical_import_payload({'kwargs':{'trigger_date':date,'trigger_last_seen':''}})
             omitted = {'related_buckets','last_active','updated_at','trigger_date','trigger_last_seen','_ob_import_operations'}
-            own_effect = (marker is not None and marker['payload_digest']==expected_digest
+            own_effect = (marker is not None and marker.get('operation_kind')=='update'
+                and marker['payload_digest']==expected_digest
                 and post.get('trigger_date')==date and post.get('trigger_last_seen')==''
                 and post.content==plan['embedding_input']
                 and {k:v for k,v in post.metadata.items() if k not in omitted}

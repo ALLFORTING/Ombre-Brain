@@ -258,6 +258,13 @@ def _plan(graph, kind, steps, request, **extra):
             **extra}
 
 
+def mutation_request(source, *, add=(), remove=(), origin='explicit'):
+    """The canonical request stored by a non-replacement relation mutation."""
+    return {"source": source, "add": list(dict.fromkeys(add)),
+            "remove": list(dict.fromkeys(remove)), "origin": origin,
+            "replace": None, "replacement": False}
+
+
 def plan_mutation(inventory, source_id, *, add=(), remove=(), replace=_UNSET, origin='explicit'):
     source = inventory.endpoint(source_id)
     add, remove = list(dict.fromkeys(add)), list(dict.fromkeys(remove))
@@ -297,9 +304,10 @@ def plan_mutation(inventory, source_id, *, add=(), remove=(), replace=_UNSET, or
             ids.append(source_id)
         changes.append(_step(endpoint, ids))
     return _plan(inventory, 'relation', changes,
-                 {"source": source_id, "add": add, "remove": remove, "origin": origin,
-                  "replace": None if replace is _UNSET else replace,
-                  "replacement": replace is not _UNSET},
+                 (mutation_request(source_id, add=add, remove=remove, origin=origin)
+                  if replace is _UNSET else
+                  {"source": source_id, "add": add, "remove": remove, "origin": origin,
+                   "replace": replace, "replacement": True}),
                  anchors=_anchors(inventory, [source_id, *add, *remove], changes))
 
 
@@ -642,7 +650,9 @@ class RelationStore:
         with bucket_write_scope(self.root):
             existing = self.lookup(operation_key) if operation_key else None
             if existing:
-                if (request_digest != existing['request_digest']
+                # Older keyed journals may carry a caller-supplied digest. The
+                # frozen request is authoritative for both old and new replay.
+                if (request_digest != digest(existing['plan']['request'])
                         or execution_guard != existing.get('execution_guard')):
                     raise RelatedError('related_operation_key_conflict')
                 if existing.get('execution_guard') is not None:
@@ -655,10 +665,13 @@ class RelationStore:
             self._recover()
             inventory = scan_relation_store(self.root)
             plan = planner(inventory)
+            canonical_digest = digest(plan['request'])
+            if request_digest is not None and request_digest != canonical_digest:
+                raise RelatedError('related_request_digest_conflict')
             if not plan['steps']:
                 return {'changed': False, 'status': 'unchanged', 'operation_id': None}
             operation = {'id': uuid.uuid4().hex, 'key': operation_key, 'version': 1,
-                         'request_digest': request_digest or digest(plan['request']),
+                         'request_digest': canonical_digest,
                          'plan': plan, 'status': 'pending', 'progress': 0,
                          'created_at': datetime.now(timezone.utc).isoformat()}
             if execution_guard is not None:
@@ -700,7 +713,7 @@ class RelationStore:
                 raise RelatedError('related_plan_stale')
             return plan
         return self.commit(validate, operation_key='repair:' + plan_id,
-                           request_digest=plan_id, repair=True)
+                           request_digest=digest(plan['request']), repair=True)
 
 
 def read_vectors(path, model):

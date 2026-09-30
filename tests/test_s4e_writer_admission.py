@@ -341,6 +341,56 @@ async def test_delayed_admission_reconciles_own_trigger_marker_before_guard_chec
     assert result==await ob.hold('own trigger receipt',trigger_date='2026-10-01',operation_id='trigger-gap')
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('effect',['feel','trigger'])
+async def test_published_update_marker_with_wrong_kind_cannot_replay(tmp_path,monkeypatch,effect):
+    ob=load(tmp_path/'root',monkeypatch);manager=ob.bucket_mgr
+    source=await manager.create('feel source') if effect=='feel' else None
+    kwargs=(dict(feel=True,source_bucket=source,valence=.7,arousal=.2)
+            if effect=='feel' else dict(trigger_date='2026-10-01'))
+    key=f'{effect}-wrong-kind'
+    method='mark_feel_source' if effect=='feel' else 'commit_hold_grow_trigger'
+    original=getattr(manager,method)
+    def lost(*args,**options):
+        result=original(*args,**options)
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(manager,method,lost)
+    with pytest.raises(asyncio.CancelledError):
+        await ob.hold('marker kind receipt',operation_id=key,**kwargs)
+    monkeypatch.setattr(manager,method,original)
+    request=manager.inspect_trace_request(key)
+    plan=request['plan']['items'][0]['plan']
+    effect_key=(plan['keys']['source'] if effect=='feel' else plan['keys']['trigger'])
+    path=Path(manager._find_bucket_file(source if effect=='feel' else plan['target']))
+    post=frontmatter.load(path)
+    marker=manager._operation_marker(post,effect_key)
+    assert marker and marker['operation_kind']=='update'
+    marker['operation_kind']='create'
+    frontmatter.dump(post,path)
+    replay=await ob.hold('marker kind receipt',operation_id=key,**kwargs)
+    assert ('operation_payload_conflict' if effect=='feel' else 'confirmed_delete_source_changed') in replay
+    assert manager.inspect_trace_request(key)['phase']!='completed'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field,value',[('operation_kind','update'),('payload_digest','wrong-digest')])
+async def test_inspected_keyed_marker_requires_exact_durable_operation(tmp_path,monkeypatch,field,value):
+    from bucket_manager import BucketIdempotencyError
+
+    ob=load(tmp_path/'root',monkeypatch);manager=ob.bucket_mgr
+    key='inspected-marker-binding'
+    identity=await manager.create('marker body',_o5b_operation_key=key)
+    operation=manager.inspect_import_operation(key)
+    assert operation['marker']['operation_kind']=='create'
+    assert operation['marker']['payload_digest']==operation['payload_digest']
+    path=Path(manager._find_bucket_file(identity))
+    post=frontmatter.load(path)
+    manager._operation_marker(post,key)[field]=value
+    frontmatter.dump(post,path)
+    with pytest.raises(BucketIdempotencyError,match='operation_marker_conflict'):
+        manager.inspect_import_operation(key)
+
+
 def test_manual_publication_admits_actual_metadata_identity(store,monkeypatch):
     import write_memory
     context=accepted(store);store.release_confirmed_delete(context)
@@ -464,7 +514,7 @@ async def test_receipt_exception_requires_exact_fenced_memory_publication(tmp_pa
 @pytest.mark.parametrize('durable_source_progress',[False,True])
 async def test_relation_receipt_requires_durable_source_effect(tmp_path,monkeypatch,durable_source_progress):
     from bucket_manager import BucketIdempotencyError
-    from related_integrity import digest as related_digest, plan_mutation
+    from related_integrity import digest as related_digest, plan_mutation, mutation_request
 
     ob=load(tmp_path/'root',monkeypatch)
     manager=ob.bucket_mgr
@@ -482,7 +532,8 @@ async def test_relation_receipt_requires_durable_source_effect(tmp_path,monkeypa
     monkeypatch.setattr(manager.relation_store,'checkpoint',interrupt)
     with pytest.raises(asyncio.CancelledError):
         manager.relation_store.commit(lambda inventory:plan_mutation(inventory,source,add=[target],origin='inferred'),
-                                      operation_key=key,request_digest=related_digest(relation))
+                                      operation_key=key,request_digest=related_digest(
+                                          mutation_request(source,add=[target],origin='inferred')))
     journal=manager.relation_store.lookup(key)
     assert journal['status']=='pending'
     source_step=next(index for index,step in enumerate(journal['plan']['steps']) if step['id']==source)
@@ -501,3 +552,28 @@ async def test_relation_receipt_requires_durable_source_effect(tmp_path,monkeypa
             current=ob._hold_grow_relation_receipt(manager,key,relation,source,frozen)
             assert current['incarnation']!=frozen['incarnation']
             assert manager.admit_delayed_effect(source,current,'relation_receipt')==current
+
+
+@pytest.mark.asyncio
+async def test_relation_receipt_rejects_different_frozen_request_with_matching_key_and_digest(tmp_path,monkeypatch):
+    from bucket_manager import BucketIdempotencyError
+    from related_integrity import digest as related_digest, mutation_request, plan_mutation
+
+    ob=load(tmp_path/'root',monkeypatch);manager=ob.bucket_mgr
+    source=await manager.create('source');target=await manager.create('target')
+    other=await manager.create('other')
+    relation={'source':source,'add':[target],'remove':[],'origin':'inferred'}
+    key='frozen-request-binding'
+    with bucket_write_scope(manager.base_dir):frozen=manager.delete_admission.capture(source)
+    request=mutation_request(source,add=[target],origin='inferred')
+    manager.relation_store.commit(lambda inventory:plan_mutation(inventory,source,add=[target],origin='inferred'),
+        operation_key=key,request_digest=related_digest(request))
+    with bucket_write_scope(manager.base_dir):
+        assert ob._hold_grow_relation_receipt(manager,key,relation,source,frozen)
+        journal=manager.relation_store.lookup(key)
+        journal['plan']['request']['add']=[other]
+        # Retain the expected key and supplied digest: only the frozen request differs.
+        assert journal['request_digest']==related_digest(request)
+        manager.relation_store._save(journal)
+        with pytest.raises(BucketIdempotencyError,match='operation_relation_receipt_conflict'):
+            ob._hold_grow_relation_receipt(manager,key,relation,source,frozen)
