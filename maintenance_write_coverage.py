@@ -363,6 +363,8 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_legacy_plan_item": "guarded_mutation",
     },
     "server.py": {
+        "_run_legacy_archive": "guarded_async_mutation",
+        "_run_legacy_pinned": "guarded_async_mutation",
         "_execute_merge_operation": "guarded_async_mutation",
         "_save_password_hash": "guarded_mutation",
         "_atomic_write_auth_payload": "guarded_caller_only",

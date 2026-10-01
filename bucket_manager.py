@@ -2834,13 +2834,16 @@ class BucketManager:
         return history
 
     @guarded_mutation("bucket_letter_write")
-    def record_letter(self, content: str, session_id: str, sealed: bool = False) -> None:
+    def record_letter(self, content: str, session_id: str, sealed: bool = False, *, _expected_source=None) -> None:
         """Persist an inter-window handoff letter outside normal memory buckets."""
         if not content or not content.strip():
             return
         with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
             if session_id:
-                self.delete_admission.admit(session_id,kind='letter',allow_missing=True)
+                if _expected_source is None:
+                    self.delete_admission.admit(session_id, kind='letter', allow_missing=True)
+                else:
+                    self.admit_delayed_effect(session_id, _expected_source, 'letter')
             self._insert_letter(conn, content.strip(), session_id or "", sealed, now_iso())
 
     @staticmethod
@@ -3268,6 +3271,7 @@ class BucketManager:
         _o5b_payload_digest: str | None = None,
         _o5c_memory_mutation_id: str | None = None,
         _legacy_import_context: dict | None = None,
+        _publication_out: dict | None = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -3437,6 +3441,8 @@ class BucketManager:
                 logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
                 raise
             published_source = self.delete_admission.capture(bucket_id)
+            if _publication_out is not None:
+                _publication_out.update(bucket_id=bucket_id, source_guard=published_source)
 
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
@@ -3873,6 +3879,7 @@ class BucketManager:
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
         """
+        expected_source = kwargs.pop('_expected_source', None)
         s4_context = kwargs.pop('_s4_context', None)
         legacy_context = kwargs.pop('_legacy_import_context', None)
         if legacy_context is not None and set(kwargs) - {
@@ -3892,6 +3899,8 @@ class BucketManager:
         if kwargs.get('superseded_by') not in (None, '', 'none'):
             references.append(str(kwargs['superseded_by']).strip())
         with bucket_write_scope(self.base_dir):
+            if expected_source is not None:
+                self.admit_delayed_effect(bucket_id, expected_source, 'update')
             self._confirmed_update_admission(bucket_id,references,kwargs)
             if s4_context is not None:
                 s4_plan = self._trace_fence(s4_context)['plan']

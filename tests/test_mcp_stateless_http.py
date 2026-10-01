@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata
 import json
 import logging
+import os
 import re
 import socket
 import sys
@@ -412,21 +413,21 @@ async def test_archive_response_loss_retry_duplicate(ob, monkeypatch, stateless)
 @pytest.mark.asyncio
 async def test_legacy_archive_cancel_after_publish_leaves_archived_bucket(ob, monkeypatch):
     monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
-    started, cancelled = asyncio.Event(), asyncio.Event()
+    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original = ob.bucket_mgr.embedding_engine
     async def pause_after_body(*args):
         started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
+        await release.wait()
+        finished.set()
     monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", SimpleNamespace(
         enabled=True, generate_and_store=pause_after_body,
     ))
     async with live(ob) as client:
         assert await disconnect_call(client, "archive_session", {"summary": "partial isolated summary"}, started)
-        await wait(cancelled)
+        release.set()
+        await wait(finished)
+        from tests.test_legacy_post_effect_cancellation import drain
+        await drain(ob)
         buckets = await ob.bucket_mgr.list_all(include_archive=True)
         assert len(buckets) == 1
         assert buckets[0]["metadata"]["type"] == "archived"
@@ -434,6 +435,124 @@ async def test_legacy_archive_cancel_after_publish_leaves_archived_bucket(ob, mo
         text(await call(client, "archive_session", {"summary": "partial isolated summary"}))
         buckets = await ob.bucket_mgr.list_all(include_archive=True)
         assert sorted(bucket["metadata"]["type"] for bucket in buckets) == ["archived", "archived"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stateless', [False, True])
+@pytest.mark.parametrize('family', ['archive', 'hold'])
+@pytest.mark.parametrize('boundary', ['provider', 'response'])
+async def test_legacy_post_effects_real_tcp(ob, monkeypatch, stateless, family, boundary, caplog):
+    from tests.test_legacy_post_effect_cancellation import prepare, snapshot, complete, drain
+    prepare(ob, monkeypatch)
+    runtime = ob._get_runtime_components()
+    engine = runtime['embedding_engine']
+    ob.bucket_mgr.embedding_engine = engine
+    engine.enabled = False
+    neighbor = await ob.bucket_mgr.create('synthetic neighbor', domain=['synthetic'])
+    engine._store_embedding(neighbor, [.1, .2])
+    engine.enabled = True
+    started, release = asyncio.Event(), asyncio.Event()
+    provider_calls = []
+    async def provider(*args, **kwargs):
+        provider_calls.append(args)
+        if boundary == 'provider' and len(provider_calls) == 1:
+            started.set(); await release.wait()
+        return [.1, .2]
+    monkeypatch.setattr(engine, '_generate_embedding', provider)
+    monkeypatch.setenv('OMBRE_MCP_STATELESS_HTTP', str(stateless))
+    name = 'archive_session' if family == 'archive' else 'hold'
+    arguments = (dict(summary='synthetic session', letter='frozen letter', valence=.7, arousal=.4)
+                 if family == 'archive' else
+                 dict(content='synthetic pinned memory', pinned=True, trigger_date='2030-01-01',
+                      valence=.7, arousal=.4))
+    if boundary == 'response':
+        tool = ob.mcp._tool_manager.get_tool(name)
+        original = tool.fn
+        first = True
+        async def delivery(**kwargs):
+            nonlocal first
+            result = await original(**kwargs)
+            if first:
+                first = False
+                started.set(); await release.wait()
+            return result
+        monkeypatch.setattr(tool, 'fn', delivery)
+    errors = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda loop, context: errors.append(context))
+    try:
+        async with live(ob) as client:
+            session = await initialize(client)
+            assert bool(session) == (not stateless)
+            assert await disconnect_call(client, name, arguments, started)
+            buckets = [b for b in await ob.bucket_mgr.list_all(include_archive=True) if b['id'] != neighbor]
+            original_id = buckets[0]['id']
+            at_disconnect = snapshot(ob, original_id)
+            release.set()
+            await drain(ob)
+            first_state = snapshot(ob, original_id)
+            complete(first_state, family)
+            if family == 'hold':
+                assert neighbor in first_state['metadata']['related_buckets']
+                assert original_id in (await ob.bucket_mgr.get(neighbor))['metadata']['related_buckets']
+            # No retry preceded the original object's completion checks.
+            response = text(await call(client, name, arguments))
+            buckets = [b for b in await ob.bucket_mgr.list_all(include_archive=True) if b['id'] != neighbor]
+            assert len(buckets) == 2
+            after_retry = [snapshot(ob, b['id']) for b in buckets]
+            for state in after_retry:
+                complete(state, family)
+                if family == 'hold':
+                    assert neighbor in state['metadata']['related_buckets']
+                    assert state['identity'] in (await ob.bucket_mgr.get(neighbor))['metadata']['related_buckets']
+            await drain(ob)
+            evidence = dict(stateless=stateless, family=family, boundary=boundary,
+                            root=ob.config['buckets_dir'], loopback_url=str(client.base_url),
+                            at_disconnect=at_disconnect, original_completed_without_retry=first_state,
+                            after_retry=after_retry, provider_calls=len(provider_calls),
+                            remaining_tasks=len(ob._LEGACY_POST_EFFECT_TASKS), omitted_exceptions=errors,
+                            response=response)
+        assert not errors and not ob._LEGACY_POST_EFFECT_TASKS
+        assert 'legacy post-effects failed' not in caplog.text
+        target = os.environ.get('OB_LEGACY_TCP_EVIDENCE')
+        if target:
+            output = Path(target); output.mkdir(parents=True, exist_ok=True)
+            (output / f'{family}-{boundary}-{stateless}.json').write_text(
+                json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')
+    finally:
+        release.set()
+        await drain(ob)
+        loop.set_exception_handler(previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stateless', [False, True])
+async def test_legacy_executor_drains_on_http_shutdown(ob, monkeypatch, stateless):
+    from tests.test_legacy_post_effect_cancellation import prepare, snapshot, complete, drain
+    prepare(ob, monkeypatch)
+    engine = ob._get_runtime_components()['embedding_engine']
+    ob.bucket_mgr.embedding_engine = engine
+    engine.enabled = True
+    started, release = asyncio.Event(), asyncio.Event()
+    async def provider(*a, **k):
+        started.set(); await release.wait(); return [.1, .2]
+    monkeypatch.setattr(engine, '_generate_embedding', provider)
+    monkeypatch.setenv('OMBRE_MCP_STATELESS_HTTP', str(stateless))
+    async with live(ob) as client:
+        await initialize(client)
+        await disconnect_call(client, 'archive_session', dict(
+            summary='shutdown synthetic', letter='frozen letter', valence=.7, arousal=.4), started)
+        identity = (await ob.bucket_mgr.list_all(include_archive=True))[0]['id']
+        worker, = ob._LEGACY_POST_EFFECT_TASKS
+        async def finish_during_shutdown():
+            await asyncio.sleep(.4)
+            assert not worker.done()
+            release.set()
+        releasing = asyncio.create_task(finish_during_shutdown())
+    await releasing
+    await drain(ob)
+    complete(snapshot(ob, identity), 'archive')
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,7 @@ from urllib.parse import urlparse
 from typing import Union
 from functools import wraps
 import inspect
+from contextlib import asynccontextmanager
 from typing_extensions import Annotated, Literal
 from pydantic import Field
 from PIL import Image, UnidentifiedImageError
@@ -634,7 +635,24 @@ def build_streamable_http_app():
     mcp.settings.stateless_http = _env_flag_enabled(
         os.getenv("OMBRE_MCP_STATELESS_HTTP", "false")
     )
-    return mcp.streamable_http_app()
+    app = mcp.streamable_http_app()
+    original_lifespan = app.router.lifespan_context
+    @asynccontextmanager
+    async def lifespan(application):
+        async with original_lifespan(application) as state:
+            try:
+                yield state
+            finally:
+                # Drain while the SDK and provider services are still available.
+                # Forced loop/process termination is outside this guarantee.
+                import anyio
+                with anyio.CancelScope(shield=True):
+                    pending = [task for task in _LEGACY_POST_EFFECT_TASKS
+                               if task.get_loop() is asyncio.get_running_loop()]
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+    app.router.lifespan_context = lifespan
+    return app
 
 
 def _env_flag_enabled(value: str) -> bool:
@@ -4302,22 +4320,27 @@ async def _run_digest(dry_run: bool = True, max_groups: int = 10, confirm_token:
     return "\n".join(lines)
 
 
-async def _auto_link_related(bucket_id: str, threshold: float | None = None, top_k: int = 3) -> list[tuple[str, float]]:
+async def _auto_link_related(bucket_id: str, threshold: float | None = None, top_k: int = 3, *, _expected_source=None) -> list[tuple[str, float]]:
     """Bidirectionally link a new bucket to its closest non-sealed semantic neighbors."""
+    def empty_result():
+        if _expected_source is not None:
+            with bucket_write_scope(config['buckets_dir']):
+                bucket_mgr.admit_delayed_effect(bucket_id, _expected_source, 'related')
+        return []
     if threshold is None:
         threshold = float(os.environ.get("OMBRE_RELATED_THRESHOLD", "0.75") or "0.75")
     if not embedding_engine or not embedding_engine.enabled:
-        return []
+        return empty_result()
     inventory = scan_relation_store(config['buckets_dir'])
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket or not automatic_eligible(inventory, bucket_id):
-        return []
+        return empty_result()
     target_embedding = await embedding_engine.get_embedding(bucket_id)
     if target_embedding is None:
         # BucketManager owns lifecycle generation; related-linking never retries it.
         # A provider failure therefore remains best-effort without replay retries.
         # Sealed targets already returned above and never reach this path.
-        return []
+        return empty_result()
     all_buckets = await bucket_mgr.list_all(include_archive=False)
     scored = []
     for other in all_buckets:
@@ -4333,9 +4356,12 @@ async def _auto_link_related(bucket_id: str, threshold: float | None = None, top
     scored.sort(key=lambda item: item[1], reverse=True)
     selected = scored[:max(1, top_k)]
     if not selected:
-        return []
+        return empty_result()
 
-    bucket_mgr.mutate_related(bucket_id, add=[identity for identity, _ in selected], origin='inferred')
+    with bucket_write_scope(config['buckets_dir']):
+        if _expected_source is not None:
+            bucket_mgr.admit_delayed_effect(bucket_id, _expected_source, 'related')
+        bucket_mgr.mutate_related(bucket_id, add=[identity for identity, _ in selected], origin='inferred')
     return selected
 
 
@@ -9863,6 +9889,65 @@ def _format_hold_feel_source_receipt(bucket_id: str, source_id: str, error: str)
         f"source_mark_error={error}"
     )
 
+_LEGACY_POST_EFFECT_TASKS = set()
+
+
+async def _await_legacy_post_effects(function, *args):
+    """One invocation, no retry identity or durable record. Cancel only the waiter."""
+    task = asyncio.create_task(function(*args))
+    _LEGACY_POST_EFFECT_TASKS.add(task)
+    def finished(done):
+        _LEGACY_POST_EFFECT_TASKS.discard(done)
+        if done.cancelled():
+            logger.error('legacy post-effects executor cancelled; recovery unavailable')
+        else:
+            error = done.exception()
+            if error is not None:
+                logger.error('legacy post-effects failed: %s',
+                             getattr(error, 'code', type(error).__name__))
+    task.add_done_callback(finished)
+    return await asyncio.shield(task)
+
+
+@guarded_async_mutation('legacy_archive_post_effects')
+async def _run_legacy_archive(store, payload, frozen_config):
+    plan = await short_step(store.publish_legacy, payload, frozen_config, _capture_source=True)
+    identity, guard = plan['bucket_id'], plan['source_guard']
+    if not bucket_mgr._record_boot_delta_event(identity, 'created', _expected_source=guard):
+        raise BucketIdempotencyError('confirmed_delete_source_changed')
+    if not payload['sealed']:
+        await bucket_mgr._refresh_ordinary_embedding_best_effort(identity, plan['embedding_input'])
+    with bucket_write_scope(frozen_config['buckets_dir']):
+        bucket_mgr.admit_delayed_effect(identity, guard, 'archive_post_effects')
+        if payload['letter']:
+            bucket_mgr.record_letter(payload['letter'], identity, sealed=payload['sealed'], _expected_source=guard)
+        if plan['snapshot'] is not None:
+            entry = plan['snapshot']
+            _record_emotion_snapshot(entry['valence'], entry['arousal'], 'archive', identity,
+                                     _expected_entry=entry, _expected_source=guard, _strict=True)
+    return plan['result_text']
+
+
+@guarded_async_mutation('legacy_pinned_post_effects')
+async def _run_legacy_pinned(values, emotion, trigger_date):
+    publication = {}
+    identity = await bucket_mgr.create(**values, _publication_out=publication)
+    guard = publication['source_guard']
+    with bucket_write_scope(config['buckets_dir']):
+        bucket_mgr.admit_delayed_effect(identity, guard, 'pinned_post_effects')
+        if emotion is not None:
+            _record_emotion_snapshot(*emotion, 'hold', identity, _expected_source=guard, _strict=True)
+        if trigger_date:
+            # This metadata-only update has no suspended provider work. The
+            # outer root mutex binds admission, field preimage and publication.
+            if not await bucket_mgr.update(identity, trigger_date=trigger_date, trigger_last_seen='',
+                                           _expected_source=guard):
+                raise BucketIdempotencyError('legacy_trigger_write_failed')
+            guard = bucket_mgr.delete_admission.capture(identity)
+    await _auto_link_related(identity, _expected_source=guard)
+    return identity
+
+
 _S4_HOLD_GROW_RUNNERS = {}
 
 
@@ -10506,7 +10591,7 @@ async def hold(
     # --- Pinned buckets bypass merge and are created directly in permanent dir ---
     # --- 钉选桶跳过合并，直接新建到 permanent 目录 ---
     if pinned:
-        bucket_id = await bucket_mgr.create(
+        values = dict(
             content=content,
             tags=all_tags,
             importance=10,
@@ -10520,11 +10605,9 @@ async def hold(
             todo_provenance=automatic_todo_provenance(analysis_todos),
             provenance_kind=explicit_provenance_kind,
         )
-        if should_record_emotion:
-            _record_emotion_snapshot(valence, arousal, "hold", bucket_id)
-        if trigger_date:
-            await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
-        await _auto_link_related(bucket_id)
+        bucket_id = await _await_legacy_post_effects(
+            _run_legacy_pinned, copy.deepcopy(values),
+            (valence, arousal) if should_record_emotion else None, trigger_date)
         response = f"📌{await _format_hold_created(bucket_id)}"
         if similarity_notice:
             response += f"\nsimilarity: {similarity_notice}"
@@ -11516,19 +11599,11 @@ async def archive_session(
             return await execute_archive_operation(
                 store, operation, bucket_mgr.embedding_engine, write_snapshot,
             )
-        plan = await short_step(store.publish_legacy, payload, config)
-        bucket_id = plan["bucket_id"]
-        bucket_mgr._record_boot_delta_event(bucket_id, "created")
-        if not sealed:
-            await bucket_mgr._refresh_ordinary_embedding_best_effort(bucket_id, plan["embedding_input"])
-        if payload["letter"]:
-            bucket_mgr.record_letter(payload["letter"], bucket_id, sealed=sealed)
-        if plan["snapshot"] is not None:
-            entry = plan["snapshot"]
-            _record_emotion_snapshot(entry["valence"], entry["arousal"], "archive", bucket_id)
-        return plan["result_text"]
+        return await _await_legacy_post_effects(_run_legacy_archive, store, copy.deepcopy(payload), copy.deepcopy(config))
     except Exception as exc:
-        code = exc.code if isinstance(exc, ArchiveSessionError) else "archive_session_storage_failed"
+        code = (exc.code if isinstance(exc, ArchiveSessionError)
+                or (operation_id is None and isinstance(exc, BucketIdempotencyError))
+                else "archive_session_storage_failed")
         if operation is not None and code != "archive_operation_payload_conflict":
             try:
                 store.blocked(operation_id, code)

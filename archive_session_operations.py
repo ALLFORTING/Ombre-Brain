@@ -331,11 +331,13 @@ class ArchiveSessionOperations:
         self._verify_bucket(plan)
 
     @guarded_mutation("archive_session_legacy_publish")
-    def publish_legacy(self, payload, config):
+    def publish_legacy(self, payload, config, *, _capture_source=False):
         # Runtime has initialized the root mutex. No journal schema initialization.
         with bucket_write_scope(self.root), closing(self._connect(readonly=True)) as conn:
             plan = self._plan(payload, None, conn, config)
             self._publish(plan)
+            if _capture_source:
+                plan['source_guard'] = self.delete_admission.capture(plan['bucket_id'])
             return plan
 
     @guarded_mutation("archive_session_publish")
