@@ -743,3 +743,110 @@ async def test_s4e_stateless_stays_default_off(ob,monkeypatch):
     monkeypatch.delenv('OMBRE_MCP_STATELESS_HTTP',raising=False)
     async with live(ob) as client:
         assert await initialize(client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("entry", ["metadata", "reindex"])
+@pytest.mark.parametrize("boundary", ["provider", "response"])
+async def test_legacy_asset_index_tcp_cancellation_safety(ob, monkeypatch, tmp_path, stateless, entry, boundary):
+    import hashlib
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
+    store, index, engine = ob.asset_store, ob.asset_embedding_index, ob.embedding_engine
+    engine.enabled, engine.model = True, "tcp-synthetic-v1"
+    engine._generate_embedding = AsyncMock(return_value=[1., 0.])
+    source = store.create_temp_path()
+    source.write_bytes(b"synthetic TCP asset")
+    asset = store.persist_upload(source, hashlib.sha256(source.read_bytes()).hexdigest(),
+                                 source.stat().st_size, "synthetic.bin", "application/octet-stream")
+    identity = asset["asset_id"]
+    asset = store.update_metadata(identity, title="old keyword")
+    assert await index.index_asset(asset) == "indexed"
+    old = index._existing(identity)
+    started, release, cancelled, finished = [asyncio.Event() for _ in range(4)]
+    calls = 0
+    async def provider(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if boundary == "provider" and calls == 1:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                finished.set()
+        return [0., 1.]
+    engine._generate_embedding = provider
+    if entry == "metadata":
+        name = "rm_asset_update_metadata"
+        arguments = {"asset_id": identity, "title": "new keyword"}
+    else:
+        store.update_metadata(identity, title="new keyword")
+        name = "rm_asset_reindex_embeddings"
+        arguments = {"asset_id": identity}
+    tool = ob.mcp._tool_manager.get_tool(name)
+    original = tool.fn
+    outcomes = []
+    async def response_loss(**kwargs):
+        output = await original(**kwargs)
+        outcomes.append(output)
+        if len(outcomes) == 1:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                finished.set()
+        return output
+    if boundary == "response":
+        monkeypatch.setattr(tool, "fn", response_loss)
+    async with live(ob) as client:
+        assert bool(await initialize(client)) is not stateless
+        assert await disconnect_call(client, name, arguments, started)
+        if stateless:
+            await wait(cancelled)
+        else:
+            release.set()
+        await wait(finished)
+        # Round trip lets the stateful handler finish its synchronous commit.
+        result(await rpc(client, "tools/list"))
+        assert store.get(identity)["title"] == "new keyword"
+        before_retry = index._existing(identity)
+        interrupted = stateless and boundary == "provider"
+        assert index.is_current(store.get(identity)) is not interrupted
+        if interrupted:
+            assert before_retry == old
+            engine._generate_embedding = AsyncMock(return_value=[0., 1.])
+            assert await index.search("semantic-only") == {}
+            merged = store.search(query="new keyword", semantic_scores=await index.search("semantic-only"))
+            assert merged["total"] == 1
+            assert "semantic" not in merged["results"][0]["match_reasons"]
+        retry = json.loads(text(await call(client, name, arguments)))
+        assert retry["ok"]
+        assert index.is_current(store.get(identity))
+        stable = index._existing(identity)
+        count = calls
+        recovery_calls = engine._generate_embedding.await_count if interrupted else None
+        again = json.loads(text(await call(client, name, arguments)))
+        assert again["ok"] and index._existing(identity) == stable
+        if interrupted:
+            assert engine._generate_embedding.await_count == recovery_calls
+        if entry == "reindex":
+            assert retry["indexed"] == int(interrupted)
+            assert retry["skipped"] == int(not interrupted)
+            assert again == {"ok": True, "scanned": 1, "indexed": 0, "skipped": 1, "failed": 0}
+        if not interrupted:
+            assert calls == count == 1
+        evidence = {"entry": entry, "stateless": stateless, "boundary": boundary,
+                    "cancelled": cancelled.is_set(), "old_preserved": before_retry == old,
+                    "current_before_retry": not interrupted, "current_after_retry": True,
+                    "retry": retry, "repeat": again, "provider_calls_before_recovery": count}
+        print("ASSET_TCP_EVIDENCE " + json.dumps(evidence, sort_keys=True))
+        import os
+        if os.environ.get("S5_RUN"):
+            (Path(os.environ["S5_RUN"]) / ("asset-tcp-" + entry + "-" + str(stateless) + "-" + boundary + ".json")).write_text(
+                json.dumps(evidence, indent=2), encoding="utf-8")

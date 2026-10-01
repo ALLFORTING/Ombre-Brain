@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import importlib
 import json
@@ -39,7 +40,7 @@ def _engine_config(root, model="fake-embedding-v1"):
     }
 
 
-def _fake_vector(text):
+def _fake_vector(text, *, model=None):
     normalized = text.casefold()
     if text == QUERY or "定位信息" in text or "gps cleanup" in normalized:
         return [1.0, 0.0, 0.0]
@@ -166,6 +167,7 @@ async def test_metadata_update_refreshes_once_and_failure_does_not_rollback(
     assert first["ok"] is True
     assert second["ok"] is True
     assert generate.await_count == 1
+    old_index = server.asset_embedding_index._existing(asset['asset_id'])
 
     server.embedding_engine._generate_embedding = AsyncMock(
         side_effect=RuntimeError("safe fake failure")
@@ -181,7 +183,8 @@ async def test_metadata_update_refreshes_once_and_failure_does_not_rollback(
     assert server.asset_store.get(asset["asset_id"])["description"] == (
         "Metadata update still commits"
     )
-    assert server.asset_embedding_index._existing(asset["asset_id"]) is None
+    assert server.asset_embedding_index._existing(asset["asset_id"]) == old_index
+    assert not server.asset_embedding_index.is_current(asset)
 
 
 @pytest.mark.asyncio
@@ -365,3 +368,231 @@ async def test_reindex_tool_and_search_response_do_not_leak_vectors(
     )
     assert invalid_limit == {"ok": False, "error": "invalid_limit"}
     assert missing == {"ok": False, "error": "asset_unavailable"}
+
+async def _indexed_case(tmp_path):
+    store = AssetStore(tmp_path / "data")
+    engine = _fake_engine(store.data_root)
+    index = AssetEmbeddingIndex(store, engine)
+    asset = store.update_metadata(_persist(store, b"race")["asset_id"], title="GPS cleanup old")
+    assert await index.index_asset(asset) == "indexed"
+    return store, engine, index, asset, index._existing(asset["asset_id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancel", "exception", "empty", "nan", "infinity", "bool", "zero", "huge"])
+async def test_replacement_failure_preserves_exact_old_row(tmp_path, failure):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="changed keyword")
+    async def provider(*args, **kwargs):
+        # A second connection can acquire the SQLite writer while provider runs.
+        with sqlite3.connect(store.db_path, timeout=0) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+        assert index._lock.acquire(blocking=False)
+        index._lock.release()
+        assert index.write_coordinator.status().active_writers == 0
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        if failure == "exception":
+            raise RuntimeError("synthetic")
+        return {"empty": [], "nan": [float("nan")], "infinity": [float("inf")],
+                "bool": [True], "zero": [0.0], "huge": [10 ** 400]}[failure]
+    engine._generate_embedding = provider
+    if failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await index.index_asset(asset)
+    else:
+        assert await index.index_asset(asset) == "failed"
+    assert index._existing(asset["asset_id"]) == old
+    assert not index.is_current(asset)
+    engine._generate_embedding = AsyncMock(return_value=[1., 0., 0.])
+    assert await index.search(QUERY) == {}
+    result = store.search(query="changed", semantic_scores=await index.search(QUERY))
+    assert result["total"] == 1
+    assert "semantic" not in result["results"][0]["match_reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["metadata", "tags", "model", "delete", "reindex"])
+async def test_conditional_replacement_rejects_delayed_provider(tmp_path, race):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="GPS cleanup replacement")
+    async def provider(*args, **kwargs):
+        if race == "metadata":
+            store.update_metadata(asset["asset_id"], description="newer metadata")
+        elif race == "tags":
+            store.update_metadata(asset["asset_id"], tags=["newer tag"])
+        elif race == "model":
+            engine.model = "newer model"
+        elif race == "delete":
+            store.delete(asset["asset_id"])
+        else:
+            other = AssetEmbeddingIndex(store, _fake_engine(store.data_root))
+            assert await other.index_asset(asset) == "indexed"
+        return [0., 1., 0.]
+    engine._generate_embedding = provider
+    assert await index.index_asset(asset) == ("skipped" if race == "reindex" else "failed")
+    if race == "delete":
+        assert index._existing(asset["asset_id"]) is None
+        assert store.get(asset["asset_id"]) is None
+    elif race == "reindex":
+        assert json.loads(index._existing(asset["asset_id"])["embedding"]) == [1., 0., 0.]
+    else:
+        assert index._existing(asset["asset_id"]) == old
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["metadata", "tags", "model", "index", "delete"])
+async def test_final_merge_rechecks_binding_and_preserves_keyword(tmp_path, race):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    scores = await index.search(QUERY)
+    assert scores
+    if race == "metadata":
+        store.update_metadata(asset["asset_id"], description="later")
+    elif race == "tags":
+        store.update_metadata(asset["asset_id"], tags=["later"])
+    elif race == "model":
+        engine.model = "later"
+    elif race == "index":
+        index.delete(asset["asset_id"])
+    else:
+        store.delete(asset["asset_id"])
+    merged = store.search(query="GPS", semantic_scores=scores, limit=1)
+    assert merged["total"] == (0 if race == "delete" else 1)
+    if merged["results"]:
+        assert "semantic" not in merged["results"][0]["match_reasons"]
+        assert merged["results"][0].get("semantic_score", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_rolls_back_replacement(tmp_path, monkeypatch):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="replacement")
+    original = index._connect
+    class CommitFailure:
+        def __init__(self):
+            self.conn = original()
+            self.writer = False
+        def __enter__(self):
+            self.conn.__enter__()
+            return self
+        def execute(self, sql, *args):
+            self.writer |= sql == "BEGIN IMMEDIATE"
+            return self.conn.execute(sql, *args)
+        def __exit__(self, kind, value, tb):
+            if self.writer and kind is None:
+                self.conn.rollback()
+                self.conn.close()
+                raise sqlite3.OperationalError("synthetic commit failure")
+            return self.conn.__exit__(kind, value, tb)
+    monkeypatch.setattr(index, "_connect", CommitFailure)
+    with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+        await index.index_asset(asset)
+    monkeypatch.setattr(index, "_connect", original)
+    assert index._existing(asset["asset_id"]) == old
+
+
+@pytest.mark.asyncio
+async def test_cross_process_replacement_wins_over_delayed_provider(tmp_path):
+    import os
+    import subprocess
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="GPS cleanup replacement")
+    async def provider(*args, **kwargs):
+        script = (
+            "import asyncio, os; print('SYNTHETIC_CHILD_PID', os.getpid()); from asset_store import AssetStore; "
+            "from asset_embedding_index import AssetEmbeddingIndex; "
+            "from types import SimpleNamespace; "
+            "from unittest.mock import AsyncMock; "
+            "s=AssetStore(" + repr(str(store.data_root)) + "); "
+            "e=SimpleNamespace(model='fake-embedding-v1',enabled=True,"
+            "_generate_embedding=AsyncMock(return_value=[1.,0.,0.])); "
+            "i=AssetEmbeddingIndex(s,e); "
+            "assert asyncio.run(i.index_asset(s.get(" + repr(asset["asset_id"]) + ")))=='indexed'"
+        )
+        completed = subprocess.run([sys.executable, "-B", "-c", script],
+                                   capture_output=True, text=True, timeout=15, env=os.environ.copy())
+        assert completed.returncode == 0, completed.stderr
+        print(completed.stdout.strip())
+        return [0., 1., 0.]
+    engine._generate_embedding = provider
+    assert await index.index_asset(asset) == "skipped"
+    assert json.loads(index._existing(asset["asset_id"])["embedding"]) == [1., 0., 0.]
+
+
+@pytest.mark.asyncio
+async def test_empty_metadata_clears_index_and_disabled_provider_preserves_stale(tmp_path):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="changed")
+    engine.enabled = False
+    assert await index.index_asset(asset) == "failed"
+    assert index._existing(asset["asset_id"]) == old
+    asset = store.update_metadata(asset["asset_id"], title="", description="", tags=[])
+    assert await index.index_asset(asset) == "skipped"
+    assert index._existing(asset["asset_id"]) is None
+    assert index.is_current(asset)
+
+
+@pytest.mark.asyncio
+async def test_same_connection_commit_reads_change_at_begin_immediate(tmp_path, monkeypatch):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    asset = store.update_metadata(asset["asset_id"], title="replacement")
+    original = index._connect
+    class CommitRace:
+        def __init__(self):
+            self.conn = original()
+        def __enter__(self):
+            self.conn.__enter__()
+            return self
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                store.update_metadata(asset["asset_id"], tags=["newer just before commit"])
+            return self.conn.execute(sql, *args)
+        def __exit__(self, *args):
+            return self.conn.__exit__(*args)
+    monkeypatch.setattr(index, "_connect", CommitRace)
+    assert await index.index_asset(asset) == "failed"
+    monkeypatch.setattr(index, "_connect", original)
+    assert index._existing(asset["asset_id"]) == old
+
+
+@pytest.mark.asyncio
+async def test_final_merge_uses_one_read_snapshot(tmp_path, monkeypatch):
+    import threading
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    scores = await index.search(QUERY)
+    original = store._tags_for_assets
+    staged = threading.Event()
+    def concurrent_write():
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute('UPDATE assets SET title = ? WHERE asset_id = ?',
+                         ('later committed', asset['asset_id']))
+            staged.set()
+    writer = threading.Thread(target=concurrent_write)
+    def read_then_concurrent_update(conn, identities):
+        tags = original(conn, identities)
+        # The default rollback journal delays its commit until this read ends.
+        writer.start()
+        assert staged.wait(5)
+        return tags
+    monkeypatch.setattr(store, "_tags_for_assets", read_then_concurrent_update)
+    merged = store.search(query="GPS", semantic_scores=scores)
+    assert merged["total"] == 1
+    assert merged["results"][0]["title"] == "GPS cleanup old"
+    assert merged["results"][0]["semantic_score"] == 1.
+    writer.join(5)
+    assert not writer.is_alive()
+    monkeypatch.setattr(store, "_tags_for_assets", original)
+    assert not index.is_current(store.get(asset["asset_id"]))
+    assert await index.search(QUERY) == {}
+
+
+@pytest.mark.asyncio
+async def test_query_model_change_does_not_publish_mixed_model_scores(tmp_path):
+    store, engine, index, asset, old = await _indexed_case(tmp_path)
+    async def provider(*args, **kwargs):
+        assert kwargs["model"] == "fake-embedding-v1"
+        engine.model = "changed-during-query"
+        return [1., 0., 0.]
+    engine._generate_embedding = provider
+    assert await index.search(QUERY) == {}

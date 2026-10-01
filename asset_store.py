@@ -939,6 +939,9 @@ class AssetStore:
             conn.execute("BEGIN")
             rows = conn.execute(f"SELECT * FROM assets {where}", params).fetchall()
             tags_by_asset = self._tags_for_assets(conn, [row["asset_id"] for row in rows])
+            validate_scores = getattr(semantic_scores, '_validated_scores', None)
+            if validate_scores is not None:
+                semantic_scores = validate_scores(conn, rows, tags_by_asset)
 
         matches = []
         for row in rows:
