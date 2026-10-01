@@ -52,17 +52,34 @@ def build(ob):
 
 
 @asynccontextmanager
-async def live(ob):
+async def live(ob, *, access_log=False, scope_snapshots=None):
     """Real HTTP, including TCP disconnect; no manual task cancellation injection."""
     # sse-starlette has a process-global shutdown flag. Each test runs a new
     # ephemeral server; restore it after shutdown so later apps are not drained.
     previous_exit = AppStatus.should_exit
     AppStatus.should_exit = False
     app = build(ob)
+    if access_log:
+        ob.install_uvicorn_access_log_redaction()
+    if scope_snapshots is not None:
+        from copy import deepcopy
+        original_app = app
+        async def observed_app(scope, receive, send):
+            if scope["type"] != "http":
+                return await original_app(scope, receive, send)
+            fields = ("path", "raw_path", "query_string", "headers", "method", "http_version")
+            before = deepcopy({key: scope.get(key) for key in fields})
+            try:
+                await original_app(scope, receive, send)
+            finally:
+                scope_snapshots.append((before, deepcopy({key: scope.get(key) for key in fields})))
+        app = observed_app
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen(128)
-    config = uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on")
+    log_options = {"log_config": None} if access_log else {}
+    config = uvicorn.Config(app, log_level="info" if access_log else "warning",
+                            access_log=access_log, lifespan="on", **log_options)
     runner = uvicorn.Server(config)
     task = asyncio.create_task(runner.serve(sockets=[sock]))
     try:
@@ -969,3 +986,125 @@ async def test_legacy_asset_index_tcp_cancellation_safety(ob, monkeypatch, tmp_p
         if os.environ.get("S5_RUN"):
             (Path(os.environ["S5_RUN"]) / ("asset-tcp-" + entry + "-" + str(stateless) + "-" + boundary + ".json")).write_text(
                 json.dumps(evidence, indent=2), encoding="utf-8")
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("authority", ["legacy", "rm"])
+async def test_access_log_tickets_real_http(ob, monkeypatch, caplog, stateless, authority):
+    """Real custom routes, real L/R persistence, and formatted server logs."""
+    import hashlib
+    import io
+    from PIL import Image
+
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", "true")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "private-query-log-test")
+    runtime = ob._get_runtime_components()
+    if authority == "rm":
+        from asset_backend import RuntimeAssetBackendRegistry
+        from tests.test_rm_cutover_routing import _open_rm_state
+        pytest.importorskip("remember_me")
+        root = Path(ob.config["buckets_dir"])
+        monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
+        monkeypatch.setenv("OMBRE_RM_DATA_ROOT", str(root / "remember-me"))
+        bundle = ob._bootstrap_remember_me_host(runtime["asset_store"], runtime["embedding_engine"])
+        _open_rm_state(root)
+        monkeypatch.setenv("OMBRE_ASSET_AUTHORITY", "rm")
+        registry = RuntimeAssetBackendRegistry.from_runtime(
+            legacy_store=runtime["asset_store"], bundle_provider=lambda: bundle,
+            embedding_index=runtime["asset_embedding_index"],
+        )
+        runtime.update(remember_me_host_bundle=bundle, asset_backend_registry=registry)
+    assert ob._selected_asset_backend().name == authority
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.WARNING)
+    access = logging.getLogger("uvicorn.access")
+    monkeypatch.setattr(access, "handlers", [caplog.handler])
+    monkeypatch.setattr(access, "propagate", False)
+    monkeypatch.setattr(access, "filters", list(access.filters))
+    image = io.BytesIO()
+    Image.new("RGB", (7, 5), "purple").save(image, format="PNG")
+    raw = image.getvalue()
+    scopes, secrets_seen = [], ["s2-private-bearer", "private-query-log-test", "private-old-session"]
+    expected_rows = []
+    with caplog.at_level(logging.INFO):
+        async with live(ob, access_log=True, scope_snapshots=scopes) as client:
+            session = await initialize(client)
+            assert bool(session) == (not stateless)
+            if session:
+                secrets_seen.append(session)
+            browser = json.loads(await ob.asset_browser_upload_link(
+                len(raw), hashlib.sha256(raw).hexdigest(), "synthetic.png", "image/png"))
+            upload = json.loads(text(await call(client, "rm_asset_upload_link", {
+                "expected_bytes": len(raw), "filename": "synthetic.png", "mime_type": "image/png"})))
+            assert browser["ok"] and upload["ok"]
+            # Seed a real asset for the download route; a separate ticket is used for upload.
+            backend = ob._selected_asset_backend()
+            if authority == "rm":
+                asset = backend.ingest_public_metadata(raw, len(raw), "synthetic.png", "image/png",
+                                                       title="", description="", tags=())
+            else:
+                temp = backend.create_temp_path()
+                temp.write_bytes(raw)
+                asset = backend.persist_upload(temp, hashlib.sha256(raw).hexdigest(), len(raw),
+                                               "synthetic.png", "image/png", require_image=True)
+            download = json.loads(text(await call(client, "rm_asset_download_link", {"asset_id": asset["asset_id"]})))
+            trial = ob._asset_new_vision_trial()
+            assert ob._asset_store_vision_trial(trial)[0]
+            vision = json.loads(ob._asset_create_vision_download_link(trial["trial_id"]))
+            assert download["ok"] and vision["ok"]
+            paths = [browser["upload_path"], upload["upload_path"], download["download_path"], vision["download_path"]]
+            for path in paths:
+                secrets_seen.append(path.rsplit("/", 1)[1])
+                prefix = path.rsplit("/", 1)[0]
+                # Percent-encoded prefix, separators and token characters must behave identically.
+                encoded = "/" + "".join(f"%{ord(c):02X}" for c in path[1:])
+                before = await client.get(path + "?mode=kept")
+                encoded_response = await client.get(encoded + "?mode=kept")
+                assert before.status_code == encoded_response.status_code == 200
+                assert before.content == encoded_response.content
+                redirected = await client.get(path + "/?mode=kept", follow_redirects=False)
+                assert redirected.status_code == 307
+                assert redirected.headers["location"].endswith(path + "?mode=kept")
+                uploading = prefix in ("/rm/upload", "/rm/asset-upload")
+                head = await client.head(path)
+                assert head.status_code == (400 if uploading else 200)
+                assert not head.content
+                assert (await client.put(path)).status_code == 405
+                if not uploading:
+                    assert int(head.headers["content-length"]) == len(before.content)
+                post = await client.post(path, files={"file": ("synthetic.png", raw, "image/png")})
+                assert post.status_code == (200 if uploading else 405)
+                if uploading:
+                    assert (await client.post(path, files={"file": ("synthetic.png", raw, "image/png")})).status_code == 404
+                assert (await client.get(prefix + "/invalid-ticket")).status_code == 404
+                expected_rows.extend([(prefix, "GET", 200), (prefix, "GET", 307),
+                                      (prefix, "HEAD", head.status_code), (prefix, "PUT", 405), (prefix, "POST", post.status_code),
+                                      (prefix, "GET", 404)])
+            status = json.loads(text(await call(client, "rm_asset_upload_status", {"upload_id": upload["upload_id"]})))
+            assert status["state"] == "completed" and status["source_sha256"] == hashlib.sha256(raw).hexdigest()
+            assert json.loads(await ob.asset_browser_upload_status(browser["upload_id"]))["state"] == "completed"
+            assert (await rpc(client, "tools/list", path="/mcp?mode=kept&token=private-query-log-test",
+                              headers={"Authorization": ""})).status_code == 200
+            assert (await rpc(client, "tools/list", headers={"Authorization": "Bearer private-wrong-bearer"})).status_code == 401
+            assert (await rpc(client, "tools/list", headers={"Mcp-Session-Id": "private-old-session"})).status_code == (200 if stateless else 404)
+            secrets_seen.append("private-wrong-bearer")
+            assert (await client.get("/health?mode=kept")).status_code == 200
+            def fail_download(*args, **kwargs):
+                raise RuntimeError("controlled download failure")
+            monkeypatch.setattr(ob, "_asset_read_vision_download", fail_download)
+            assert (await client.get(vision["download_path"])).status_code == 500
+            expected_rows.append(("/rm/vision-download", "GET", 500))
+    rows = [record.getMessage() for record in caplog.records if record.name == "uvicorn.access"]
+    for prefix, method, code in expected_rows:
+        assert any(f'"{method} {prefix}/[redacted]' in row and row.endswith(f'" {code}') for row in rows)
+    assert any("/mcp?mode=kept&token=[redacted] HTTP/1.1" in row for row in rows)
+    assert any("/health?mode=kept HTTP/1.1" in row for row in rows)
+    assert "controlled download failure" in caplog.text
+    assert all(secret not in caplog.text for secret in secrets_seen)
+    assert any("?mode=kept HTTP/1.1" in row for row in rows)
+    assert scopes and all(before == after for before, after in scopes)
+    observed_paths = {before["path"] for before, after in scopes}
+    assert set(paths) <= observed_paths

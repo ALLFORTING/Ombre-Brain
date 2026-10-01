@@ -218,23 +218,38 @@ _ACCESS_LOG_QUERY_TOKEN_PATTERN = re.compile(
 )
 
 
+_ACCESS_LOG_TICKET_PATH_PATTERN = re.compile(
+    r"^(/rm/(?:upload|asset-upload|asset-download|vision-download)/)(.+?)(/?)$",
+)
+
+
+def _redact_uvicorn_access_path(path_with_query: str) -> str:
+    """Sanitize the log copy of a Uvicorn path; never change ASGI scope.
+
+    Uvicorn logs a quoted, already decoded scope path. Hide the entire
+    capability suffix, including malformed requests, independently of status.
+    """
+    path, separator, query = path_with_query.partition("?")
+    path = _ACCESS_LOG_TICKET_PATH_PATTERN.sub(r"\1[redacted]\3", path)
+    return _ACCESS_LOG_QUERY_TOKEN_PATTERN.sub(
+        r"\1[redacted]", path + separator + query,
+    )
+
+
 class _UvicornAccessTokenRedactionFilter(logging.Filter):
-    """Redact query-token values without changing the request scope."""
+    """Redact path tickets and query tokens without changing request scope."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
             redacted_args = list(args)
-            redacted_args[2] = _ACCESS_LOG_QUERY_TOKEN_PATTERN.sub(
-                r"\1[redacted]",
-                args[2],
-            )
+            redacted_args[2] = _redact_uvicorn_access_path(args[2])
             record.args = tuple(redacted_args)
         return True
 
 
 def install_uvicorn_access_log_redaction() -> None:
-    """Install the idempotent server-side query-token log filter.
+    """Install the idempotent server-side path-ticket/query-token log filter.
 
     This relies on uvicorn keeping the raw path/query string in record.args[2];
     revisit the filter whenever uvicorn or the access-log formatter changes.

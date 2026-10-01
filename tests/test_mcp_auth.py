@@ -1,6 +1,8 @@
 import importlib
 import logging
 import sys
+
+import pytest
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -300,3 +302,59 @@ def test_both_http_entrypoints_use_shared_cors_policy():
     assert "server.install_uvicorn_access_log_redaction()" in backup_source
     assert 'allow_origins=["*"]' not in server_source
     assert 'allow_origins=["*"]' not in backup_source
+
+
+
+@pytest.fixture
+def access_redaction_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
+    return _load_server(monkeypatch)
+
+
+@pytest.mark.parametrize("route", ["upload", "asset-upload", "asset-download", "vision-download"])
+@pytest.mark.parametrize("method", ["GET", "POST", "HEAD"])
+@pytest.mark.parametrize("status", [200, 404, 405, 307, 500])
+def test_access_ticket_redaction_preserves_request_and_diagnostics(
+    access_redaction_server, route, method, status,
+):
+    from copy import deepcopy
+    from uvicorn.protocols.utils import get_path_with_query_string
+
+    scope = {"path": f"/rm/{route}/private-path-ticket",
+             "query_string": b"mode=kept&token=private-query&after=also-kept",
+             "method": method, "http_version": "1.1",
+             "headers": [(b"authorization", b"Bearer private-bearer")],
+             "raw_path": f"/rm/{route}/private-path-ticket".encode()}
+    original_scope = deepcopy(scope)
+    original_args = ("127.0.0.1:1234", method, get_path_with_query_string(scope), "1.1", status)
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
+                               '%s - "%s %s HTTP/%s" %d', original_args, None)
+    assert access_redaction_server._UvicornAccessTokenRedactionFilter().filter(record)
+    formatted = logging.Formatter("%(name)s %(message)s").format(record)
+    assert formatted == (f'uvicorn.access 127.0.0.1:1234 - "{method} /rm/{route}/[redacted]'
+                         f'?mode=kept&token=[redacted]&after=also-kept HTTP/1.1" {status}')
+    assert scope == original_scope
+    assert original_args[2] == get_path_with_query_string(original_scope)
+    assert record.args[:2] == original_args[:2] and record.args[3:] == original_args[3:]
+
+
+@pytest.mark.parametrize("route", ["upload", "asset-upload", "asset-download", "vision-download"])
+@pytest.mark.parametrize("suffix", ["private-ticket/", "invalid%25ticket", "ticket%2fextra",
+                                    "%70rivate%2Dticket", "%2570rivate", "ticket%3fextra"])
+def test_access_ticket_redaction_handles_uvicorn_encoded_paths(access_redaction_server, route, suffix):
+    from urllib.parse import unquote
+    from uvicorn.protocols.utils import get_path_with_query_string
+
+    raw_path = f"/%72m%2f{route}/{suffix}"
+    scope = {"path": unquote(raw_path), "raw_path": raw_path.encode(), "query_string": b"keep=yes"}
+    logged = get_path_with_query_string(scope)
+    expected = f"/rm/{route}/[redacted]" + ("/" if suffix.endswith("/") else "") + "?keep=yes"
+    assert access_redaction_server._redact_uvicorn_access_path(logged) == expected
+    assert scope["raw_path"] == raw_path.encode() and scope["path"] == unquote(raw_path)
+
+
+@pytest.mark.parametrize("path", ["/health?mode=kept", "/rm/upload-status/public-id",
+                                  "/rm/asset-upload-status/public-id", "/api/assets/public-id/image",
+                                  "/rm/asset-upload-other/not-a-ticket", "/rm/upload/"])
+def test_access_ticket_redaction_keeps_non_ticket_paths(access_redaction_server, path):
+    assert access_redaction_server._redact_uvicorn_access_path(path) == path
