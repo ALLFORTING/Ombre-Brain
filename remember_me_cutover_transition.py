@@ -16,6 +16,8 @@ operation.
 
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 import argparse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -58,7 +60,7 @@ from cutover_lease_capability import (
 TOOL_NAME = "ombre-rm-cutover-transition"
 TOOL_VERSION = "1.0.0-d2"
 D2_SCHEMA_VERSION = 1
-RM_SOURCE_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
+RM_SOURCE_COMMIT = DEPENDENCY.commit
 SAFE_ID = re.compile(r"[A-Za-z0-9_.:@/-]{1,160}\Z")
 SAFE_REASON = re.compile(r"[A-Za-z0-9_.:@/ -]{1,256}\Z")
 

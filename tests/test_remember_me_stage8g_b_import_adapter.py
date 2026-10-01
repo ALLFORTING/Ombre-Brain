@@ -40,17 +40,13 @@ from remember_me_import_adapter import (
 )
 
 
+from remember_me_dependency import DEPENDENCY
+
 ROOT = Path(__file__).resolve().parent.parent
-RM_VERSION = "0.1.0.dev7"
-RM_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
-RM_ARCHIVE_SHA256 = (
-    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
-)
-RM_ARCHIVE_URL = (
-    "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
-    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
-)
+RM_VERSION = DEPENDENCY.version
+RM_COMMIT = DEPENDENCY.commit
+RM_ARCHIVE_SHA256 = DEPENDENCY.sha256
+RM_ARCHIVE_URL = DEPENDENCY.url
 CREATED_AT = "2026-06-01T01:02:03+00:00"
 TAG_CREATED_AT = "2026-06-01T01:03:04+00:00"
 UPDATED_AT = "2026-06-02T05:06:07+00:00"
@@ -202,7 +198,7 @@ def test_pin_version_and_public_import_contract():
         RM_ARCHIVE_URL,
         RM_ARCHIVE_SHA256,
     )
-    assert RM_COMMIT in RM_ARCHIVE_URL
+    assert RM_COMMIT == DEPENDENCY.commit
     assert PROJECT_VERSION == RM_VERSION
     assert all(
         item is not None

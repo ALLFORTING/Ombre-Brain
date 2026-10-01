@@ -29,19 +29,15 @@ from remember_me_adapter import (
 )
 
 
+from remember_me_dependency import DEPENDENCY
+
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "0.1.0.dev7"
-EXPECTED_TAG = "v0.1.0-dev.7-public.1"
-EXPECTED_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
-EXPECTED_TREE = "a958d995421c97ccc572b127cb859797aa7a415f"
-EXPECTED_ARCHIVE_SHA256 = (
-    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
-)
-EXPECTED_ARCHIVE_URL = (
-    "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
-    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
-)
+EXPECTED_VERSION = DEPENDENCY.version
+EXPECTED_TAG = DEPENDENCY.tag
+EXPECTED_COMMIT = DEPENDENCY.commit
+EXPECTED_TREE = DEPENDENCY.tree
+EXPECTED_ARCHIVE_SHA256 = DEPENDENCY.sha256
+EXPECTED_ARCHIVE_URL = DEPENDENCY.url
 OLD_COMMIT = "184e223c6392fd14dd5cfa73227d41f46d90e3c8"
 
 
@@ -68,7 +64,7 @@ def test_dependency_is_immutable_release_asset_and_digest_pinned():
     assert len(EXPECTED_COMMIT) == 40
     assert EXPECTED_VERSION in EXPECTED_ARCHIVE_URL
     assert EXPECTED_TAG in EXPECTED_ARCHIVE_URL
-    assert EXPECTED_COMMIT in EXPECTED_ARCHIVE_URL
+    assert EXPECTED_COMMIT in integration_text
     assert EXPECTED_TREE in integration_text
     assert "git+" not in line
     assert "remember-me[" not in line
@@ -235,3 +231,101 @@ def test_adapter_module_does_not_import_standalone_or_server():
 
     assert "remember_me.standalone" not in sys.modules
     assert "server" not in sys.modules
+
+
+@pytest.mark.parametrize("change", [
+    lambda t: t.replace("# BEGIN REMEMBER-ME PIN", "# WRONG"),
+    lambda t: t + t[t.index("# BEGIN REMEMBER-ME PIN"):t.index("# END REMEMBER-ME PIN") + len("# END REMEMBER-ME PIN")],
+    lambda t: t.replace("# tree:", "# unknown:"),
+    lambda t: t.replace("# version: 0.1.0", "# version: 0.1.0.dev7"),
+    lambda t: t.replace("# tag: v0.1.0", "# tag: v0.1.1"),
+    lambda t: t.replace("#sha256=", "#sha256=NOTHEX"),
+    lambda t: t + "\nremember_me==0.1.0\n",
+    lambda t: t.replace("remember-me @", " remember-me @"),
+    lambda t: t.replace("/download/v0.1.0/", "/download/v0.1.1/"),
+    lambda t: t.replace("# commit: ", "# commit: A"),
+])
+def test_fixed_dependency_stanza_rejects_missing_duplicate_or_malformed(change):
+    from remember_me_dependency import parse_dependency
+    with pytest.raises(ValueError, match="^remember_me_pin_invalid$"):
+        parse_dependency(change((ROOT / "requirements.txt").read_text()))
+
+
+def test_dependency_path_does_not_depend_on_cwd(tmp_path):
+    import json
+    script = "import json; from remember_me_dependency import DEPENDENCY; print(json.dumps(DEPENDENCY.__dict__))"
+    output = subprocess.check_output([sys.executable, "-c", script], cwd=tmp_path, env=os.environ.copy(), text=True)
+    assert json.loads(output) == DEPENDENCY.__dict__
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("archive", [
+    {"hash": "sha256=" + DEPENDENCY.sha256},
+    {"hashes": {"sha256": DEPENDENCY.sha256}},
+    {"hash": "sha256=" + DEPENDENCY.sha256, "hashes": {"sha256": DEPENDENCY.sha256}},
+])
+def test_standard_direct_url_hash_representations(archive):
+    import json
+    adapter_module._validate_archive_provenance(json.dumps({"url": DEPENDENCY.url, "archive_info": archive}))
+
+
+@pytest.mark.parametrize("value", [
+    None, "{}", "not-json",
+    '{"url":"x","url":"y","archive_info":{}}',
+    {"url": "file:///local/archive.tar.gz", "archive_info": {"hashes": {"sha256": DEPENDENCY.sha256}}},
+    {"url": DEPENDENCY.url, "archive_info": {}},
+    {"url": DEPENDENCY.url, "archive_info": {"hashes": {"sha256": "0" * 64}}},
+    {"url": DEPENDENCY.url, "archive_info": {"hash": "sha256=" + "0" * 64, "hashes": {"sha256": DEPENDENCY.sha256}}},
+    {"url": DEPENDENCY.url, "archive_info": {"hash": None, "hashes": {"sha256": DEPENDENCY.sha256}}},
+    {"url": DEPENDENCY.url, "dir_info": {}},
+])
+def test_wrong_or_conflicting_installed_provenance_rejected(value):
+    import json
+    raw = json.dumps(value) if isinstance(value, dict) else value
+    with pytest.raises(adapter_module.RememberMeAdapterError, match="^remember_me_contract_mismatch:provenance$"):
+        adapter_module._validate_archive_provenance(raw)
+
+
+def test_runtime_cannot_bypass_provenance_even_with_contract_mock(tmp_path, monkeypatch):
+    real = adapter_module.metadata.distribution("remember-me")
+    class WrongSource:
+        def __getattr__(self, name): return getattr(real, name)
+        def read_text(self, name): return '{}' if name == "direct_url.json" else real.read_text(name)
+    monkeypatch.setattr(adapter_module.metadata, "distribution", lambda _: WrongSource())
+    monkeypatch.setattr(adapter_module, "validate_remember_me_contract", lambda: None)
+    root = tmp_path / "blocked"
+    with pytest.raises(adapter_module.RememberMeAdapterError, match="provenance"):
+        RememberMeAdapter().create_runtime(root)
+    assert not root.exists()
+
+
+def test_same_version_shadow_module_is_rejected_before_storage(tmp_path, monkeypatch):
+    import remember_me.metadata as rm_metadata
+    monkeypatch.setattr(rm_metadata, "__file__", str(tmp_path / "metadata.py"))
+    root = tmp_path / "blocked"
+    with pytest.raises(adapter_module.RememberMeAdapterError, match="module_source"):
+        RememberMeAdapter().create_runtime(root)
+    assert not root.exists()
+
+
+def test_changed_recorded_source_hash_rejected_without_editing_install(monkeypatch):
+    import copy
+    real = adapter_module.metadata.distribution("remember-me")
+    records = [copy.copy(p) for p in real.files]
+    record = next(p for p in records if str(p) == "remember_me/metadata.py")
+    record.hash = adapter_module.metadata.FileHash("sha256=wrong")
+    class ChangedRecord:
+        files = records
+        def locate_file(self, p): return real.locate_file(p)
+    with pytest.raises(adapter_module.RememberMeAdapterError, match="module_source"):
+        adapter_module._validate_distribution_modules(ChangedRecord())
+
+
+def test_reused_runtime_rechecks_provenance(tmp_path, monkeypatch):
+    owner = RememberMeAdapter()
+    runtime = owner.create_runtime(tmp_path / "runtime")
+    def fail(): raise adapter_module.RememberMeAdapterError("remember_me_contract_mismatch:provenance")
+    monkeypatch.setattr(adapter_module, "_checked_distribution", fail)
+    with pytest.raises(adapter_module.RememberMeAdapterError, match="provenance"):
+        owner.create_runtime(tmp_path / "runtime")
+    assert owner._runtime is runtime

@@ -594,3 +594,37 @@ asyncio.run(main())
     output = subprocess.check_output([sys.executable, "-c", script], cwd=ROOT, env=diag_env, text=True)
     diag_names = json.loads(output.strip().splitlines()[-1])
     assert len(diag_names) == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling,counterpart", [("ＡＢＣ", "ABC"), ("①", "1"), ("Ⅰ", "I"), ("Å", "Å"), ("ﬁ", "fi"), ("神", "神"), ("e\u0301", "é")])
+async def test_rm_unicode_spelling_survives_public_update_get_search(tmp_path, monkeypatch, spelling, counterpart):
+    server = _load_server(tmp_path, monkeypatch, rm_enabled=True)
+    core = server.remember_me_host_bundle.core_adapter
+    data = _png_bytes()
+    asset = core.ingest_ob_public_metadata(data, len(data), "Ａ.png", "image/png")
+    payload = json.loads(await server.rm_asset_update_metadata(asset["asset_id"], title=spelling, description=spelling, tags=[spelling]))
+    assert set(payload) == UPDATE_KEYS
+    assert (payload["title"], payload["description"], payload["tags"]) == (spelling, spelling, [spelling])
+    before = core.get_ob_public_metadata(asset["asset_id"])
+    core.update_metadata(asset["asset_id"], tags=[counterpart])
+    after = core.get_ob_public_metadata(asset["asset_id"])
+    assert after["tags"] == [spelling] and after["updated_at"] == before["updated_at"]
+    got = json.loads(await server.rm_asset_get(asset["asset_id"]))
+    assert got["title"] == spelling and got["tags"] == [spelling]
+    result = json.loads(await server.rm_asset_search(query=counterpart, tags=[counterpart]))
+    assert result["total"] == 1 and result["results"][0]["title"] == spelling
+
+
+@pytest.mark.parametrize("values,code", [
+    ({"title": "e\u0301" * 101}, "title_too_long"),
+    ({"title": "ﬁ" * 101}, "title_too_long"),
+    ({"description": "e\u0301" * 2001}, "description_too_long"),
+    ({"tags": ["e\u0301" * 33]}, "tag_too_long"),
+    ({"tags": ["ﬁ" * 33]}, "tag_too_long"),
+])
+def test_rm_display_and_comparison_expansion_limits_keep_ob_errors(values, code):
+    from remember_me_core_adapter import RememberMeCoreAdapter
+    with pytest.raises(RememberMeCoreAdapterError) as caught:
+        RememberMeCoreAdapter._validate_metadata_update(title=values.get("title"), description=values.get("description"), tags=values.get("tags"))
+    assert caught.value.ob_code == code

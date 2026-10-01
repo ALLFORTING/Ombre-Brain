@@ -519,63 +519,48 @@ class RememberMeCoreAdapter:
         description: Any,
         tags: Any,
     ) -> tuple[str, ...] | None:
+        from remember_me.core.normalization import (
+            normalize_title, normalize_description, normalize_tags,
+        )
+
         import unicodedata
 
-        whitespace = re.compile(r"\s+")
-        control_categories = {"Cc", "Cf"}
-        for value, field, maximum in (
-            (title, "title", 200),
-            (description, "description", 4000),
+        for value, field, cleaner in (
+            (title, "title", normalize_title),
+            (description, "description", normalize_description),
         ):
             if value is None:
                 continue
             if type(value) is not str:
-                raise RememberMeCoreAdapterError(
-                    "invalid_metadata", ob_code=f"invalid_{field}"
-                )
-            normalized = unicodedata.normalize("NFKC", value)
-            normalized = "".join(
-                " "
-                if unicodedata.category(character)
-                in control_categories
-                else character
-                for character in normalized
-            )
-            normalized = normalized.strip()
-            if len(normalized) > maximum:
-                raise RememberMeCoreAdapterError(
-                    "invalid_metadata", ob_code=f"{field}_too_long"
-                )
-
-        clean_tags = None if tags is None else cls._tag_tuple(tags)
-        if clean_tags is None:
+                raise RememberMeCoreAdapterError("invalid_metadata", ob_code=f"invalid_{field}")
+            # Preserve OB's existing raw internal-whitespace length gate.
+            comparison = unicodedata.normalize("NFKC", value)
+            comparison = "".join(
+                " " if unicodedata.category(char) in {"Cc", "Cf"} else char
+                for char in comparison
+            ).strip()
+            if len(comparison) > (200 if field == "title" else 4000):
+                raise RememberMeCoreAdapterError("invalid_metadata", ob_code=f"{field}_too_long")
+            try:
+                cleaner(value)
+            except InvalidMetadata as exc:
+                raise RememberMeCoreAdapterError("invalid_metadata", ob_code=f"{field}_too_long") from exc
+        if tags is None:
             return None
-        identities = set()
-        for value in clean_tags:
+        if not isinstance(tags, (list, tuple)):
+            raise RememberMeCoreAdapterError("invalid_metadata", ob_code="invalid_tags")
+        for value in tags:
             if type(value) is not str:
-                raise RememberMeCoreAdapterError(
-                    "invalid_metadata", ob_code="invalid_tag"
-                )
-            normalized = unicodedata.normalize("NFKC", value)
-            normalized = "".join(
-                " "
-                if unicodedata.category(character)
-                in control_categories
-                else character
-                for character in normalized
-            )
-            normalized = whitespace.sub(" ", normalized).strip()
-            if len(normalized) > 64:
-                raise RememberMeCoreAdapterError(
-                    "invalid_metadata", ob_code="tag_too_long"
-                )
-            if normalized:
-                identities.add(normalized.casefold())
-        if len(identities) > 30:
-            raise RememberMeCoreAdapterError(
-                "invalid_metadata", ob_code="too_many_tags"
-            )
-        return clean_tags
+                raise RememberMeCoreAdapterError("invalid_metadata", ob_code="invalid_tag")
+            try:
+                normalize_tags((value,))
+            except InvalidMetadata as exc:
+                raise RememberMeCoreAdapterError("invalid_metadata", ob_code="tag_too_long") from exc
+        try:
+            normalize_tags(tags)
+        except InvalidMetadata as exc:
+            raise RememberMeCoreAdapterError("invalid_metadata", ob_code="too_many_tags") from exc
+        return tuple(tags)
 
     @staticmethod
     def _raise_mapped(exc: Exception) -> None:

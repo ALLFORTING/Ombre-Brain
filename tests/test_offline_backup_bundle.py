@@ -1100,3 +1100,26 @@ def test_capture_does_not_use_network_or_legacy_payload_export(tmp_path, monkeyp
     monkeypatch.setattr(backup_export, "backup_payload_json", forbidden)
     result = _capture(workspace, public_key)
     assert result.status == "success"
+
+
+@pytest.mark.parametrize("version", ["0.1.0.dev7", "0.1.0"])
+def test_historical_version_is_reader_only_and_integrity_stays_required(tmp_path, version):
+    workspace = _workspace(tmp_path)
+    _, public_key = generate_test_keypair()
+    manifest = bundle._build_manifest(workspace=workspace, bundle_id="a" * 32, created_at="2026-08-01T00:00:00.000000+00:00", ob_commit_sha=BASE_SHA, remember_me_version=version, recipient_fingerprint=bundle._public_key_fingerprint(public_key), entries=[], exclusions=[])
+    assert bundle._validate_manifest(bundle._canonical_json_bytes(manifest))["remember_me_version"] == version
+    corrupted = dict(manifest, ob_commit_sha="bad")
+    corrupted = _recompute_manifest_digest(corrupted)
+    with pytest.raises(BackupBundleError, match="manifest_invalid"):
+        bundle._validate_manifest(bundle._canonical_json_bytes(corrupted))
+    if version != bundle.EXPECTED_REMEMBER_ME_VERSION:
+        with pytest.raises(BackupBundleError, match="workspace_invalid"):
+            _capture(workspace, public_key, remember_me_version=version)
+
+
+def test_unknown_manifest_package_version_is_rejected(tmp_path):
+    workspace = _workspace(tmp_path)
+    _, public_key = generate_test_keypair()
+    manifest = bundle._build_manifest(workspace=workspace, bundle_id="a" * 32, created_at="2026-08-01T00:00:00.000000+00:00", ob_commit_sha=BASE_SHA, remember_me_version="0.1.1", recipient_fingerprint=bundle._public_key_fingerprint(public_key), entries=[], exclusions=[])
+    with pytest.raises(BackupBundleError, match="manifest_invalid"):
+        bundle._validate_manifest(bundle._canonical_json_bytes(manifest))

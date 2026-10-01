@@ -1,3 +1,4 @@
+from remember_me_dependency import DEPENDENCY
 import hashlib
 import io
 import json
@@ -151,7 +152,7 @@ def test_prepare_creates_only_fixed_workspace_and_preflight_is_read_only(
 
     assert preflight.passed is True
     assert preflight.legacy_asset_count == 0
-    assert preflight.remember_me_version == "0.1.0.dev7"
+    assert preflight.remember_me_version == DEPENDENCY.version
     assert before == after
 
 

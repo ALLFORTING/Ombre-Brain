@@ -38,17 +38,13 @@ from rm_cutover_test_support import configure_rm_authority, install_fake_rm_back
 from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
 
+from remember_me_dependency import DEPENDENCY
+
 ROOT = Path(__file__).resolve().parent.parent
-RM_VERSION = "0.1.0.dev7"
-RM_COMMIT = "a00ea991442d7581a3856b178525a8e77da833fe"
-RM_ARCHIVE_SHA256 = (
-    "80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214"
-)
-RM_ARCHIVE_URL = (
-    "https://github.com/peanutsuee/Remember-Me/releases/download/"
-    "v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-"
-    "a00ea991442d7581a3856b178525a8e77da833fe.tar.gz"
-)
+RM_VERSION = DEPENDENCY.version
+RM_COMMIT = DEPENDENCY.commit
+RM_ARCHIVE_SHA256 = DEPENDENCY.sha256
+RM_ARCHIVE_URL = DEPENDENCY.url
 ASSET_ID = "a" * 32
 DIAGNOSTIC_SECRETS = (
     "url-user-secret",
@@ -311,7 +307,7 @@ def test_target_rm_source_version_and_async_api_provenance():
         RM_ARCHIVE_URL,
         RM_ARCHIVE_SHA256,
     )
-    assert RM_COMMIT in RM_ARCHIVE_URL
+    assert RM_COMMIT == DEPENDENCY.commit
     assert inspect.iscoroutinefunction(RememberMeService.search_assets)
     assert inspect.iscoroutinefunction(RememberMeService.reindex_embeddings)
 
@@ -1731,3 +1727,49 @@ def test_nine_tool_names_order_and_input_schema_fixture_are_unchanged():
     )
     assert "rm_asset_reindex_embeddings" in json.dumps(fixture)
     assert "rm_asset_search" in json.dumps(fixture)
+
+
+@pytest.mark.asyncio
+async def test_real_batch_cancellation_keeps_old_vector_and_retry_counts(tmp_path):
+    class Engine(FakeEngine):
+        block = False
+        calls_in_batch = 0
+        async def embed_text(self, text):
+            if self.block:
+                self.calls_in_batch += 1
+                if self.calls_in_batch == 2:
+                    entered.set()
+                    await release.wait()
+            return self.vector
+    entered, release = asyncio.Event(), asyncio.Event()
+    engine = Engine()
+    owner = RememberMeAdapter()
+    core = RememberMeCoreAdapter.from_host_adapter(owner, tmp_path / "rm", vector_provider=RememberMeVectorProviderAdapter(engine))
+    data = _png_bytes()
+    first = core.ingest_image(data, len(data), "first.png", "image/png", title="first")
+    output = io.BytesIO()
+    Image.new("RGB", (8, 6), "red").save(output, format="PNG")
+    other = output.getvalue()
+    second = core.ingest_image(other, len(other), "second.png", "image/png", title="second")
+    assert (await core.reindex_embeddings()).indexed == 2
+    ids = [a["asset_id"] for a in (first, second)]
+    old = {i: core._runtime.repository.get_embedding(i) for i in ids}
+    for i in ids: core.update_metadata(i, description="changed")
+    presenter = RememberMeMcpCompatibilityPresenter(core, NullLinks())
+    engine.block = True
+    task = asyncio.create_task(presenter.rm_asset_reindex_embeddings())
+    await asyncio.wait_for(entered.wait(), 3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    after = {i: core._runtime.repository.get_embedding(i) for i in ids}
+    assert sum(after[i] == old[i] for i in ids) == 1
+    assert core.write_coordinator.status().active_writers == 0
+    engine.block = False
+    retry = json.loads(await presenter.rm_asset_reindex_embeddings())
+    assert retry == {"ok": True, "scanned": 2, "indexed": 1, "skipped": 1, "failed": 0}
+    before_failure = {i: core._runtime.repository.get_embedding(i) for i in ids}
+    for i in ids: core.update_metadata(i, description="changed again")
+    engine.vector = []
+    failed = json.loads(await presenter.rm_asset_reindex_embeddings())
+    assert failed == {"ok": True, "scanned": 2, "indexed": 0, "skipped": 0, "failed": 2, "last_error_details": {}}
+    assert {i: core._runtime.repository.get_embedding(i) for i in ids} == before_failure

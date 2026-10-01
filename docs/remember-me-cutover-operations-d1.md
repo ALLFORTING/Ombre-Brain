@@ -2,8 +2,8 @@
 
 This workspace is the D1 operational-safety layer for the accepted
 Remember-Me production cutover. It is pinned to Ombre-Brain C commit
-`bf3683852a30fcd09d44af80f2e114c7d9609a03` and the exact Remember-Me dev7
-source commit `a00ea991442d7581a3856b178525a8e77da833fe`.
+`bf3683852a30fcd09d44af80f2e114c7d9609a03` and the exact Remember-Me 0.1.0
+source commit `d50b27074f194f299813789d3874d7a5fc83bda4`.
 
 The operational module is intentionally not imported by `server.py`. It does
 not choose an authority, change environment configuration, acquire a live

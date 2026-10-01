@@ -520,3 +520,37 @@ def test_public_contracts_and_stage8fh_isolation_remain(tmp_path):
     assert "asset_embedding_index" not in reindex_block
     assert "RememberMeCoreAdapter" not in reindex_block
     assert "RememberMeMcpCompatibilityPresenter" not in reindex_block
+
+
+@pytest.mark.asyncio
+async def test_rm_default_threshold_filters_before_public_total_and_pagination(tmp_path):
+    import io
+    import math
+    from PIL import Image
+    from remember_me_adapter import RememberMeAdapter
+    from remember_me_core_adapter import RememberMeCoreAdapter
+    class Provider:
+        enabled = True
+        model_id = "threshold-test"
+        async def embed(self, text):
+            title = text.split("\n", 1)[0].removeprefix("Title: ")
+            score = {"needle keyword": 0.1, "below": 0.419, "boundary": 0.42, "above": 0.8}.get(title)
+            return [1.0, 0.0] if score is None else [score, math.sqrt(1-score*score)]
+    core = RememberMeCoreAdapter.from_host_adapter(RememberMeAdapter(), tmp_path / "rm", vector_provider=Provider())
+    ids = {}
+    for index, title in enumerate(("needle keyword", "below", "boundary", "above")):
+        data = io.BytesIO()
+        Image.new("RGB", (2, 2), (index * 40, 0, 0)).save(data, format="PNG")
+        content = data.getvalue()
+        ids[title] = core.ingest_image(content, len(content), title + ".png", "image/png", title=title)["asset_id"]
+    assert core._runtime.service.semantic_min_score == 0.42
+    assert (await core.reindex_embeddings()).indexed == 4
+    presenter = RememberMeMcpCompatibilityPresenter(core, NullDownloadLinks())
+    result = json.loads(await presenter.rm_asset_search(query="needle", limit=2))
+    assert set(result) == SEARCH_KEYS and result["total"] == 3
+    assert [item["asset_id"] for item in result["results"]] == [ids["needle keyword"], ids["above"]]
+    assert "semantic_score" not in result["results"][0]
+    second = json.loads(await presenter.rm_asset_search(query="needle", limit=2, offset=2))
+    assert second["total"] == 3 and [item["asset_id"] for item in second["results"]] == [ids["boundary"]]
+    assert second["results"][0]["semantic_score"] == pytest.approx(0.42)
+    assert ids["below"] not in {item["asset_id"] for item in result["results"] + second["results"]}

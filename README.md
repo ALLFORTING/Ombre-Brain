@@ -572,9 +572,9 @@ Conflict candidate recall is broad, but the final detector returns structured `s
 
 #### Remember-Me Stage 1 asset storage
 
-- Ombre-Brain pins public `peanutsuee/Remember-Me` package `0.1.0.dev7` at
-  public source commit `a00ea991442d7581a3856b178525a8e77da833fe` and tree
-  `a958d995421c97ccc572b127cb859797aa7a415f`. The dependency comes from the
+- Ombre-Brain pins public `peanutsuee/Remember-Me` package `0.1.0` at
+  public source commit `d50b27074f194f299813789d3874d7a5fc83bda4` and tree
+  `0974890e5b77a6ec77813bc6d3e75bd31a15906c`. The dependency comes from the
   immutable public release's custom deterministic archive, not a
   GitHub-generated Source code archive. Stage 8F-J completes RM-enabled Core
   ownership for all nine `rm_asset_*` tools while the default-off path retains

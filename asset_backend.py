@@ -270,11 +270,35 @@ class RememberMeAssetBackend:
 
     @staticmethod
     def clean_metadata_text(value: str, max_chars: int, field: str) -> str:
-        return AssetStore._clean_metadata_text(value, max_chars, field)
+        from remember_me.core.normalization import normalize_title, normalize_description
+        from remember_me_core_adapter import RememberMeCoreAdapter, RememberMeCoreAdapterError
+
+        cleaners = {("title", 200): normalize_title, ("description", 4000): normalize_description}
+        cleaner = cleaners.get((field, max_chars))
+        if cleaner is None:
+            raise AssetBackendError("invalid_metadata")
+        try:
+            RememberMeCoreAdapter._validate_metadata_update(
+                title=value if field == "title" else None,
+                description=value if field == "description" else None,
+                tags=None,
+            )
+            return cleaner(value)
+        except RememberMeCoreAdapterError as exc:
+            raise AssetBackendError(exc.ob_code or exc.code) from exc
 
     @staticmethod
     def normalize_tags(tags: list[str]) -> list[str]:
-        return [display for _, display in AssetStore._normalize_tags(tags)]
+        from remember_me.core.normalization import normalize_tags
+        from remember_me_core_adapter import RememberMeCoreAdapter, RememberMeCoreAdapterError
+
+        if not isinstance(tags, list):
+            raise AssetBackendError("invalid_tags")
+        try:
+            RememberMeCoreAdapter._validate_metadata_update(title=None, description=None, tags=tags)
+            return list(normalize_tags(tags))
+        except RememberMeCoreAdapterError as exc:
+            raise AssetBackendError(exc.ob_code or exc.code) from exc
 
     def persist_upload(
         self,

@@ -26,7 +26,13 @@ tzdata==2026.4
 Pillow>=11,<13
 
 # Public Remember-Me Core pinned to an immutable source archive.
-remember-me @ https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-a00ea991442d7581a3856b178525a8e77da833fe.tar.gz#sha256=80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214
+# BEGIN REMEMBER-ME PIN
+# version: 0.1.0
+# tag: v0.1.0
+# commit: d50b27074f194f299813789d3874d7a5fc83bda4
+# tree: 0974890e5b77a6ec77813bc6d3e75bd31a15906c
+remember-me @ https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0/remember_me-0.1.0.tar.gz#sha256=93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485
+# END REMEMBER-ME PIN
 
 # 中文分词
 jieba>=0.42.1

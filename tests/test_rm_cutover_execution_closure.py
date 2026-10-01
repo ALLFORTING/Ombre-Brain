@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 import hashlib
 import os
 from pathlib import Path
@@ -198,7 +200,7 @@ def test_d2_handoff_releases_and_cleans_shared_capability(tmp_path):
     evidence = {
         "transition_identity": "d2-test",
         "readiness_evidence_id": "readiness-test",
-        "dependency": {"version": "0.1.0.dev7", "source_commit": RM_SOURCE_COMMIT},
+        "dependency": {"version": DEPENDENCY.version, "source_commit": RM_SOURCE_COMMIT},
         "rm_runtime_healthy": True,
         "rm_data_root_healthy": True,
         "state_healthy": True,

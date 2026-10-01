@@ -6,19 +6,19 @@ Ombre-Brain pins the public Remember-Me Core to:
 
 - official repository: `peanutsuee/Remember-Me`;
 - distribution: `remember-me`;
-- package version: `0.1.0.dev7`;
-- immutable public release tag: `v0.1.0-dev.7-public.1`;
-- source commit: `a00ea991442d7581a3856b178525a8e77da833fe`;
-- Git tree: `a958d995421c97ccc572b127cb859797aa7a415f`;
+- package version: `0.1.0`;
+- immutable public release tag: `v0.1.0`;
+- source commit: `d50b27074f194f299813789d3874d7a5fc83bda4`;
+- Git tree: `0974890e5b77a6ec77813bc6d3e75bd31a15906c`;
 - custom deterministic archive:
-  `https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0-dev.7-public.1/Remember-Me-0.1.0.dev7-public.1-a00ea991442d7581a3856b178525a8e77da833fe.tar.gz`;
+  `https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0/remember_me-0.1.0.tar.gz`;
 - archive SHA-256:
-  `80a0b334f08db19c95c053537dec484be645f29fcf67898037e6641224012214`;
+  `93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485`;
 - data compatibility: `ombre-brain-assets-v1`;
 - sanitizer: `remember-me-pillow-v1`.
 
-The dependency is the custom source asset uploaded to an immutable GitHub
-prerelease, with an exact SHA-256 fragment in `requirements.txt`. GitHub's
+The dependency is the custom source asset uploaded to a GitHub
+Release, with an exact SHA-256 fragment in `requirements.txt`. GitHub's
 automatically generated Source code archives are not pin targets. The pin does
 not use a branch URL, Git checkout, Standalone extra, submodule, vendored
 source, or sibling working tree.
@@ -128,7 +128,8 @@ Stage 8G-D added local migration acceptance, reconciliation, and recovery
 diagnostics on top of the Stage 8G-C batch core. Stage 8H-D retains that sole
 acceptance entry, checkpoint state machine, report boundary, write freeze, and
 stable errors while replacing the historical unsupported target checks with
-evidence from the Remember-Me `0.1.0.dev7` public verification API. The flow
+evidence from the Remember-Me `0.1.0.dev7` public verification API, also retained
+by the current release. The flow
 remains restricted to factory-created fixtures and synthetic data. The
 production Remember-Me runtime remains disabled, and the legacy `AssetStore`
 remains the production image implementation.
@@ -225,7 +226,7 @@ capability. The capability expires when the run ends and cannot be obtained
 from ordinary runtime construction, environment configuration, server
 startup, Dashboard, HTTP, or MCP code. The runner reuses the existing bounded
 migration coordinator, checkpoint and lease state, import adapter,
-`LegacyRmReconciler`, recovery diagnostics, and the Remember-Me `0.1.0.dev7`
+`LegacyRmReconciler`, recovery diagnostics, and the Remember-Me `0.1.0`
 public begin/page/blob/complete verification API. One in-process service
 instance owns the complete verification session.
 
@@ -990,8 +991,8 @@ Stage 8F-J originally updated the immutable Remember-Me dependency pin to
 `5c430d3f265be059198fe230c1a0682e23e89e32` and completed 9/9
 RM-enabled Core ownership. That commit is the historical Stage 8F-J
 implementation pin, not the current dependency. The current dependency is the
-independently published public1 asset at source commit
-`a00ea991442d7581a3856b178525a8e77da833fe`, package `0.1.0.dev7`; it retains
+independently published 0.1.0 Release asset at source commit
+`d50b27074f194f299813789d3874d7a5fc83bda4`, package `0.1.0`; it retains
 the public vector, Search, and Reindex contracts required by Stage 8F-J. The
 Python RM Search API is
 async, so the OB CoreAdapter, Presenter, and server handler await it end to end
@@ -1090,3 +1091,11 @@ Ombre-Brain does not modify Remember-Me source in this stage. Any future
 Ombre-Brain modification of Remember-Me Covered Code must preserve applicable
 origin and upstream notices and make the corresponding Covered Code and change
 record available as required by the license.
+
+## RM 0.1.0 integration boundary
+
+`requirements.txt` contains the single fixed identity stanza (version, tag, commit, tree, URL and SHA-256); `remember_me_dependency.py` parses it without depending on cwd. Missing, duplicate, ambiguous or malformed identities fail closed. Installed `direct_url.json` must identify this asset and digest, including consistent `hash`/`hashes` fields. Loaded RM modules must belong to the inspected distribution and match its recorded source hashes; creation and reuse cannot bypass these checks. No runtime network check is performed.
+
+RM authority preserves safely cleaned Unicode spelling; NFKC is comparison-only. The Dashboard RM backend uses RM exported normalization, while the legacy backend retains its existing behavior. Semantic-only results below the Core default 0.42 threshold are excluded before counting and pagination; keyword hits remain. Public tools, schemas and success envelopes are unchanged. Reindex generates a replacement before atomic storage: failed/cancelled provider work preserves the old vector; previously completed assets remain committed, and retry skips current records. This is per-asset safety, not a batch receipt. Empty metadata and disabled-provider stale cleanup retain their established behavior.
+
+There is no metadata migration, production reindex or automatic authority switch. New backups use the current package version; only manifest reading accepts historical dev7 and 0.1.0, with all other integrity gates retained. Historical read compatibility never permits an old runtime installation. Stateless remains unset/default false and Snows of Yesteryear remains frozen.

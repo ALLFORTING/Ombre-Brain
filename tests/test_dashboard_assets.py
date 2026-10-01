@@ -618,3 +618,23 @@ def test_dashboard_missing_id_keeps_open_state_not_found_semantics(method):
     assert raised.value.code == "asset_not_found"
     assert raised.value.status_code == 404
     assert backend.calls == ["gate", ("get", "0" * 32)]
+
+
+@pytest.mark.parametrize("spelling,counterpart", [("ＡＢＣ", "ABC"), ("①", "1"), ("ﬁ", "fi"), ("e\u0301", "é")])
+def test_rm_dashboard_upload_preserves_unicode_before_core(tmp_path, spelling, counterpart):
+    from types import SimpleNamespace
+    from asset_backend import RememberMeAssetBackend, RuntimeMutationGate
+    from asset_dashboard import AssetUpload
+    from remember_me_adapter import RememberMeAdapter
+    from remember_me_core_adapter import RememberMeCoreAdapter
+    core = RememberMeCoreAdapter.from_host_adapter(RememberMeAdapter(), tmp_path / "rm")
+    backend = RememberMeAssetBackend(lambda: SimpleNamespace(core_adapter=core), RuntimeMutationGate(None))
+    service = AssetDashboardService(backend_provider=lambda: backend, max_asset_bytes=1024 * 1024)
+    data = _png()
+    path = tmp_path / "upload.png"
+    path.write_bytes(data)
+    upload = AssetUpload(path=path, filename="Ａ.png", mime_type="image/png", decoded_bytes=len(data), source_sha256=hashlib.sha256(data).hexdigest(), title=spelling, description=spelling, tags=[spelling, counterpart])
+    asset = service.create_asset(upload)
+    assert (asset["title"], asset["description"], asset["tags"]) == (spelling, spelling, [spelling])
+    stored = core.get(asset["asset_id"])
+    assert stored["title"] == spelling and stored["tags"] == [spelling]

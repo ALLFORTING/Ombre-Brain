@@ -401,7 +401,8 @@ async def test_shadow_business_scenarios_and_cleaned_bytes(tmp_path):
     assert _semantic(old_empty) == _semantic(new_empty)
     old_unicode = legacy.update_metadata(old_id, title="Ｎｅｅｄｌｅ", description="照片")
     new_unicode = rm.update_metadata(new_id, title="Ｎｅｅｄｌｅ", description="照片")
-    assert _semantic(old_unicode) == _semantic(new_unicode)
+    assert new_unicode["title"] == "Ｎｅｅｄｌｅ"
+    assert _semantic(old_unicode) == {**_semantic(new_unicode), "title": "Needle"}
     assert old_unicode["title"] == "Needle"
 
     queries = [

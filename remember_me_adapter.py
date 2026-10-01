@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
+import base64
+import hashlib
+import importlib
+import json
+import sys
 import threading
 import weakref
 
 
 EXPECTED_DISTRIBUTION = "remember-me"
-EXPECTED_PACKAGE_VERSION = "0.1.0.dev7"
+EXPECTED_PACKAGE_VERSION = DEPENDENCY.version
 EXPECTED_DATA_COMPATIBILITY = "ombre-brain-assets-v1"
 EXPECTED_SANITIZER_ID = "remember-me-pillow-v1"
 EXPECTED_PILLOW_RANGE = "Pillow>=10.4,<13"
@@ -41,10 +48,90 @@ class RememberMeContract:
     mcp_tools: tuple[str, ...]
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_key")
+        result[key] = value
+    return result
+
+
+def _validate_archive_provenance(raw: str) -> None:
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+        if not isinstance(value, dict) or set(value) != {"url", "archive_info"}:
+            raise ValueError("invalid_direct_url")
+        archive = value["archive_info"]
+        if value["url"] != DEPENDENCY.url or not isinstance(archive, dict):
+            raise ValueError("invalid_direct_url")
+        if not archive or set(archive) - {"hash", "hashes"}:
+            raise ValueError("invalid_archive_info")
+        hashes = archive.get("hashes", {})
+        if not isinstance(hashes, dict):
+            raise ValueError("invalid_hashes")
+        if any(not isinstance(k, str) or not isinstance(v, str) for k, v in hashes.items()):
+            raise ValueError("invalid_hashes")
+        legacy = archive.get("hash")
+        if "hash" in archive:
+            if not isinstance(legacy, str) or legacy.count("=") != 1:
+                raise ValueError("invalid_hash")
+            algorithm, digest = legacy.split("=")
+            if not algorithm or not digest or (algorithm in hashes and hashes[algorithm] != digest):
+                raise ValueError("conflicting_hashes")
+            hashes = {**hashes, algorithm: digest}
+        if hashes.get("sha256") != DEPENDENCY.sha256:
+            raise ValueError("wrong_digest")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise RememberMeAdapterError("remember_me_contract_mismatch:provenance") from exc
+
+
+def _validate_distribution_modules(distribution) -> None:
+    """Reject shadow modules and changed installed source recorded by this distribution."""
+    try:
+        files = distribution.files
+        if not files:
+            raise ValueError("missing_record")
+        owned = {Path(distribution.locate_file(f)).resolve(): f for f in files}
+        package = importlib.import_module("remember_me")
+        modules = [module for name, module in tuple(sys.modules.items())
+                   if name == "remember_me" or name.startswith("remember_me.")]
+        for module in modules:
+            origin = Path(module.__file__).resolve()
+            if Path(module.__spec__.origin).resolve() != origin or origin not in owned:
+                raise ValueError("shadow_module")
+            record = owned[origin]
+            if record.hash is None or record.hash.mode != "sha256":
+                raise ValueError("missing_source_hash")
+            digest = base64.urlsafe_b64encode(hashlib.sha256(origin.read_bytes()).digest()).decode().rstrip("=")
+            if digest != record.hash.value:
+                raise ValueError("changed_source")
+            if hasattr(module, "__path__") and tuple(Path(p).resolve() for p in module.__path__) != (origin.parent,):
+                raise ValueError("shadow_package_path")
+        if package is not sys.modules.get("remember_me"):
+            raise ValueError("shadow_package")
+    except Exception as exc:
+        raise RememberMeAdapterError("remember_me_contract_mismatch:module_source") from exc
+
+
+def _checked_distribution():
+    try:
+        distribution = metadata.distribution(EXPECTED_DISTRIBUTION)
+        if distribution.version != EXPECTED_PACKAGE_VERSION:
+            raise RememberMeAdapterError("remember_me_contract_mismatch:package_version")
+        _validate_archive_provenance(distribution.read_text("direct_url.json"))
+        _validate_distribution_modules(distribution)
+        return distribution
+    except RememberMeAdapterError:
+        raise
+    except Exception as exc:
+        raise RememberMeAdapterError("remember_me_contract_unavailable") from exc
+
+
 def inspect_remember_me_contract() -> RememberMeContract:
     """Inspect package constants without creating storage or protocol runtimes."""
     try:
-        distribution = metadata.distribution(EXPECTED_DISTRIBUTION)
+        distribution = _checked_distribution()
         distribution_name = distribution.metadata.get("Name", "")
 
         from remember_me.imaging.pillow_sanitizer import (
@@ -57,6 +144,7 @@ def inspect_remember_me_contract() -> RememberMeContract:
             PROJECT_VERSION,
         )
 
+        _validate_distribution_modules(distribution)
         installed_version = distribution.version
         if PROJECT_VERSION != installed_version:
             raise RememberMeAdapterError(
@@ -120,6 +208,7 @@ class RememberMeAdapter:
             raise RememberMeAdapterError("remember_me_data_root_must_be_path")
         normalized_root = data_root.expanduser().resolve()
         if self._runtime is not None:
+            _checked_distribution()
             if (
                 normalized_root == self._data_root
                 and (
@@ -140,6 +229,8 @@ class RememberMeAdapter:
                 )
 
             from remember_me.factory import create_local_runtime
+
+            _checked_distribution()
 
             try:
                 runtime = create_local_runtime(

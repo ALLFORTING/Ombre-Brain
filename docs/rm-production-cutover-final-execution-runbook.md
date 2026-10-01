@@ -11,8 +11,8 @@ reindex production, or release a production freeze.
 - merged-main tree: `b7eab186a5ce145e9a05cb287d5ad19b19e99b36`
 - service: `Ombre-Brain`
 - service ID: `srv-d7sqj128qa3s73essoug`
-- Remember-Me: `0.1.0.dev7`
-- Remember-Me source contract: `a00ea991442d7581a3856b178525a8e77da833fe`
+- Remember-Me: `0.1.0`
+- Remember-Me source contract: `d50b27074f194f299813789d3874d7a5fc83bda4`
 - legacy root: `/opt/render/project/src/buckets`
 - RM root: `/opt/render/project/src/buckets/remember-me`
 - state root: `/opt/render/project/src/buckets/state`
@@ -249,8 +249,8 @@ python -m remember_me_cutover_operations readiness-gate \
 
 Require `READY_FOR_AUTHORITY_SWITCH=YES`, `status=PASS`, all hard gates PASS,
 `blocking_gates=[]`, and `production_access_occurred=false`. D2 evidence must
-identify Remember-Me `0.1.0.dev7` and source contract
-`a00ea991442d7581a3856b178525a8e77da833fe`.
+identify Remember-Me `0.1.0` and source contract
+`d50b27074f194f299813789d3874d7a5fc83bda4`.
 
 ## Phase 8 - D2 prepare, external coordination, restart, and switch
 

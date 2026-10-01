@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 import argparse
 import base64
 from contextlib import closing, contextmanager
@@ -58,7 +60,7 @@ GCM_TAG_SIZE = 16
 MAX_HEADER_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
-EXPECTED_REMEMBER_ME_VERSION = "0.1.0.dev7"
+EXPECTED_REMEMBER_ME_VERSION = DEPENDENCY.version
 
 _FIXED_PATHS = {
     "source": "source",
@@ -1603,7 +1605,7 @@ def _validate_manifest(raw: bytes) -> dict[str, Any]:
         or manifest["bundle_format_version"] != BUNDLE_FORMAT_VERSION
         or manifest["capture_mode"] != CAPTURE_MODE
         or manifest["encryption_profile"] != ENCRYPTION_PROFILE
-        or manifest["remember_me_version"] != EXPECTED_REMEMBER_ME_VERSION
+        or manifest["remember_me_version"] not in ("0.1.0.dev7", "0.1.0")
         or _BUNDLE_ID_PATTERN.fullmatch(str(manifest["bundle_id"])) is None
         or _WORKSPACE_ID_PATTERN.fullmatch(
             str(manifest["capture_workspace_id"])

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -50,7 +52,7 @@ DEFAULT_BATCH_SIZE = 100
 DEFAULT_MAX_BATCHES = 10_000
 DEFAULT_LEASE_TTL_SECONDS = 60
 MIN_FREE_SPACE_BYTES = 10 * 1024 * 1024
-EXPECTED_REMEMBER_ME_VERSION = "0.1.0.dev7"
+EXPECTED_REMEMBER_ME_VERSION = DEPENDENCY.version
 _WORKSPACE_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _NONCE_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")

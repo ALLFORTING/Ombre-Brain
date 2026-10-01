@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from remember_me_dependency import DEPENDENCY
+
 import hashlib
 import io
 from pathlib import Path
@@ -204,7 +206,7 @@ def _prepare_rm_coordination(root: Path) -> tuple[CutoverStateStore, object]:
                 "target_identity": "target",
             },
             "dependency": {
-                "version": "0.1.0.dev7",
+                "version": DEPENDENCY.version,
                 "source_commit": RM_SOURCE_COMMIT,
             },
             "rm_runtime_healthy": True,
