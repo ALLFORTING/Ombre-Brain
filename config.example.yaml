@@ -30,11 +30,19 @@ log_level: "INFO"
 merge_threshold: 75
 
 # --- Dehydration API / 脱水压缩 API 配置 ---
-# Uses a cheap LLM for intelligent compression. API is required; if the
-# configured key/endpoint is unavailable, hold/grow will raise an explicit
-# error instead of silently degrading (see BEHAVIOR_SPEC.md 三、降级行为表).
-# 用廉价 LLM 做智能压缩。API 为必需；如 key/endpoint 不可用，
-# hold/grow 会直接报错而非静默降级（详见 BEHAVIOR_SPEC.md 三、降级行为表）。
+# Uses an LLM for compression, tagging and diary splitting.
+# hold and short grow (<30 stripped characters) use analyze; failure may
+# persist content with default metadata and an explicit classified warning.
+# Long grow uses digest: provider/structure failure returns a classified
+# error; valid-content items with invalid metadata carry a fallback warning.
+# 单条 hold 与去首尾空白后 <30 字符的 grow 走 analyze；失败可继续存正文，
+# 回执明确 warning：「自动打标失败；原因=...；已使用默认 metadata」。
+# 长 grow 走 digest；provider/整体结构失败返回 reason，不改走短内容路径。
+# 有效正文条目的 metadata 无效可回落默认值，并明确 parse_error warning。
+# 分类：rate_limited（429）、parse_error（解析/结构）、connection_error
+# （连接/超时）、provider_unconfigured（未配置）、provider_error（其他）。
+# 单条持久化失败另报 persistence_error；API key/endpoint 并非一律直接报错。
+# 以上不是 dehydrate 的本地压缩 fallback；详见 BEHAVIOR_SPEC.md 当前规则。
 dehydration:
   # Supports any OpenAI-compatible API: DeepSeek / Ollama / LM Studio / vLLM / Gemini etc.
   # 支持所有 OpenAI 兼容 API：DeepSeek / Ollama / LM Studio / vLLM / Gemini 等

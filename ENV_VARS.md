@@ -44,7 +44,19 @@
 
 MCP 1.29.1 的 `streamable_http_app()` 无此关键字参数；共享 builder 在首次构造前设置 `mcp.settings.stateless_http`。开关仅在启动构造时生效，修改后需重启。`json_response` 继续 false，认证、CORS 和 session diagnostics 保持原样。
 
-这是默认关闭的候选实现，尚不建议线上启用。stateless 客户端断连会取消工具任务，现有多步骤写可能只完成部分步骤；此开关不提供 exactly-once、请求幂等或重试去重保障。详见 [S-2 验证报告](docs/S2_STATELESS_HTTP_VALIDATION.md)。
+这是默认关闭的候选实现，尚不建议线上启用。stateless 客户端断连会取消工具任务；开关本身不提供 exactly-once、请求幂等或重试去重保障。[S-2 验证报告](docs/S2_STATELESS_HTTP_VALIDATION.md) 保留 2026-09-26 当时的 partial-write 风险与 FAIL 判定，后续限定修复见下节，不能把旧风险概括为当前所有写路径的状态。
+
+## 当前限定可靠性与日志边界
+
+截至源码基线 654577e，后续修复与旧 S2 风险须分开理解：
+
+- S-3 / S-4：携带稳定 operation_id 的 archive_session、trace、hold/grow 等指定写路径使用 durable plan/receipt 与 owner/epoch fencing；同 key、同参数可恢复或重放，改参数拒绝。确认删除与 legacy import 另有各自状态机；不能把这些能力扩展为任意请求的幂等保证，外部 provider 仍可能被重复调用。
+- 后续 legacy asset metadata/reindex 修复保留旧向量并标为 stale；无 key archive 与 pinned hold 的取消后续步骤已补修；Raw Evidence 取消后释放 runner 并允许已有入口重新接手。进度提交依次为 [dd07983](https://github.com/ALLFORTING/Ombre-Brain/commit/dd07983)、[dc7327e](https://github.com/ALLFORTING/Ombre-Brain/commit/dc7327e)、[8b83608](https://github.com/ALLFORTING/Ombre-Brain/commit/8b83608)。这些限定修复不新增进程退出后的自动恢复；无 key 响应丢失后重试仍可重复。旧 FAIL 和历史测试数字保持原样，不代表最终 HEAD 一次 full suite 全绿。
+- 日志：[cc1ed93](https://github.com/ALLFORTING/Ombre-Brain/commit/cc1ed93) 遮蔽已验证的 L/R upload/download 四类票据路径；[654577e](https://github.com/ALLFORTING/Ombre-Brain/commit/654577e) 补齐 query 名称单次 unquote_plus 解码后匹配 token 的值遮蔽（含 to%6ben、%74oken、重复项、空值和值内等号），并保留既有大小写兼容。只修改 Uvicorn access LogRecord.args 路径参数副本，不改变 ASGI scope、认证或请求 query；原始名称、顺序、非目标参数和编码保留。双重编码名称单次解码后不是 token，保持原样且不能作为 token 认证；裸名称无值可遮蔽。非目标参数无任意凭据脱敏保证。
+- 以上日志保证仅限已验证的 Uvicorn 根路由/formatter 调用链及现有 MCP diagnostics，不覆盖所有代理、root_path 挂载、其他 formatter、异常或 provider 错误日志。Query token 仍可能被客户端、代理或浏览器历史保留，首选 Bearer。
+- S-5 整体未通过，真实 Claude connector 尚未验收；stateless 默认关闭。dream.touch / boot.preview 仍延后，原 P/D 建议不自动采纳；旧日雪同步已取消。
+
+源码及测试节点是实现定位，历史动态证据仍以各阶段原报告为准；不得用文档修订替代真实 connector 或后续独立验收。
 
 ## HTTP MCP authentication
 

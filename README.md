@@ -77,8 +77,9 @@ copy config.example.yaml config.yaml
 ```
 
 ```bash
-# 创建 .env 文件——把 your-key-here 换成第三步拿到的 key
+# 创建 .env 文件——API key 与 MCP 认证 token 分别配置，替换占位值
 echo "OMBRE_API_KEY=your-key-here" > .env
+echo "OMBRE_AUTH_TOKEN=your-independent-random-mcp-token" >> .env
 ```
 
 ```bash
@@ -92,7 +93,7 @@ docker compose up -d --build
 curl http://localhost:18001/health
 ```
 
-看到类似这样的输出就是成功了：
+看到类似输出说明 health 可访问；它不验证 MCP 认证。客户端仍需发送与服务端 OMBRE_AUTH_TOKEN 一致的 Authorization: Bearer 请求头：
 ```json
 {"status":"ok","buckets":0,"decay_engine":"stopped"}
 ```
@@ -113,13 +114,16 @@ curl http://localhost:18001/health
   "mcpServers": {
     "ombre-brain": {
       "type": "streamable-http",
-      "url": "http://localhost:18001/mcp"
+      "url": "http://localhost:18001/mcp",
+      "headers": {
+        "Authorization": "Bearer <same OMBRE_AUTH_TOKEN>"
+      }
     }
   }
 }
 ```
 
-重启 Claude Desktop，你应该能在工具列表里看到 `breath`、`hold`、`grow` 等工具了。
+替换 headers 中的占位值为服务端同一 OMBRE_AUTH_TOKEN，再按客户端支持的 HTTP 配置方式重连并检查 tools/list。此示例不代表真实 Claude connector 已验收；不支持 headers 的客户端见下述显式兼容模式。
 
 > 本地 HTTP 的 MCP 默认也是 fail-closed：设置 `OMBRE_AUTH_TOKEN`，并让客户端发送 `Authorization: Bearer <your-token>`；URL 保持为 `http://localhost:18001/mcp`。
 > Local HTTP MCP is also fail-closed by default: set `OMBRE_AUTH_TOKEN` and have the client send `Authorization: Bearer <your-token>`; keep the URL at `http://localhost:18001/mcp`.
@@ -166,6 +170,7 @@ cd Ombre-Brain
 
 ```
 OMBRE_API_KEY=你的API密钥
+OMBRE_AUTH_TOKEN=独立生成的随机MCP认证token
 ```
 
 > **🔑 推荐免费方案：Google AI Studio**
@@ -187,7 +192,7 @@ OMBRE_API_KEY=你的API密钥
 > 3. Set `dehydration.base_url` to `https://generativelanguage.googleapis.com/v1beta/openai` in `config.yaml`
 > Also supports DeepSeek, Ollama, LM Studio, vLLM, or any OpenAI-compatible API.
 
-没有 API key 则脱水压缩和自动打标功能不可用（会报错），但记忆的读写和检索仍正常工作。如果暂时不用脱水功能，可以留空：
+没有可用 API 时，hold 与短 grow 的自动打标可回落默认 metadata，回执明确标注失败；长 grow 的拆分失败返回分类 reason，不能保证照常写入。详细分类见 config.example.yaml；这不替代 HTTP MCP 认证，OMBRE_AUTH_TOKEN 仍需配置。如果暂时不用 provider，可以把 OMBRE_API_KEY 留空：
 
 ```
 OMBRE_API_KEY=
@@ -1078,10 +1083,10 @@ $$emotion\_weight = base + arousal \times arousal\_boost$$
 > 下列阈值、转换条件和路由列表是当前实现参考，不是 Contract v1 的精确公共保证；v1 只承诺其已明确限定的默认可见性和显式包含边界。
 
 - `dormant` 是自然衰减产生的“自动沉底”状态：`pulse(touch=True)` 会遍历桶，将超过 30 天未访问、`importance < 3`、非 pinned、非 sealed 的桶标记为 dormant。默认 `breath`、`pulse`、`dream` 不显示 dormant；`breath(include_dormant=True)` 或 `pulse(show_all=True, limit=50, offset=0)` 可按 bounded page 管理它们。普通读取只更新访问记账，不解除 dormant；维护型 `breath(..., touch=False)` 与 `pulse(..., touch=False)` 不更新该记账或 dormant。需要显式使用 `breath(include_dormant=True, wake_dormant=True)` 或 `dream(detail_ids="...", wake_dormant=True)` 才会唤醒实际读取的桶。
-- `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；需要显式 `include_sealed=True` 才显示。
+- `sealed` 是手动封存状态，只能通过 `trace(sealed=1/0)` 设置或取消。自然衰减不会自动 sealed。sealed 优先级高于 pinned，默认不会在 `breath`、`pulse`、`dream`、`todos` 泄漏桶名、ID 或摘要；`breath(include_sealed=True)`、`pulse(include_sealed=True)` 可显式包含 sealed；`dream(detail_ids="", wake_dormant=False)` 与 `todos(include_provenance=False)` 不支持该参数，仍排除 sealed。
 
 - `dormant` is automatic sinking from natural decay: `pulse(touch=True)` marks non-pinned, non-sealed buckets as dormant when they have not been accessed for 30+ days and `importance < 3`. By default `breath`, `pulse`, and `dream` hide dormant buckets; use `breath(include_dormant=True)` or bounded `pulse(show_all=True, limit=50, offset=0)` pages for management. Ordinary reads update activation bookkeeping without waking dormant buckets; maintenance `breath(..., touch=False)` and `pulse(..., touch=False)` do not update that bookkeeping or dormant state. Explicitly pass `wake_dormant=True` to a dormant-inclusive `breath` call or a detail `dream` call to wake buckets actually read.
-- `sealed` is manual hiding, only changed by `trace(sealed=1/0)`. Natural decay never creates sealed buckets. Sealed overrides pinned and hides the bucket name, ID, and summary from `breath`, `pulse`, `dream`, and `todos` unless `include_sealed=True`.
+- `sealed` is manual hiding, only changed by `trace(sealed=1/0)`. Natural decay never creates sealed buckets. Sealed overrides pinned and hides the bucket name, ID, and summary from `breath`, `pulse`, `dream`, and `todos` by default. Only `breath` and `pulse` among these four tools accept `include_sealed=True`; `dream` and `todos` have no such parameter and continue to exclude sealed buckets.
 
 ### 参数说明 / Parameters
 

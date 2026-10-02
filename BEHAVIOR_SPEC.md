@@ -6,6 +6,12 @@
 
 ---
 
+## 当前规则与历史段的阅读方式
+
+当前公开参数以 [MCP schema](docs/mcp-public-contract.json) 与源码为准：`breath.max_results=5`、`hold.importance=5`。默认浮现的 max_results 限制动态候选，pinned/protected 另计但共享 token 预算；检索及固定列表把它们计入结果上限。参数适用规则见文末 W-7。
+
+下列一至五节保留历史流程与后续局部注记，不是完整的现行行为规格；旧签名、top-20 流程和 importance=7 示例不能当作当前默认值。历史失败记录也不表示后来修复仍未完成；当前限定可靠性与日志边界见 [ENV_VARS](ENV_VARS.md#当前限定可靠性与日志边界)。
+
 ## 一、系统角色说明
 
 ### 1.1 参与方总览
@@ -42,7 +48,7 @@
 
 **用户操作**：打开新对话窗口，说第一句话
 
-**历史示例行为（非强制）**：在需要启动上下文时调用 `boot()` 或 `breath()`（无参）
+**历史示例行为（非强制）**：在需要启动上下文时调用 `boot()` 或 `breath()`（无参）。下方历史调用显式设为 max_results=20；当前省略该参数时默认 5。
 
 **OB 工具调用**：
 ```
@@ -100,7 +106,7 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 hold(content="用户拿到实习 offer，情绪激动", importance=7)
 ```
 
-**OB 工具调用**：`hold(content, tags="", importance=7, pinned=False, feel=False, source_bucket="", valence=-1, arousal=-1)`
+**OB 工具调用（历史签名示意；上例显式 importance=7，当前默认 5）**：`hold(content, tags="", importance=7, pinned=False, feel=False, source_bucket="", valence=-1, arousal=-1)`
 
 **系统内部发生什么**：
 
@@ -634,7 +640,7 @@ feel 桶自身:
 
 ---
 
-### W-7：breath 参数适用契约
+### W-7：breath 参数适用契约（现行规则）
 
 先决定 canonical selector，再应用 visibility 与 metadata filters，之后匹配/排序、计算 total/page、渲染预算，最后对本页完整显示的既有可 touch 对象 direct touch。filter 不抢 selector；不适用的非默认参数在 dispatch 前返回实际 mode、参数、原因和可用参数。
 

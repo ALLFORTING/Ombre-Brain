@@ -3,10 +3,13 @@
 # Docker Compose 配置
 #
 # Usage / 使用：
-#   1. Create .env: echo "OMBRE_API_KEY=your-key" > .env
+#   1. Create .env with OMBRE_API_KEY=your-provider-key and
+#      OMBRE_AUTH_TOKEN=your-independent-random-mcp-token (no real secrets here)
 #      创建 .env 文件
 #   2. docker-compose up -d
 #   3. docker compose logs tunnel (for public URL / 查看公网地址)
+#   4. MCP client: Authorization: Bearer <same OMBRE_AUTH_TOKEN>
+#      MCP 默认 fail-closed；API key 不替代 MCP token，health 成功不证明认证。
 # ============================================================
 
 services:
@@ -18,6 +21,7 @@ services:
       - "18001:8000"                        # Local debug port (optional) / 本地调试端口
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}      # From .env file / 从 .env 文件读取
+      - OMBRE_AUTH_TOKEN=${OMBRE_AUTH_TOKEN} # Independent MCP Bearer token / 独立 MCP 认证
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
       - OMBRE_BUCKETS_DIR=/data             # Container-internal bucket path / 容器内路径
     volumes:
