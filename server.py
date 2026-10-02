@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfoNotFoundError
 from boot_todos import active_display_candidates, todo_page, fit_todos, shanghai_date, TodoPage
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote_plus, urlparse
 from typing import Union
 from functools import wraps
 import inspect
@@ -212,12 +212,6 @@ def _mcp_auth_token() -> str:
     return os.environ.get("OMBRE_AUTH_TOKEN", "").strip()
 
 
-_ACCESS_LOG_QUERY_TOKEN_PATTERN = re.compile(
-    r"([?&]token=)[^&\s]*",
-    flags=re.IGNORECASE,
-)
-
-
 _ACCESS_LOG_TICKET_PATH_PATTERN = re.compile(
     r"^(/rm/(?:upload|asset-upload|asset-download|vision-download)/)(.+?)(/?)$",
 )
@@ -231,9 +225,14 @@ def _redact_uvicorn_access_path(path_with_query: str) -> str:
     """
     path, separator, query = path_with_query.partition("?")
     path = _ACCESS_LOG_TICKET_PATH_PATTERN.sub(r"\1[redacted]\3", path)
-    return _ACCESS_LOG_QUERY_TOKEN_PATTERN.sub(
-        r"\1[redacted]", path + separator + query,
-    )
+    segments = query.split("&")
+    for index, segment in enumerate(segments):
+        name, equals, _value = segment.partition("=")
+        # Match Starlette's single parse_qsl name decoding; retain literal
+        # case-insensitive redaction compatibility without changing auth.
+        if equals and unquote_plus(name).casefold() == "token":
+            segments[index] = name + equals + "[redacted]"
+    return path + separator + "&".join(segments)
 
 
 class _UvicornAccessTokenRedactionFilter(logging.Filter):

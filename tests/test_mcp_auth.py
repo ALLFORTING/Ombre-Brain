@@ -358,3 +358,44 @@ def test_access_ticket_redaction_handles_uvicorn_encoded_paths(access_redaction_
                                   "/rm/asset-upload-other/not-a-ticket", "/rm/upload/"])
 def test_access_ticket_redaction_keeps_non_ticket_paths(access_redaction_server, path):
     assert access_redaction_server._redact_uvicorn_access_path(path) == path
+
+
+@pytest.mark.parametrize("query,expected,authenticated", [
+    ("token=synthetic-sentinel", "token=[redacted]", True),
+    ("to%6ben=synthetic-sentinel", "to%6ben=[redacted]", True),
+    ("%74oken=synthetic-sentinel", "%74oken=[redacted]", True),
+    ("TOKEN=synthetic-sentinel", "TOKEN=[redacted]", False),
+    ("To%6Ben=synthetic-sentinel", "To%6Ben=[redacted]", False),
+    ("token=wrong&to%6ben=synthetic-sentinel", "token=[redacted]&to%6ben=[redacted]", True),
+    ("%74oken=synthetic-sentinel&token=wrong", "%74oken=[redacted]&token=[redacted]", False),
+    ("token=&to%6ben=", "token=[redacted]&to%6ben=[redacted]", False),
+    ("token=synthetic-sentinel=tail", "token=[redacted]", False),
+    ("to%256ben=public", "to%256ben=public", False),
+    ("%2574oken=public", "%2574oken=public", False),
+    ("to+ken=public&to%2Bken=public", "to+ken=public&to%2Bken=public", False),
+    ("token&empty=&keep=a=b%26c+%20&bad%=public", "token&empty=&keep=a=b%26c+%20&bad%=public", False),
+    ("keep=%74oken%3Dpublic&&to%6ben=synthetic-sentinel&after=%2f+%20", "keep=%74oken%3Dpublic&&to%6ben=[redacted]&after=%2f+%20", True),
+])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_encoded_query_log_copy_matches_auth_parsing(access_redaction_server, monkeypatch, query, expected, authenticated, opt_in):
+    from copy import deepcopy
+    from starlette.datastructures import QueryParams
+    from uvicorn.protocols.utils import get_path_with_query_string
+
+    ob = access_redaction_server
+    monkeypatch.setenv("OMBRE_AUTH_TOKEN", "synthetic-bearer")
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", "synthetic-sentinel")
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", str(opt_in))
+    monkeypatch.delenv("OMBRE_MCP_ALLOW_ANONYMOUS_HTTP", raising=False)
+    assert (QueryParams(query).get("token") == "synthetic-sentinel") is authenticated
+    with TestClient(_app_with_auth(ob)) as client:
+        assert client.get("/mcp?" + query).status_code == (200 if opt_in and authenticated else 401)
+    scope = {"path": "/mcp", "raw_path": b"/mcp", "query_string": query.encode()}
+    original = deepcopy(scope)
+    args = ("127.0.0.1:1234", "GET", get_path_with_query_string(scope), "1.1", 200)
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
+                               '%s - "%s %s HTTP/%s" %d', args, None)
+    assert ob._UvicornAccessTokenRedactionFilter().filter(record)
+    assert record.args[2] == "/mcp?" + expected
+    assert "synthetic-sentinel" not in record.getMessage()
+    assert scope == original and args[2] == "/mcp?" + query

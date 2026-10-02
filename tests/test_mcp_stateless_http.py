@@ -1108,3 +1108,72 @@ async def test_access_log_tickets_real_http(ob, monkeypatch, caplog, stateless, 
     assert scopes and all(before == after for before, after in scopes)
     observed_paths = {before["path"] for before, after in scopes}
     assert set(paths) <= observed_paths
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("opt_in", [False, True])
+async def test_encoded_query_access_log_real_http(ob, monkeypatch, caplog, stateless, opt_in):
+    """Assert production output before evidence serialization or redaction."""
+    import uuid
+    from starlette.datastructures import QueryParams
+    sentinel = "synthetic-" + uuid.uuid4().hex
+    credential = sentinel + "=tail"
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", str(stateless))
+    monkeypatch.setenv("OMBRE_MCP_ALLOW_QUERY_TOKEN", str(opt_in))
+    monkeypatch.setenv("OMBRE_MCP_QUERY_TOKEN", credential)
+    cases = [
+        ("literal", "token=" + credential, "token=[redacted]"),
+        ("encoded-middle", "to%6ben=" + credential, "to%6ben=[redacted]"),
+        ("encoded-first", "%74oken=" + credential, "%74oken=[redacted]"),
+        ("duplicate-last-valid", "token=wrong&to%6ben=" + credential, "token=[redacted]&to%6ben=[redacted]"),
+        ("duplicate-last-invalid", "%74oken=" + credential + "&token=wrong", "%74oken=[redacted]&token=[redacted]"),
+        ("blank", "token=&to%6ben=", "token=[redacted]&to%6ben=[redacted]"),
+        ("literal-uppercase", "TOKEN=" + credential, "TOKEN=[redacted]"),
+        ("encoded-uppercase", "To%6Ben=" + credential, "To%6Ben=[redacted]"),
+        ("double-middle", "to%256ben=public", "to%256ben=public"),
+        ("double-first", "%2574oken=public", "%2574oken=public"),
+        ("plus", "to+ken=public&to%2Bken=public", "to+ken=public&to%2Bken=public"),
+        ("unchanged", "token&empty=&keep=a=b%26c+%20&bad%=public", "token&empty=&keep=a=b%26c+%20&bad%=public"),
+        ("mixed", "keep=%74oken%3Dpublic&&to%6ben=" + credential + "&after=%2f+%20", "keep=%74oken%3Dpublic&&to%6ben=[redacted]&after=%2f+%20"),
+    ]
+    access = logging.getLogger("uvicorn.access")
+    monkeypatch.setattr(access, "handlers", [caplog.handler])
+    monkeypatch.setattr(access, "propagate", False)
+    monkeypatch.setattr(access, "filters", [])
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.WARNING)
+    scopes, evidence = [], []
+    with caplog.at_level(logging.INFO):
+        async with live(ob, access_log=True, scope_snapshots=scopes) as client:
+            port = client.base_url.port
+            client.headers.pop("Authorization")
+            for label, query, expected_query in cases:
+                start = len(caplog.records)
+                response = await rpc(client, "initialize", {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "synthetic-query-regression", "version": "1"},
+                }, path="/mcp?" + query)
+                parsed_match = QueryParams(query).get("token") == credential
+                assert response.status_code == (200 if opt_in and parsed_match else 401)
+                assert bool(response.headers.get("mcp-session-id")) is (response.status_code == 200 and not stateless)
+                rows = [r.getMessage() for r in caplog.records[start:] if r.name == "uvicorn.access"]
+                assert len(rows) == 1
+                # This is the production filter output; no archive substitution.
+                assert sentinel not in rows[0]
+                assert f"/mcp?{expected_query} HTTP/1.1" in rows[0]
+                evidence.append(dict(case=label, status=response.status_code,
+                                     parsed_match=parsed_match, sentinel_absent=True,
+                                     access_line=rows[0]))
+    assert len(scopes) == len(cases) and all(before == after for before, after in scopes)
+    for (before, _after), (_label, query, _expected) in zip(scopes, cases):
+        assert before["query_string"] == query.encode()
+    with socket.socket() as check:
+        check.settimeout(1)
+        assert check.connect_ex(("127.0.0.1", port)) != 0
+    if os.environ.get("QUERY_FIX_EVIDENCE"):
+        (Path(os.environ["QUERY_FIX_EVIDENCE"]) / f"http-{stateless}-{opt_in}.json").write_text(
+            json.dumps(dict(stateless=stateless, opt_in=opt_in, worker_count=1,
+                            root=ob.config["buckets_dir"], port=port,
+                            server_task_stopped=True, port_closed=True, scope_unchanged=True,
+                            requests=evidence), indent=2), encoding="utf-8")
