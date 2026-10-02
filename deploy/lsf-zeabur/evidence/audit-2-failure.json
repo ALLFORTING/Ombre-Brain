@@ -1,0 +1,1 @@
+{"result":"FAIL","stage":"Linux Git diff baseline check","reason":"Linux lacked Windows global core.autocrlf=true; Windows Git confirmed zero business diff; audit command now supplies equivalent temporary conversion","persistent_git_config_changed":false,"business_modified":false,"S5":"INCOMPLETE"}

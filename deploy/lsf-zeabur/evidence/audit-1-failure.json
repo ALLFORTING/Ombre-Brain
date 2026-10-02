@@ -1,0 +1,1 @@
+{"result":"FAIL","stage":"Linux Git baseline check","reason":"Windows-created worktree gitdir pointer requires read-only Linux path translation","business_modified":false,"S5":"INCOMPLETE"}

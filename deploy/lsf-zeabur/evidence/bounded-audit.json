@@ -1,0 +1,37 @@
+{
+  "baseline": "885807cf460bec47af09812a523677d9dbb33eba",
+  "result": "PASS",
+  "cases": [
+    {
+      "case": "deployment_python_syntax",
+      "result": "PASS"
+    },
+    {
+      "case": "exact_baseline_no_business_diff",
+      "result": "PASS"
+    },
+    {
+      "case": "trace_parameters_only_operation_ids_preserved",
+      "result": "PASS"
+    },
+    {
+      "case": "accepted_artifact_hashes_and_exact_reuse",
+      "result": "PASS"
+    },
+    {
+      "case": "official_rm_archive_hash_and_linux_pins",
+      "result": "PASS"
+    },
+    {
+      "case": "docker_context_allowlist_no_data_or_secrets",
+      "result": "PASS"
+    },
+    {
+      "case": "missing_opt_in_and_token_fail_closed",
+      "result": "PASS"
+    }
+  ],
+  "archive_sha256": "93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485",
+  "docker": "UNAVAILABLE_UNVERIFIED",
+  "S5": "INCOMPLETE"
+}

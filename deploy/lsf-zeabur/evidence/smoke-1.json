@@ -1,0 +1,60 @@
+{
+  "baseline": "885807cf460bec47af09812a523677d9dbb33eba",
+  "S5": "INCOMPLETE",
+  "cases": [
+    {
+      "case": "first_seed",
+      "result": "PASS",
+      "count": 2
+    },
+    {
+      "case": "socket_bindings",
+      "result": "PASS",
+      "ob": "0.0.0.0:18991",
+      "stub": "127.0.0.1:18995"
+    },
+    {
+      "case": "health_surface_auth",
+      "result": "PASS"
+    },
+    {
+      "case": "stateful_sse_schema",
+      "result": "PASS",
+      "tool_count": 27
+    },
+    {
+      "case": "synthetic_read_and_one_write",
+      "result": "PASS"
+    }
+  ],
+  "image_build": "UNVERIFIED_DOCKER_UNAVAILABLE",
+  "processes_closed": true,
+  "runtime": {
+    "python": "3.12.14",
+    "executable": "/home/ting/.venvs/ombre/bin/python",
+    "mcp": "1.29.1",
+    "mcp_source": "/home/ting/.venvs/ombre/lib/python3.12/site-packages/mcp/__init__.py",
+    "remember_me": "0.1.0",
+    "remember_me_source": "/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py",
+    "remember_me_release": "https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0/remember_me-0.1.0.tar.gz",
+    "remember_me_sha256": "93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485"
+  },
+  "first_shutdown_logs": {
+    "raw_value_leaked": false,
+    "sentinel_checked_before_archive": true,
+    "access_records": 15,
+    "redacted_access_records": 6,
+    "record_counts": {
+      "ombre_brain": 5,
+      "uvicorn.error": 14,
+      "mcp.server.streamable_http_manager": 3,
+      "uvicorn.access": 15,
+      "ombre_brain.mcp": 7,
+      "mcp.server.lowlevel.server": 3,
+      "httpx2": 6
+    },
+    "raw_logs_archived": false
+  },
+  "result": "FAIL",
+  "failure_type": "JSONDecodeError"
+}
