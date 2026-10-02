@@ -989,7 +989,6 @@ class ImportEngine:
                     status="failed",
                     error_category="parse_no_turns",
                 )
-                self._running = False
                 return {"error": "No conversation turns found in file"}
 
             self._chunks = chunk_turns(turns)
@@ -999,7 +998,6 @@ class ImportEngine:
                     status="failed",
                     error_category="parse_no_chunks",
                 )
-                self._running = False
                 return {"error": "No processable chunks after splitting"}
 
             source_hash_prefix = prepared.source_sha256[:16]
@@ -1032,6 +1030,27 @@ class ImportEngine:
                 prepared.run_id,
                 preserve_raw,
             )
+        except asyncio.CancelledError:
+            # Only this admitted worker owns cleanup; HTTP callers do not.
+            try:
+                if coordinator is not None and prepared is not None:
+                    run = coordinator.store.get_import_run(prepared.run_id)
+                    saved, _ = self.state.read_legacy()
+                    if run["status"] != "completed" and (not saved or saved.get("status") != "completed"):
+                        try:
+                            coordinator.update_run(prepared.run_id, status="paused")
+                        except Exception:
+                            logger.exception("O5B cancellation run pause save failed")
+                        previous_status = self.state.data["status"]
+                        self.state.data["status"] = "paused"
+                        try:
+                            self.state.save()
+                        except Exception:
+                            self.state.data["status"] = previous_status
+                            logger.exception("O5B cancellation progress pause save failed")
+            except Exception:
+                logger.exception("O5B cancellation state inspection failed")
+            raise
         except RawEvidenceError as exc:
             if coordinator is not None and prepared is not None:
                 try:
@@ -1044,8 +1063,11 @@ class ImportEngine:
                     logger.exception("O5B run failure state update failed")
             self.state.data["status"] = "error"
             self.state.data["errors"].append("import_failed")
-            self.state.save()
-            self._running = False
+            try:
+                self.state.save()
+            except Exception:
+                logger.exception("O5B failure progress save failed")
+                raise
             raise
         except Exception:
             if coordinator is not None and prepared is not None:
@@ -1059,10 +1081,15 @@ class ImportEngine:
                     logger.exception("O5B run failure state update failed")
             self.state.data["status"] = "error"
             self.state.data["errors"].append("import_failed")
-            self.state.save()
-            self._running = False
+            try:
+                self.state.save()
+            except Exception:
+                logger.exception("O5B failure progress save failed")
+                raise
             logger.exception("O5B import failed")
             raise
+        finally:
+            self._running = False
 
     @staticmethod
     def _o5b_digest(value: Any) -> str:
@@ -1366,7 +1393,6 @@ class ImportEngine:
                 self.state.data["status"] = "paused"
                 self.state.save()
                 coordinator.update_run(run_id, status="paused", processed_chunks=i)
-                self._running = False
                 return self.state.to_dict()
 
             chunk = self._chunks[i]
@@ -1465,7 +1491,6 @@ class ImportEngine:
                     )
                 except Exception:
                     logger.exception("O5B run failure state update failed")
-                self._running = False
                 logger.exception("O5B import chunk failed index=%d", i)
                 return self.state.to_dict()
 
@@ -1476,7 +1501,6 @@ class ImportEngine:
             status="completed",
             processed_chunks=len(self._chunks),
         )
-        self._running = False
         return self.state.to_dict()
 
     async def _process_chunks(self, preserve_raw: bool) -> dict:
