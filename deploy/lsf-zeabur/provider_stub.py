@@ -2,6 +2,7 @@
 import hashlib
 import json
 from collections import Counter
+from c2_vectors import c2_input, vector
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -20,8 +21,8 @@ async def provider(request):
         COUNTS["embedding"] += 1
         ROWS.append(dict(kind="embedding", model=data["model"], input_count=len(inputs)))
         return JSONResponse(dict(object="list", model=data["model"],
-            data=[dict(object="embedding", index=i, embedding=[1.0, 0.0, 0.0, 0.0])
-                  for i, _ in enumerate(inputs)], usage=dict(prompt_tokens=1,total_tokens=1)))
+            data=[dict(object="embedding", index=i, embedding=vector(text))
+                  for i, text in enumerate(inputs)], usage=dict(prompt_tokens=1,total_tokens=1)))
     if request.url.path != "/v1/chat/completions":
         return JSONResponse({"error": {"type": "unsupported_path"}}, status_code=404)
     messages = data["messages"]
@@ -39,6 +40,9 @@ async def provider(request):
     elif "信息压缩专家" in system:
         kind = "dehydrate"
         result = dict(core_facts=[body], keywords=["obweb-ls"], summary=body[:50])
+        if c2_input(body):
+            result = dict(core_facts=["C2 synthetic retrieval fixture"],
+                          keywords=["c2-v1"], summary="C2 compact summary: " + body[:40])
     else:
         return JSONResponse({"error": {"type": "unsupported_prompt"}}, status_code=422)
     COUNTS[kind] += 1

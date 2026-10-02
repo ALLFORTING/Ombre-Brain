@@ -2,6 +2,7 @@
 import asyncio
 import importlib.metadata as metadata
 import json
+import hashlib
 import os
 import re
 import signal
@@ -9,6 +10,19 @@ import sys
 from collections import deque
 from pathlib import Path
 from environment import configure, RM_URL, RM_SHA
+
+def verify_c2_sources():
+    from environment import SOURCE
+    pins = json.loads((Path(__file__).parent / "c2-source-hashes.json").read_text())
+    if pins.get("baseline") != "ab7a348b11e6c7d8725d8d0c4ad1f0a26e19cec6":
+        raise RuntimeError("c2_source_identity_mismatch")
+    for relative, expected in pins["sha256"].items():
+        path = SOURCE / relative
+        if not path.resolve().is_relative_to(SOURCE):
+            raise RuntimeError("c2_source_path_refused")
+        actual = hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        if actual != expected:
+            raise RuntimeError("c2_source_hash_mismatch")
 
 class TestSurface:
     """Dedicated MCP surface; no dashboard/config/import HTTP endpoints."""
@@ -53,6 +67,7 @@ async def serve(token, root, port, ready=None, stop_event=None):
     seeded = False
     try:
         sources = runtime_sources()
+        verify_c2_sources()
         seeded = initialize(root)
         import server as ob
         from environment import SOURCE
@@ -66,11 +81,13 @@ async def serve(token, root, port, ready=None, stop_event=None):
         from launcher import start, stop, build
         import provider_stub as stub
         handles.append(await start(stub.app, 18995))
-        surface = TestSurface(build(ob, deque(maxlen=256)))
-        handles.append(await start(surface, port, "0.0.0.0"))
+        from c2_seed import initialize_c2
+        c2 = await initialize_c2(ob, root, lock)
         if seeded:
             from seed import readback
             await readback(ob)
+        surface = TestSurface(build(ob, deque(maxlen=256)))
+        handles.append(await start(surface, port, "0.0.0.0"))
         surface.ready = True
         event = stop_event or asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -82,7 +99,7 @@ async def serve(token, root, port, ready=None, stop_event=None):
         waiter = asyncio.create_task(event.wait())
         try:
             if ready is not None:
-                ready.set_result(dict(sources=sources, seeded=seeded, logs=logs))
+                ready.set_result(dict(sources=sources, seeded=seeded, c2=c2, logs=logs))
             completed, _ = await asyncio.wait([waiter, *[h[1] for h in handles]], return_when=asyncio.FIRST_COMPLETED)
             if waiter not in completed:
                 raise RuntimeError("test_service_unexpected_exit")

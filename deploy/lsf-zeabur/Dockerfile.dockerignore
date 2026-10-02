@@ -78,6 +78,9 @@
 !deploy/lsf-zeabur/run.py
 !deploy/lsf-zeabur/launcher.py
 !deploy/lsf-zeabur/seed.py
+!deploy/lsf-zeabur/c2_seed.py
+!deploy/lsf-zeabur/c2_vectors.py
+!deploy/lsf-zeabur/c2-source-hashes.json
 !deploy/lsf-zeabur/provider_stub.py
 !deploy/lsf-zeabur/observe.py
 !deploy/lsf-zeabur/healthcheck.py

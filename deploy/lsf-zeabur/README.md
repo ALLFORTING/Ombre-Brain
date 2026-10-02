@@ -1,10 +1,12 @@
 # L-SF Zeabur 独立测试服务
 
-本轮仅本地部署适配及预检；没有 push、创建服务、部署或操作 connector。S-5 仍未完成。停止 ngrok 路线，不复制旧 ngrok 配置、凭据或既有本地预检数据。
+本目录包含原部署适配及新增 C2 启动初始化。本 Phase 仅本地实现、限定验证和 local commit；没有 push、部署或操作云端。婷已确认小白鼠首组连接、写入重放和跨重启读回；这些既有结果保留，不据此宣布 C2 或 S-5 全部通过。
 
-来源基线：885807cf460bec47af09812a523677d9dbb33eba。
-独立分支：codex/lsf-zeabur-test-20261002。
-复用来源：D:/Codex/projects/OB-Claude-Synthetic-20261002-LSF-Local；原文件 hash 见 reuse-provenance.json。provider_stub.py、observe.py、seed.py 原样复用；launcher 仅增容器 host 参数和 socket 地址复用，environment 改为 Linux 容器固定布局；不运行原 preflight 或故障矩阵。
+原部署来源基线：885807cf460bec47af09812a523677d9dbb33eba。
+C2指定起点：ab7a348b11e6c7d8725d8d0c4ad1f0a26e19cec6。
+C2隔离分支：codex/lsf-c2-20261003。
+本次结果、样例和指令见 [C2验证](C2_VALIDATION.md)、[21桶清单](C2_FIXTURES.md)、[分批Claude指令](C2_CLAUDE_INSTRUCTIONS.md)。
+原复用来源：D:/Codex/projects/OB-Claude-Synthetic-20261002-LSF-Local；历史来源 hash 保留在 reuse-provenance.json。observe.py、seed.py 继续原样；provider_stub.py 仅新增 C2 输入短摘要和差异4维单位向量，非C2行为保留。原 audit.py/evidence 是历史记录，C2 使用 c2_audit.py、test_c2.py 和 C2_VALIDATION.md。
 
 ## 婷需要填写的内容
 
@@ -63,17 +65,17 @@ Python 基础镜像3.12.14；沿用原 requirements.txt 和 Linux constraints，
 
 同服务保持单实例/副本，关闭自动扩容，不启动多个worker，不同时运行两服务指向同一实际目录。卷锁会拒绝第二个进程。Zeabur挂卷服务采用停止旧实例再启动的Recreate策略，重启会有短暂停机，不保证旧MCP transport session跨进程可用。[官方卷说明](https://zeabur.com/docs/en-US/operations/data/volumes)、[官方健康检查](https://zeabur.com/docs/en-US/operations/monitoring/health-checks)。
 
-## 未来 Zeabur 操作顺序（本轮不执行）
+## 未来 C2 更新顺序（本轮不执行）
 
-1. 单独授权后，仅发布/选择这个专用测试分支的提交，在Zeabur新建独立测试服务 ob-lsf-synthetic-20261002。不要绑定生产服务、域名、卷、共享变量或connector。Root Directory为仓库根，用上述ZBPACK_DOCKERFILE_PATH。[官方Dockerfile选择规则](https://zeabur.com/docs/en-US/deploy/methods/dockerfile)。本轮没有push，所以远端当前不存在本次提交。
-2. 在首次成功启动前配置全新专用卷 /data/lsf 和变量；确认单实例。入口在缺卷/缺opt-in/token时fail closed。
-3. 保持Dockerfile默认启动命令；只开放OB平台端口。健康检查设置HTTP路径 /health，不附凭据。只有stub/OB启动及首次fixture读回完成后返回200；初始为503。镜像还有内部健康检查脚本，但平台仍须按官方设置自定义HTTP路径。
-4. 为这个服务分配全新测试HTTPS域名，确认外部443指向OB平台端口；不给18995分配端口或域名。/api/config应404，无token /mcp应401。
-5. 在发出首组指令前，单独完成实际平台的POST/GET/DELETE、query/protocol/session headers保持、SSE无缓冲与超时、重连、TLS/redirect、认证拒绝，以及平台/上游日志与Traffic Inspector保留策略核验。本轮Python可控日志通过，不证明Zeabur或第三方代理日志已过滤query。未通过不得宣布公网/Claude验收完成。
-6. 后续由婷私密添加OB-accept-L-SF测试connector；带query凭据URL仅在私密connector设置里填写，不进入报告。只有门槛通过才发送本目录FIRST_GROUP_CLAUDE_INSTRUCTIONS.md；trace已修正为content="OBWEB-LS-APPEND-ONCE", append=True，operation_id仍为obweb-ls-trace-001。其他operation_id未改，本轮没有执行这些Claude指令。
-7. 后续同组重启须保留同一服务/卷及token，仅新建transport session并核对原对象与receipt。不要删除卷、清空根、重新seed或换operation_id。完整首组重放、Claude体验、四组/C2～C8仍待后续Phase；S-5未完成。
+1. 另行授权push/更新后，将本次local commit用于现有小白鼠测试服务构建；本Phase不执行。
+2. 保持现有Dockerfile、仓库根、卷/data/lsf、query token、域名和connector；不新增必填变量。
+3. 停旧测试进程释放service.lock后启动新版本，需要短暂停机。若平台新旧重叠持锁，新进程拒绝；不能绕过锁。
+4. 新进程自动追加C2，完整批次直接复用；部分批次或身份冲突停止。保留卷和失败现场，不删marker或重新seed。
+5. ready后重新连接L-SF，用C2_CLAUDE_INSTRUCTIONS.md逐批验收；本地结果不替代真实Claude或平台协议/日志验收。
+6. 既有首组连接、写入重放和跨重启读回结果保留；不占用/更换obweb-ls-*回执。
+   详细步骤与边界见C2_IMPLEMENTATION.md。C2客户端及S-5仍未宣布完成。
 
-## 本轮验证与限制
+## 原部署适配历史验证（ab7a348；C2结果另见C2_VALIDATION.md）
 
 WSL Ubuntu /home/ting/.venvs/ombre/bin/python 实测3.12.14、MCP1.29.1；正式RM0.1.0实际import来自原.s5-rm010-official，direct_url/hash/contract通过。Windows对既有官方tar.gz重新计算SHA256与正式pin完全一致。
 

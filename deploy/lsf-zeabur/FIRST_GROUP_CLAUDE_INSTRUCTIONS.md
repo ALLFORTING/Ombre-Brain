@@ -1,5 +1,7 @@
 # 首组 L-SF：可直接发给 Claude 的指令
 
+C1 既有指令保留；后续 C2 使用 [分批指令](C2_CLAUDE_INSTRUCTIONS.md)，不重做本页 smoke。
+
 仅在管理员已完成隔离启动、fixture ID读回、端到端流式/query-token认证及日志门槛，且婷已自行在网页添加 OB-accept-L-SF 后发送。此文件不含任何认证凭据。本轮尚未执行。
 
 下面内容可整段发给 Claude：

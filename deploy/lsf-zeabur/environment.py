@@ -2,6 +2,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 BASELINE = "885807cf460bec47af09812a523677d9dbb33eba"
 SOURCE = Path(__file__).resolve().parents[2]
@@ -38,6 +39,7 @@ def configure(token, root, port):
         "OMBRE_DEHYDRATION_MODEL": "synthetic-chat-v1",
         "OMBRE_EMBEDDING_MODEL": "synthetic-embedding-4-v1",
     })
+    time.tzset()
     for name in ("home", "cache", "tmp", "remember-me", "raw-evidence"):
         (root / name).mkdir(exist_ok=True)
     tempfile.tempdir = str(root / "tmp")
