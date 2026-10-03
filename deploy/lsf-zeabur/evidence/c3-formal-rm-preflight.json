@@ -1,0 +1,10 @@
+{
+  "python": "3.12.14",
+  "executable": "/home/ting/.venvs/ombre/bin/python",
+  "mcp": "1.29.1",
+  "mcp_source": "/home/ting/.venvs/ombre/lib/python3.12/site-packages/mcp/__init__.py",
+  "remember_me": "0.1.0",
+  "remember_me_source": "/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py",
+  "remember_me_release": "https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0/remember_me-0.1.0.tar.gz",
+  "remember_me_sha256": "93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485"
+}

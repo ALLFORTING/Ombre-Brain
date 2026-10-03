@@ -1,0 +1,28 @@
+F
+=================================== FAILURES ===================================
+____________________________ test_c3_bounded_batch _____________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-ting/pytest-0/test_c3_bounded_batch0')
+
+    def test_c3_bounded_batch(tmp_path):
+        root = tmp_path/'lsf'
+>       run_child(root,'prepare')
+
+deploy/lsf-zeabur/test_c3.py:147: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+root = PosixPath('/tmp/pytest-of-ting/pytest-0/test_c3_bounded_batch0/lsf')
+action = 'prepare', ok = True
+
+    def run_child(root, action, ok=True):
+        proc = subprocess.run([sys.executable,'-B',str(__file__),'--worker',action,str(root)],capture_output=True,text=True,timeout=150)
+        result = json.loads(proc.stdout)
+>       assert (proc.returncode==0)==ok, result
+E       AssertionError: {'error': 'AssertionError', 'location': 'run.py:49'}
+E       assert (1 == 0) == True
+E        +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...test_c3_bounded_batch0/lsf'], returncode=1, stdout='{"error": "AssertionError", "location": "run.py:49"}\n', stderr='').returncode
+
+deploy/lsf-zeabur/test_c3.py:17: AssertionError
+=========================== short test summary info ============================
+FAILED deploy/lsf-zeabur/test_c3.py::test_c3_bounded_batch - AssertionError: ...
+1 failed in 1.17s

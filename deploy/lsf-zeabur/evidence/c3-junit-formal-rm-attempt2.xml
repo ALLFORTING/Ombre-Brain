@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="16.675" timestamp="2026-10-03T15:42:52.202938+08:00" hostname="USER-TING"><testcase classname="deploy.lsf-zeabur.test_c3" name="test_c3_bounded_batch" time="16.311"><failure message="AssertionError: {'error': 'KeyError', 'location': 'test_c3.py:104', 'child_rm_source': '/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py', 'child_rm_version': '0.1.0'}&#10;assert (1 == 0) == True&#10; +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...jects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py&quot;, &quot;child_rm_version&quot;: &quot;0.1.0&quot;}\n', stderr='').returncode">tmp_path = PosixPath('/tmp/pytest-of-ting/pytest-1/test_c3_bounded_batch0')
+
+    def test_c3_bounded_batch(tmp_path):
+        root = tmp_path/'lsf'
+        if (HERE/'evidence/c3-refusals-completed.json').exists():
+            run_child(root,'prepare')
+&gt;           result = run_child(root,'exercise')
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+deploy/lsf-zeabur/test_c3.py:186: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+root = PosixPath('/tmp/pytest-of-ting/pytest-1/test_c3_bounded_batch0/lsf')
+action = 'exercise', ok = True
+
+    def run_child(root, action, ok=True):
+        proc = subprocess.run([sys.executable,'-B',str(__file__),'--worker',action,str(root)],capture_output=True,text=True,timeout=150)
+        result = json.loads(proc.stdout)
+        expected = Path(os.environ['PYTHONPATH']).resolve()
+        assert Path(result['child_rm_source']).resolve().is_relative_to(expected)
+        assert result['child_rm_version'] == '0.1.0'
+&gt;       assert (proc.returncode==0)==ok, result
+E       AssertionError: {'error': 'KeyError', 'location': 'test_c3.py:104', 'child_rm_source': '/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py', 'child_rm_version': '0.1.0'}
+E       assert (1 == 0) == True
+E        +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...jects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py", "child_rm_version": "0.1.0"}\n', stderr='').returncode
+
+deploy/lsf-zeabur/test_c3.py:22: AssertionError</failure></testcase></testsuite></testsuites>

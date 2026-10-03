@@ -1,0 +1,41 @@
+F
+=================================== FAILURES ===================================
+____________________________ test_c3_bounded_batch _____________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-ting/pytest-2/test_c3_bounded_batch0')
+
+    def test_c3_bounded_batch(tmp_path):
+        root = tmp_path/'lsf'
+        continuation = HERE/'evidence/c3-runtime-continuation.json'
+        if continuation.exists():
+            prior = Path(json.loads(continuation.read_text(encoding='utf-8-sig'))['root'])
+            if prior.is_dir():
+                root = prior
+        if (HERE/'evidence/c3-refusals-completed.json').exists():
+            if not (root/'.c2-v1.json').exists():
+                run_child(root,'prepare')
+>           result = run_child(root,'exercise')
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+deploy/lsf-zeabur/test_c3.py:192: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+root = PosixPath('/tmp/pytest-of-ting/pytest-1/test_c3_bounded_batch0/lsf')
+action = 'exercise', ok = True
+
+    def run_child(root, action, ok=True):
+        proc = subprocess.run([sys.executable,'-B',str(__file__),'--worker',action,str(root)],capture_output=True,text=True,timeout=150)
+        result = json.loads(proc.stdout)
+        expected = Path(os.environ['PYTHONPATH']).resolve()
+        assert Path(result['child_rm_source']).resolve().is_relative_to(expected)
+        assert result['child_rm_version'] == '0.1.0'
+>       assert (proc.returncode==0)==ok, result
+E       AssertionError: {'error': 'TypeError', 'location': 'encoder.py:180', 'child_rm_source': '/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py', 'child_rm_version': '0.1.0'}
+E       assert (1 == 0) == True
+E        +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...jects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py", "child_rm_version": "0.1.0"}\n', stderr='').returncode
+
+deploy/lsf-zeabur/test_c3.py:22: AssertionError
+=========================== short test summary info ============================
+FAILED deploy/lsf-zeabur/test_c3.py::test_c3_bounded_batch - AssertionError: ...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 12.79s

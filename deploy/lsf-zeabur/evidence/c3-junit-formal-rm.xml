@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="8.465" timestamp="2026-10-03T15:47:48.006023+08:00" hostname="USER-TING"><testcase classname="deploy.lsf-zeabur.test_c3" name="test_c3_bounded_batch" time="8.156" /></testsuite></testsuites>

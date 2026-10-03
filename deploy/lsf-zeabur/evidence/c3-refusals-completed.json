@@ -1,0 +1,1 @@
+{"completed":["C2 preparation","identity refusal","partial refusal","held lock refusal","C2 preservation after refusals"],"evidence":"c3-formal-rm-attempt1-output.txt","root":"/tmp/pytest-of-ting/pytest-0/test_c3_bounded_batch0","basis":"attempt1 reached exercise only after these assertions succeeded","skip_completed_batch":true}

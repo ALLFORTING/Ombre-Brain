@@ -1,0 +1,39 @@
+{
+  "baseline": "6be6e84d11f3942061aa6061ea9f431155b5d29b",
+  "newline": "LF-normalized",
+  "sha256": {
+    "c3_run.py": "83a2c531d80916125c0fc7cb6552fa03a91b0d16dc13b5fc1cc85bd7b303028b",
+    "c3_provider.py": "899031de417de239266af7c072c416814e73b9d16cc8e7e4bf9e4f00643c9d1e",
+    "c3_inputs.py": "f9843c44728d2973990890b8add5ff4c28687ad21ae09180cb11a308460d5ce2",
+    "c3_control.py": "c3df2ec19e22eb0e396a1c7d419543967de5d210898723eaecebb7121da42a3e",
+    "c3_audit.py": "8305a6c24ce8a5394255454e396471500a3c5b5c82d5cc573346998dabb154a9",
+    "c3-fixed-inputs.json": "42c681348f7e08915a4cb1ea47bb5f0166b6234af22c4a6ad2d45b9267471f1c",
+    "test_c3.py": "4bb9116739815ac2a57bf322c890fe28d0a0c4a951a989e5024a390069d21a1b",
+    "Dockerfile": "dacb8f1be1946a632cb1b64e8b822a7fccaffccc821a183539f9e550e3015942",
+    "Dockerfile.dockerignore": "d06cfa098f5416025634de25d1cd3cb16590d5e38e78f5049487b35bab0a5aa7"
+  },
+  "delivery_sha256": {
+    "C3_CLAUDE_INSTRUCTIONS.md": "30bf68ae3f77c17f3908ac626a8476c534d203974690827ae923ed43adc34edf",
+    "C3_IMPLEMENTATION.md": "9ded70fa216144df694f83566b3aa18c77dc0eb7cb02ab82de2df979390532c8",
+    "C3_VALIDATION.md": "5baaaaaa712e2be4563ba981055c792244d6c8235a7de1c9361625cde007511e",
+    "evidence/c3-bounded-output.txt": "06b4563612cc5fb75bfc2ca515dde58561b1d660f1989dadbceb6e2e0a056e83",
+    "evidence/c3-formal-rm-attempt1-output.txt": "e00d990d657a14b1f20731272e28212a3f3a1f49709be36209cc6cca730360df",
+    "evidence/c3-formal-rm-attempt2-output.txt": "94d45fb9d9b8f0d8e1a0445040d92c2926f2e0f3713665e49eec0790c4a5beb3",
+    "evidence/c3-formal-rm-attempt3-output.txt": "81dd62d11f1f660e293e97c42496e5370f3febff4d7d5c50fe1356dcadd4a653",
+    "evidence/c3-formal-rm-output.txt": "e648f9d353bf61e172454e240716998eb81d224e673e3633c835a216a4c7b187",
+    "evidence/c3-formal-rm-preflight.json": "dddace6080d71b6c18dac10623a812779016fae1027fe2b88887157f5b1c8a9d",
+    "evidence/c3-formal-safe-evidence.json": "e066c4b54dda12ff93173075598661a43afb9fc1ea1782755ba1dee3aeb9b5eb",
+    "evidence/c3-junit-formal-rm-attempt1.xml": "bf7b0f710e6881e3bca80450ac27c16460a34a28f609aa2769801cb553ae688c",
+    "evidence/c3-junit-formal-rm-attempt2.xml": "fbc8db86c7e18b992a6f251ee9e8dbda0dca48fe13351262d00b3c159cd91bcc",
+    "evidence/c3-junit-formal-rm-attempt3.xml": "1d451ad6ed8de1df78ad038286518f84b2377c0cc66e731279ae7a170daf8b27",
+    "evidence/c3-junit-formal-rm.xml": "30d5aff8b37c328dd4dfd22f821f2c9a71b677492735f55ba226bec35d879ae3",
+    "evidence/c3-junit.xml": "ef828e4558e0ef5e757d119453b4319b9d7657e791136529cfebf576716cec98",
+    "evidence/c3-listener-closure.json": "abec13e7e4d74e9419330db6e79e8942592c461e76c070cae8472f9650ea1801",
+    "evidence/c3-refusals-completed.json": "8833ab0bbbb46a70329516ec66223b75d42ab4b36e428e7cf43bb14e3af13083",
+    "evidence/c3-runtime-continuation.json": "6b684117cfcc026ee2e2054b581866f6323613c338a08f55a68afc6b587b56a8"
+  },
+  "excluded_self_outputs": [
+    "c3-artifact-hashes.json",
+    "evidence/c3-static-audit.json"
+  ]
+}

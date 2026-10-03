@@ -1,0 +1,42 @@
+{
+  "rate": {
+    "content": "C3-v1 rate：第一条隔离事项是准备蓝色纸卡。第二条独立事项是核对绿色纸卡。只用于合成验收。",
+    "operation_id": "obweb-ls-c3-v1-rate",
+    "sha256": "40ac862b767c019de578638da925c411853840e08eb4483ebaea641ec43ae614",
+    "prompt": "digest",
+    "path": "/v1/chat/completions",
+    "tool": "grow"
+  },
+  "parse": {
+    "content": "C3-v1 parse：第一条隔离事项是准备蓝色纸卡。第二条独立事项是核对绿色纸卡。只用于合成验收。",
+    "operation_id": "obweb-ls-c3-v1-parse",
+    "sha256": "1335fc93a19a0163bfaf555427c98c0811e016cac29eac90f11bd2d5ee748138",
+    "prompt": "digest",
+    "path": "/v1/chat/completions",
+    "tool": "grow"
+  },
+  "connection": {
+    "content": "C3-v1 connection：第一条隔离事项是准备蓝色纸卡。第二条独立事项是核对绿色纸卡。只用于合成验收。",
+    "operation_id": "obweb-ls-c3-v1-connection",
+    "sha256": "865e329616847fcac362e54b9740005f29ea36664981535ab0ef81f7bff43784",
+    "prompt": "digest",
+    "path": "/v1/chat/completions",
+    "tool": "grow"
+  },
+  "fallback": {
+    "content": "C3-v1 fallback：第一条隔离事项是准备蓝色纸卡。第二条独立事项是核对绿色纸卡。只用于合成验收。",
+    "operation_id": "obweb-ls-c3-v1-fallback",
+    "sha256": "ad5ac4ae076133fc377e1273542367635ce181160a41e44ff91ecfb0f8bc943a",
+    "prompt": "analyze",
+    "path": "/v1/chat/completions",
+    "tool": "hold"
+  },
+  "disconnect": {
+    "content": "C3-v1 disconnect：第一条隔离事项是准备蓝色纸卡。第二条独立事项是核对绿色纸卡。只用于合成验收。",
+    "operation_id": "obweb-ls-c3-v1-disconnect",
+    "sha256": "f5e97cb1f32c3ee9e4a1a329a7b0670baa4b093721167fd90330f0cf3466caef",
+    "prompt": "analyze",
+    "path": "/v1/chat/completions",
+    "tool": "hold"
+  }
+}

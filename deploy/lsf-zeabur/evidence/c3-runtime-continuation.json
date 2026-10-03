@@ -1,0 +1,1 @@
+{"root":"/tmp/pytest-of-ting/pytest-1/test_c3_bounded_batch0/lsf","mode":"recover","reason":"all exercise assertions finished; child output failed to serialize deque; only replay receipts, never reinject faults"}

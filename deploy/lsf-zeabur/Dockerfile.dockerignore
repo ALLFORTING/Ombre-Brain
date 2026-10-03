@@ -86,3 +86,16 @@
 !deploy/lsf-zeabur/healthcheck.py
 !deploy/lsf-zeabur/Dockerfile
 !deploy/lsf-zeabur/Dockerfile.dockerignore
+
+!deploy/lsf-zeabur/c3_run.py
+!deploy/lsf-zeabur/c3_provider.py
+!deploy/lsf-zeabur/c3_inputs.py
+!deploy/lsf-zeabur/c3-artifact-hashes.json
+
+!deploy/lsf-zeabur/c3_control.py
+
+!deploy/lsf-zeabur/c3_audit.py
+
+!deploy/lsf-zeabur/c3-fixed-inputs.json
+
+!deploy/lsf-zeabur/test_c3.py

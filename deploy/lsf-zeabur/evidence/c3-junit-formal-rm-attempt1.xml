@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="33.626" timestamp="2026-10-03T15:39:59.704661+08:00" hostname="USER-TING"><testcase classname="deploy.lsf-zeabur.test_c3" name="test_c3_bounded_batch" time="33.225"><failure message="AssertionError: {'error': 'KeyError', 'location': 'test_c3.py:147', 'child_rm_source': '/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py', 'child_rm_version': '0.1.0'}&#10;assert (1 == 0) == True&#10; +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...jects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py&quot;, &quot;child_rm_version&quot;: &quot;0.1.0&quot;}\n', stderr='').returncode">tmp_path = PosixPath('/tmp/pytest-of-ting/pytest-0/test_c3_bounded_batch0')
+
+    def test_c3_bounded_batch(tmp_path):
+        root = tmp_path/'lsf'
+        run_child(root,'prepare')
+        snapshot = c2_snapshot(root)
+        original = (root/'.c2-v1.json').read_bytes()
+        for field, value, expected in [('baseline','wrong','c2_identity_conflict'),('status','started','c3_existing_c2_complete_required')]:
+            probe = tmp_path/field
+            shutil.copytree(root,probe)
+            marker = probe/'.c2-v1.json'
+            state = json.loads(original);state[field]=value
+            marker.write_text(json.dumps(state))
+            before = c2_snapshot(probe)
+            refused = run_child(probe,'refuse',False)
+            assert refused['error']==expected, refused
+            assert c2_snapshot(probe)==before
+        refused = run_child(root,'locked',False)
+        assert refused['error']=='test_volume_already_in_use'
+        assert c2_snapshot(root)==snapshot
+&gt;       result = run_child(root,'exercise')
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+deploy/lsf-zeabur/test_c3.py:200: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+root = PosixPath('/tmp/pytest-of-ting/pytest-0/test_c3_bounded_batch0/lsf')
+action = 'exercise', ok = True
+
+    def run_child(root, action, ok=True):
+        proc = subprocess.run([sys.executable,'-B',str(__file__),'--worker',action,str(root)],capture_output=True,text=True,timeout=150)
+        result = json.loads(proc.stdout)
+        expected = Path(os.environ['PYTHONPATH']).resolve()
+        assert Path(result['child_rm_source']).resolve().is_relative_to(expected)
+        assert result['child_rm_version'] == '0.1.0'
+&gt;       assert (proc.returncode==0)==ok, result
+E       AssertionError: {'error': 'KeyError', 'location': 'test_c3.py:147', 'child_rm_source': '/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py', 'child_rm_version': '0.1.0'}
+E       assert (1 == 0) == True
+E        +  where 1 = CompletedProcess(args=['/home/ting/.venvs/ombre/bin/python', '-B', '/mnt/d/Codex/projects/Ombre-Brain-C3/deploy/lsf-ze...jects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py", "child_rm_version": "0.1.0"}\n', stderr='').returncode
+
+deploy/lsf-zeabur/test_c3.py:22: AssertionError</failure></testcase></testsuite></testsuites>
