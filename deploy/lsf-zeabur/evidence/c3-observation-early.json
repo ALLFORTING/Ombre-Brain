@@ -1,0 +1,59 @@
+{
+  "accepted": false,
+  "refusal_verified": true,
+  "mode": "early",
+  "events": [
+    {
+      "event": "armed",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": null,
+      "monotonic": 159.304955507,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "request_matched",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "17f46cfae83a44ef9ea1a86d1332bcfc",
+      "monotonic": 159.305464631,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "http.disconnect",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "17f46cfae83a44ef9ea1a86d1332bcfc",
+      "monotonic": 159.325689426,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "disconnect_refused_unaccepted",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "17f46cfae83a44ef9ea1a86d1332bcfc",
+      "monotonic": 159.325697778,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "waiting",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "17f46cfae83a44ef9ea1a86d1332bcfc",
+      "monotonic": 159.325749002,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "control_refused_unaccepted",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "17f46cfae83a44ef9ea1a86d1332bcfc",
+      "monotonic": 159.326089274,
+      "time_basis": "observed_at"
+    }
+  ],
+  "cli_actions": [
+    "status",
+    "status"
+  ]
+}

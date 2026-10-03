@@ -3,9 +3,9 @@
   "newline": "LF-normalized",
   "sha256": {
     "c3_run.py": "83a2c531d80916125c0fc7cb6552fa03a91b0d16dc13b5fc1cc85bd7b303028b",
-    "c3_provider.py": "899031de417de239266af7c072c416814e73b9d16cc8e7e4bf9e4f00643c9d1e",
+    "c3_provider.py": "29f2b57b58c817283470da54028fa21d0159b8857ec63559e838162aa478be47",
     "c3_inputs.py": "f9843c44728d2973990890b8add5ff4c28687ad21ae09180cb11a308460d5ce2",
-    "c3_control.py": "c3df2ec19e22eb0e396a1c7d419543967de5d210898723eaecebb7121da42a3e",
+    "c3_control.py": "fb723ec9c68d32068dce0be88ea861d6a33daf66a65b7e89dfb20b61070fb230",
     "c3_audit.py": "8305a6c24ce8a5394255454e396471500a3c5b5c82d5cc573346998dabb154a9",
     "c3-fixed-inputs.json": "42c681348f7e08915a4cb1ea47bb5f0166b6234af22c4a6ad2d45b9267471f1c",
     "test_c3.py": "4bb9116739815ac2a57bf322c890fe28d0a0c4a951a989e5024a390069d21a1b",
@@ -13,9 +13,9 @@
     "Dockerfile.dockerignore": "d06cfa098f5416025634de25d1cd3cb16590d5e38e78f5049487b35bab0a5aa7"
   },
   "delivery_sha256": {
-    "C3_CLAUDE_INSTRUCTIONS.md": "30bf68ae3f77c17f3908ac626a8476c534d203974690827ae923ed43adc34edf",
-    "C3_IMPLEMENTATION.md": "9ded70fa216144df694f83566b3aa18c77dc0eb7cb02ab82de2df979390532c8",
-    "C3_VALIDATION.md": "f6059312237d92c58e492e749c864b6674c6659634fafdab5ea870a1a745c882",
+    "C3_CLAUDE_INSTRUCTIONS.md": "59016c647fa00604f801148f890bc69b977a4f48016efaf68950b9232bb9a06a",
+    "C3_IMPLEMENTATION.md": "423dfc5f729d7c389996cfde51a97a4d5cf3c81c02303e318effd0867924f896",
+    "C3_VALIDATION.md": "c1953f36e43e0204a7bcd1ca0d3f504fcfaa41e0157889fc9a5cc33132e18cbd",
     "evidence/c3-bounded-output.txt": "06b4563612cc5fb75bfc2ca515dde58561b1d660f1989dadbceb6e2e0a056e83",
     "evidence/c3-formal-rm-attempt1-output.txt": "e00d990d657a14b1f20731272e28212a3f3a1f49709be36209cc6cca730360df",
     "evidence/c3-formal-rm-attempt2-output.txt": "94d45fb9d9b8f0d8e1a0445040d92c2926f2e0f3713665e49eec0790c4a5beb3",
@@ -35,12 +35,20 @@
     "evidence/c3-disconnect-new-evidence.json": "e27efac7d992e9179e687e8f7e3600d5d85a8e5fa7ac8f416d842a8a502aa167",
     "evidence/c3-disconnect-new-junit.xml": "7bd8944b6f78146b137abc719483aa07630da3b8a125f7260a0d7251f47b4cc0",
     "evidence/c3-disconnect-new-output.txt": "d4bb930d6682fab37ea74b455802dca1f063744f8cae167da0fb8dfaad353ea1",
-    "evidence/c3-disconnect-new-preflight.json": "dddace6080d71b6c18dac10623a812779016fae1027fe2b88887157f5b1c8a9d"
+    "evidence/c3-disconnect-new-preflight.json": "dddace6080d71b6c18dac10623a812779016fae1027fe2b88887157f5b1c8a9d",
+    "test_c3_observation.py": "b920a2bdfa805f0635b52bc6786c9e3e8b9446306c13bf3d3e229592bce7ba79",
+    "evidence/c3-observation-early.json": "810ca9b5894f8fd64e47be683e6c143682f0024152d62b39f43adb6669fa4a8b",
+    "evidence/c3-observation-mismatch.json": "f36a6efd6fbabd3de64ca9d836382521db5f0140d4b4620db8ee7c980b956962",
+    "evidence/c3-observation-evidence.json": "94baf67422cd1064e5a4d4747e90c5bb657e35e50768197bcce41aa6662f8830",
+    "evidence/c3-observation-junit.xml": "ab973a752b006e29a5c3098e83c00a266fabf960f99da6502d94143566665f96",
+    "evidence/c3-observation-output.txt": "691464c4245fa520fdb9855687509308f896994e1571573fd25cacf7f1b7e6e1"
   },
   "excluded_self_outputs": [
     "c3-artifact-hashes.json",
     "evidence/c3-static-audit.json",
-    "evidence/c3-disconnect-new-audit.json"
+    "evidence/c3-disconnect-new-audit.json",
+    "evidence/c3-observation-audit.json"
   ],
-  "evidence_parent": "508f01fc7f996c9e5477f141ae26eaab53fba1de"
+  "evidence_parent": "508f01fc7f996c9e5477f141ae26eaab53fba1de",
+  "observation_parent": "499fb66e8fcfa422fb6a1d6a26990d1bc48f9f92"
 }

@@ -18,8 +18,9 @@ def control(action, data=None, deadline=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action',choices=['status','arm','release','disarm','arguments','watch-disconnect'])
+    parser.add_argument('action',choices=['status','arm','release','disarm','arguments','watch-disconnect','mark-operation'])
     parser.add_argument('scenario',nargs='?',choices=list(SCENARIOS))
+    parser.add_argument('--request-id')
     args = parser.parse_args()
     if args.action=='arguments':
         if not args.scenario:
@@ -38,12 +39,21 @@ def main():
             state = control('status',deadline=deadline)
             if state['generation']!=generation or state['armed']!='disconnect' or state['gate_expired']:
                 raise RuntimeError('unaccepted_gate_changed_or_expired')
-            events = {e['event'] for e in state['events'] if e['scenario']=='disconnect' and e['generation']==generation}
-            if {'waiting','http.disconnect'}<=events and not released:
-                control('release',{},deadline=deadline)
+            if state.get('unaccepted'):
+                raise RuntimeError('unaccepted_evidence_no_rerun')
+            request_id = state.get('target_request')
+            rows = [e for e in state['events'] if e['scenario']=='disconnect' and e['generation']==generation
+                    and e.get('request_id')==request_id and request_id]
+            ordered = [e['event'] for e in rows if e['event'] in ('waiting','operation_marked','http.disconnect','released','completed')]
+            events = set(ordered)
+            expected = ['waiting','operation_marked','http.disconnect','released','completed']
+            if ordered!=expected[:len(ordered)]:
+                raise RuntimeError('unaccepted_event_order_no_rerun')
+            if ordered==expected[:3] and not released:
+                control('release',{'request_id':request_id},deadline=deadline)
                 released = True
-            if {'waiting','http.disconnect','released','completed'}<=events:
-                print(json.dumps(dict(accepted=True,scenario='disconnect',generation=generation,events=sorted(events))))
+            if ordered==expected:
+                print(json.dumps(dict(accepted=True,scenario='disconnect',generation=generation,request_id=request_id,events=ordered,completion_time_basis='observed_at')))
                 return
             time.sleep(max(0,min(.1,deadline-time.monotonic())))
         raise RuntimeError('unaccepted_missing_events_no_rerun')
@@ -52,7 +62,8 @@ def main():
             parser.error('scenario required')
         state = control('arm',dict(scenario=args.scenario))
     else:
-        state = control(args.action,None if args.action=='status' else {})
+        data = {'request_id':args.request_id} if args.action in ('release','mark-operation') else {}
+        state = control(args.action,None if args.action=='status' else data)
     print(json.dumps(state,ensure_ascii=False,indent=2))
 
 if __name__=='__main__':

@@ -177,3 +177,54 @@ The new evidence is independent of the old missing rows. The local CLI/disconnec
 serialization evidence gaps are now covered by this new case. Real Claude connector,
 Docker/container/volume and Zeabur acceptance remain unexecuted. No push/deployment or
 formal OB/main/origin/旧日雪 change occurred.
+
+
+## Observation-layer minimal correction — 2026-10-03
+
+Verified clean starting HEAD: 499fb66e8fcfa422fb6a1d6a26990d1bc48f9f92.
+Only local C3 observer/control, hashes, bounded test and documentation changed. The prior
+five-scenario batch and prior disconnect test/evidence were not rerun or rewritten.
+Historical acceptance statements above describe their original observations; the strict
+operation marker and per-request acceptance contract here applies to the corrected layer.
+
+Exactly three selected checks ran once in WSL Ubuntu using Python 3.12.14 and command-only
+official RM0.1.0 PYTHONPATH: **3 passed in 17.91s**. No full suite, TMP/TEMP or basetemp.
+
+```sh
+PYTHONPATH=/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official /home/ting/.venvs/ombre/bin/python -B -m pytest   deploy/lsf-zeabur/test_c3_observation.py::test_early_disconnect_refused   deploy/lsf-zeabur/test_c3_observation.py::test_same_key_request_mismatch_refused   deploy/lsf-zeabur/test_c3_observation.py::test_observation_socket_cli_replay   -q -x -p no:cacheprovider   --junitxml=deploy/lsf-zeabur/evidence/c3-observation-junit.xml
+```
+
+Early-disconnect rejection uses the actual C3 ASGI receive pump, a fixed matching request,
+and disconnect before waiting. Later waiting cannot repair it: release returns409, gate
+stays closed and CLI exits its decision path without release. Request-mismatch rejection
+uses two separate ASGI requests with the identical key/content. Their UUIDs differ; the
+second disconnect cannot satisfy the first request's gate. It likewise returns409 and
+CLI makes only status calls. These are observer/control probes with a synthetic registered
+receipt; they do not claim real business storage or socket behavior.
+
+The independent positive check prepares a fresh synthetic C2 root, validates original
+C2 identity, confirms the original fixed disconnect key unused, then runs real authenticated
+MCP HTTP, provider and durable storage. The client waits, registers the exact request's
+operation marker, then closes its actual TCP socket. The shipped CLI alone releases after
+observing that request's disconnect and waits for completed. The five required events occur
+exactly once in order and share target_request. Timestamps are live unrounded monotonic
+observation times. completed/time_basis=observed_at explicitly records the time the completed
+receipt was observed, not a real commit timestamp.
+
+Fresh HTTP replay uses exactly the original key/body and has a different request UUID.
+Its durable receipt is identical, with exactly one new bucket/plan item, full body readback
+and vector. Fault provider and original stub counts do not increase on replay. C2 marker
+bytes, all21 fixture file hashes and manifest-designated SQL/vector rows remain identical.
+The original complete C2 validator runs before listeners open. All three ports18993/18994/
+18995 return ECONNREFUSED(111) after shutdown; no listener is retained.
+
+New exclusive safe JSON archives: c3-observation-early.json, c3-observation-mismatch.json
+and c3-observation-evidence.json under evidence/. Each contains parseable actual observer
+events and request identities. The real case also stores CLI stdout/exit0, replay identities,
+C2 comparisons and listener closure. Existing evidence and markers are preserved. The test
+refuses an existing output rather than repeating an attempted experiment.
+
+Final read-only preservation/hash/syntax/scope/credential audit: c3-observation-audit.json.
+It checks original C2 source pins and the complete original Git tree outside this explicit
+C3 allowlist against499fb66, including every old evidence file. No deployment, push or
+business source edit. Remote Claude/Zeabur acceptance remains unexecuted.

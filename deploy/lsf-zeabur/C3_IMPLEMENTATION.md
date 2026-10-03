@@ -82,3 +82,17 @@ python -B /app/deploy/lsf-zeabur/c3_control.py arguments disconnect
 
 Docker build, container UID/mount permissions, Zeabur update and real Claude connector
 acceptance remain unexecuted. Formal OB/main/旧日雪 are outside this delivery.
+
+
+## C3 observation correction at parent 499fb66 (local only)
+
+Each matching MCP HTTP request receives a UUID, including same-key replay. The armed
+first request owns the waiting gate. Concurrent matching retries poison acceptance rather
+than contributing their disconnect to another request. Events retain each request identity.
+The local mark-operation command requires the exact target request ID after waiting.
+The only accepted order is waiting -> operation_marked -> target http.disconnect -> release.
+Release rechecks the wait/deadline, durable registration and non-completed receipt. Rejected
+or incomplete observations never cause CLI release or automatic rerun. Normal timeout
+passthrough retains its existing business behavior and remains unaccepted.
+completed/time_basis=observed_at means completion was observed in a durable receipt;
+it does not claim the time of the actual commit. No business/C2 identity changes are needed.

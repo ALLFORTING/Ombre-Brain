@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import uuid
 from collections import Counter, deque
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -34,9 +35,13 @@ class Controller:
         self.expired = False
         self.completed = set()
         self.tasks = set()
-    def event(self, event, scenario=None, generation=None):
+        self.target_request = None
+        self.waiting = False
+        self.unaccepted = None
+    def event(self, event, scenario=None, generation=None, request_id=None):
         self.events.append(dict(event=event,scenario=scenario,generation=generation,
-                                monotonic=round(asyncio.get_running_loop().time(),3)))
+                                request_id=request_id, monotonic=asyncio.get_running_loop().time(),
+                                time_basis="observed_at"))
     def projection(self):
         receipts = {}
         for name,fixed in SCENARIOS.items():
@@ -45,8 +50,10 @@ class Controller:
                 receipts[name] = dict(status=row['status'],result_sha256=digest(row.get('result_text') or ''))
                 if row['status']=='completed' and name not in self.completed:
                     self.completed.add(name)
-                    self.event('completed',name,self.generation if name==self.armed else None)
+                    self.event('completed',name,self.generation if name==self.armed else None,
+                               self.target_request if name==self.armed else None)
         return dict(armed=self.armed,generation=self.generation,counts=dict(self.counts),
+                    target_request=self.target_request,waiting=self.waiting,unaccepted=self.unaccepted,
                     events=list(self.events),receipts=receipts,gate_expired=self.expired,
                     waiting_seconds_remaining=max(0,round(self.deadline-asyncio.get_running_loop().time(),2)) if self.deadline else None)
     async def control(self, request):
@@ -75,14 +82,31 @@ class Controller:
             self.gate.clear()
             self.deadline = None
             self.expired = False
+            self.target_request = None
+            self.waiting = False
+            self.unaccepted = None
             self.event('armed',name,self.generation)
-        elif action=='release':
-            now = asyncio.get_running_loop().time()
-            observed = {e['event'] for e in self.events if e['scenario']=='disconnect' and e['generation']==self.generation}
-            if self.armed!='disconnect' or self.deadline is None or now>=self.deadline or self.expired or not {'waiting','http.disconnect'} <= observed:
-                return JSONResponse({'error':'gate_not_releasable'},status_code=409)
-            self.gate.set()
-            self.event('released',self.armed,self.generation)
+        elif action in ('mark-operation','release'):
+            state = self.projection()
+            request_id = data.get('request_id')
+            row = self.ob.bucket_mgr.inspect_trace_request(SCENARIOS['disconnect']['operation_id'])
+            own = [e['event'] for e in self.events if e['scenario']=='disconnect'
+                   and e['generation']==self.generation and e['request_id']==self.target_request]
+            expected = ['waiting'] if action=='mark-operation' else ['waiting','operation_marked','http.disconnect']
+            ordered = [e for e in own if e in ('waiting','operation_marked','http.disconnect','released','completed')]
+            if (self.armed!='disconnect' or not request_id or request_id!=self.target_request
+                    or not self.waiting or self.gate.is_set() or self.deadline is None
+                    or asyncio.get_running_loop().time()>=self.deadline or self.expired
+                    or self.unaccepted or not row or row['status']=='completed' or ordered!=expected):
+                self.unaccepted = self.unaccepted or 'gate_evidence_or_request_refused'
+                self.event('control_refused_unaccepted','disconnect',self.generation,request_id)
+                return JSONResponse({'error':'gate_not_releasable','accepted':False},status_code=409)
+            if action=='mark-operation':
+                self.event('operation_marked',self.armed,self.generation,request_id)
+            else:
+                self.gate.set()
+                self.waiting = False
+                self.event('released',self.armed,self.generation,request_id)
         elif action=='disarm':
             row = self.ob.bucket_mgr.inspect_trace_request(SCENARIOS[self.armed]['operation_id']) if self.armed else None
             if self.tasks or (row and row['status']!='completed'):
@@ -125,13 +149,16 @@ class Controller:
                         # One deadline across all attempts; timeout never starts another window.
                         if self.deadline is None:
                             self.deadline = asyncio.get_running_loop().time()+45
-                            self.event('waiting',name,generation)
+                            self.waiting = True
+                            self.event('waiting',name,generation,self.target_request)
                         remaining = self.deadline-asyncio.get_running_loop().time()
                         if not self.expired and remaining>0:
                             try:
                                 await asyncio.wait_for(self.gate.wait(),remaining)
                             except TimeoutError:
                                 self.expired = True
+                                self.waiting = False
+                                self.unaccepted = self.unaccepted or 'gate_timeout'
                                 self.event('gate_timeout_unaccepted',name,generation)
                         elif not self.gate.is_set():
                             self.expired = True
@@ -181,8 +208,9 @@ class TransportEvents:
         name = None
         generation = self.controller.generation
         response_done = False
+        request_id = None
         async def pump():
-            nonlocal name
+            nonlocal name, request_id
             body = bytearray()
             while True:
                 message = await receive()
@@ -193,12 +221,30 @@ class TransportEvents:
                     elif not message.get('more_body',False):
                         try:
                             name = fixed_request(json.loads(body))
+                            if name:
+                                request_id = uuid.uuid4().hex
+                                c = self.controller
+                                c.event('request_matched',name,generation,request_id)
+                                if name=='disconnect' and c.armed==name and c.generation==generation:
+                                    if c.target_request is None:
+                                        c.target_request = request_id
+                                    elif not c.gate.is_set() and not c.expired:
+                                        c.unaccepted = 'matching_request_overlap'
+                                        c.event('request_mismatch_unaccepted',name,generation,request_id)
                         except (ValueError,TypeError,AttributeError):
                             pass
                 elif message['type']=='http.disconnect':
                     # Only the exact keyed call, before its response completes, owns this event.
                     if name and not response_done:
-                        self.controller.event('http.disconnect',name,generation)
+                        c = self.controller
+                        c.event('http.disconnect',name,generation,request_id)
+                        if name=='disconnect' and c.armed==name and c.generation==generation:
+                            own = [e['event'] for e in c.events if e['scenario']==name
+                                   and e['generation']==generation and e['request_id']==request_id]
+                            ordered = [e for e in own if e in ('waiting','operation_marked','http.disconnect')]
+                            if request_id!=c.target_request or ordered!=['waiting','operation_marked','http.disconnect']:
+                                c.unaccepted = 'early_or_mismatched_disconnect'
+                                c.event('disconnect_refused_unaccepted',name,generation,request_id)
                     await queue.put(message)
                     return
                 await queue.put(message)

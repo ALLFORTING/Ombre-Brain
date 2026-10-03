@@ -1,0 +1,836 @@
+{
+  "format": 1,
+  "parent": "499fb66e8fcfa422fb6a1d6a26990d1bc48f9f92",
+  "new_experiment": true,
+  "root": "/tmp/c3-disconnect-evidence-b80jayct/fresh-c3-disconnect",
+  "started_utc": "2026-10-03T11:15:16.251256+00:00",
+  "stage": "finished",
+  "accepted": true,
+  "c2_before": {
+    "marker_sha256": "d6965de3bc9f83becc7accb86c153301101147b89ceb00db32271157f8b0b4d2",
+    "files": {
+      "dynamic/c2-v1/C2-NAME-EXACT_c20000000001.md": "c1204bf5339a91f4efce038867a106ed49534b2e7be42d4ff4a5c121c1c9c75f",
+      "dynamic/c2-v1/C2-NAME-EXACT-NEAR_c20000000002.md": "0a60f09563eb798fcf66869bf0b7bbdd4085779e4fa06bf4361fec35fb9ceadb",
+      "dynamic/c2-v1/C2-TAG-TODAY_c20000000003.md": "9212e61cbb9cae5ac4c8075c6104e5307a5d2bb7e7b7efa62473e29bc7d2a8a6",
+      "dynamic/c2-v1/C2-BODY-LOW_c20000000004.md": "4bfe1893eff3e3c864456899be9a4dbf679367ac32d86d030cf53889c8edc037",
+      "dynamic/c2-v1/C2-TAG-YESTERDAY_c20000000005.md": "831bbbd5b0440290cf521d19424030bf6e27179cb6b8942aab6cab04b0659e6f",
+      "dynamic/c2-v1/C2-OTHER-DOMAIN_c20000000006.md": "1aeecebc523b2fda459c3b5b7b82481814e20518a9b1eba5ac1307451488c131",
+      "dynamic/c2-v1/C2-DORMANT_c20000000007.md": "29c50cedc8b5d3572d3ff663b79e1d7e7f203d3ed3ee35c19787e7579b159335",
+      "dynamic/c2-v1/C2-SEALED_c20000000008.md": "1cc1748a9d4e85c6040f6ff092626884769bdd2312d5f1fd1d04b9888e0e7a1d",
+      "dynamic/c2-v1/C2-COMPRESSED_c20000000009.md": "4ef5988122a77ed5ea52d5a40203368232b1e430f62021ed175d1ac0a35ba1e8",
+      "dynamic/c2-v1/C2-OLD_c20000000010.md": "e9264cf393e7eadf338eb756d1a059ea5d9eb2542cf34c9645171327c8364cae",
+      "dynamic/c2-v1/C2-SUCCESSOR_c20000000011.md": "a9b389f9af9926c1f2c1e33ae771fad84dc8b11a1a4394b9cb964dd3f0c8a19b",
+      "feel/c2-v1/C2-FEEL_c20000000012.md": "191ff0fbb1905fc574c5a38d9f49a3c84a903678aa356340fe93bb6fbb3f4f60",
+      "archive/c2-v1/C2-SESSION_c20000000013.md": "abbfb16f413ca5dcf01f3bcb1a66c691bc55908e47f6e48f9e3ea5b2df9c28fc",
+      "permanent/c2-v1/C2-PIN_c20000000014.md": "cf809b38c7302c5dc66b282b202c8fcd4b52dc68814857eeb78d6a61b5e0f5ca",
+      "dynamic/c2-v1/C2-HISTORY_c20000000015.md": "56f31ad36c8a0329ec2da55a46c6064526e1a045afc01eb998b20ea3f02f62d4",
+      "dynamic/c2-v1/C2-PAGE-16_c20000000016.md": "00b749fadde531c538fc4d00cc3e8e08ebf8fb86c0dd38f08aa95c1dab7000ba",
+      "dynamic/c2-v1/C2-PAGE-17_c20000000017.md": "27fa66c995bd52c54354360b6f00c11a27889969215a16e56935d94959a4162e",
+      "dynamic/c2-v1/C2-PAGE-18_c20000000018.md": "46bb7cb47bad613d23140290f20912b0beb3a405f4f4c17fabdcbd7eff4e9e08",
+      "dynamic/c2-v1/C2-PAGE-19_c20000000019.md": "2db05014d2996c20314e033f2ddea09696c6fa099d800bb876deea45c94e6aec",
+      "dynamic/c2-v1/C2-PAGE-20_c20000000020.md": "637d7d251c3a408f33f235425c23001589fc5c084259cb86868595ab12b55fab",
+      "dynamic/c2-v1/C2-PAGE-LONG_c20000000021.md": "0c6362d2e2ecc73e4c139b39b313f4eaba0c79eabb42b8e45b5a5f725886650f"
+    },
+    "rows": {
+      "bucket_history": [
+        [
+          1,
+          "c20000000015",
+          "C2HISTORY OLD-V1",
+          "2026-10-02T00:00:00",
+          "replace"
+        ]
+      ],
+      "letters": [
+        [
+          1,
+          "C2LETTER PUBLIC synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          0
+        ],
+        [
+          2,
+          "C2LETTER HIDDEN synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          1
+        ]
+      ],
+      "vectors": [
+        [
+          "c20000000001",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000002",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000003",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000004",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000005",
+          "[0.0, 0.0, 0.6, 0.8]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000006",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000007",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000009",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000010",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000011",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000012",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000013",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000014",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000015",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000016",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000017",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000018",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000019",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000020",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000021",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ]
+      ]
+    }
+  },
+  "runtime": {
+    "python": "3.12.14",
+    "executable": "/home/ting/.venvs/ombre/bin/python",
+    "mcp": "1.29.1",
+    "mcp_source": "/home/ting/.venvs/ombre/lib/python3.12/site-packages/mcp/__init__.py",
+    "remember_me": "0.1.0",
+    "remember_me_source": "/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official/remember_me/__init__.py",
+    "remember_me_release": "https://github.com/peanutsuee/Remember-Me/releases/download/v0.1.0/remember_me-0.1.0.tar.gz",
+    "remember_me_sha256": "93d1514f940bde00a43b34b61681fe7f64da130313840f247869157d6e250485"
+  },
+  "key_unused_confirmed": true,
+  "input_sha256": "f5e97cb1f32c3ee9e4a1a329a7b0670baa4b093721167fd90330f0cf3466caef",
+  "operation_id": "obweb-ls-c3-v1-disconnect",
+  "generation": 1,
+  "provider_before": {},
+  "stub_before": {},
+  "cli": {
+    "command": [
+      "python",
+      "-B",
+      "c3_control.py",
+      "watch-disconnect"
+    ],
+    "pid": 502,
+    "pythonpath": "/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official",
+    "exit_code": 0,
+    "stdout": "{\"accepted\": true, \"scenario\": \"disconnect\", \"generation\": 1, \"request_id\": \"62f1335922c74ca79aa7a080224f021a\", \"events\": [\"waiting\", \"operation_marked\", \"http.disconnect\", \"released\", \"completed\"], \"completion_time_basis\": \"observed_at\"}\n",
+    "stderr": ""
+  },
+  "waiting_projection": {
+    "armed": "disconnect",
+    "generation": 1,
+    "counts": {
+      "disconnect": 1
+    },
+    "target_request": "62f1335922c74ca79aa7a080224f021a",
+    "waiting": true,
+    "unaccepted": null,
+    "events": [
+      {
+        "event": "armed",
+        "scenario": "disconnect",
+        "generation": 1,
+        "request_id": null,
+        "monotonic": 175.052801996,
+        "time_basis": "observed_at"
+      },
+      {
+        "event": "request_matched",
+        "scenario": "disconnect",
+        "generation": 1,
+        "request_id": "62f1335922c74ca79aa7a080224f021a",
+        "monotonic": 175.151672405,
+        "time_basis": "observed_at"
+      },
+      {
+        "event": "provider_attempt",
+        "scenario": "disconnect",
+        "generation": 1,
+        "request_id": null,
+        "monotonic": 175.424539491,
+        "time_basis": "observed_at"
+      },
+      {
+        "event": "waiting",
+        "scenario": "disconnect",
+        "generation": 1,
+        "request_id": "62f1335922c74ca79aa7a080224f021a",
+        "monotonic": 175.424543561,
+        "time_basis": "observed_at"
+      },
+      {
+        "event": "operation_marked",
+        "scenario": "disconnect",
+        "generation": 1,
+        "request_id": "62f1335922c74ca79aa7a080224f021a",
+        "monotonic": 175.475697722,
+        "time_basis": "observed_at"
+      }
+    ],
+    "receipts": {
+      "disconnect": {
+        "status": "pending",
+        "result_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "gate_expired": false,
+    "waiting_seconds_remaining": 44.95
+  },
+  "target_request": "62f1335922c74ca79aa7a080224f021a",
+  "client_close_utc": "2026-10-03T11:15:23.247508+00:00",
+  "client_close_monotonic": 175.553604543,
+  "events": [
+    {
+      "event": "armed",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": null,
+      "monotonic": 175.052801996,
+      "time_basis": "observed_at",
+      "sequence": 0
+    },
+    {
+      "event": "request_matched",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.151672405,
+      "time_basis": "observed_at",
+      "sequence": 1
+    },
+    {
+      "event": "provider_attempt",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": null,
+      "monotonic": 175.424539491,
+      "time_basis": "observed_at",
+      "sequence": 2
+    },
+    {
+      "event": "waiting",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.424543561,
+      "time_basis": "observed_at",
+      "sequence": 3
+    },
+    {
+      "event": "operation_marked",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.475697722,
+      "time_basis": "observed_at",
+      "sequence": 4
+    },
+    {
+      "event": "http.disconnect",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.553940975,
+      "time_basis": "observed_at",
+      "sequence": 5
+    },
+    {
+      "event": "released",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.617012684,
+      "time_basis": "observed_at",
+      "sequence": 6
+    },
+    {
+      "event": "completed",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.875712925,
+      "time_basis": "observed_at",
+      "sequence": 7
+    }
+  ],
+  "event_time_basis": "observed_at; completed is observation time, not commit time",
+  "deque_serialization_verified": true,
+  "cli_result": {
+    "accepted": true,
+    "scenario": "disconnect",
+    "generation": 1,
+    "request_id": "62f1335922c74ca79aa7a080224f021a",
+    "events": [
+      "waiting",
+      "operation_marked",
+      "http.disconnect",
+      "released",
+      "completed"
+    ],
+    "completion_time_basis": "observed_at"
+  },
+  "receipt": "新建 1103d14307e941ac4e40cd5c1434b16c | synthetic-f5e97cb1 | importance=5 | tags=[obweb-ls] | domain=[obweb-ls]\nbucket_id=1103d14307e941ac4e40cd5c1434b16c reused=false written_fields=['content', 'tags', 'importance', 'domain', 'valence', 'arousal', 'name', 'todos'] ignored_fields=[]",
+  "receipt_sha256": "48c4afacb783f250649c7e8279dd15396dddb1328ce0dd1b9cb3d46b487806a5",
+  "bucket_id": "1103d14307e941ac4e40cd5c1434b16c",
+  "one_new_bucket": true,
+  "one_planned_item": true,
+  "provider_after_first": {
+    "disconnect": 1
+  },
+  "stub_after_first": {
+    "embedding": 4,
+    "analyze": 1
+  },
+  "c2_after_first": {
+    "marker_sha256": "d6965de3bc9f83becc7accb86c153301101147b89ceb00db32271157f8b0b4d2",
+    "files": {
+      "dynamic/c2-v1/C2-NAME-EXACT_c20000000001.md": "c1204bf5339a91f4efce038867a106ed49534b2e7be42d4ff4a5c121c1c9c75f",
+      "dynamic/c2-v1/C2-NAME-EXACT-NEAR_c20000000002.md": "0a60f09563eb798fcf66869bf0b7bbdd4085779e4fa06bf4361fec35fb9ceadb",
+      "dynamic/c2-v1/C2-TAG-TODAY_c20000000003.md": "9212e61cbb9cae5ac4c8075c6104e5307a5d2bb7e7b7efa62473e29bc7d2a8a6",
+      "dynamic/c2-v1/C2-BODY-LOW_c20000000004.md": "4bfe1893eff3e3c864456899be9a4dbf679367ac32d86d030cf53889c8edc037",
+      "dynamic/c2-v1/C2-TAG-YESTERDAY_c20000000005.md": "831bbbd5b0440290cf521d19424030bf6e27179cb6b8942aab6cab04b0659e6f",
+      "dynamic/c2-v1/C2-OTHER-DOMAIN_c20000000006.md": "1aeecebc523b2fda459c3b5b7b82481814e20518a9b1eba5ac1307451488c131",
+      "dynamic/c2-v1/C2-DORMANT_c20000000007.md": "29c50cedc8b5d3572d3ff663b79e1d7e7f203d3ed3ee35c19787e7579b159335",
+      "dynamic/c2-v1/C2-SEALED_c20000000008.md": "1cc1748a9d4e85c6040f6ff092626884769bdd2312d5f1fd1d04b9888e0e7a1d",
+      "dynamic/c2-v1/C2-COMPRESSED_c20000000009.md": "4ef5988122a77ed5ea52d5a40203368232b1e430f62021ed175d1ac0a35ba1e8",
+      "dynamic/c2-v1/C2-OLD_c20000000010.md": "e9264cf393e7eadf338eb756d1a059ea5d9eb2542cf34c9645171327c8364cae",
+      "dynamic/c2-v1/C2-SUCCESSOR_c20000000011.md": "a9b389f9af9926c1f2c1e33ae771fad84dc8b11a1a4394b9cb964dd3f0c8a19b",
+      "feel/c2-v1/C2-FEEL_c20000000012.md": "191ff0fbb1905fc574c5a38d9f49a3c84a903678aa356340fe93bb6fbb3f4f60",
+      "archive/c2-v1/C2-SESSION_c20000000013.md": "abbfb16f413ca5dcf01f3bcb1a66c691bc55908e47f6e48f9e3ea5b2df9c28fc",
+      "permanent/c2-v1/C2-PIN_c20000000014.md": "cf809b38c7302c5dc66b282b202c8fcd4b52dc68814857eeb78d6a61b5e0f5ca",
+      "dynamic/c2-v1/C2-HISTORY_c20000000015.md": "56f31ad36c8a0329ec2da55a46c6064526e1a045afc01eb998b20ea3f02f62d4",
+      "dynamic/c2-v1/C2-PAGE-16_c20000000016.md": "00b749fadde531c538fc4d00cc3e8e08ebf8fb86c0dd38f08aa95c1dab7000ba",
+      "dynamic/c2-v1/C2-PAGE-17_c20000000017.md": "27fa66c995bd52c54354360b6f00c11a27889969215a16e56935d94959a4162e",
+      "dynamic/c2-v1/C2-PAGE-18_c20000000018.md": "46bb7cb47bad613d23140290f20912b0beb3a405f4f4c17fabdcbd7eff4e9e08",
+      "dynamic/c2-v1/C2-PAGE-19_c20000000019.md": "2db05014d2996c20314e033f2ddea09696c6fa099d800bb876deea45c94e6aec",
+      "dynamic/c2-v1/C2-PAGE-20_c20000000020.md": "637d7d251c3a408f33f235425c23001589fc5c084259cb86868595ab12b55fab",
+      "dynamic/c2-v1/C2-PAGE-LONG_c20000000021.md": "0c6362d2e2ecc73e4c139b39b313f4eaba0c79eabb42b8e45b5a5f725886650f"
+    },
+    "rows": {
+      "bucket_history": [
+        [
+          1,
+          "c20000000015",
+          "C2HISTORY OLD-V1",
+          "2026-10-02T00:00:00",
+          "replace"
+        ]
+      ],
+      "letters": [
+        [
+          1,
+          "C2LETTER PUBLIC synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          0
+        ],
+        [
+          2,
+          "C2LETTER HIDDEN synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          1
+        ]
+      ],
+      "vectors": [
+        [
+          "c20000000001",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000002",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000003",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000004",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000005",
+          "[0.0, 0.0, 0.6, 0.8]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000006",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000007",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000009",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000010",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000011",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000012",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000013",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000014",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000015",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000016",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000017",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000018",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000019",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000020",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000021",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ]
+      ]
+    }
+  },
+  "events_after_replay": [
+    {
+      "event": "armed",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": null,
+      "monotonic": 175.052801996,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "request_matched",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.151672405,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "provider_attempt",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": null,
+      "monotonic": 175.424539491,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "waiting",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.424543561,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "operation_marked",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.475697722,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "http.disconnect",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.553940975,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "released",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.617012684,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "completed",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "62f1335922c74ca79aa7a080224f021a",
+      "monotonic": 175.875712925,
+      "time_basis": "observed_at"
+    },
+    {
+      "event": "request_matched",
+      "scenario": "disconnect",
+      "generation": 1,
+      "request_id": "83f456bb8b954be2ab874b08dce37662",
+      "monotonic": 175.954656653,
+      "time_basis": "observed_at"
+    }
+  ],
+  "exact_replay": true,
+  "body_readback": true,
+  "provider_after_replay": {
+    "disconnect": 1
+  },
+  "stub_after_replay": {
+    "embedding": 4,
+    "analyze": 1
+  },
+  "c2_after": {
+    "marker_sha256": "d6965de3bc9f83becc7accb86c153301101147b89ceb00db32271157f8b0b4d2",
+    "files": {
+      "dynamic/c2-v1/C2-NAME-EXACT_c20000000001.md": "c1204bf5339a91f4efce038867a106ed49534b2e7be42d4ff4a5c121c1c9c75f",
+      "dynamic/c2-v1/C2-NAME-EXACT-NEAR_c20000000002.md": "0a60f09563eb798fcf66869bf0b7bbdd4085779e4fa06bf4361fec35fb9ceadb",
+      "dynamic/c2-v1/C2-TAG-TODAY_c20000000003.md": "9212e61cbb9cae5ac4c8075c6104e5307a5d2bb7e7b7efa62473e29bc7d2a8a6",
+      "dynamic/c2-v1/C2-BODY-LOW_c20000000004.md": "4bfe1893eff3e3c864456899be9a4dbf679367ac32d86d030cf53889c8edc037",
+      "dynamic/c2-v1/C2-TAG-YESTERDAY_c20000000005.md": "831bbbd5b0440290cf521d19424030bf6e27179cb6b8942aab6cab04b0659e6f",
+      "dynamic/c2-v1/C2-OTHER-DOMAIN_c20000000006.md": "1aeecebc523b2fda459c3b5b7b82481814e20518a9b1eba5ac1307451488c131",
+      "dynamic/c2-v1/C2-DORMANT_c20000000007.md": "29c50cedc8b5d3572d3ff663b79e1d7e7f203d3ed3ee35c19787e7579b159335",
+      "dynamic/c2-v1/C2-SEALED_c20000000008.md": "1cc1748a9d4e85c6040f6ff092626884769bdd2312d5f1fd1d04b9888e0e7a1d",
+      "dynamic/c2-v1/C2-COMPRESSED_c20000000009.md": "4ef5988122a77ed5ea52d5a40203368232b1e430f62021ed175d1ac0a35ba1e8",
+      "dynamic/c2-v1/C2-OLD_c20000000010.md": "e9264cf393e7eadf338eb756d1a059ea5d9eb2542cf34c9645171327c8364cae",
+      "dynamic/c2-v1/C2-SUCCESSOR_c20000000011.md": "a9b389f9af9926c1f2c1e33ae771fad84dc8b11a1a4394b9cb964dd3f0c8a19b",
+      "feel/c2-v1/C2-FEEL_c20000000012.md": "191ff0fbb1905fc574c5a38d9f49a3c84a903678aa356340fe93bb6fbb3f4f60",
+      "archive/c2-v1/C2-SESSION_c20000000013.md": "abbfb16f413ca5dcf01f3bcb1a66c691bc55908e47f6e48f9e3ea5b2df9c28fc",
+      "permanent/c2-v1/C2-PIN_c20000000014.md": "cf809b38c7302c5dc66b282b202c8fcd4b52dc68814857eeb78d6a61b5e0f5ca",
+      "dynamic/c2-v1/C2-HISTORY_c20000000015.md": "56f31ad36c8a0329ec2da55a46c6064526e1a045afc01eb998b20ea3f02f62d4",
+      "dynamic/c2-v1/C2-PAGE-16_c20000000016.md": "00b749fadde531c538fc4d00cc3e8e08ebf8fb86c0dd38f08aa95c1dab7000ba",
+      "dynamic/c2-v1/C2-PAGE-17_c20000000017.md": "27fa66c995bd52c54354360b6f00c11a27889969215a16e56935d94959a4162e",
+      "dynamic/c2-v1/C2-PAGE-18_c20000000018.md": "46bb7cb47bad613d23140290f20912b0beb3a405f4f4c17fabdcbd7eff4e9e08",
+      "dynamic/c2-v1/C2-PAGE-19_c20000000019.md": "2db05014d2996c20314e033f2ddea09696c6fa099d800bb876deea45c94e6aec",
+      "dynamic/c2-v1/C2-PAGE-20_c20000000020.md": "637d7d251c3a408f33f235425c23001589fc5c084259cb86868595ab12b55fab",
+      "dynamic/c2-v1/C2-PAGE-LONG_c20000000021.md": "0c6362d2e2ecc73e4c139b39b313f4eaba0c79eabb42b8e45b5a5f725886650f"
+    },
+    "rows": {
+      "bucket_history": [
+        [
+          1,
+          "c20000000015",
+          "C2HISTORY OLD-V1",
+          "2026-10-02T00:00:00",
+          "replace"
+        ]
+      ],
+      "letters": [
+        [
+          1,
+          "C2LETTER PUBLIC synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          0
+        ],
+        [
+          2,
+          "C2LETTER HIDDEN synthetic handoff",
+          "2026-10-03T00:00:00",
+          "c20000000013",
+          1
+        ]
+      ],
+      "vectors": [
+        [
+          "c20000000001",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000002",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000003",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000004",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000005",
+          "[0.0, 0.0, 0.6, 0.8]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000006",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000007",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000009",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000010",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000011",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000012",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000013",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:14"
+        ],
+        [
+          "c20000000014",
+          "[0.0, 0.0, 0.0, 1.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000015",
+          "[0.0, 0.0, 1.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000016",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000017",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000018",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000019",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000020",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ],
+        [
+          "c20000000021",
+          "[0.0, 1.0, 0.0, 0.0]",
+          "synthetic-embedding-4-v1",
+          "2026-10-03T19:15:15"
+        ]
+      ]
+    }
+  },
+  "c2_marker_bytes_unchanged": true,
+  "c2_snapshot_unchanged": true,
+  "logs": {
+    "raw_value_leaked": false,
+    "sentinel_checked_before_archive": true,
+    "access_records": 18,
+    "redacted_access_records": 4,
+    "record_counts": {
+      "ombre_brain": 5,
+      "uvicorn.error": 6,
+      "mcp.server.streamable_http_manager": 2,
+      "ombre_brain.mcp": 4,
+      "uvicorn.access": 18,
+      "mcp.server.lowlevel.server": 2,
+      "httpx2": 5
+    },
+    "raw_logs_archived": false
+  },
+  "listener_exit_codes": {
+    "18993": 111,
+    "18994": 111,
+    "18995": 111
+  },
+  "listeners_closed": true,
+  "finished_utc": "2026-10-03T11:15:24.179061+00:00"
+}

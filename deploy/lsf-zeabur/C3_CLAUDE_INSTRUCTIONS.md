@@ -71,9 +71,20 @@ python -B /app/deploy/lsf-zeabur/c3_control.py watch-disconnect
 ```
 
 Start the watcher immediately before Claude's already-prepared call. A second local
-terminal may use status to observe waiting. Upon waiting, perform the preidentified real
-client transport close action. The watcher checks waiting+http.disconnect for that exact
-request/generation, releases the provider gate itself and waits for completed, all within
+terminal uses status to observe waiting and records target_request. Immediately before the
+preidentified real client transport close action, register its operation-stage marker:
+
+```sh
+python -B /app/deploy/lsf-zeabur/c3_control.py mark-operation --request-id REQUEST_ID
+```
+
+REQUEST_ID must be the exact target_request from status. Wait for successful marker response,
+then perform the actual transport close. The watcher requires the ordered same-request chain
+waiting -> operation_marked -> http.disconnect -> released -> completed. Before release,
+the server checks an active unexpired wait and a registered durable receipt not yet completed.
+Early automatic closure, request mismatch, overlap or incomplete evidence is unaccepted;
+preserve evidence and stop without automatic release/rearm/rerun. The watcher waits for
+observed completion, all within
 its45-second window. No chat relay is needed. A timeout or missing event is unaccepted;
 the gate may finish normal passthrough at its own deadline, which does not convert a failed
 observation into success. Do not automatically rearm or replay an unobserved experiment.
@@ -85,7 +96,9 @@ related effects are permitted. Save status, disarm and stop.
 ## Acceptance record
 
 Keep actual tool name/arguments/key, first/replay receipts, provider count deltas, generation
-and waiting/http.disconnect/released/completed metadata. Check C2 marker bytes/21 files/
+and target request_id plus waiting/operation_marked/http.disconnect/released/completed metadata.
+completed means the observer read a completed receipt; its timestamp is observed_at, never
+the actual business commit time. Check C2 marker bytes/21 files/
 SQL rows/vectors unchanged using the original complete manifest validator. Never print
 or archive query tokens, cookies or provider auth headers. A local WSL client test does
 not count as Claude connector or Zeabur acceptance.
