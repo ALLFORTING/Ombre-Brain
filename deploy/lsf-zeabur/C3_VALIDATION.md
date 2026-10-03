@@ -116,3 +116,64 @@ The original first pytest command created ignored .pytest_cache in this independ
 WSL static audit uses command-only GIT_DIR/GIT_WORK_TREE to read the Windows-created worktree; no Git pointer or config is rewritten.
 
 Source/doc diff whitespace checks pass; failure-output/JUnit whitespace is intentionally preserved rather than rewritten.
+
+## New local disconnect evidence addendum — 2026-10-03
+
+This is a new experiment authorized after parent commit
+508f01fc7f996c9e5477f141ae26eaab53fba1de. It does not rebuild, replace or claim to recover
+attempt3's missing original event rows. Every old output/JUnit/evidence file and the original
+commit remain unchanged. The historical artifact gap above still applies to that old run;
+this addendum supplies independently observed evidence for a new local disconnect case.
+
+Only test_c3_disconnect_evidence.py ran: **1 passed in17.45s**, once. No other fault scenario
+or old batch ran. New C2 synthetic preparation reused the original initializer/provider;
+its distinct root is /tmp/c3-disconnect-evidence-w26gxqxi/fresh-c3-disconnect. The test uses
+Linux mkdtemp directly rather than pytest numbered temporary directories, avoiding rotation
+or cleanup of earlier failed roots. No root was removed or repaired. Command-level official
+RM PYTHONPATH and the original runtime identity/contract checks passed again.
+
+```sh
+PYTHONPATH=/mnt/d/Codex/projects/Ombre-Brain-S5-Remaining/.s5-rm010-official \
+/home/ting/.venvs/ombre/bin/python -B -m pytest \
+  deploy/lsf-zeabur/test_c3_disconnect_evidence.py -q -x -p no:cacheprovider \
+  --junitxml=deploy/lsf-zeabur/evidence/c3-disconnect-new-junit.xml
+```
+
+The existing fixed disconnect key obweb-ls-c3-v1-disconnect and its exact content hash were
+confirmed absent from this fresh root before arm. The existing shipped watch-disconnect CLI
+was launched as a real child process with the official command-level RM path inherited.
+The CLI, not the test controller, released the gate after observing the exact request's
+http.disconnect. The MCP client was an actual loopback TCP connection: it sent an authenticated
+stateful tools/call request, observed waiting via status, closed its writer and socket, and
+then let the CLI observe/release/wait for completion. No500, model stop or page refresh.
+
+New safe JSON: evidence/c3-disconnect-new-evidence.json. It is parsed back after every write.
+It contains actual live monotonic timestamps, observer sequence, generation, actual CLI
+stdout/exit code, count snapshots, receipt/body/single-effect checks, C2 snapshots and listener
+closure. It also keeps UTC collection/close/start/end timestamps. Event monotonic times
+retain the existing observer's rounding; sequence records actual append order even when
+rounded timestamps coincide. No old event is reconstructed. Runtime event storage is deque;
+list conversion and JSON roundtrip are explicitly asserted, and the entire artifact parses.
+
+Generation1 observed exactly one of each required event in this order:
+waiting -> http.disconnect -> released -> completed. The CLI returned accepted=true with
+exit code0, before the45-second limit; no gate timeout event occurred. The JSON includes
+armed/provider_attempt as preceding observed events. Fault provider count is disconnect=1.
+Original stub counts after completion are embedding=4 and analyze=1; these are ordinary
+business provider calls, not repeated disconnect injections.
+
+Readback preserves the complete original body in exactly one new bucket and one frozen
+plan item, with a stored vector. A fresh real HTTP MCP client precisely replays the same
+key/content. Its receipt equals the original durable result; bucket IDs/effects are unchanged.
+Fault provider and stub counts after replay equal their before-replay values.
+
+The original full C2 complete validator passed before listeners opened. Before/after actual
+marker bytes, all21 fixture hashes,20 fixed vector rows and manifest-designated history/
+letter SQL rows are identical. Credential sentinel checks pass, no raw auth/session values
+are archived. 18993/18994/18995 all return ECONNREFUSED(111) after service/CLI shutdown.
+
+The new test refuses execution if this evidence artifact already exists; do not rerun it.
+The new evidence is independent of the old missing rows. The local CLI/disconnect and
+serialization evidence gaps are now covered by this new case. Real Claude connector,
+Docker/container/volume and Zeabur acceptance remain unexecuted. No push/deployment or
+formal OB/main/origin/旧日雪 change occurred.

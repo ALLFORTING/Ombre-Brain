@@ -15,7 +15,7 @@
   "delivery_sha256": {
     "C3_CLAUDE_INSTRUCTIONS.md": "30bf68ae3f77c17f3908ac626a8476c534d203974690827ae923ed43adc34edf",
     "C3_IMPLEMENTATION.md": "9ded70fa216144df694f83566b3aa18c77dc0eb7cb02ab82de2df979390532c8",
-    "C3_VALIDATION.md": "5baaaaaa712e2be4563ba981055c792244d6c8235a7de1c9361625cde007511e",
+    "C3_VALIDATION.md": "f6059312237d92c58e492e749c864b6674c6659634fafdab5ea870a1a745c882",
     "evidence/c3-bounded-output.txt": "06b4563612cc5fb75bfc2ca515dde58561b1d660f1989dadbceb6e2e0a056e83",
     "evidence/c3-formal-rm-attempt1-output.txt": "e00d990d657a14b1f20731272e28212a3f3a1f49709be36209cc6cca730360df",
     "evidence/c3-formal-rm-attempt2-output.txt": "94d45fb9d9b8f0d8e1a0445040d92c2926f2e0f3713665e49eec0790c4a5beb3",
@@ -30,10 +30,17 @@
     "evidence/c3-junit.xml": "ef828e4558e0ef5e757d119453b4319b9d7657e791136529cfebf576716cec98",
     "evidence/c3-listener-closure.json": "abec13e7e4d74e9419330db6e79e8942592c461e76c070cae8472f9650ea1801",
     "evidence/c3-refusals-completed.json": "8833ab0bbbb46a70329516ec66223b75d42ab4b36e428e7cf43bb14e3af13083",
-    "evidence/c3-runtime-continuation.json": "6b684117cfcc026ee2e2054b581866f6323613c338a08f55a68afc6b587b56a8"
+    "evidence/c3-runtime-continuation.json": "6b684117cfcc026ee2e2054b581866f6323613c338a08f55a68afc6b587b56a8",
+    "test_c3_disconnect_evidence.py": "c85db3841698b6596b94d32067237dc57314db12606a3663fea202d3fb71b4aa",
+    "evidence/c3-disconnect-new-evidence.json": "e27efac7d992e9179e687e8f7e3600d5d85a8e5fa7ac8f416d842a8a502aa167",
+    "evidence/c3-disconnect-new-junit.xml": "7bd8944b6f78146b137abc719483aa07630da3b8a125f7260a0d7251f47b4cc0",
+    "evidence/c3-disconnect-new-output.txt": "d4bb930d6682fab37ea74b455802dca1f063744f8cae167da0fb8dfaad353ea1",
+    "evidence/c3-disconnect-new-preflight.json": "dddace6080d71b6c18dac10623a812779016fae1027fe2b88887157f5b1c8a9d"
   },
   "excluded_self_outputs": [
     "c3-artifact-hashes.json",
-    "evidence/c3-static-audit.json"
-  ]
+    "evidence/c3-static-audit.json",
+    "evidence/c3-disconnect-new-audit.json"
+  ],
+  "evidence_parent": "508f01fc7f996c9e5477f141ae26eaab53fba1de"
 }
