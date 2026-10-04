@@ -66,7 +66,7 @@ from urllib.parse import unquote_plus, urlparse
 from typing import Union
 from functools import wraps
 import inspect
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing_extensions import Annotated, Literal
 from pydantic import Field
 from PIL import Image, UnidentifiedImageError
@@ -525,6 +525,20 @@ mcp = _TodoDropGuardFastMCP(
 )
 
 
+def _backup_v2_initialization_scope():
+    # Disabled mode retains the existing lazy initialization behavior.
+    if os.environ.get("OMBRE_BACKUP_V2_ENABLED") != "true":
+        return nullcontext()
+    from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
+    return DEFAULT_WRITE_COORDINATOR.writer_scope("backup_v2_runtime_initialization")
+
+
+def _register_backup_v2(transport):
+    from backup_v2_runtime import register_backup_v2_if_enabled
+    # __main__ is the actual running module; never import a second server.
+    return register_backup_v2_if_enabled(sys.modules[__name__], transport)
+
+
 def _get_runtime_components() -> dict[str, object]:
     """Create durable runtime services on first use, never at module import."""
     global _runtime_components
@@ -533,40 +547,41 @@ def _get_runtime_components() -> dict[str, object]:
     with _runtime_components_lock:
         if _runtime_components is not None:
             return _runtime_components
-        components: dict[str, object] = {}
-        ensure_bucket_storage(config)
-        store = AssetStore(config["buckets_dir"])
-        embedding = EmbeddingEngine(config)
-        index = AssetEmbeddingIndex(store, embedding)
-        manager = BucketManager(config, embedding_engine=embedding)
-        dehydrator_instance = Dehydrator(config)
-        decay = DecayEngine(config, manager)
-        importer = ImportEngine(config, manager, dehydrator_instance, embedding)
-        components.update({
-            "asset_store": store,
-            "embedding_engine": embedding,
-            "asset_embedding_index": index,
-            "bucket_mgr": manager,
-            "dehydrator": dehydrator_instance,
-            "decay_engine": decay,
-            "import_engine": importer,
-        })
-        bundle = _bootstrap_remember_me_host(store, embedding)
-        components["remember_me_host_bundle"] = bundle
-        registry = RuntimeAssetBackendRegistry.from_runtime(
-            legacy_store=store,
-            bundle_provider=lambda: components["remember_me_host_bundle"],
-            embedding_index=index,
-        )
-        components["asset_backend_registry"] = registry
-        components["asset_dashboard"] = AssetDashboardService(
-            store,
-            backend_provider=lambda: registry.selected_backend(),
-            max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
-            max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
-        )
-        _runtime_components = components
-        return components
+        with _backup_v2_initialization_scope():
+            components: dict[str, object] = {}
+            ensure_bucket_storage(config)
+            store = AssetStore(config["buckets_dir"])
+            embedding = EmbeddingEngine(config)
+            index = AssetEmbeddingIndex(store, embedding)
+            manager = BucketManager(config, embedding_engine=embedding)
+            dehydrator_instance = Dehydrator(config)
+            decay = DecayEngine(config, manager)
+            importer = ImportEngine(config, manager, dehydrator_instance, embedding)
+            components.update({
+                "asset_store": store,
+                "embedding_engine": embedding,
+                "asset_embedding_index": index,
+                "bucket_mgr": manager,
+                "dehydrator": dehydrator_instance,
+                "decay_engine": decay,
+                "import_engine": importer,
+            })
+            bundle = _bootstrap_remember_me_host(store, embedding)
+            components["remember_me_host_bundle"] = bundle
+            registry = RuntimeAssetBackendRegistry.from_runtime(
+                legacy_store=store,
+                bundle_provider=lambda: components["remember_me_host_bundle"],
+                embedding_index=index,
+            )
+            components["asset_backend_registry"] = registry
+            components["asset_dashboard"] = AssetDashboardService(
+                store,
+                backend_provider=lambda: registry.selected_backend(),
+                max_asset_bytes=RM_ASSET_MAX_UPLOAD_BYTES,
+                max_image_pixels=RM_ASSET_MAX_IMAGE_PIXELS,
+            )
+            _runtime_components = components
+            return components
 
 
 def _get_runtime_component(name: str):
@@ -14208,6 +14223,7 @@ def add_http_cors_middleware(app):
 
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
+    _register_backup_v2(transport)
     logger.info(f"Ombre Brain starting | transport: {transport}")
 
     if transport in ("sse", "streamable-http"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -25,7 +26,6 @@ REQUIRED_ENV = (
     "OMBRE_BACKUP_V2_MAX_BUNDLE_BYTES",
     "OMBRE_BACKUP_V2_MINIMUM_FREE_BYTES",
     "OMBRE_BACKUP_V2_READY_TTL_SECONDS",
-    "RENDER_GIT_COMMIT",
 )
 V2_ROUTE_SIGNATURES = frozenset({
     ("POST", "/api/backup/v2/captures"),
@@ -78,8 +78,23 @@ def register_backup_v2_if_enabled(
     if transport != "streamable-http":
         raise BackupV2RuntimeConfigError("backup_v2_transport_unsupported")
 
+    # Resolve provenance before initialization can write to the source.
+    runtime_commit = resolve_runtime_commit(env)
+    initializer = getattr(server_module, "_get_runtime_components", None)
+    if initializer is not None:
+        initializer()
+    coordinator = require_runtime_coordinator(server_module)
     config = _parse_enabled_config(server_module, env)
     _require_single_worker(env)
+    existing = _custom_route_signatures(server_module.mcp)
+    if existing.intersection(V2_ROUTE_SIGNATURES):
+        previous = getattr(server_module, "_backup_v2_controller", None)
+        if (not V2_ROUTE_SIGNATURES.issubset(existing)
+                or previous is None
+                or getattr(server_module, "_backup_v2_config", None) != config):
+            raise BackupV2RuntimeConfigError("backup_v2_route_conflict")
+        require_runtime_coordinator(server_module, previous)
+        return BackupV2RegistrationResult(enabled=True, registered=True, route_count=4)
 
     from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
     from offline_backup_bundle import load_backup_workspace, prepare_backup_workspace
@@ -115,10 +130,17 @@ def register_backup_v2_if_enabled(
         minimum_free_bytes=config["minimum_free_bytes"],
         ready_ttl_seconds=config["ready_ttl_seconds"],
     )
-    controller = ProductionBackupCaptureController(
+    class RuntimeCaptureController(ProductionBackupCaptureController):
+        def _preflight(self, abort_signal=None):
+            require_runtime_coordinator(server_module, self)
+            if resolve_runtime_commit(env) != runtime_commit:
+                raise BackupV2RuntimeConfigError("backup_v2_commit_conflict")
+            return super()._preflight(abort_signal)
+
+    controller = RuntimeCaptureController(
         enabled=True,
         worker_count=1,
-        coordinator=getattr(server_module, "bucket_mgr").write_coordinator,
+        coordinator=coordinator,
         source_root=config["source_root"],
         workspace_root=workspace.root,
         recipient_public_key=public_key,
@@ -128,8 +150,17 @@ def register_backup_v2_if_enabled(
         oidc_policy=policy,
     )
     verifier = GitHubActionsBackupV2OidcVerifier()
-    routes = build_backup_v2_routes(controller, verifier.verify_request)
+
+    async def verify_runtime_request(request):
+        require_runtime_coordinator(server_module, controller)
+        if resolve_runtime_commit(env) != runtime_commit:
+            raise BackupV2RuntimeConfigError("backup_v2_commit_conflict")
+        return await verifier.verify_request(request)
+
+    routes = build_backup_v2_routes(controller, verify_runtime_request)
     _register_routes_once(server_module.mcp, routes)
+    server_module._backup_v2_controller = controller
+    server_module._backup_v2_config = config
     active_logger.info(
         "backup-v2 registration enabled for commit %s fingerprint %s",
         config["runtime_commit"],
@@ -152,9 +183,7 @@ def _parse_enabled_config(server_module: Any, env: Mapping[str, str]) -> dict[st
         raise BackupV2RuntimeConfigError()
     repository_id = _parse_repository_id(env["OMBRE_BACKUP_V2_REPOSITORY_ID"])
     owner_id = _parse_repository_id(env["OMBRE_BACKUP_V2_REPOSITORY_OWNER_ID"])
-    runtime_commit = env["RENDER_GIT_COMMIT"]
-    if _GIT_SHA.fullmatch(runtime_commit) is None:
-        raise BackupV2RuntimeConfigError()
+    runtime_commit = resolve_runtime_commit(env)
     return {
         "public_key_b64": env["OMBRE_BACKUP_V2_PUBLIC_KEY_B64"],
         "recipient_fingerprint": env["OMBRE_BACKUP_V2_RECIPIENT_FINGERPRINT"],
@@ -273,3 +302,82 @@ def _custom_route_signatures(mcp: Any) -> set[tuple[str, str]]:
             if method not in {"HEAD", "OPTIONS"}:
                 signatures.add((method, route.path))
     return signatures
+
+
+BUILD_METADATA_PATH = Path(__file__).resolve().parent / ".backup-v2-build.json"
+
+
+def resolve_runtime_commit(env: Mapping[str, str], *, metadata_path: Path | None = None) -> str:
+    """Use image build provenance or Render's provider-issued runtime SHA only."""
+    path = BUILD_METADATA_PATH if metadata_path is None else metadata_path
+    commits = []
+    build_valid = False
+    if path.exists() or path.is_symlink():
+        try:
+            if path.is_symlink() or path.stat().st_size > 512:
+                raise ValueError()
+            record = json.loads(path.read_text(encoding="ascii"))
+            if set(record) != {"source", "status", "commit"} or record["source"] != "zeabur-build":
+                raise ValueError()
+            if record["status"] == "valid" and isinstance(record["commit"], str) and _GIT_SHA.fullmatch(record["commit"]):
+                commits.append(record["commit"])
+                build_valid = True
+            elif record["status"] != "missing" or record["commit"] is not None:
+                raise ValueError()
+        except (OSError, ValueError, TypeError, KeyError):
+            raise BackupV2RuntimeConfigError("backup_v2_commit_invalid") from None
+    # On Zeabur an arbitrary RENDER_GIT_COMMIT cannot stand in for build metadata.
+    if env.get("ZEABUR_SERVICE_ID") and not build_valid:
+        raise BackupV2RuntimeConfigError("backup_v2_commit_missing")
+    zeabur_runtime = env.get("ZEABUR_GIT_COMMIT_SHA")
+    if zeabur_runtime is not None:
+        if not build_valid:
+            raise BackupV2RuntimeConfigError("backup_v2_commit_missing")
+        if not isinstance(zeabur_runtime, str) or _GIT_SHA.fullmatch(zeabur_runtime) is None:
+            raise BackupV2RuntimeConfigError("backup_v2_commit_invalid")
+        commits.append(zeabur_runtime)
+    render_commit = env.get("RENDER_GIT_COMMIT")
+    if render_commit is not None:
+        if not isinstance(render_commit, str) or _GIT_SHA.fullmatch(render_commit) is None:
+            raise BackupV2RuntimeConfigError("backup_v2_commit_invalid")
+        commits.append(render_commit)
+    if not commits:
+        raise BackupV2RuntimeConfigError("backup_v2_commit_missing")
+    if len(set(commits)) != 1:
+        raise BackupV2RuntimeConfigError("backup_v2_commit_conflict")
+    return commits[0]
+
+
+def require_runtime_coordinator(server_module: Any, controller: Any = None):
+    """Reject a partially initialized or split write boundary on every request."""
+    from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
+    try:
+        components = {
+            name: getattr(server_module, name)
+            for name in ("bucket_mgr", "asset_store", "embedding_engine",
+                         "asset_embedding_index", "dehydrator")
+        }
+        manager = components["bucket_mgr"]
+        coordinator = manager.write_coordinator
+        if coordinator is not DEFAULT_WRITE_COORDINATOR:
+            raise ValueError()
+        components["relations"] = manager.relation_store
+        state_store = server_module.asset_backend_registry.state_store
+        if state_store is not None:
+            components["migration_state"] = state_store
+        bundle = getattr(server_module, "remember_me_host_bundle", None)
+        if bundle is not None:
+            components["remember_me"] = bundle.core_adapter
+        if any(item.write_coordinator is not coordinator for item in components.values()):
+            raise ValueError()
+        if controller is not None and controller.coordinator is not coordinator:
+            raise ValueError()
+        if getattr(server_module.decay_engine.bucket_mgr, "write_coordinator", None) is not coordinator:
+            raise ValueError()
+        importer = server_module.import_engine
+        for item in (importer.bucket_mgr, importer.dehydrator, importer.embedding_engine):
+            if item.write_coordinator is not coordinator:
+                raise ValueError()
+        return coordinator
+    except (AttributeError, ValueError):
+        raise BackupV2RuntimeConfigError("backup_v2_coordinator_mismatch") from None

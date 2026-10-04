@@ -1,145 +1,129 @@
-# Backup v2 Production Registration
+# Backup v2：入口、版本来源与离线恢复
 
-Stage 8H-G1D-B adds code-only preparation for the encrypted backup-v2 production
-channel. The route factory remains unavailable unless production explicitly opts
-in with `OMBRE_BACKUP_V2_ENABLED=true`. This PR does not configure Render,
-GitHub secrets, GitHub variables, or any endpoint, and it does not start a
-server, dispatch a workflow, generate a real key, capture data, rehearse a
-restore, migrate, reindex, deploy, or cut over production.
+本 Phase 仅实施本地代码和聚焦验证。未配置正式服务、未 push、未部署、
+未生成正式密钥、未触发 workflow，也未采集正式数据。正式备份尚未完成。
 
-## Default-Disabled Registration
+## 当前入口与默认关闭
 
-Backup-v2 is disabled when `OMBRE_BACKUP_V2_ENABLED` is unset, empty, or exactly
-`false`. Disabled startup does not import or initialize the capture controller,
-does not prepare or inspect a backup workspace, does not instantiate a JWK
-client, does not register backup-v2 routes, and performs no network access.
+保留 Dockerfile 的 python server.py 入口、基础镜像、依赖和
+/app/buckets 卷路径。server 在启动后台线程和构建 HTTP app 之前，
+向正在运行的模块注册 v2；使用 sys.modules[__name__]，不会再次 import server。
+本入口只新增以下四条 v2 路由，不引入 /api/backup/export：
 
-When the value is any other non-empty string except exact lowercase `true`,
-startup fails closed with a stable configuration error. Invalid enabled
-configuration also aborts startup; the service must not silently fall back to
-disabled mode after an attempted enable.
+- POST /api/backup/v2/captures
+- GET /api/backup/v2/captures/{request_id}
+- GET /api/backup/v2/captures/{request_id}/bundle
+- POST /api/backup/v2/captures/{request_id}/ack
 
-## Environment Contract
+OMBRE_BACKUP_V2_ENABLED 未设置、为空或精确为 false 时保持原有懒初始化；
+不读取版本文件，不创建备份 workspace，不创建 Controller，不注册 v2。
+只有精确的 true 可启用；其他值拒绝启动。启用只支持 streamable-http、
+单实例、单进程和单 Uvicorn worker；禁止 reload。WEB_CONCURRENCY 与
+UVICORN_WORKERS 必须未设置、为空或为 1。backup_entry.py 未修改。
 
-Enabled mode requires these values:
+## 同一写入边界
 
-- `OMBRE_BACKUP_V2_ENABLED`: exact lowercase `true`.
-- `OMBRE_BACKUP_V2_PUBLIC_KEY_B64`: canonical base64 for the 32 raw X25519
-  recipient public-key bytes.
-- `OMBRE_BACKUP_V2_RECIPIENT_FINGERPRINT`: `x25519-sha256:` followed by 64
-  lowercase hexadecimal characters, matching the configured public key.
-- `OMBRE_BACKUP_V2_REPOSITORY_ID`: decimal GitHub repository ID for the
-  approved transport repository.
-- `OMBRE_BACKUP_V2_REPOSITORY_OWNER_ID`: decimal GitHub owner ID for the
-  approved transport owner.
-- `OMBRE_BACKUP_V2_WORKSPACE_ROOT`: absolute backup-v2 workspace directory,
-  outside the source tree and not containing it.
-- `OMBRE_BACKUP_V2_FREEZE_TIMEOUT_SECONDS`: positive integer, 1 through 600.
-- `OMBRE_BACKUP_V2_MAX_FREEZE_SECONDS`: positive integer, 2 through 1800, and
-  greater than the freeze timeout.
-- `OMBRE_BACKUP_V2_MAX_SOURCE_BYTES`: positive integer, at most 10737418240.
-- `OMBRE_BACKUP_V2_MAX_BUNDLE_BYTES`: positive integer, at most 10737418240.
-- `OMBRE_BACKUP_V2_MINIMUM_FREE_BYTES`: positive integer, at most 10737418240.
-- `OMBRE_BACKUP_V2_READY_TTL_SECONDS`: positive integer, 1 through 86400.
-- `RENDER_GIT_COMMIT`: exact 40-character lowercase Git commit SHA. There is no
-  separate production override for the runtime commit.
+启用时，桶目录创建、资产库、embedding、桶历史及关系库、dehydrator、
+RM runtime 和资产 registry 的整个初始化都在默认协调器 writer_scope 内完成；
+只有初始化全部成功后才发布 runtime components 并注册采集路由。
+初始化失败不会发布半初始化组件，writer_scope 会退出。
 
-Numeric values reject whitespace, signs, booleans, decimals, zero, negatives,
-overflow, scientific notation, and trailing junk. Invalid values are not
-clamped.
+Controller 使用运行模块 bucket_mgr.write_coordinator。
+注册、请求处理和采集 preflight 都核对桶、关系库、资产库、embedding、
+资产 embedding index、dehydrator、后台 decay/import 引用、启用的
+RM Core Adapter，以及存在的迁移/Cutover state store。还核对现有
+HTTP mutation 门禁使用的默认协调器。身份不同即拒绝采集。
+重复注册不得悄悄替换已注册 Controller 或配置。
 
-The source root always comes from the normal Ombre-Brain configuration,
-`server.config["buckets_dir"]`. There is no second environment variable for the
-source root.
+仍复用既有排空、冻结、SQLite WAL snapshot、取消/超时退出后解冻机制。
+未修改 RM Core、schema、业务工具契约或自动定时策略。
 
-## Workspace Boundary
+## 可核验的实际部署版本
 
-The workspace root must be absolute, must not use traversal, must not equal the
-source root, must not sit inside the source root, and must not contain the
-source root. Existing workspace validation also rejects symlink or reparse-point
-escapes.
+Dockerfile 接收构建参数 ZEABUR_GIT_COMMIT_SHA，仅接受 40 位小写十六进制 SHA。
+构建命令写入镜像内 /app/.backup-v2-build.json，位于持久化卷之外：
+source=zeabur-build、status=valid/missing/invalid 和合法的 commit 或 null。
+非法输入原值不会写入镜像；不写入凭据。缺失/非法输入不阻止默认关闭模式启动。
 
-When enabled, an absent workspace is created only by the existing
-`prepare_backup_workspace` implementation. An existing workspace is loaded only
-by `load_backup_workspace`. A partial, non-empty, invalid, or unsafe workspace
-fails startup and is not repaired or deleted automatically.
+runtime 的固定读取路径位于 backup_v2_runtime.py 旁；没有可手填的通用 SHA override。
+合法镜像记录可以作为来源；Render 保留平台注入的 RENDER_GIT_COMMIT 兼容。
+缺失记录且无可信 provider 来源时拒绝启用。非法记录拒绝启用，即使同时有 Render SHA。
+Zeabur 服务不得用 RENDER_GIT_COMMIT 冒充缺失的构建记录。
+若 runtime 也提供 ZEABUR_GIT_COMMIT_SHA，它只能与合法镜像记录一致。
+多个来源不一致、非法 SHA、后续版本漂移都拒绝采集，不静默选择某一来源。
 
-## Process Guard
+[Zeabur 官方说明 Git 信息变量仅在构建阶段出现](https://zeabur.com/docs/en-US/deploy/config/environment-variables)。
 
-Backup-v2 production registration is supported only for `streamable-http`, one
-Python process, one Uvicorn worker, and no reload mode. Known worker count
-environment variables such as `WEB_CONCURRENCY` and `UVICORN_WORKERS` must be
-unset, empty, or exact integer `1`.
+本地测试逐项执行 Dockerfile 中实际的注入命令，并通过 runtime reader 验证正常、
+缺失、非法和冲突输入。未完成容器镜像构建或 Zeabur 部署验证。
+后续仍须核对 Zeabur 是否实际把构建变量传给 Docker ARG，并在新部署中核对
+镜像记录 SHA、面板 Running deployment、GitHub deployment SHA 三者一致。
+不得将远端 main SHA 手工填写为“实际部署版本”；未传参时保持 v2 关闭。
 
-Render scaling must remain one instance during capture and restore rehearsal.
-This stage does not add distributed locks or multi-instance coordination.
+## 启用配置（后续阶段）
 
-## OIDC Verification
+除实际部署版本来源外，启用需要：
 
-Backup-v2 uses the GitHub Actions issuer
-`https://token.actions.githubusercontent.com`, the exact audience
-`ombre-brain-backup-v2`, and the issuer's official JWKS endpoint. The JWK client
-is lazy: no OIDC or JWKS network request occurs at startup.
+- OMBRE_BACKUP_V2_PUBLIC_KEY_B64：32 字节 X25519 公钥的 canonical base64。
+- OMBRE_BACKUP_V2_RECIPIENT_FINGERPRINT：匹配公钥的 x25519-sha256 指纹。
+- OMBRE_BACKUP_V2_REPOSITORY_ID、OMBRE_BACKUP_V2_REPOSITORY_OWNER_ID：批准仓库及 owner 的十进制 ID。
+- OMBRE_BACKUP_V2_WORKSPACE_ROOT：绝对路径，不与配置中的 buckets_dir 相等、互相包含或通过链接越界。
+- OMBRE_BACKUP_V2_FREEZE_TIMEOUT_SECONDS：1..600。
+- OMBRE_BACKUP_V2_MAX_FREEZE_SECONDS：2..1800，且大于 freeze timeout。
+- OMBRE_BACKUP_V2_MAX_SOURCE_BYTES、OMBRE_BACKUP_V2_MAX_BUNDLE_BYTES、
+  OMBRE_BACKUP_V2_MINIMUM_FREE_BYTES：1..10737418240。
+- OMBRE_BACKUP_V2_READY_TTL_SECONDS：1..86400。
 
-Authenticated requests must supply exactly one `Authorization: Bearer ...`
-header. Query-string, cookie, and request-body tokens are rejected. Tokens are
-length-bounded, are not logged, are not decoded for debugging, are not written
-to disk, and underlying JWT or JWK exception text is not exposed.
+source root 始终取自正常 server.config["buckets_dir"]。
+启用前核对桶、历史、资产、RM 与迁移库均在该根中。workspace 不能位于该根。
+私钥永不进入正式服务、GitHub Actions、环境变量、Git、日志或工件。
+OIDC 保留 RS256、GitHub issuer/JWKS、固定 audience、批准仓库/owner ID、
+main、workflow path、workflow_dispatch、run ID 和 run attempt 限制。
+JWK client 为懒加载，启动时不联网；禁止 query/cookie/body token。
+现有单实例限制不提供分布式锁。
 
-The cryptographic verifier accepts only `RS256`, validates the signature,
-issuer, exact audience, expiry, and required temporal claims, then passes the
-validated claims to the existing strict backup-v2 OIDC policy. That policy keeps
-the approved repository, owner, branch, workflow path, dispatch event, audience,
-run ID, and run attempt contract unchanged. Legacy v1 workflow claims do not
-authorize v2 endpoints.
+## 加密 PEM 离线恢复
 
-## Route Lifecycle
+scripts/backup_v2_recovery.py 仅在本机终端通过 getpass 隐藏输入口令。
+无安全终端时拒绝回退到回显输入；没有口令参数或口令环境变量。
+只接受 encrypted PKCS8 PEM，私钥在内存解密，不导出明文私钥，
+复用 verify_bundle 和 restore_bundle。
 
-`backup_entry.run()` evaluates backup-v2 registration after it knows the
-transport and before constructing the streamable HTTP app. Disabled mode returns
-without registering anything. Enabled mode validates the complete configuration,
-constructs the controller and verifier, builds the existing four v2 routes from
-the G1C route factory, and registers them only after construction succeeds.
+先在 D:\Codex\projects 下准备独立恢复 workspace：
+python offline_backup_bundle.py prepare <new-workspace>。
+将已绑定 run/artifact 且校验过的唯一加密包以不覆盖方式放入 workspace/bundles，
+保留原 <32位bundle-id>.obbackup 文件名。以下命令只在后续明确授权恢复时运行：
 
-The exact paths are:
+~~~text
+python scripts/backup_v2_recovery.py verify --workspace <workspace> --bundle <bundle-id>.obbackup --private-key <encrypted-pem>
+python scripts/backup_v2_recovery.py restore --workspace <workspace> --bundle <bundle-id>.obbackup --private-key <encrypted-pem> --target <absolute-workspace>/restored/<new-32-lowercase-hex-id>
+~~~
 
-- `POST /api/backup/v2/captures`
-- `GET /api/backup/v2/captures/{request_id}`
-- `GET /api/backup/v2/captures/{request_id}/bundle`
-- `POST /api/backup/v2/captures/{request_id}/ack`
+target 必须是 workspace/restored 下不存在的新目录，拒绝现有目录、链接、
+相对路径及其他位置。底层 core 在完全认证后以 no-replace 方式发布；
+失败不覆盖已有目录。verify 不发布恢复目录，但会使用并清理隔离临时解密文件。
+“私钥在内存”不表示恢复明文数据从不写入临时磁盘。
 
-Registration is idempotent within one process and rejects duplicate or partial
-backup-v2 route state. It is unavailable for stdio and SSE transports.
+## 本地验证环境与回退
 
-## Legacy Preservation
+OB 测试只在 Ubuntu WSL 使用 /home/ting/.venvs/ombre/bin/python（3.12.14）。
+使用 constraints-py312-linux.txt 的锁定依赖；不设置 TMP/TEMP 或 --basetemp。
+现有解释器中的 RM dev7 与仓库 pin 不符，因此在本 worktree 的 ignored
+.venv/backup-v2-validation 中隔离安装 0.1.0，不改全局 venv。
+release archive 按 requirements.txt 的 SHA256 验证；离线安装记录的来源为实际
+下载的固定 release URL 和已验证 SHA，RM source 未修改。
+执行时通过进程内 PYTHONPATH 选中该隔离包。所有数据和密钥均为合成测试材料。
 
-This stage does not remove or redesign `/api/backup/export`. The
-`/api/embeddings/backfill`, `/api/aliases/clean`, `/mcp`, and `/health`
-behaviors are preserved. Legacy v1 OIDC tokens are not routed into v2 endpoints,
-and a v2 token does not authorize legacy operations through shared mutable claim
-state.
+未启用或部署时，只需保留本地分支即可，无正式服务回退操作。
+后续若已经启用，回退应先将备份仓库 ARMED 改为 false，再将服务
+OMBRE_BACKUP_V2_ENABLED 改为 false，并按另行批准的部署流程发布。
+必要时回到本 Phase 前的已验证版本。不要删除密钥、加密包或正式卷数据。
 
-## Offline Key Workflow
+## 2026-10-04 本地验证记录
 
-Production uses X25519 recipient keys. Only the public key and its fingerprint
-may later enter Render. The private key must never enter Render, GitHub Actions,
-Git, logs, artifacts, job summaries, environment exports, ChatGPT, Codex,
-GitHub issue or PR text, shell history, or production configuration.
-
-Future production key preparation should be:
-
-1. Create a trusted directory outside this repository.
-2. Run the offline key tool locally.
-3. Make at least one independently protected recovery copy.
-4. Verify the keyset.
-5. Compare fingerprints.
-6. Only later copy the public key and fingerprint into production settings.
-7. Retain the private key offline.
-8. Keep old private keys until every artifact encrypted to them has expired or
-   been independently preserved.
-
-Rollback is achieved by setting `OMBRE_BACKUP_V2_ENABLED` to exact lowercase
-`false` and redeploying. Do not delete keys or artifacts as part of rollback.
-
-This PR does not generate a real production key. Tests create only ephemeral
-synthetic keys in temporary directories.
+最终仅运行 runtime、recovery、quiesced capture、offline bundle、key tool 五个相关测试文件：
+220 passed，1 skipped（Windows ACL 专用测试），2 个既有依赖/合成 JWT warning。
+覆盖初始化排空、实际 RM/后台桶写入、协调器分裂拒绝、WAL snapshot、
+失败/取消/冻结超时后的解冻、加密 PEM 恢复及构建版本注入/冲突。
+未重跑全套正式验收。两个来源库基线分别为
+885807cf460bec47af09812a523677d9dbb33eba 与 8ad77d5c1301df849ed9b9e7126d5fdcece0200b。

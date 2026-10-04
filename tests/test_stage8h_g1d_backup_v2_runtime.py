@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import serialization
 
 import backup_v2_runtime
 from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
-from maintenance_write_gate import MaintenanceWriteCoordinator
+from maintenance_write_gate import MaintenanceWriteCoordinator, DEFAULT_WRITE_COORDINATOR
 from production_backup_capture import (
     CaptureChannelError,
     V2_AUDIENCE,
@@ -60,12 +60,23 @@ class FakeServer:
 def _server(tmp_path: Path) -> FakeServer:
     source = tmp_path / "buckets"
     source.mkdir()
-    return FakeServer(
+    server = FakeServer(
         config={"buckets_dir": str(source)},
         mcp=FakeMcp(),
-        bucket_mgr=SimpleNamespace(write_coordinator=MaintenanceWriteCoordinator()),
+        bucket_mgr=SimpleNamespace(write_coordinator=DEFAULT_WRITE_COORDINATOR),
     )
 
+    for name in ("asset_store", "embedding_engine", "asset_embedding_index", "dehydrator"):
+        setattr(server, name, SimpleNamespace(write_coordinator=DEFAULT_WRITE_COORDINATOR))
+    server.bucket_mgr.relation_store = SimpleNamespace(write_coordinator=DEFAULT_WRITE_COORDINATOR)
+    server.remember_me_host_bundle = SimpleNamespace(core_adapter=SimpleNamespace(
+        write_coordinator=DEFAULT_WRITE_COORDINATOR))
+    server.asset_backend_registry = SimpleNamespace(state_store=None)
+    server.decay_engine = SimpleNamespace(bucket_mgr=server.bucket_mgr)
+    server.import_engine = SimpleNamespace(
+        bucket_mgr=server.bucket_mgr, dehydrator=server.dehydrator,
+        embedding_engine=server.embedding_engine)
+    return server
 
 def _key_env(tmp_path: Path) -> dict[str, str]:
     private_key = X25519PrivateKey.generate()
@@ -363,3 +374,261 @@ def test_oidc_rs256_signature_validation_and_stable_failures():
         assert error.value.code == "oidc_denied"
 
     asyncio.run(exercise())
+
+@pytest.mark.parametrize("component", [
+    "asset_store", "embedding_engine", "asset_embedding_index", "dehydrator",
+    "relations", "remember_me", "migration", "controller", "background",
+])
+def test_split_coordinator_is_rejected(tmp_path, component):
+    server = _server(tmp_path)
+    controller = SimpleNamespace(coordinator=DEFAULT_WRITE_COORDINATOR)
+    other = MaintenanceWriteCoordinator()
+    if component == "relations":
+        server.bucket_mgr.relation_store.write_coordinator = other
+    elif component == "remember_me":
+        server.remember_me_host_bundle.core_adapter.write_coordinator = other
+    elif component == "migration":
+        server.asset_backend_registry.state_store = SimpleNamespace(write_coordinator=other)
+    elif component == "controller":
+        controller.coordinator = other
+    elif component == "background":
+        server.decay_engine.bucket_mgr = SimpleNamespace(write_coordinator=other)
+    else:
+        getattr(server, component).write_coordinator = other
+    with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="coordinator_mismatch"):
+        backup_v2_runtime.require_runtime_coordinator(server, controller)
+
+
+def test_registered_routes_reject_coordinator_drift_before_oidc(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=_key_env(tmp_path))
+    server.asset_store.write_coordinator = MaintenanceWriteCoordinator()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("OIDC must not run on a split boundary")
+    monkeypatch.setattr(GitHubActionsBackupV2OidcVerifier, "verify_request", forbidden)
+    route = next(r for r in server.mcp._custom_starlette_routes if r.path.endswith("/captures"))
+    result = asyncio.run(route.endpoint(Request([])))
+    assert result.status_code != 202
+    assert DEFAULT_WRITE_COORDINATOR.status().state == "open"
+
+
+@pytest.mark.parametrize("value,status", [
+    ("1" * 40, "valid"), ("", "missing"), ("main", "invalid"),
+    ("A" * 40, "invalid"), ("1" * 40 + "\n", "invalid"),
+])
+def test_docker_build_injection_and_runtime_reader(tmp_path, value, status):
+    import json
+    import os
+    import shlex
+    import subprocess
+    docker = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    line = next(line for line in docker.splitlines() if line.startswith("RUN python -c "))
+    code = shlex.split(line)[3]
+    output = tmp_path / ".backup-v2-build.json"
+    code = code.replace("/app/.backup-v2-build.json", str(output))
+    subprocess.run([sys.executable, "-c", code], check=True,
+                   env={**os.environ, "ZEABUR_GIT_COMMIT_SHA": value})
+    record = json.loads(output.read_text())
+    assert record["status"] == status
+    assert record["commit"] == (value if status == "valid" else None)
+    if status == "valid":
+        assert backup_v2_runtime.resolve_runtime_commit({}, metadata_path=output) == value
+        assert backup_v2_runtime.resolve_runtime_commit(
+            {"RENDER_GIT_COMMIT": value}, metadata_path=output) == value
+        with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="conflict"):
+            backup_v2_runtime.resolve_runtime_commit(
+                {"RENDER_GIT_COMMIT": "2" * 40}, metadata_path=output)
+    else:
+        with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError):
+            backup_v2_runtime.resolve_runtime_commit({}, metadata_path=output)
+        if status == "missing":
+            assert backup_v2_runtime.resolve_runtime_commit(
+                {"RENDER_GIT_COMMIT": COMMIT}, metadata_path=output) == COMMIT
+            with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError):
+                backup_v2_runtime.resolve_runtime_commit(
+                    {"RENDER_GIT_COMMIT": COMMIT, "ZEABUR_SERVICE_ID": "synthetic"},
+                    metadata_path=output)
+
+
+def test_runtime_does_not_accept_generic_sha_override(tmp_path):
+    with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="missing"):
+        backup_v2_runtime.resolve_runtime_commit(
+            {"OMBRE_BACKUP_V2_RUNTIME_COMMIT": COMMIT, "ZEABUR_GIT_COMMIT_SHA": COMMIT},
+            metadata_path=tmp_path / "absent")
+
+
+def test_server_registration_uses_running_module(monkeypatch):
+    import server
+    import types
+    running = types.ModuleType("__main__")
+    monkeypatch.setitem(sys.modules, "__main__", running)
+    calls = []
+    monkeypatch.setattr(backup_v2_runtime, "register_backup_v2_if_enabled",
+                        lambda module, transport: calls.append((module, transport)))
+    fn = types.FunctionType(server._register_backup_v2.__code__, {"__name__": "__main__", "sys": sys})
+    fn("streamable-http")
+    assert calls == [(running, "streamable-http")]
+    source = Path(server.__file__).read_text()
+    entry = source[source.index('if __name__ == "__main__":'):]
+    assert entry.index("_register_backup_v2(transport)") < entry.index("digest_thread.start()")
+    assert "backup_entry" not in entry
+
+
+def test_enabled_real_initialization_and_rm_share_boundary(tmp_path, monkeypatch, test_config):
+    import server
+    monkeypatch.setattr(server, "config", test_config)
+    monkeypatch.setattr(server, "_runtime_components", None)
+    monkeypatch.setenv("OMBRE_BACKUP_V2_ENABLED", "true")
+    monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
+    monkeypatch.setenv("OMBRE_RM_DATA_ROOT", str(Path(test_config["buckets_dir"]) / "remember-me"))
+    stages = []
+    original = server.ensure_bucket_storage
+    def storage(config):
+        stages.append(DEFAULT_WRITE_COORDINATOR.status().active_writers)
+        original(config)
+    monkeypatch.setattr(server, "ensure_bucket_storage", storage)
+    bootstrap = server._bootstrap_remember_me_host
+    def rm(*args):
+        stages.append(DEFAULT_WRITE_COORDINATOR.status().active_writers)
+        return bootstrap(*args)
+    monkeypatch.setattr(server, "_bootstrap_remember_me_host", rm)
+    components = server._get_runtime_components()
+    assert stages == [1, 1]
+    assert components["remember_me_host_bundle"] is not None
+    assert backup_v2_runtime.require_runtime_coordinator(server) is DEFAULT_WRITE_COORDINATOR
+    assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
+
+
+@pytest.mark.asyncio
+async def test_initialization_waits_inside_boundary_before_capture(tmp_path, monkeypatch, test_config):
+    import server
+    import threading
+    monkeypatch.setattr(server, "config", test_config)
+    monkeypatch.setattr(server, "_runtime_components", None)
+    monkeypatch.setenv("OMBRE_BACKUP_V2_ENABLED", "true")
+    monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "false")
+    started, release = threading.Event(), threading.Event()
+    original = server.ensure_bucket_storage
+    def storage(config):
+        started.set()
+        assert release.wait(3)
+        original(config)
+    monkeypatch.setattr(server, "ensure_bucket_storage", storage)
+    init = asyncio.create_task(asyncio.to_thread(server._get_runtime_components))
+    assert await asyncio.to_thread(started.wait, 2)
+    assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 1
+    frozen = asyncio.Event()
+    async def capture_boundary():
+        async with DEFAULT_WRITE_COORDINATOR.freeze(
+            reason="test", drain_timeout_seconds=2, max_freeze_seconds=3):
+            frozen.set()
+            assert server._runtime_components is not None
+    freeze = asyncio.create_task(capture_boundary())
+    try:
+        await asyncio.sleep(0.03)
+        assert not frozen.is_set()
+        release.set()
+        await init
+        await freeze
+        assert frozen.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(init, freeze, return_exceptions=True)
+    assert DEFAULT_WRITE_COORDINATOR.status().state == "open"
+
+
+def test_failed_initialization_does_not_publish_components(monkeypatch):
+    import server
+    monkeypatch.setattr(server, "_runtime_components", None)
+    monkeypatch.setenv("OMBRE_BACKUP_V2_ENABLED", "true")
+    def fail(config):
+        assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 1
+        raise RuntimeError("synthetic")
+    monkeypatch.setattr(server, "ensure_bucket_storage", fail)
+    with pytest.raises(RuntimeError, match="synthetic"):
+        server._get_runtime_components()
+    assert server._runtime_components is None
+    assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
+
+
+def test_disabled_initialization_scope_retains_lazy_behavior(monkeypatch):
+    import server
+    monkeypatch.setenv("OMBRE_BACKUP_V2_ENABLED", "false")
+    with server._backup_v2_initialization_scope():
+        assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
+
+def test_build_and_zeabur_runtime_source_conflict(tmp_path):
+    import json
+    metadata = tmp_path / "build.json"
+    metadata.write_text(json.dumps({"source": "zeabur-build", "status": "valid", "commit": COMMIT}))
+    for env in ({"ZEABUR_GIT_COMMIT_SHA": "2" * 40},
+                {"ZEABUR_GIT_COMMIT_SHA": "invalid"}):
+        with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError):
+            backup_v2_runtime.resolve_runtime_commit(env, metadata_path=metadata)
+    assert backup_v2_runtime.resolve_runtime_commit(
+        {"ZEABUR_GIT_COMMIT_SHA": COMMIT}, metadata_path=metadata) == COMMIT
+
+
+def test_disabled_does_not_read_invalid_metadata_or_initialize(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    metadata = tmp_path / "invalid.json"
+    metadata.write_text("invalid")
+    monkeypatch.setattr(backup_v2_runtime, "BUILD_METADATA_PATH", metadata)
+    def forbidden():
+        raise AssertionError("disabled must remain lazy")
+    server._get_runtime_components = forbidden
+    result = backup_v2_runtime.register_backup_v2_if_enabled(
+        server, "streamable-http", environ={})
+    assert result.registered is False
+
+
+def test_controller_rechecks_drift_at_capture_preflight(tmp_path):
+    server = _server(tmp_path)
+    env = _key_env(tmp_path)
+    backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
+    server.import_engine.embedding_engine = SimpleNamespace(write_coordinator=MaintenanceWriteCoordinator())
+    with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="coordinator_mismatch"):
+        server._backup_v2_controller._preflight()
+    assert DEFAULT_WRITE_COORDINATOR.status().state == "open"
+
+
+def test_registration_does_not_silently_replace_existing_controller(tmp_path):
+    server = _server(tmp_path)
+    env = _key_env(tmp_path)
+    backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
+    controller = server._backup_v2_controller
+    backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
+    assert server._backup_v2_controller is controller
+    env["RENDER_GIT_COMMIT"] = "2" * 40
+    with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="route_conflict"):
+        backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
+
+
+@pytest.mark.asyncio
+async def test_real_rm_and_background_writes_are_blocked_then_thaw(monkeypatch, test_config):
+    import server
+    import io
+    from PIL import Image
+    from maintenance_write_gate import MaintenanceWriteError
+    monkeypatch.setattr(server, "config", test_config)
+    monkeypatch.setattr(server, "_runtime_components", None)
+    monkeypatch.setenv("OMBRE_BACKUP_V2_ENABLED", "true")
+    monkeypatch.setenv("OMBRE_RM_RUNTIME_ENABLED", "true")
+    monkeypatch.setenv("OMBRE_RM_DATA_ROOT", str(Path(test_config["buckets_dir"]) / "remember-me"))
+    components = server._get_runtime_components()
+    core = components["remember_me_host_bundle"].core_adapter
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), "blue").save(image, format="PNG")
+    data = image.getvalue()
+    manager = components["decay_engine"].bucket_mgr
+    async with DEFAULT_WRITE_COORDINATOR.freeze(
+        reason="test", drain_timeout_seconds=2, max_freeze_seconds=3):
+        with pytest.raises(MaintenanceWriteError):
+            await asyncio.to_thread(core.ingest_image, data, len(data), "synthetic.png", "image/png")
+        with pytest.raises(MaintenanceWriteError):
+            await asyncio.create_task(manager.create("synthetic background memory"))
+    result = await asyncio.to_thread(core.ingest_image, data, len(data), "synthetic.png", "image/png")
+    assert result["asset_id"]
+    assert await manager.create("synthetic background memory")
+    assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
