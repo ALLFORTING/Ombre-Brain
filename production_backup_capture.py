@@ -37,6 +37,7 @@ from offline_backup_bundle import (
     _inventory_source,
     capture_external_source,
     load_backup_workspace,
+    ProductionDirectoryPolicy,
 )
 
 
@@ -226,6 +227,7 @@ class ProductionBackupCaptureController:
         oidc_policy: StrictBackupV2OidcPolicy,
         clock: Callable[[], datetime] | None = None,
         disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+        directory_policy: ProductionDirectoryPolicy | None = None,
     ) -> None:
         if not enabled:
             raise CaptureChannelError("capture_disabled")
@@ -243,8 +245,11 @@ class ProductionBackupCaptureController:
         ):
             raise CaptureChannelError("capture_key_invalid")
         self.coordinator = coordinator
+        self.directory_policy = directory_policy
+        if directory_policy is not None:
+            directory_policy.validate(Path(source_root), source=True)
         self.source_root = Path(source_root).resolve(strict=True)
-        self.workspace = load_backup_workspace(workspace_root)
+        self.workspace = load_backup_workspace(workspace_root, directory_policy=directory_policy)
         for private_root in (self.workspace.temp_root, self.workspace.bundles_root):
             with suppress(OSError):
                 private_root.chmod(0o700)
@@ -391,6 +396,7 @@ class ProductionBackupCaptureController:
                         minimum_free_bytes=self.limits.minimum_free_bytes,
                     ),
                     disk_usage=self._disk_usage,
+                    directory_policy=self.directory_policy,
                 ))
                 self._active_workers += 1
                 try:
@@ -624,6 +630,9 @@ class ProductionBackupCaptureController:
         return cleaned
 
     def _preflight(self, abort_signal: CaptureAbortSignal | None = None) -> None:
+        if self.directory_policy is not None:
+            self.directory_policy.validate(self.source_root, source=True)
+            load_backup_workspace(self.workspace.root, directory_policy=self.directory_policy)
         inventory = _inventory_source(
             self.source_root,
             chunk_size=1024 * 1024,

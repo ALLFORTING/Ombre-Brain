@@ -127,3 +127,37 @@ OMBRE_BACKUP_V2_ENABLED 改为 false，并按另行批准的部署流程发布�
 失败/取消/冻结超时后的解冻、加密 PEM 恢复及构建版本注入/冲突。
 未重跑全套正式验收。两个来源库基线分别为
 885807cf460bec47af09812a523677d9dbb33eba 与 8ad77d5c1301df849ed9b9e7126d5fdcece0200b。
+
+### 生产目录策略与本地验证边界
+
+启用后的生产注册将配置中的 buckets 根与 workspace 根绑定到同一个确切目录策略，
+并记录目录的设备号与 inode；prepare、load、控制器预检和冻结采集共享此策略。
+源码位于 /app 时，/app/buckets 与 /app/backup-v2-workspace 是允许的独立根。
+生产路径、入口、卷和数据无需迁移。仍拒绝源码目录本身及其祖先、两根重叠、
+符号链接／重解析路径、目录替换以及 workspace 内部越界。
+离线 CLI 默认 repository 隔离保留，无通用跳过开关。
+恢复验证继续使用另行准备的离线 workspace。
+
+本补丁仅做本地合成数据验证，不代表正式业务验收。
+部署前先审查本地提交，核对镜像构建来源及确切目录配置，并处理验证报告中的既有阻塞。
+保持 backup-v2 disabled 与 GitHub ARMED=false；发布、启用和正式验收需另行批准。
+本阶段不授权 push、部署、启用、Dispatch、正式采集或恢复。
+
+本地验证记录（2026-10-04，基线 9fef5cbf41801a132688b7c289654967cc2baa60）：
+
+- WSL Ubuntu，/home/ting/.venvs/ombre/bin/python 3.12.14；
+  constraints-py312-linux.txt 中 53 个锁定版本均匹配。未修改环境或依赖。
+- 相关测试文件：test_backup_v2_directory_policy、test_stage8h_g1d_backup_v2_runtime、
+  test_stage8h_g1c_quiesced_capture、test_offline_backup_bundle、
+  test_backup_v2_recovery、test_backup_v2_key_tool。
+  结果为 241 passed、2 failed、1 skipped；跳过项需要 Windows ACL。
+- 新增 23 项目录策略用例全部通过，包括合成 /app 布局下旧默认规则拒绝、
+  生产 prepare → load → 实际冻结采集 → 离线验证加密包、SQLite 合成快照、
+  默认离线隔离与拒绝边界。既有 disabled/lazy-startup 及写覆盖回归通过。
+- 两个失败为 test_enabled_real_initialization_and_rm_share_boundary 与
+  test_real_rm_and_background_writes_are_blocked_then_thaw，
+  均报 remember_me_host_bootstrap_failed。
+  从指定基线读取三个改动模块并在内存加载后复跑这两项，得到相同失败；
+  未将其计为本补丁新回归，也未扩大范围修复 Remember-Me。
+- 部署前仍需处理上述既有初始化阻塞、审查补丁并另行批准发布与正式验收。
+  未读取正式数据或真实私钥，未执行任何云端变更。

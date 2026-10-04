@@ -253,9 +253,88 @@ class FrozenCaptureLimits:
             raise BackupBundleError("internal_error")
 
 
-def prepare_backup_workspace(path: str | Path) -> BackupWorkspace:
+@dataclass(frozen=True)
+class ProductionDirectoryPolicy:
+    """Bind one runtime source/workspace pair; never an isolation bypass."""
+
+    source_root: Path
+    workspace_root: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_root", self._canonical(self.source_root, strict=True))
+        object.__setattr__(self, "workspace_root", self._canonical(self.workspace_root, strict=False))
+        repository = Path(__file__).resolve().parent
+        for root in (self.source_root, self.workspace_root):
+            if root == repository or _is_within(root, repository):
+                raise BackupBundleError("workspace_invalid")
+            # Keep filesystem-root/home protection without excluding /app children.
+            if root == root.parent or root == Path.home().resolve():
+                raise BackupBundleError("workspace_invalid")
+        if (_is_within(self.source_root, self.workspace_root)
+                or _is_within(self.workspace_root, self.source_root)):
+            raise BackupBundleError("workspace_invalid")
+        object.__setattr__(self, "_source_identity", self._identity(self.source_root))
+        object.__setattr__(self, "_workspace_identity", (
+            self._identity(self.workspace_root) if self.workspace_root.exists() else None
+        ))
+        object.__setattr__(self, "_workspace_paths_identity", (
+            self._fixed_identities() if self._workspace_identity is not None else None
+        ))
+
+    def _fixed_identities(self) -> dict[str, tuple[int, int]]:
+        identities = {}
+        for relative in _FIXED_PATHS.values():
+            path = self.workspace_root / relative
+            self._canonical(path, strict=True)
+            identities[relative] = self._identity(path)
+        return identities
+
+    @staticmethod
+    def _canonical(path: Path, *, strict: bool) -> Path:
+        candidate = Path(path)
+        if (not candidate.is_absolute() or ".." in candidate.parts
+                or _path_contains_reparse_point(candidate)):
+            raise BackupBundleError("workspace_invalid")
+        try:
+            return candidate.resolve(strict=strict)
+        except OSError as exc:
+            raise BackupBundleError("workspace_invalid") from exc
+
+    @staticmethod
+    def _identity(path: Path) -> tuple[int, int]:
+        if not path.is_dir():
+            raise BackupBundleError("workspace_invalid")
+        try:
+            metadata = path.stat()
+        except OSError as exc:
+            raise BackupBundleError("workspace_invalid") from exc
+        return metadata.st_dev, metadata.st_ino
+
+    def validate(self, root: Path, *, source: bool = False) -> None:
+        expected = self.source_root if source else self.workspace_root
+        if self._canonical(root, strict=source) != expected:
+            raise BackupBundleError("workspace_invalid")
+        if self._canonical(self.source_root, strict=True) != self.source_root:
+            raise BackupBundleError("workspace_invalid")
+        if self._identity(self.source_root) != self._source_identity:
+            raise BackupBundleError("workspace_invalid")
+        current = self._canonical(self.workspace_root, strict=False)
+        if current != self.workspace_root:
+            raise BackupBundleError("workspace_invalid")
+        if self._workspace_identity is not None:
+            if (self._identity(current) != self._workspace_identity
+                    or self._fixed_identities() != self._workspace_paths_identity):
+                raise BackupBundleError("workspace_invalid")
+
+    def bind_prepared_workspace(self) -> None:
+        self.validate(self.workspace_root)
+        object.__setattr__(self, "_workspace_identity", self._identity(self.workspace_root))
+        object.__setattr__(self, "_workspace_paths_identity", self._fixed_identities())
+
+
+def prepare_backup_workspace(path: str | Path, *, directory_policy: ProductionDirectoryPolicy | None = None) -> BackupWorkspace:
     """Create the fixed offline workspace without copying source data."""
-    root = _validate_prepare_root(path)
+    root = _validate_prepare_root(path, directory_policy=directory_policy)
     if root.exists() and (not root.is_dir() or any(root.iterdir())):
         raise BackupBundleError("workspace_invalid")
     root.mkdir(parents=True, exist_ok=True)
@@ -273,17 +352,22 @@ def prepare_backup_workspace(path: str | Path) -> BackupWorkspace:
     marker = {"workspace_id": workspace_id, "nonce": nonce}
     _atomic_write_json(root / WORKSPACE_MANIFEST, manifest)
     _atomic_write_json(root / WORKSPACE_MARKER, marker)
-    return load_backup_workspace(root)
+    if directory_policy is not None:
+        directory_policy.bind_prepared_workspace()
+    return load_backup_workspace(root, directory_policy=directory_policy)
 
 
-def load_backup_workspace(path: str | Path) -> BackupWorkspace:
+def load_backup_workspace(path: str | Path, *, directory_policy: ProductionDirectoryPolicy | None = None) -> BackupWorkspace:
     """Validate workspace identity, containment, and reparse boundaries."""
     try:
         candidate = Path(path)
         if not candidate.is_absolute() or _path_contains_reparse_point(candidate):
             raise BackupBundleError("workspace_invalid")
         root = candidate.resolve(strict=True)
-        _validate_root_location(root)
+        _validate_root_location(root, directory_policy=directory_policy)
+        for relative in (*_FIXED_PATHS.values(), WORKSPACE_MANIFEST, WORKSPACE_MARKER):
+            if _path_contains_reparse_point(root / relative):
+                raise BackupBundleError("workspace_invalid")
         manifest = json.loads(
             (root / WORKSPACE_MANIFEST).read_text(encoding="utf-8")
         )
@@ -368,14 +452,16 @@ def capture_external_source(
     abort_signal: CaptureAbortSignal | None = None,
     frozen_limits: FrozenCaptureLimits | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+    directory_policy: ProductionDirectoryPolicy | None = None,
 ) -> CaptureResult:
     """Capture one explicitly authorized external root under a live freeze."""
-    workspace = load_backup_workspace(workspace_path)
+    workspace = load_backup_workspace(workspace_path, directory_policy=directory_policy)
     coordinator.validate_lease(freeze_lease)
     source = _validate_external_source(
         workspace,
         source_root,
         authorized_source_root,
+        directory_policy=directory_policy,
     )
     _validate_public_key(recipient_public_key)
     if _GIT_SHA_PATTERN.fullmatch(ob_commit_sha) is None:
@@ -395,6 +481,7 @@ def capture_external_source(
         abort_signal=abort_signal,
         frozen_limits=frozen_limits,
         disk_usage=disk_usage,
+        directory_policy=directory_policy,
     )
     try:
         coordinator.validate_lease(freeze_lease)
@@ -419,6 +506,7 @@ def _capture_source_into_bundle(
     abort_signal: CaptureAbortSignal | None = None,
     frozen_limits: FrozenCaptureLimits | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
+    directory_policy: ProductionDirectoryPolicy | None = None,
 ) -> CaptureResult:
     bundle_id = secrets.token_hex(16)
     bundle_name = f"{bundle_id}{BUNDLE_SUFFIX}"
@@ -494,6 +582,9 @@ def _capture_source_into_bundle(
             abort_signal=abort_signal,
         )
         _check_abort(abort_signal)
+        if directory_policy is not None:
+            directory_policy.validate(source_root, source=True)
+            load_backup_workspace(workspace.root, directory_policy=directory_policy)
         _call_abortable(
             _encrypt_archive,
             archive_path,
@@ -512,6 +603,9 @@ def _capture_source_into_bundle(
         )
         try:
             _check_abort(abort_signal)
+            if directory_policy is not None:
+                directory_policy.validate(source_root, source=True)
+                load_backup_workspace(workspace.root, directory_policy=directory_policy)
         except BackupBundleError:
             _remove_file(final_bundle)
             raise
@@ -1762,16 +1856,19 @@ def _verify_restored_sqlite(path: Path, entry: dict[str, Any]) -> None:
         raise BackupBundleError("manifest_invalid")
 
 
-def _validate_prepare_root(path: str | Path) -> Path:
+def _validate_prepare_root(path: str | Path, *, directory_policy: ProductionDirectoryPolicy | None = None) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute() or _path_contains_reparse_point(candidate):
         raise BackupBundleError("workspace_invalid")
     resolved = candidate.resolve(strict=False)
-    _validate_root_location(resolved)
+    _validate_root_location(resolved, directory_policy=directory_policy)
     return resolved
 
 
-def _validate_root_location(root: Path) -> None:
+def _validate_root_location(root: Path, *, directory_policy: ProductionDirectoryPolicy | None = None, source: bool = False) -> None:
+    if directory_policy is not None:
+        directory_policy.validate(root, source=source)
+        return
     repository = Path(__file__).resolve().parent
     home = Path.home().resolve()
     if (
@@ -1801,6 +1898,7 @@ def _validate_external_source(
     workspace: BackupWorkspace,
     source_root: str | Path,
     authorized_source_root: str | Path,
+    *, directory_policy: ProductionDirectoryPolicy | None = None,
 ) -> Path:
     try:
         candidate = Path(source_root)
@@ -1812,11 +1910,14 @@ def _validate_external_source(
             or _path_contains_reparse_point(authorized)
         ):
             raise BackupBundleError("workspace_invalid")
+        if directory_policy is not None:
+            directory_policy.validate(candidate, source=True)
+            directory_policy.validate(authorized, source=True)
         source = candidate.resolve(strict=True)
         expected = authorized.resolve(strict=True)
         if source != expected or not source.is_dir():
             raise BackupBundleError("workspace_invalid")
-        _validate_root_location(source)
+        _validate_root_location(source, directory_policy=directory_policy, source=True)
         workspace_roots = (
             workspace.root,
             workspace.bundles_root,
@@ -2228,10 +2329,10 @@ def _path_contains_reparse_point(path: Path) -> bool:
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current = current / part
-        if not current.exists():
-            break
         try:
             metadata = current.lstat()
+        except FileNotFoundError:
+            break
         except OSError:
             return True
         if current.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:

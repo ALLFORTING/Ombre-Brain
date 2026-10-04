@@ -97,7 +97,7 @@ def register_backup_v2_if_enabled(
         return BackupV2RegistrationResult(enabled=True, registered=True, route_count=4)
 
     from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
-    from offline_backup_bundle import load_backup_workspace, prepare_backup_workspace
+    from offline_backup_bundle import ProductionDirectoryPolicy, load_backup_workspace, prepare_backup_workspace
     from production_backup_capture import (
         CaptureLimits,
         ProductionBackupCaptureController,
@@ -113,10 +113,11 @@ def register_backup_v2_if_enabled(
         raise BackupV2RuntimeConfigError("backup_v2_key_invalid")
 
     workspace_root = Path(config["workspace_root"])
+    directory_policy = ProductionDirectoryPolicy(Path(config["source_root"]), workspace_root)
     if workspace_root.exists():
-        workspace = load_backup_workspace(workspace_root)
+        workspace = load_backup_workspace(workspace_root, directory_policy=directory_policy)
     else:
-        workspace = prepare_backup_workspace(workspace_root)
+        workspace = prepare_backup_workspace(workspace_root, directory_policy=directory_policy)
 
     policy = StrictBackupV2OidcPolicy(
         expected_repository_id=config["repository_id"],
@@ -148,6 +149,7 @@ def register_backup_v2_if_enabled(
         runtime_commit=config["runtime_commit"],
         limits=limits,
         oidc_policy=policy,
+        directory_policy=directory_policy,
     )
     verifier = GitHubActionsBackupV2OidcVerifier()
 
@@ -173,7 +175,13 @@ def _parse_enabled_config(server_module: Any, env: Mapping[str, str]) -> dict[st
     missing = [name for name in REQUIRED_ENV if env.get(name) in (None, "")]
     if missing:
         raise BackupV2RuntimeConfigError()
-    source_root = Path(str(server_module.config["buckets_dir"])).resolve(strict=True)
+    from offline_backup_bundle import _path_contains_reparse_point
+    source_candidate = Path(str(server_module.config["buckets_dir"]))
+    workspace_candidate = Path(env["OMBRE_BACKUP_V2_WORKSPACE_ROOT"])
+    if (_path_contains_reparse_point(source_candidate)
+            or _path_contains_reparse_point(workspace_candidate)):
+        raise BackupV2RuntimeConfigError("backup_v2_workspace_invalid")
+    source_root = source_candidate.resolve(strict=True)
     workspace_root = _validate_workspace_root(env["OMBRE_BACKUP_V2_WORKSPACE_ROOT"], source_root)
     freeze_timeout = _parse_bounded_int(
         "OMBRE_BACKUP_V2_FREEZE_TIMEOUT_SECONDS", env
