@@ -16,7 +16,7 @@
     "deploy/lsf-zeabur/seed.py": "e3a95eb13a703eaa3ea20f54405c7564075724c4b595c0cc60112e22fe462d7a",
     "embedding_engine.py": "6bf4864b72defe00c00cb404b5b5f4ee1c45ea69e77a3f2e5216d7a055e10787",
     "requirements.txt": "5ed784bc016c5936caff4aeca9fb40806e00ae0e72765943efaa44314d8633a5",
-    "server.py": "819b14fbcf16a749c2053245782d335748983ec8a46bbce0960dc02189ffbd70",
+    "server.py": "6dac2714b000cd198ec105665299b6deb97576839b0b914f63eac6476e713414",
     "utils.py": "6f451819310151f8ebe41a2b26e114ea0924f63480e5e73844dbb1591da9e00c"
   }
 }
