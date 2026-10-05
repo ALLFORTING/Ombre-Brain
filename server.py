@@ -2338,8 +2338,9 @@ async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = F
         bucket.get("metadata", {}).get("provenance_kind")
     )
     lines = [f"[prov={provenance_kind}] {text}"]
-    current_todos = _canonical_todos(
-        bucket.get("metadata", {}).get("todos")
+    meta = bucket.get("metadata", {})
+    current_todos, _ = active_todo_projection(
+        meta.get("todos"), meta.get("todo_provenance")
     )
     if current_todos:
         lines.append(
@@ -12211,7 +12212,12 @@ def _maintenance_health_report(
             if importance is not None and importance < 3:
                 pinned_low_importance += 1
 
-        if metadata.get("resolved", False) or not _canonical_todos(metadata.get("todos")):
+        if metadata.get("resolved", False):
+            continue
+        active_todos, _ = active_todo_projection(
+            metadata.get("todos"), metadata.get("todo_provenance")
+        )
+        if not active_todos:
             continue
         age_days = _health_todo_age_days(metadata)
         if age_days is None:

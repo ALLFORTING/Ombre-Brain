@@ -471,3 +471,76 @@ async def test_dream_detail_reads_full_compressed_body(tmp_path, monkeypatch):
     detail = await server.dream(detail_ids=bucket_id)
     assert original in detail
     assert (await server.bucket_mgr.get(bucket_id))["content"] == original
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case, expected", [
+    ("mixed", ["active"]),
+    ("terminal", []),
+    ("legacy", ["legacy"]),
+    ("legacy_missing", ["legacy"]),
+    ("same_text", ["same"]),
+])
+async def test_breath_current_todos_active_projection_is_read_only(tmp_path, monkeypatch, case, expected):
+    from copy import deepcopy
+    from uuid import UUID
+
+    server = _load_server(tmp_path, monkeypatch)
+
+    def record(number, text, **state):
+        return {"id": f"todo_{UUID(int=number)}", "text": text,
+                "said_by": "unknown", "said_at": None, "source_bucket": None, **state}
+
+    records = [
+        record(1, "completed", done_at="2026-10-05T18:41:40"),
+        record(2, "dropped", dropped_at="2026-10-05T18:41:50"),
+        record(3, "active"),
+    ]
+    texts = ["completed", "dropped", "active"]
+    if case == "terminal":
+        records, texts = records[:2], texts[:2]
+    elif case in ("legacy", "legacy_missing"):
+        records, texts = [], ["legacy"]
+    elif case == "same_text":
+        records = [record(1, "same", done_at="2026-10-05T18:41:40"),
+                   record(2, "same", dropped_at="2026-10-05T18:41:50"), record(3, "same")]
+        texts = ["same"]
+    bucket = {"id": "synthetic", "content": "body",
+              "metadata": {"todos": texts, "todo_provenance": records}}
+    if case == "legacy_missing":
+        bucket["metadata"].pop("todo_provenance")
+    before = deepcopy(bucket)
+    output = await server._append_bucket_extras("summary", bucket)
+    heading = "=== 当前 todos（以 metadata 为准）==="
+    assert (heading in output) == bool(expected)
+    if expected:
+        assert output.split(heading + "\n", 1)[1].splitlines() == [f"- {text}" for text in expected]
+    assert bucket == before
+
+
+@pytest.mark.asyncio
+async def test_breath_cached_summary_uses_terminal_projection_without_writes(tmp_path, monkeypatch):
+    from pathlib import Path
+    from copy import deepcopy
+
+    server = _load_server(tmp_path, monkeypatch)
+    identity = await server.bucket_mgr.create(
+        content="cached body", todos=["completed", "dropped", "active"], tags=["C5-v1"])
+    records = (await server.bucket_mgr.get(identity))["metadata"]["todo_provenance"]
+    server.bucket_mgr.complete_todo(identity, records[0]["id"], lambda _: True)
+    server.bucket_mgr.drop_todo(identity, records[1]["id"], lambda _: True)
+    current = await server.bucket_mgr.get(identity)
+    path = Path(server.bucket_mgr._find_bucket_file(identity))
+    before = path.read_bytes()
+    metadata_before = deepcopy(current["metadata"])
+    server.bucket_mgr.search = AsyncMock(return_value=[current])
+    server.bucket_mgr.touch = AsyncMock(side_effect=AssertionError("touch=False must not touch"))
+    server.dehydrator.dehydrate = AsyncMock(return_value="cached summary without authoritative todos")
+
+    output = await server.breath(query="cached body", tags_filter=["C5-v1"], touch=False)
+
+    section = output.split("=== 当前 todos（以 metadata 为准）===\n", 1)[1]
+    assert "- active" in section
+    assert "- completed" not in section and "- dropped" not in section
+    assert path.read_bytes() == before
+    assert (await server.bucket_mgr.get(identity))["metadata"] == metadata_before
+    server.bucket_mgr.touch.assert_not_awaited()
