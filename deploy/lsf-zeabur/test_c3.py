@@ -252,3 +252,106 @@ if __name__=='__main__' and '--worker' in sys.argv:
         frames=traceback.extract_tb(exc.__traceback__)
         print(json.dumps(dict(error=str(exc) if isinstance(exc,RuntimeError) else type(exc).__name__,location=f'{Path(frames[-1].filename).name}:{frames[-1].lineno}',**child_identity)))
         sys.exit(1)
+
+
+@pytest.fixture
+def startup_entry(monkeypatch):
+    monkeypatch.syspath_prepend(str(HERE))
+    import c3_run
+    monkeypatch.setattr(c3_run, '_STARTUP_STAGE', 'entry')
+    return c3_run
+
+
+def test_startup_source_pins_valid(startup_entry):
+    startup_entry.verify_c2_sources()
+    startup_entry.verify_c3_sources()
+
+
+@pytest.mark.parametrize('kind', ['c2', 'c3'])
+def test_startup_tampering_rejected(startup_entry, monkeypatch, tmp_path, kind):
+    if kind == 'c2':
+        import environment
+        pins = json.loads((HERE/'c2-source-hashes.json').read_text())
+        for name in pins['sha256']:
+            target = tmp_path/name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(environment.SOURCE/name, target)
+        with (tmp_path/'server.py').open('ab') as stream:
+            stream.write(b'\n# deliberately altered test copy\n')
+        monkeypatch.setattr(environment, 'SOURCE', tmp_path)
+        with pytest.raises(RuntimeError, match='^c2_source_hash_mismatch$'):
+            startup_entry.verify_c2_sources()
+    else:
+        pins = json.loads((HERE/'c3-artifact-hashes.json').read_text())
+        (tmp_path/'c3-artifact-hashes.json').write_text(json.dumps(pins))
+        for name in pins['sha256']:
+            shutil.copyfile(HERE/name, tmp_path/name)
+        with (tmp_path/'c3_run.py').open('ab') as stream:
+            stream.write(b'\n# deliberately altered test copy\n')
+        monkeypatch.setattr(startup_entry, 'HERE', tmp_path)
+        with pytest.raises(RuntimeError, match='^c3_artifact_hash_mismatch$'):
+            startup_entry.verify_c3_sources()
+
+
+@pytest.mark.parametrize('exception_type', [RuntimeError, ValueError, OSError])
+def test_startup_diagnostic_redacts_unknown_errors(startup_entry, monkeypatch, capsys, exception_type):
+    sentinel = 'PRIVATE_SENTINEL_never_emit_0123456789'
+    monkeypatch.setenv('PRIVATE_DIAGNOSTIC_SENTINEL', sentinel)
+    monkeypatch.setattr(startup_entry, '_STARTUP_STAGE', sentinel)
+    code = compile('raise exception_type(sentinel)', '/private/'+sentinel+'.py', 'exec')
+    try:
+        exec(code, {'exception_type': exception_type, 'sentinel': sentinel})
+    except Exception as exc:
+        startup_entry.emit_startup_diagnostic(exc)
+    captured = capsys.readouterr()
+    output = json.loads(captured.err)
+    assert captured.out == ''
+    assert set(output) == {'stage', 'error_code', 'location'}
+    assert output == {'stage': 'entry', 'error_code': 'startup_runtime_error', 'location': 'external:1'}
+    assert sentinel not in captured.err and 'PRIVATE_DIAGNOSTIC_SENTINEL' not in captured.err
+    assert '/private/' not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_startup_c2_failure_stage_is_preserved(startup_entry, monkeypatch, tmp_path, capsys):
+    import observe
+    sentinel = 'PRIVATE_STARTUP_FAILURE_DO_NOT_EMIT'
+    monkeypatch.setattr(startup_entry, 'configure_c3', lambda *args: None)
+    monkeypatch.setattr(observe, 'install_logging', lambda *args: None)
+    monkeypatch.setattr(startup_entry, 'runtime_sources', lambda: {})
+    def fail():
+        raise RuntimeError('c2_source_hash_mismatch')
+    monkeypatch.setattr(startup_entry, 'verify_c2_sources', fail)
+    with pytest.raises(RuntimeError) as failure:
+        await startup_entry.serve(sentinel, tmp_path, 8080)
+    startup_entry.emit_startup_diagnostic(failure.value)
+    output = capsys.readouterr().err
+    row = json.loads(output)
+    assert row['stage'] == 'c2_sources'
+    assert row['error_code'] == 'c2_source_hash_mismatch'
+    assert sentinel not in output
+
+
+@pytest.mark.parametrize('case, stage, code', [
+    ('opt_in', 'opt_in', 'test_opt_in_required'),
+    ('token', 'token', 'fresh_query_token_required'),
+    ('port', 'port', 'startup_runtime_error'),
+])
+def test_startup_cli_safe_stderr(case, stage, code):
+    sentinel = 'PRIVATE_ENV_SENTINEL_DO_NOT_EMIT_0123456789'
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8',
+           'PYTHONDONTWRITEBYTECODE': '1', 'PRIVATE_ENV_SENTINEL': sentinel}
+    if case != 'opt_in':
+        env.update(OB_LSF_TEST_SERVICE='true', OMBRE_MCP_ALLOW_QUERY_TOKEN='true',
+                   OMBRE_MCP_QUERY_TOKEN='invalid!'+sentinel)
+    if case == 'port':
+        env['OMBRE_MCP_QUERY_TOKEN'] = sentinel + '_valid_token'
+        env['PORT'] = sentinel
+    proc = subprocess.run([sys.executable, '-B', str(HERE/'c3_run.py')],
+                          env=env, text=True, capture_output=True, timeout=15)
+    assert proc.returncode == 1 and proc.stdout == ''
+    row = json.loads(proc.stderr)
+    assert set(row) == {'stage', 'error_code', 'location'}
+    assert row['stage'] == stage and row['error_code'] == code
+    assert row['location'].startswith('c3_run.py:')
+    assert sentinel not in proc.stderr and 'OMBRE_MCP_QUERY_TOKEN' not in proc.stderr
