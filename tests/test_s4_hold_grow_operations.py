@@ -564,3 +564,46 @@ async def test_noop_reuse_does_not_backfill_legacy_todo_ids(setup):
     assert 'written_fields=[]' in await call()
     assert request_item(manager)['updates'] == {}
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('key', [None, 'feel-tags'])
+@pytest.mark.parametrize('analysis_mode', ['tags', 'empty', 'failure'])
+async def test_feel_preserves_explicit_tags_and_lifecycle(setup, monkeypatch, key, analysis_mode):
+    manager, _, config = setup
+    source = await manager.create('source for tag preservation', tags=['source'])
+    analysis = copy.deepcopy(ANALYSIS)
+    analysis['tags'] = ['auto', 'C5-v1'] if analysis_mode == 'tags' else []
+    analyzer = AsyncMock(side_effect=RuntimeError('synthetic analysis failure')) if analysis_mode == 'failure' else AsyncMock(return_value=analysis)
+    monkeypatch.setattr(server.dehydrator, 'analyze', analyzer)
+    # Exercise the real breath selector without starting a background decay task.
+    from decay_engine import DecayEngine
+    monkeypatch.setattr(server.decay_engine, 'calculate_score', DecayEngine(config, manager).calculate_score, raising=False)
+    kwargs = dict(content='isolated first person feeling', feel=True, source_bucket=source,
+                  tags=' C5-v1, ,C5-FEEL,C5-v1, ', valence=.7, arousal=.2)
+    first = await call(key=key, **kwargs)
+    buckets = await manager.list_all()
+    feels = [b for b in buckets if b['metadata'].get('type') == 'feel']
+    assert len(feels) == 1
+    bucket = feels[0]
+    expected = ['auto', 'C5-v1', 'C5-FEEL'] if analysis_mode == 'tags' else ['C5-v1', 'C5-FEEL']
+    meta = bucket['metadata']
+    assert meta['tags'] == expected
+    assert f"tags=[{', '.join(expected)}]" in first
+    assert meta['domain'] == [] and meta['type'] == 'feel'
+    assert meta['provenance_kind'] == 'inference'
+    assert meta.get('todos', []) == [] and meta.get('todo_provenance', []) == []
+    assert meta['valence'] == .7 and meta['arousal'] == .2
+    source_meta = (await manager.get(source))['metadata']
+    assert source_meta['digested'] is True and source_meta['model_valence'] == .7
+    assert source_meta['tags'] == ['source']
+    assert 'source_marked=true' in first
+    ordinary = await server.breath(tags_filter='C5-FEEL', touch=False)
+    assert bucket['id'] not in ordinary and kwargs['content'] not in ordinary
+    visible = await server.breath(feels=True, touch=False)
+    assert bucket['id'] in visible and 'C5-FEEL' in visible
+    if key is not None:
+        before = business_counts(manager)
+        assert await call(key=key, **kwargs) == first
+        assert business_counts(manager) == before
+        assert analyzer.await_count == 1
+        assert (await manager.get(bucket['id']))['metadata']['tags'] == expected
