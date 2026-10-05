@@ -10155,7 +10155,7 @@ def _hold_grow_item_values(payload, parent, entry):
             if payload[field] != -1:
                 values[field] = payload[field]
         if mode == 'feel':
-            values.update(tags=analysis.get('tags', []), importance=5, domain=[], todos=[],
+            values.update(importance=5, domain=[], todos=[],
                 valence=payload['valence'] if payload['valence'] != -1 else .5,
                 arousal=payload['arousal'] if payload['arousal'] != -1 else .3,
                 name=_canonical_body_name(content.strip().replace('\n', ' ')) or None,
@@ -10529,7 +10529,7 @@ async def hold(
         feel_name = _canonical_body_name(content.strip().replace("\n", " ")) or None
         bucket_id = await bucket_mgr.create(
             content=content,
-            tags=feel_analysis.get("tags", []),
+            tags=list(dict.fromkeys(feel_analysis.get("tags", []) + extra_tags)),
             importance=5,
             domain=[],
             valence=feel_valence,
