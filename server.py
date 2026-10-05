@@ -3310,6 +3310,7 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
         if bucket.get("metadata", {}).get("type") == "feel"
         and not _is_sealed(bucket)
         and not _is_test_bucket(bucket)
+        and not _superseded_by_id(bucket.get("metadata", {}))
     ]
     if not feels:
         return "=== boot: 回声 ===\n（暂无可见 feel）"
