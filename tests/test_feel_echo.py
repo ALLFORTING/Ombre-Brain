@@ -69,3 +69,57 @@ async def test_sealed_feel_hidden_from_echo_and_feels_search(tmp_path, monkeypat
     assert sealed_id not in breath_result
     assert "Sealed echo" not in breath_result
 
+
+
+def _echo_bucket(identity, **metadata):
+    return dict(id=identity, content=f'body {identity}',
+                metadata=dict(type='feel', name=identity, **metadata))
+
+
+@pytest.mark.parametrize('successor', ['successor-id', 'none', '', None])
+@pytest.mark.parametrize('dormant', [False, True])
+def test_echo_supersession_filter_preserves_dormant(tmp_path, monkeypatch, successor, dormant):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket = _echo_bucket('candidate', dormant=dormant)
+    if successor is not None:
+        bucket['metadata']['superseded_by'] = successor
+    echo = server._format_feel_echo([bucket])
+    if successor in ('successor-id', 'none'):
+        assert echo == '=== boot: 回声 ===\n（暂无可见 feel）'
+    else:
+        assert '[bucket_id:candidate]' in echo and 'body candidate' in echo
+
+
+def test_echo_mixed_candidates_only_select_eligible_feels(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    eligible = [_echo_bucket('active'), _echo_bucket('dormant', dormant=True, superseded_by='')]
+    excluded = [
+        _echo_bucket('superseded', superseded_by='successor-id'),
+        _echo_bucket('retired', superseded_by='none'),
+        _echo_bucket('sealed', sealed=1),
+        _echo_bucket('test-list', tags=['test']),
+        _echo_bucket('test-csv', tags='audit, test'),
+    ]
+    ordinary = _echo_bucket('ordinary')
+    ordinary['metadata']['type'] = 'dynamic'
+    excluded.append(ordinary)
+    def choose(candidates):
+        assert candidates == eligible
+        return candidates[1]
+    monkeypatch.setattr(server.random, 'choice', choose)
+    assert '[bucket_id:dormant]' in server._format_feel_echo(excluded + eligible)
+    assert server._format_feel_echo(excluded) == '=== boot: 回声 ===\n（暂无可见 feel）'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('retired', [False, True])
+async def test_talk_boot_echo_excludes_superseded_feel(tmp_path, monkeypatch, retired):
+    server = _load_server(tmp_path, monkeypatch)
+    feel_id = await server.bucket_mgr.create('obsolete feel echo', bucket_type='feel')
+    successor = 'none' if retired else await server.bucket_mgr.create('successor memory')
+    await server.trace(feel_id, superseded_by=successor)
+    assert (await server.bucket_mgr.get(feel_id))['metadata']['superseded_by'] == successor
+    result = await server.boot(profile='talk')
+    echo = result.split('=== boot: 回声 ===\n', 1)[1]
+    assert '（暂无可见 feel）' in echo
+    assert feel_id not in echo and 'obsolete feel echo' not in echo
