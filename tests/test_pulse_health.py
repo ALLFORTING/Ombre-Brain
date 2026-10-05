@@ -318,3 +318,41 @@ async def test_health_counts_pinned_low_importance_and_validates_inputs(tmp_path
     assert "health=True 不支持 include_sealed" in await server.pulse(
         health=True, touch=False, include_sealed=True
     )
+
+@pytest.mark.asyncio
+async def test_health_counts_only_active_todo_buckets_without_writes(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from uuid import UUID
+
+    server = _load_server(tmp_path, monkeypatch)
+
+    def bucket(number, texts, records, **age):
+        return {"id": str(number), "metadata": {
+            "name": f"bucket-{number}", "tags": ["synthetic"], "todos": texts,
+            "todo_provenance": records, **age}}
+
+    def record(number, text, **state):
+        return {"id": f"todo_{UUID(int=number)}", "text": text,
+                "said_by": "unknown", "said_at": None, "source_bucket": None, **state}
+
+    terminal = [record(1, "completed", done_at="2026-10-05T18:41:40"),
+                record(2, "dropped", dropped_at="2026-10-05T18:41:50")]
+    old = (datetime.now() - timedelta(days=40)).isoformat()
+    buckets = [
+        bucket(1, ["completed", "dropped"], terminal, last_active=old),
+        bucket(2, ["completed", "dropped"], terminal),
+        bucket(3, ["completed", "dropped", "active"],
+               terminal + [record(3, "active")], last_active=old),
+        bucket(4, ["legacy"], [], last_active=old),
+        bucket(5, ["active"], [record(5, "active")]),
+        bucket(6, ["recent"], [record(6, "recent")], last_active=datetime.now().isoformat()),
+        bucket(7, ["same"], [record(7, "same", done_at=old),
+                            record(8, "same")], last_active=old),
+    ]
+    before = deepcopy(buckets)
+    output = server._maintenance_health_report(
+        buckets, buckets, todo_stale_days=30, include_archive=False)
+
+    assert "stale todo buckets (>30d): 3" in output
+    assert "todo age unavailable: 1" in output
+    assert buckets == before
