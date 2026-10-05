@@ -479,7 +479,7 @@ boot、todos 和 feel echo 默认排除完整、精确匹配 `test` 的 tag；�
 - direct touch 只发生在完整输出组装成功后、对通过过滤且本页实际显示的既有可 touch 桶；弱匹配、session/feel/historical/mailbox 和 default 的核心钉选/保护桶保持原 direct-touch 边界。合法 touch 的 ripple 原样保留；失败追加 side-effect/accounting warning，不改 retrieval/counts、不重试 / Direct touch follows successful emission; failure leaves retrieval accounting intact.
 - query 结果中的“精确”仅表示规范化后的完整桶名或完整 tag 与 query 相等；正文子串命中不标“精确”。`检索分`取检索结果的 `score`，它不是纯 cosine similarity：常规检索优先返回规范化后完整桶名与 query 相等的结果，再按 `match_tier` 和该分数排序；同名结果仍按原有 tier 与分数排序，resolved/superseded 降权保持不变；指定 `resonance` 时还可能按情绪距离重排。旧 cursor 没有冻结该分数时显示“检索分=未记录”，不会把旧 `sim` 当作检索分。📌 仅表示 pinned，包含 dormant 的结果标记 `[休眠]`。/ Exact display requires a whole normalized name or tag match. The retrieval score is the stored search score, with whole normalized name equality preceding match tier and score; ranking penalties and optional resonance reordering remain unchanged.
 - session 默认节选仍取正文前 1200 字符；无 query 且确实截断时给出全文读取提示，带 query 的默认节选沿用 `[显示=原文节选·已截断]` 标记；`mode="full"` 的 query 路径保持原有预算截断行为。importance-only 按真实 importance 排序并显示 `重要:n` 与桶类型图标，不显示占位权重。/ Default session previews retain the 1200-character cut; full query mode retains its existing budget behavior.
-- 命中桶后，输出中的 todos 会从当前 bucket metadata 重新读取并追加；即使脱水摘要来自旧缓存，todos 也以当前 metadata 为准 / After a bucket is matched, todos are reread from current bucket metadata and appended to the output; current metadata remains authoritative even when the dehydrated summary comes from an older cache entry.
+- 命中桶后，输出中的 todos 会从当前 bucket metadata 重新读取并追加，仅显示 active 项；即使脱水摘要来自旧缓存，todos 也以当前 metadata 为准 / After a bucket is matched, todos are reread from current bucket metadata and appended to the output, showing only active items; current metadata remains authoritative even when the dehydrated summary comes from an older cache entry.
 - `as_of` cursor 会冻结规范化的历史时点；不能拿一个时点的 cursor 改传另一个时点。历史版本边界使用 write-ahead `changed_at`：`T < changed_at` 选快照中的旧正文，`T >= changed_at` 选后续正文；同秒连续写入无法从现有秒级快照进一步区分 / An `as_of` cursor freezes the normalized historical instant. Version boundaries use write-ahead `changed_at`: `T < changed_at` selects the snapshotted old body, while `T >= changed_at` selects the following body. The existing second-precision snapshot model cannot distinguish multiple writes within the same second.
 
 #### `get_letter`
@@ -1115,11 +1115,12 @@ Feel 不是事件记录，是**模型带走的东西**——一句感受、一�
 Feel is not an event log — it's **what the model carries away**: a feeling, an unanswered question, a noticed change.
 
 - `hold(content="...", feel=True, source_bucket="源记忆ID", valence=模型自己的感受)`
+- `hold(feel=True)` 时，调用方 `tags` 与自动标签合并去重保留 / With `hold(feel=True)`, caller-supplied `tags` are merged with automatic tags, deduplicated and retained.
 - `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
 - `source_bucket` 指向被消化的记忆；成功 marking 写入「已消化」。feel 创建与 source marking 的结果须分别检查，已消化且 resolved 的记忆会加速淡化，不会因此删除。
-- Feel 不参与普通浮现、不衰减、不参与 dreaming；但 `boot()` 会在“回声”区随机带出 1 条可见 feel，`breath(feels=True)` 可专门检索 feel
+- Feel 不参与普通浮现、不衰减、不参与 dreaming；但 `boot()` 会在“回声”区随机带出 1 条可见 feel，候选排除 sealed、精确匹配完整 `test` 标签和已作废（`superseded_by` 为后继 ID 或 `"none"`）的 feel，dormant feel 仍可能出现；`breath(feels=True)` 可专门检索 feel
 - 用 `breath(domain="feel")` 或 `breath(feels=True)` 读取之前的 feel；sealed feel 仍默认隐藏
-- Feel does not join normal surfacing, does not decay, and does not join dreaming; `boot()` surfaces one visible feel in the echo section, and `breath(feels=True)` searches feel memories directly.
+- Feel does not join normal surfacing, does not decay, and does not join dreaming; `boot()` surfaces one visible feel in the echo section, excluding sealed feels, exact whole-tag matches for `test`, and superseded feels (`superseded_by` is a successor ID or `"none"`); dormant feels may still appear, and `breath(feels=True)` searches feel memories directly.
 - Use `breath(domain="feel")` or `breath(feels=True)` to read previous feel; sealed feel remains hidden by default.
 
 当 source_bucket 去除首尾空白后非空时，hold 会在创建 feel 前严格验证 source 的可读性和唯一身份；missing、unreadable、malformed identity、duplicate identity、filename/metadata ID conflict 或无法证明唯一身份时直接拒绝，不创建 feel。sealed、dormant、archived、superseded 和 feel source 仍可标记，生命周期和目录不变。
