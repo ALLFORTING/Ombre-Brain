@@ -7,10 +7,11 @@
 # own MCP instance and runtime state. server.py imports the split modules,
 # never the other way round.
 #
-# The guard also covers server_assets.py: it is executed inside server's own
-# namespace rather than imported, and an `import server` there would load the
-# same second copy.
-# 守护同样覆盖 server_assets.py：它在 server 命名空间里执行而不是被 import，
+# The guard also covers the fragments (server_dashboard_auth.py,
+# server_assets.py, server_dashboard_api.py): they are executed inside
+# server's own namespace rather than imported, and an `import server` there
+# would load the same second copy.
+# 守护同样覆盖各个片段：它们在 server 命名空间里执行而不是被 import，
 # 其中若写 import server 同样会加载出第二份 server。
 # ============================================================
 

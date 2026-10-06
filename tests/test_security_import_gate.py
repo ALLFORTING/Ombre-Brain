@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
+from tests._server_source import effective_server_source
 
 
 def _load_server(tmp_path, monkeypatch):
@@ -123,7 +124,7 @@ def test_import_review_rejects_multi_delete_without_mutation(tmp_path, monkeypat
 
 @pytest.mark.security
 def test_import_review_and_pause_keep_custom_route_outermost():
-    source = open("server.py", encoding="utf-8").read()
+    source = effective_server_source()
     for route in ("/api/import/review", "/api/import/pause"):
         start = source.index(f'@mcp.custom_route("{route}"')
         end = source.index("async def ", start)

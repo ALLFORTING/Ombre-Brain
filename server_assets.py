@@ -2,11 +2,13 @@
 # Fragment: image assets and Remember-Me (server_assets.py)
 # 片段：图片资产与 Remember-Me
 #
-# NOT an importable module. server.py reads this file at the position where
-# this code used to live and executes it in server's own namespace via
-# compile(source, path, "exec"). Never `import server_assets`.
-# 这不是可以单独 import 的模块。server.py 在这段代码原来所在的位置读入本文件，
-# 用 compile(源码, 路径, "exec") 在 server 自己的命名空间里执行。禁止 import server_assets。
+# NOT an importable module. server.py executes this file in its own
+# namespace, at the position where this code used to live, through
+# _exec_server_fragment("server_assets.py"), i.e. compile(source, path, "exec").
+# Never `import server_assets`.
+# 这不是可以单独 import 的模块。server.py 在这段代码原来所在的位置，通过
+# _exec_server_fragment("server_assets.py")（即 compile(源码, 路径, "exec")）
+# 在 server 自己的命名空间里执行。禁止 import server_assets。
 #
 # Why: tests unload and re-import server and keep using older server module
 # objects, so each server module needs its own copies of these functions,
@@ -26,6 +28,7 @@
 # components, helpers). Tracebacks show this file and its own line numbers.
 # 这里用到的名字都来自 server.py 的命名空间。报错堆栈显示本文件和它自己的行号。
 # ============================================================
+# --- end of fragment header ---
 
 ASSET_PROBE_MAX_BASE64_CHARS = 4 * 1024 * 1024
 ASSET_PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "probe.png")

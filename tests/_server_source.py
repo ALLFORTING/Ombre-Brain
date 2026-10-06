@@ -1,31 +1,51 @@
 """Effective server source text for static source-inspection tests.
 
-server.py executes server_assets.py in its own namespace at a fixed include
-point. Tests that inspect "the server source" read this text: server.py with
-the fragment's code spliced back in where it is executed, so assertions see
-the same code, in the same order, as before the split.
+server.py executes its fragments (server_dashboard_auth.py, server_assets.py,
+server_dashboard_api.py) in its own namespace at fixed include points. Tests
+that inspect "the server source" read this text: server.py with every
+fragment's code spliced back in, in include order, where it is executed, so
+assertions see the same code, in the same order, as before the split.
 """
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_INCLUDE_START = "# --- Image assets and Remember-Me: server_assets.py"
-_INCLUDE_END = "del _server_assets_source\n"
+HEADER_END = "# --- end of fragment header ---"
+_INCLUDE = re.compile(r'^_exec_server_fragment\("([A-Za-z0-9_]+\.py)"\)$')
+_INCLUDE_COMMENT = re.compile(r"^# --- Fragment ([A-Za-z0-9_]+\.py): ")
 
 
-def _fragment_code() -> str:
-    lines = (ROOT / "server_assets.py").read_text(encoding="utf-8").splitlines(keepends=True)
-    index = 0
-    while index < len(lines) and lines[index].startswith("#"):
-        index += 1
+def fragment_code(filename: str) -> str:
+    """Return a fragment's code without its explanatory header."""
+    lines = (ROOT / filename).read_text(encoding="utf-8").splitlines(keepends=True)
+    markers = [index for index, line in enumerate(lines) if line.rstrip("\n") == HEADER_END]
+    assert len(markers) == 1, f"{filename}: fragment header end marker missing"
+    index = markers[0] + 1
     while index < len(lines) and not lines[index].strip():
         index += 1
     return "".join(lines[index:])
 
 
+def included_fragments() -> list[str]:
+    """Fragment filenames in the order server.py executes them."""
+    server = (ROOT / "server.py").read_text(encoding="utf-8").splitlines()
+    return [match.group(1) for line in server if (match := _INCLUDE.match(line))]
+
+
 def effective_server_source() -> str:
-    server = (ROOT / "server.py").read_text(encoding="utf-8")
-    start = server.find(_INCLUDE_START)
-    end = server.find(_INCLUDE_END, start)
-    assert start != -1 and end != -1, "server_assets.py include point not found in server.py"
-    return server[:start] + _fragment_code() + server[end + len(_INCLUDE_END):]
+    lines = (ROOT / "server.py").read_text(encoding="utf-8").splitlines(keepends=True)
+    output = []
+    spliced = 0
+    for line in lines:
+        include = _INCLUDE.match(line.rstrip("\n"))
+        if include:
+            comment = _INCLUDE_COMMENT.match(output[-1]) if output else None
+            if comment and comment.group(1) == include.group(1):
+                output.pop()
+            output.append(fragment_code(include.group(1)))
+            spliced += 1
+            continue
+        output.append(line)
+    assert spliced, "no server fragment include point found in server.py"
+    return "".join(output)
