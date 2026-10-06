@@ -3,8 +3,9 @@
 # 测试：服务片段只能由 server.py 在原位置读入执行
 #
 # server.py executes server_dashboard_auth.py, server_digest.py,
-# server_maintenance_checks.py, server_assets.py and server_dashboard_api.py
-# in its own namespace where that code used to live.
+# server_maintenance_checks.py, server_breath.py, server_assets.py,
+# server_breath_tool.py and server_dashboard_api.py in its own namespace
+# where that code used to live.
 # Nothing may import them, each include must stay at its position (tool and
 # route registration order), and a missing fragment must stop startup.
 # ============================================================
@@ -29,8 +30,10 @@ EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "build"
 FRAGMENTS = {
     "server_dashboard_auth.py": ("_exec_server_fragment", "root_redirect", "_create_session"),
     "server_digest.py": ("_format_boot_delta", "_auto_link_related", "_run_digest"),
-    "server_maintenance_checks.py": ("_auto_link_related", "_breath_parameter_error", "_detect_conflict_warning"),
-    "server_assets.py": ("_breath_impl", "digest", "_selected_asset_backend"),
+    "server_maintenance_checks.py": ("_auto_link_related", "digest", "_detect_conflict_warning"),
+    "server_breath.py": ("_auto_link_related", "digest", "_breath_impl"),
+    "server_assets.py": ("_auto_link_related", "digest", "_selected_asset_backend"),
+    "server_breath_tool.py": ("related_backfill", "_format_hold_created", "breath"),
     "server_dashboard_api.py": ("dream", None, "api_system_status"),
 }
 

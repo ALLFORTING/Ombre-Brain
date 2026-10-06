@@ -1,8 +1,9 @@
 """Effective server source text for static source-inspection tests.
 
 server.py executes its fragments (server_dashboard_auth.py, server_digest.py,
-server_maintenance_checks.py, server_assets.py, server_dashboard_api.py) in its
-own namespace at fixed include points. Tests
+server_maintenance_checks.py, server_breath.py, server_assets.py,
+server_breath_tool.py, server_dashboard_api.py) in its own namespace at fixed
+include points. Tests
 that inspect "the server source" read this text: server.py with every
 fragment's code spliced back in, in include order, where it is executed, so
 assertions see the same code, in the same order, as before the split.

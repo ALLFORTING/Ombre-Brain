@@ -8,8 +8,9 @@
 # never the other way round.
 #
 # The guard also covers the fragments (server_dashboard_auth.py,
-# server_digest.py, server_maintenance_checks.py, server_assets.py,
-# server_dashboard_api.py): they are executed inside
+# server_digest.py, server_maintenance_checks.py, server_breath.py,
+# server_assets.py, server_breath_tool.py, server_dashboard_api.py): they
+# are executed inside
 # server's own namespace rather than imported, and an `import server` there
 # would load the same second copy.
 # 守护同样覆盖各个片段：它们在 server 命名空间里执行而不是被 import，
