@@ -70,6 +70,7 @@
 !remember_me_vector_provider.py
 !requirements.txt
 !server.py
+!server_assets.py
 !server_boot_format.py
 !server_common.py
 !server_http_security.py
