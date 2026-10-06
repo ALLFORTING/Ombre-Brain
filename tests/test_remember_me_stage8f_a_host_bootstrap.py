@@ -14,6 +14,7 @@ from remember_me_host_runtime import (
     RememberMeHostRuntimeError,
     create_remember_me_host_bundle,
 )
+from tests._server_source import effective_server_source
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -378,7 +379,7 @@ def test_server_enabled_runtime_exception_fails_closed_without_details(tmp_path,
 
 
 def test_stage8f_a_bootstrap_surface_remains_compatible_after_later_wiring():
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     production_modules = [
         ROOT / "asset_dashboard.py",
         ROOT / "asset_viewer.py",

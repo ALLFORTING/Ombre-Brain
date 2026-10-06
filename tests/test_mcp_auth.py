@@ -9,6 +9,7 @@ from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
+from tests._server_source import effective_server_source
 
 
 def _load_server(monkeypatch):
@@ -293,7 +294,7 @@ def test_http_cors_origins_are_explicit(tmp_path, monkeypatch):
 
 def test_both_http_entrypoints_use_shared_cors_policy():
     root = Path(__file__).parents[1]
-    server_source = (root / "server.py").read_text(encoding="utf-8")
+    server_source = effective_server_source()
     backup_source = (root / "backup_entry.py").read_text(encoding="utf-8")
 
     assert "add_http_cors_middleware(_app)" in server_source

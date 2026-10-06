@@ -26,6 +26,7 @@ from remember_me_core_adapter import (
     RememberMeCoreAdapter,
     RememberMeCoreAdapterError,
 )
+from tests._server_source import effective_server_source
 
 
 ASSET_ID = re.compile(r"[0-9a-f]{32}")
@@ -606,9 +607,11 @@ def test_production_modules_do_not_import_stage8c_adapter():
         "asset_viewer.py",
         "asset_embedding_index.py",
     ):
-        assert "remember_me_core_adapter" not in (
-            root / relative
-        ).read_text(encoding="utf-8")
+        text = (
+            effective_server_source() if relative == "server.py"
+            else (root / relative).read_text(encoding="utf-8")
+        )
+        assert "remember_me_core_adapter" not in text
 
 
 OB_PUBLIC_UPLOAD_FIELDS = {

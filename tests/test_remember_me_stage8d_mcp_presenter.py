@@ -18,6 +18,7 @@ from remember_me_mcp_presenter import (
     RememberMeMcpCompatibilityPresenterError,
 )
 import remember_me_mcp_presenter as presenter_module
+from tests._server_source import effective_server_source
 
 
 ASSET_ID = "a" * 32
@@ -517,6 +518,8 @@ def test_presenter_has_no_production_import_or_registration():
         "asset_viewer.py",
         "asset_embedding_index.py",
     ):
-        assert "remember_me_mcp_presenter" not in (
-            root / relative
-        ).read_text(encoding="utf-8")
+        text = (
+            effective_server_source() if relative == "server.py"
+            else (root / relative).read_text(encoding="utf-8")
+        )
+        assert "remember_me_mcp_presenter" not in text
