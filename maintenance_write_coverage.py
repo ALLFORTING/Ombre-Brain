@@ -366,15 +366,21 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_run_legacy_archive": "guarded_async_mutation",
         "_run_legacy_pinned": "guarded_async_mutation",
         "_execute_merge_operation": "guarded_async_mutation",
+        "_record_emotion_snapshot": "guarded_mutation",
+        "_run_hold_grow_request": "guarded_async_mutation",
+        "_execute_hold_grow_item": "guarded_async_mutation",
+        "_hold_grow_related": "guarded_mutation",
+    },
+    # Fragments executed inside server's namespace (see server.py); each is
+    # scanned as its own file, so its write points are registered under it.
+    "server_dashboard_auth.py": {
         "_save_password_hash": "guarded_mutation",
         "_atomic_write_auth_payload": "guarded_caller_only",
         "_write_fd_bytes": "guarded_caller_only",
         "_publish_auth_payload_exclusive": "guarded_caller_only",
         "_create_auth_file_if_absent": "guarded_caller_only",
-        "_record_emotion_snapshot": "guarded_mutation",
-        "_run_hold_grow_request": "guarded_async_mutation",
-        "_execute_hold_grow_item": "guarded_async_mutation",
-        "_hold_grow_related": "guarded_mutation",
+    },
+    "server_dashboard_api.py": {
         "api_config_update": "guarded_http_mutation",
         "_write_env_var": "guarded_mutation",
         "api_import_upload": "excluded_transient_import_upload",
@@ -424,8 +430,8 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
 
 GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("asset_dashboard.py", "on_part_data"): {("asset_dashboard.py", "parse_upload")},
-    ("asset_dashboard.py", "parse_upload"): {("server.py", "api_assets")},
-    ("asset_dashboard.py", "create_asset"): {("server.py", "api_assets")},
+    ("asset_dashboard.py", "parse_upload"): {("server_dashboard_api.py", "api_assets")},
+    ("asset_dashboard.py", "create_asset"): {("server_dashboard_api.py", "api_assets")},
     ("asset_store.py", "_create_temp_path_unchecked"): {
         ("asset_store.py", "create_temp_path"),
         ("asset_store.py", "_clean_image"),
