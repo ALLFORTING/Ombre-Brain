@@ -70,6 +70,8 @@
 !remember_me_vector_provider.py
 !requirements.txt
 !server.py
+!server_breath.py
+!server_breath_tool.py
 !server_digest.py
 !server_maintenance_checks.py
 !server_dashboard_api.py
