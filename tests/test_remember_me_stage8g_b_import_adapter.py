@@ -41,6 +41,7 @@ from remember_me_import_adapter import (
 
 
 from remember_me_dependency import DEPENDENCY
+from tests._server_source import effective_server_source
 
 ROOT = Path(__file__).resolve().parent.parent
 RM_VERSION = DEPENDENCY.version
@@ -214,7 +215,7 @@ def test_pin_version_and_public_import_contract():
 
 def test_host_adapter_uses_only_public_rm_core_and_is_not_server_wired():
     text = (ROOT / "remember_me_import_adapter.py").read_text(encoding="utf-8")
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     assert "from remember_me.core import" in text
     assert "remember_me.storage" not in text
     assert "remember_me.repository" not in text
@@ -779,7 +780,7 @@ def test_callers_cannot_directly_forge_fixture_capability():
 
 
 def test_default_off_and_ownership_contracts_remain_unchanged():
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     adapter_text = (ROOT / "remember_me_import_adapter.py").read_text(
         encoding="utf-8"
     )

@@ -18,6 +18,7 @@ from remember_me_mcp_presenter import (
     _OB_PUBLIC_METADATA_KEYS,
 )
 from rm_cutover_test_support import configure_rm_authority
+from tests._server_source import effective_server_source
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -275,7 +276,7 @@ def test_presenter_json_failure_returns_stable_error(monkeypatch):
 
 
 def test_public_contracts_and_stage8fb_isolation_remain(tmp_path):
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
 
     get_start = server_text.index("async def rm_asset_get")
     get_stop = server_text.find("\n@mcp.", get_start + 1)

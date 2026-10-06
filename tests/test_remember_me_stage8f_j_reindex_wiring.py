@@ -39,6 +39,7 @@ from remember_me_vector_provider import RememberMeVectorProviderAdapter
 
 
 from remember_me_dependency import DEPENDENCY
+from tests._server_source import effective_server_source
 
 ROOT = Path(__file__).resolve().parent.parent
 RM_VERSION = DEPENDENCY.version
@@ -1648,7 +1649,7 @@ async def test_rm_search_before_reindex_does_not_consume_legacy_vectors(tmp_path
 
 
 def test_static_ownership_has_no_migration_dual_write_or_schema_change():
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     reindex_start = server_text.index("async def rm_asset_reindex_embeddings(")
     reindex_stop = server_text.index("async def rm_asset_download_link", reindex_start)
     reindex = server_text[reindex_start:reindex_stop]
@@ -1693,7 +1694,7 @@ def test_nine_tool_names_order_and_input_schema_fixture_are_unchanged():
 
     assert EXPECTED_MCP_TOOLS == expected
 
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     markers = {
         "rm_asset_upload_link": 'source = "remember_me"',
         "rm_asset_upload_status": 'source = "remember_me"',
