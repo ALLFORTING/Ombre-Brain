@@ -63,6 +63,7 @@ from production_backup_capture import (
     public_key_fingerprint,
     receive_encrypted_bundle,
 )
+from tests._server_source import effective_server_source
 
 
 COMMIT = "1" * 40
@@ -870,7 +871,7 @@ def test_route_factory_is_unregistered_and_path_body_is_not_accepted(tmp_path):
     routes = build_backup_v2_routes(controller, lambda request: _claims())
     assert len(routes) == 4
     assert all(route.path.startswith("/api/backup/v2/") for route in routes)
-    server_source = (Path(__file__).parents[1] / "server.py").read_text(encoding="utf-8")
+    server_source = effective_server_source()
     backup_entry_source = (Path(__file__).parents[1] / "backup_entry.py").read_text(encoding="utf-8")
     assert "production_backup_capture" not in server_source
     assert "production_backup_capture" not in backup_entry_source

@@ -18,6 +18,7 @@ from remember_me_mcp_presenter import (
     _OB_PUBLIC_METADATA_KEYS,
 )
 from rm_cutover_test_support import configure_rm_authority
+from tests._server_source import effective_server_source
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -517,7 +518,7 @@ def test_presenter_update_metadata_rejects_malformed_mutation_results(result):
 
 
 def test_public_contracts_and_stage8fg_isolation_remain(tmp_path):
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     get_block = server_text[server_text.index("async def rm_asset_get"):server_text.index("async def rm_asset_update_metadata")]
     update_block = server_text[server_text.index("async def rm_asset_update_metadata"):server_text.index("async def rm_asset_search")]
     search_block = server_text[server_text.index("async def rm_asset_search"):server_text.index("async def rm_asset_reindex_embeddings")]

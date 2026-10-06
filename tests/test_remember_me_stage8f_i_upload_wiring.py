@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from remember_me_mcp_presenter import RememberMeMcpCompatibilityPresenter
 from rm_cutover_test_support import install_fake_rm_backend
+from tests._server_source import effective_server_source
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -483,7 +484,7 @@ async def test_rm_complete_none_releases_ticket_without_fallback(tmp_path, monke
 def test_public_contract_static_scope_and_counts_remain_unchanged(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server_text = (server.ROOT if hasattr(server, "ROOT") else None)
-    text = __import__("pathlib").Path("server.py").read_text(encoding="utf-8")
+    text = effective_server_source()
     assert "ingest_public_metadata(" in (ROOT / "asset_backend.py").read_text(encoding="utf-8")
     assert "core_adapter.ingest_image" not in text[text.index("async def rm_asset_upload_route"):text.index("@mcp.custom_route(\"/rm/asset-download/{token}\"")]
     assert "_rm_asset_upload_sources" in text

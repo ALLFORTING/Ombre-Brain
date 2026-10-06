@@ -12,6 +12,7 @@ import pytest
 from remember_me_core_adapter import RememberMeCoreAdapterError
 from remember_me_mcp_presenter import RememberMeMcpCompatibilityPresenter
 from rm_cutover_test_support import configure_rm_authority, install_fake_rm_backend
+from tests._server_source import effective_server_source
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -475,7 +476,7 @@ async def test_core_adapter_preserves_allowlisted_search_errors():
 
 
 def test_public_contracts_and_stage8fh_isolation_remain(tmp_path):
-    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    server_text = effective_server_source()
     snapshot_path = ROOT / "tests/fixtures/stage8b-ob-rm-mcp-contract.json"
     before_snapshot = snapshot_path.read_bytes()
 

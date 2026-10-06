@@ -1,14 +1,11 @@
 """Upload-boundary contract tests for O5B."""
 
-from pathlib import Path
-
 from raw_evidence_import import parse_capture_option
+from tests._server_source import effective_server_source
 
 
 def test_upload_route_keeps_additive_capture_contract():
-    source = Path(__file__).resolve().parents[1].joinpath("server.py").read_text(
-        encoding="utf-8"
-    )
+    source = effective_server_source()
     route = source[source.index('"/api/import/upload"'):]
     assert "raw_evidence_capture" in route
     assert "start_raw_evidence" in route

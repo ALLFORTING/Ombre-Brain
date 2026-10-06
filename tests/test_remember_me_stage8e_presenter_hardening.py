@@ -22,6 +22,7 @@ from remember_me_download_links import (
 from remember_me_mcp_presenter import (
     RememberMeMcpCompatibilityPresenter,
 )
+from tests._server_source import effective_server_source
 
 ASSET_ID = "a" * 32
 STORED_SHA = "1" * 64
@@ -674,7 +675,7 @@ def test_known_download_store_full_error_is_preserved():
 
 def test_stage8e_modules_remain_outside_production_import_paths():
     root = Path(__file__).resolve().parent.parent
-    server_source = (root / "server.py").read_text(encoding="utf-8")
+    server_source = effective_server_source()
     assert "remember_me_mcp_presenter" not in server_source
 
     for relative in (
