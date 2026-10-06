@@ -70,6 +70,7 @@
 !remember_me_vector_provider.py
 !requirements.txt
 !server.py
+!server_http_security.py
 !source_span_producer.py
 !utils.py
 !write_memory.py
