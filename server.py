@@ -189,6 +189,61 @@ from server_http_security import (
     add_http_cors_middleware,
     _env_flag_enabled,
 )
+# Stateless helpers live in server_common.py and server_boot_format.py; every
+# name stays importable from server for existing callers and tests.
+from server_common import (
+    _canonical_body_name,
+    _provider_failure_category,
+    _bucket_date,
+    _bucket_topic,
+    _bucket_emotion,
+    _superseded_by_id,
+    _supersedes_ids,
+    _bucket_display_icon,
+    _is_recent_bucket,
+    _parse_date_filter,
+    _parse_optional_date,
+    _is_in_date_range,
+    _parse_resonance,
+    _resonance_distance,
+    _parse_csv_ids,
+    _normalize_archive_topics,
+    _structured_metadata_values,
+    _is_test_bucket,
+    _matches_any_structured_filter,
+    _breath_recency_key,
+    _normalize_todos,
+    _canonical_todos,
+    _parse_explicit_provenance_kind,
+    _structured_todo_items,
+    _parse_emotion_history,
+    _encode_emotion_history,
+    _read_emotion_timeline_for_write,
+    _related_ids,
+    _metadata_restore_value,
+    _split_search_results,
+    _is_sealed,
+)
+from server_boot_format import (
+    BOOT_TRUNCATION_NOTICE_TOKENS,
+    BOOT_PROFILE_CODE_ROOTS,
+    BOOT_PROFILE_TG_MIN_IMPORTANCE,
+    _extract_session_summary,
+    _format_note_preview,
+    _parse_note_open_at,
+    _note_delivery_state,
+    _format_bucket_truncation_notice,
+    _format_boot_preview,
+    _format_tg_summary_refresh_notice,
+    _format_tg_summary_preview,
+    _profile_metadata_labels,
+    _profile_is_code_context,
+    _profile_is_global_constraint,
+    _profile_allows_bucket,
+    _prefix_within_token_budget,
+    _fit_sections_to_budget,
+    _boot_delta_locator,
+)
 from utils import (
     DISPLAY_ALIASES,
     apply_display_aliases,
@@ -1327,76 +1382,6 @@ async def _merge_or_create(
     return bucket_id, False
 
 
-def _canonical_body_name(content: str) -> str:
-    """Use at most 20 Unicode characters from the stored body as a title."""
-    return " ".join(str(content).split())[:20]
-
-
-def _provider_failure_category(exc: BaseException) -> str:
-    """Map an exception chain to a small public reason without exposing details."""
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, AnalysisParseError):
-            return "parse_error"
-        if getattr(current, "status_code", None) == 429:
-            return "rate_limited"
-        if isinstance(current, (APIConnectionError, APITimeoutError)):
-            return "connection_error"
-        current = current.__cause__
-    if "API 不可用" in str(exc) or "OMBRE_API_KEY" in str(exc):
-        return "provider_unconfigured"
-    return "provider_error"
-
-
-def _bucket_date(meta: dict, *keys: str) -> str:
-    """Return the first available bucket date as YYYY-MM-DD."""
-    for key in keys:
-        value = meta.get(key)
-        if not value:
-            continue
-        try:
-            return datetime.fromisoformat(str(value)).date().isoformat()
-        except (ValueError, TypeError):
-            continue
-    return ""
-
-
-def _bucket_topic(meta: dict) -> str:
-    domains = meta.get("domain", []) or meta.get("domains", [])
-    if isinstance(domains, list) and domains:
-        return ",".join(str(d) for d in domains if d)
-    if isinstance(domains, str):
-        return domains
-    return "未分类"
-
-
-def _bucket_emotion(meta: dict) -> str:
-    try:
-        val = float(meta.get("valence", 0.5))
-        aro = float(meta.get("arousal", 0.3))
-    except (ValueError, TypeError):
-        val, aro = 0.5, 0.3
-    return f"V{val:.1f}/A{aro:.1f}"
-
-
-def _superseded_by_id(metadata: dict) -> str:
-    """Return the normalized successor marker; absent/empty metadata means active."""
-    value = metadata.get("superseded_by", "") if isinstance(metadata, dict) else ""
-    return str(value or "").strip()
-
-
-def _supersedes_ids(metadata: dict) -> list[str]:
-    """Read legacy-tolerant reverse supersession metadata as unique bucket IDs."""
-    value = metadata.get("supersedes", []) if isinstance(metadata, dict) else []
-    if isinstance(value, str):
-        values = _parse_csv_ids(value)
-    elif isinstance(value, list):
-        values = [str(item).strip() for item in value if str(item).strip()]
-    else:
-        values = []
-    return list(dict.fromkeys(values))
-
-
 async def _superseded_marker(bucket: dict) -> str:
     """Render a successor marker without leaking a sealed successor."""
     successor_id = _superseded_by_id(bucket.get("metadata", {}))
@@ -1452,23 +1437,6 @@ async def _dream_superseded_notice(bucket: dict) -> str:
     return f"此桶已被 {successor_id}({successor_name}) 取代于 {timestamp}"
 
 
-def _bucket_display_icon(meta: dict, *, protected_as_pinned: bool = False) -> str:
-    """Share the pulse type/status icons while keeping query pins literal."""
-    if int(meta.get("sealed", 0) or 0) == 1:
-        return "🔒"
-    if meta.get("pinned") or (protected_as_pinned and meta.get("protected")):
-        return "📌"
-    if meta.get("type") == "permanent":
-        return "📦"
-    if meta.get("type") == "feel":
-        return "🫧"
-    if meta.get("type") == "archived":
-        return "🗄️"
-    if meta.get("resolved", False):
-        return "✅"
-    return "💭"
-
-
 async def _bucket_summary_line(
     bucket: dict, score: float | None = None, pinned: bool = False,
     *, importance_only: bool = False,
@@ -1510,73 +1478,6 @@ def _recent_cutoff(recent_days: int) -> str | None:
     return (datetime.now().date() - timedelta(days=recent_days)).isoformat()
 
 
-def _is_recent_bucket(bucket: dict, cutoff: str | None, *, exact_day: bool = False) -> bool:
-    if not cutoff:
-        return True
-    updated = _bucket_date(bucket.get("metadata", {}), "updated_at", "last_active", "created")
-    return bool(updated and (updated == cutoff if exact_day else updated >= cutoff))
-
-
-def _parse_date_filter(value: str, parameter: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return ""
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
-    except ValueError as exc:
-        raise ValueError(f"{parameter} must use YYYY-MM-DD format.") from exc
-
-
-def _parse_optional_date(value: str, parameter: str) -> str | None:
-    value = (value or "").strip()
-    if not value:
-        return ""
-    return _parse_date_filter(value, parameter)
-
-
-def _is_in_date_range(
-    bucket: dict,
-    date_from: str = "",
-    date_to: str = "",
-) -> bool:
-    if not date_from and not date_to:
-        return True
-    updated = _bucket_date(
-        bucket.get("metadata", {}),
-        "updated_at",
-        "last_active",
-        "created",
-    )
-    if not updated:
-        return False
-    return (not date_from or updated >= date_from) and (
-        not date_to or updated <= date_to
-    )
-
-
-def _parse_resonance(value: str) -> tuple[float, float] | None:
-    value = (value or "").strip()
-    if not value:
-        return None
-    try:
-        raw_v, raw_a = [part.strip() for part in value.split(",", 1)]
-        target = (float(raw_v), float(raw_a))
-    except (ValueError, TypeError) as exc:
-        raise ValueError("resonance must use 'v,a' format, both between 0 and 1.") from exc
-    if not (0 <= target[0] <= 1 and 0 <= target[1] <= 1):
-        raise ValueError("resonance values must be between 0 and 1.")
-    return target
-
-
-def _resonance_distance(bucket: dict, target: tuple[float, float]) -> float:
-    meta = bucket.get("metadata", {})
-    raw_valence = meta.get("valence")
-    raw_arousal = meta.get("arousal")
-    valence = float(0.5 if raw_valence is None else raw_valence)
-    arousal = float(0.3 if raw_arousal is None else raw_arousal)
-    return ((valence - target[0]) ** 2 + (arousal - target[1]) ** 2) ** 0.5
-
-
 def _last_access_days(meta: dict) -> float:
     value = meta.get("last_active") or meta.get("updated_at") or meta.get("created")
     try:
@@ -1602,28 +1503,6 @@ async def _mark_dormant_buckets(buckets: list[dict]) -> int:
                 meta["dormant"] = True
                 marked += 1
     return marked
-
-
-def _parse_csv_ids(value: str) -> list[str]:
-    return [part.strip() for part in (value or "").split(",") if part.strip()]
-
-
-def _normalize_archive_topics(topics: list[str] | None) -> list[str]:
-    """Normalize structured archive topics without changing their labels."""
-    if topics is None:
-        return []
-    if not isinstance(topics, list) or any(not isinstance(item, str) for item in topics):
-        raise ValueError("topics must be a list of strings.")
-
-    normalized = []
-    seen = set()
-    for item in topics:
-        topic = item.strip()
-        if not topic or topic in seen:
-            continue
-        seen.add(topic)
-        normalized.append(topic)
-    return normalized
 
 
 def _normalize_breath_filter(
@@ -1653,34 +1532,6 @@ def _normalize_breath_filter(
         seen.add(item)
         normalized.append(item)
     return normalized
-
-
-def _structured_metadata_values(metadata: dict, field: str) -> list[str]:
-    """Return safe structured values without stringifying malformed metadata."""
-    raw = metadata.get(field, [])
-    if field == "tags" and isinstance(raw, str):
-        raw = [part.strip() for part in raw.split(",") if part.strip()]
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, str)]
-
-
-def _is_test_bucket(bucket: dict) -> bool:
-    """Use the existing exact tag identity only at delivery entry points."""
-    return "test" in _structured_metadata_values(bucket.get("metadata", {}), "tags")
-
-
-def _matches_any_structured_filter(
-    bucket: dict,
-    field: str,
-    values: list[str],
-) -> bool:
-    if not values:
-        return True
-    metadata = bucket.get("metadata", {})
-    stored_values = _structured_metadata_values(metadata, field)
-    wanted = set(values)
-    return any(item in wanted for item in stored_values)
 
 
 def _filter_breath_candidates(
@@ -1737,104 +1588,6 @@ def _filter_breath_candidates(
         and _matches_any_structured_filter(bucket, "tags", tags_filter)
         and _matches_any_structured_filter(bucket, "topics", topic_filter)
     ]
-
-
-def _breath_recency_key(bucket: dict) -> tuple[str, str]:
-    """Return the canonical deterministic breath recency key."""
-    metadata = bucket.get("metadata", {})
-    return (
-        _bucket_date(
-            metadata,
-            "updated_at",
-            "last_active",
-            "created_at",
-            "created",
-        ),
-        str(bucket.get("id", "")),
-    )
-
-
-def _normalize_todos(raw) -> list[str]:
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item).strip()]
-    if isinstance(raw, dict):
-        return [
-            f"{key}: {value}".strip()
-            for key, value in raw.items()
-            if str(value).strip()
-        ]
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        try:
-            parsed = _json_lib.loads(text)
-        except (ValueError, TypeError):
-            parsed = None
-        if parsed is not None and parsed != raw:
-            return _normalize_todos(parsed)
-        return [
-            line.strip().lstrip("-* ").strip()
-            for line in text.replace(",", "\n").splitlines()
-            if line.strip().lstrip("-* ").strip()
-        ]
-    return [str(raw).strip()] if raw is not None and str(raw).strip() else []
-
-
-def _canonical_todos(raw) -> list[str]:
-    """Normalize legacy todo shapes and return an ordered, deduplicated list."""
-    return canonicalize_todos(_normalize_todos(raw))
-
-
-def _parse_explicit_provenance_kind(value) -> str | None:
-    """Validate a public assertion without treating an omitted value as one."""
-    if value is None or value == "":
-        return None
-    return normalize_provenance_kind(value, strict=True)
-
-
-def _structured_todo_items(todo_items) -> tuple[list[str], list[dict]]:
-    """Validate MCP todo_items without changing legacy todos semantics."""
-    if not isinstance(todo_items, list):
-        raise ValueError("todo_items 必须是数组。")
-    raw_todos = []
-    for item in todo_items:
-        if not isinstance(item, dict):
-            raise ValueError("todo_items 的每一项必须是对象。")
-        text = item.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("todo_items.text 必须是非空字符串。")
-        for field in ("done_at", "dropped_at"):
-            if field in item:
-                raise ValueError(f"todo_items.{field} is server-generated and cannot be supplied.")
-        raw_todos.append(text.strip())
-    todos = _canonical_todos(raw_todos)
-    try:
-        provenance = reconcile_todo_provenance(
-            todos,
-            todo_items,
-            strict=True,
-        )
-    except ValueError as exc:
-        raise ValueError(f"todo_items 无效：{exc}") from exc
-    return todos, provenance
-
-
-def _parse_emotion_history(raw) -> list[dict]:
-    if isinstance(raw, list):
-        history = raw
-    elif isinstance(raw, str) and raw.strip():
-        try:
-            history = _json_lib.loads(raw)
-        except Exception:
-            history = []
-    else:
-        history = []
-    return [item for item in history if isinstance(item, dict)]
-
-
-def _encode_emotion_history(history: list[dict]) -> str:
-    return _json_lib.dumps(history[-20:], ensure_ascii=False, separators=(",", ":"))
 
 
 def _append_emotion_history(meta: dict, valence: float, arousal: float) -> str:
@@ -1927,31 +1680,6 @@ def _record_emotion_snapshot(
         logger.warning("Failed to persist emotion timeline: emotion_timeline_write_failed")
 
 
-def _read_emotion_timeline_for_write(path: str) -> list[dict]:
-    def invalid_constant(_value):
-        raise ValueError()
-    def unique_keys(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError()
-            result[key] = value
-        return result
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            timeline = _json_lib.load(handle, parse_constant=invalid_constant, object_pairs_hook=unique_keys)
-    except FileNotFoundError:
-        if os.path.lexists(path):
-            raise ArchiveSessionError("archive_emotion_timeline_invalid") from None
-        return []
-    except (OSError, ValueError):
-        raise ArchiveSessionError("archive_emotion_timeline_invalid") from None
-    if (os.path.islink(path) or not isinstance(timeline, list)
-            or any(not isinstance(item, dict) for item in timeline)):
-        raise ArchiveSessionError("archive_emotion_timeline_invalid")
-    return timeline
-
-
 def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) -> str:
     if not enabled:
         return text
@@ -2001,18 +1729,9 @@ def _with_emotion_timeline(text: str, enabled: bool, max_tokens: int = 10000) ->
     return prefix + encode(chosen) + notice
 
 
-def _related_ids(meta: dict) -> list[str]:
-    return parse_related(meta).require_safe()
-
-
 async def _unlink_related(source: dict, relation_ids: list[str]) -> bool:
     bucket_mgr.mutate_related(str(source['id']), remove=relation_ids)
     return True
-
-
-def _metadata_restore_value(metadata: dict, field: str):
-    """Return a BucketManager.update-compatible value that restores field presence."""
-    return metadata.get(field) if field in metadata else None
 
 
 async def _apply_supersession(
@@ -2512,28 +2231,6 @@ async def _execute_merge_operation(operation: dict) -> str:
             _merge_running_operations.discard(operation_id)
 
 
-def _split_search_results(matches: list[dict], max_results: int) -> tuple[list[dict], list[dict], int]:
-    """Return all pinned matches plus a separately limited non-pinned result set."""
-    pinned = [
-        bucket for bucket in matches
-        if bucket.get("metadata", {}).get("pinned")
-        or bucket.get("metadata", {}).get("protected")
-    ]
-    regular = [
-        bucket for bucket in matches
-        if bucket not in pinned
-    ]
-    pinned.sort(key=lambda bucket: float(bucket.get("score", 0)), reverse=True)
-    regular.sort(key=lambda bucket: float(bucket.get("score", 0)), reverse=True)
-    hidden_count = max(0, len(regular) - max_results)
-    return pinned, regular[:max_results], hidden_count
-
-
-def _is_sealed(bucket: dict) -> bool:
-    """Return True when a bucket is manually sealed."""
-    return int(bucket.get("metadata", {}).get("sealed", 0) or 0) == 1
-
-
 def _confirmation_payload_digest(payload: dict) -> str:
     """Return a canonical digest for an in-memory mutation confirmation plan."""
     encoded = _json_lib.dumps(
@@ -2893,17 +2590,6 @@ def _dashboard_delete_response(bucket_id: str, outcome: dict, *, review: bool = 
     return JSONResponse(body, status_code=200 if status == "preview" else 500 if status == "failed" else 409)
 
 
-def _extract_session_summary(content: str, max_chars: int | None = 700) -> str:
-    """Extract the Summary section from an archived session bucket."""
-    text = strip_wikilinks(content or "").strip()
-    marker = "## Summary"
-    if marker in text:
-        text = text.split(marker, 1)[1].strip()
-        if "\n## " in text:
-            text = text.split("\n## ", 1)[0].strip()
-    return text[:max_chars].strip() if max_chars is not None else text
-
-
 def _format_mailbox(
     limit: int = 1, include_sealed: bool = False, *, exclude_session_ids: set[str] | None = None,
 ) -> str:
@@ -2922,36 +2608,6 @@ def _format_mailbox(
             f"{letter.get('content', '')}"
         )
     return "\n---\n".join(parts)
-
-
-def _format_note_preview(text: str, limit: int = 80) -> str:
-    """Make a bounded one-line preview without changing the stored note body."""
-    compact = " ".join((text or "").split())
-    return compact[:limit] + ("…" if len(compact) > limit else "")
-
-
-def _parse_note_open_at(value: str) -> str:
-    """Normalize an optional local open_at timestamp for note visibility."""
-    value = (value or "").strip()
-    if not value:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("open_at must use ISO local date/time format.") from exc
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone().replace(tzinfo=None)
-    return parsed.isoformat(timespec="seconds")
-
-
-def _note_delivery_state(note: dict) -> str:
-    if note.get("dismissed_at"):
-        return "dismissed"
-    if note.get("skipped_at"):
-        return "skipped_for_delivery"
-    if note.get("boot_delivered_at"):
-        return "boot_delivered"
-    return "pending"
 
 
 def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | None]:
@@ -2979,49 +2635,6 @@ def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | No
         "=== boot: 婷留言 ===\n"
         f"婷留言：无（上次留言 #{latest['note_id']}，{latest['created_at']}）",
         None,
-    )
-
-
-def _format_bucket_truncation_notice(bucket_id: str, shown: int, total: int) -> str:
-    return (
-        f"[…已截断：bucket {bucket_id}，显示 {shown} / {total} 字符；"
-        f"完整内容可用 dream(detail_ids=\"{bucket_id}\") 读取]"
-    )
-
-
-def _format_boot_preview(
-    bucket: dict,
-    max_chars: int,
-    *,
-    show_truncation: bool = False,
-) -> str:
-    """Return a display-safe bucket preview with an optional truncation marker."""
-    content = strip_wikilinks(bucket.get("content", "")).strip()
-    preview = content[:max_chars]
-    if show_truncation and len(content) > len(preview):
-        bucket_id = str(bucket.get("id", ""))
-        return f"{preview}\n{_format_bucket_truncation_notice(bucket_id, len(preview), len(content))}"
-    return preview
-
-
-def _format_tg_summary_refresh_notice(bucket_id: str, state: str, source_hash: str) -> str:
-    """Tell the caller how to refresh a missing or stale TG summary safely."""
-    label = "尚未生成" if state == "missing" else "已过期"
-    return (
-        f"[…TG summary {label}：bucket {bucket_id}；当前原文 source_hash:{source_hash}；"
-        f"请先用 dream(detail_ids=\"{bucket_id}\") 读取全文，再按 refresh_tg_summary "
-        "的 generation contract 生成并保存压缩版]"
-    )
-
-
-def _format_tg_summary_preview(bucket: dict, source_hash: str, summary: str) -> str:
-    """Render a valid caller-generated TG summary with a source-of-truth reminder."""
-    bucket_id = str(bucket.get("id", ""))
-    return (
-        f"[TG 压缩版：bucket {bucket_id}；source_hash:{source_hash}]\n"
-        f"{summary}\n"
-        f"[这是压缩版；原 bucket 是唯一真实来源；需要细节时用 "
-        f"dream(detail_ids=\"{bucket_id}\") 读取全文]"
     )
 
 
@@ -3089,7 +2702,6 @@ def _format_feel_echo(active_buckets: list[dict]) -> str:
     )
 
 
-BOOT_TRUNCATION_NOTICE_TOKENS = 160
 BOOT_TG_TRUNCATION_NOTICE_TOKENS = 600
 BOOT_DELTA_MAX_TOKENS = 600
 TG_SUMMARY_MAX_CHARS = 1200
@@ -3152,271 +2764,7 @@ BOOT_PROFILE_CONFIG = {
         },
     },
 }
-BOOT_PROFILE_CODE_ROOTS = frozenset({"项目", "工程", "工具", "环境", "部署"})
-BOOT_PROFILE_TG_MIN_IMPORTANCE = 8
 BOOT_PROFILE_NAMES = frozenset(BOOT_PROFILE_CONFIG)
-
-
-def _profile_metadata_labels(bucket: dict) -> set[str]:
-    """Return normalized structured labels without inspecting bucket prose."""
-    meta = bucket.get("metadata", {})
-    labels = []
-    for key in ("domain", "tags", "topics"):
-        value = meta.get(key, [])
-        if isinstance(value, str):
-            value = [value]
-        if isinstance(value, list):
-            labels.extend(str(item).strip() for item in value if str(item).strip())
-    return {label.split("/", 1)[0].casefold() for label in labels}
-
-
-def _profile_is_code_context(bucket: dict) -> bool:
-    return bool(_profile_metadata_labels(bucket) & BOOT_PROFILE_CODE_ROOTS)
-
-
-def _profile_is_global_constraint(bucket: dict) -> bool:
-    meta = bucket.get("metadata", {})
-    return bool(
-        meta.get("pinned")
-        or meta.get("protected")
-        or int(meta.get("importance", 0) or 0) >= 9
-    )
-
-
-def _profile_allows_bucket(bucket: dict, profile: str) -> bool:
-    """Conservatively filter display-only profile sections from metadata."""
-    if _is_sealed(bucket):
-        return False
-    if profile == "talk":
-        return True
-    if profile == "code":
-        return _profile_is_global_constraint(bucket) or _profile_is_code_context(bucket)
-    return _profile_is_global_constraint(bucket) or (
-        int(bucket.get("metadata", {}).get("importance", 0) or 0)
-        >= BOOT_PROFILE_TG_MIN_IMPORTANCE
-    )
-
-
-def _prefix_within_token_budget(text: str, token_budget: int) -> str:
-    """Return the longest text prefix that fits the approximate token budget."""
-    if token_budget <= 0:
-        return ""
-    if count_tokens_approx(text) <= token_budget:
-        return text
-    low, high = 0, len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_tokens_approx(text[:middle]) <= token_budget:
-            low = middle
-        else:
-            high = middle - 1
-    return text[:low].rstrip()
-
-
-def _fit_sections_to_budget(
-    sections: list[tuple[str, str, str]],
-    max_tokens: int,
-    *,
-    minimum_chars: dict[str, int] | None = None,
-    atomic_sections: set[str] | None = None,
-    omission_item_refs: dict[str, list[str]] | None = None,
-    omission_item_ends: dict[str, list[tuple[str, int]]] | None = None,
-    truncation_notice_tokens: int = BOOT_TRUNCATION_NOTICE_TOKENS,
-    return_sections: bool = False,
-    todo_display: TodoPage | None = None,
-) -> str | tuple[str, dict[str, str]]:
-    """Fit named sections in priority order and report every omitted block."""
-    if not sections:
-        return ("", {}) if return_sections else ""
-    minimum_chars = minimum_chars or {}
-    atomic_sections = atomic_sections or set()
-    omission_item_refs = omission_item_refs or {}
-    omission_item_ends = omission_item_ends or {}
-    total_tokens = (
-        count_tokens_approx("\n\n".join(text for _, _, text in sections))
-        if todo_display is not None
-        else sum(count_tokens_approx(text) for _, _, text in sections)
-    )
-    if total_tokens <= max_tokens:
-        body = "\n\n".join(text for _, _, text in sections)
-        return (body, {key: text for key, _, text in sections}) if return_sections else body
-
-    # Per-section rounding and separators must fit too. The existing notice
-    # reserve also protects a complete todo summary if no content slot survives.
-    content_budget = max(0, max_tokens - truncation_notice_tokens - (
-        len(sections) if todo_display is not None else 0
-    ))
-    requested_tokens = {}
-    for key, _, text in sections:
-        minimum = max(0, minimum_chars.get(key, 0))
-        if key == "triggers":
-            requested_tokens[key] = count_tokens_approx(text)
-        elif minimum > 0:
-            requested_tokens[key] = count_tokens_approx(text[:minimum])
-
-    reserved_tokens = {}
-    remaining_reserve = content_budget
-    # If every guarantee fits, later sections keep their full reservation.
-    # Otherwise the same pass assigns the available budget in output order.
-    for key, _, _ in sections:
-        requested = requested_tokens.get(key, 0)
-        reserved = min(requested, remaining_reserve)
-        if key in requested_tokens:
-            reserved_tokens[key] = reserved
-        remaining_reserve -= reserved
-    output = []
-    emitted_sections: dict[str, str] = {}
-    complete = []
-    partial = []
-    omitted = []
-
-    def _omission_detail(
-        key: str,
-        display_name: str,
-        emitted_text: str,
-        *,
-        partial_output: bool,
-    ) -> str:
-        refs = omission_item_refs.get(key, [])
-        if not refs:
-            return display_name
-        if key in omission_item_ends:
-            ends = omission_item_ends[key]
-            emitted_refs = [ref for ref, end in ends if end <= len(emitted_text)]
-            omitted_refs = [ref for ref, end in ends if end > len(emitted_text)]
-            complete_count = len(emitted_refs)
-        else:
-            emitted_refs = [ref for ref in refs if ref in emitted_text]
-            omitted_refs = [ref for ref in refs if ref not in emitted_text]
-            complete_count = len(emitted_refs)
-            if partial_output and emitted_refs:
-                last_emitted = emitted_refs[-1]
-                if last_emitted not in omitted_refs:
-                    omitted_refs.append(last_emitted)
-                    complete_count -= 1
-        omitted_label = "、".join(omitted_refs) or "正文尾部"
-        continuation = ""
-        if key == "mailbox":
-            letter_ids = [
-                ref.split(":", 1)[1]
-                for ref in omitted_refs
-                if ref.startswith("letter_id:")
-            ]
-            if letter_ids:
-                continuation = (
-                    "；完整内容请用 "
-                    + "、".join(
-                        f"get_letter(letter_id={letter_id})"
-                        for letter_id in letter_ids
-                    )
-                    + " 读取"
-                )
-        return (
-            f"{display_name}（原 {len(refs)} 项，完整输出 {complete_count} 项；"
-            f"省略/截断：{omitted_label}{continuation}）"
-        )
-
-    used = 0
-    priority_exhausted = False
-    todo_index = None
-    todo_summary_tokens = 0
-
-    for index, (key, display_name, text) in enumerate(sections):
-        later_reserve = sum(
-            reserved_tokens.get(later_key, 0)
-            for later_key, _, _ in sections[index + 1 :]
-        )
-        is_reserved = key in reserved_tokens
-        if priority_exhausted and not is_reserved:
-            omitted.append(
-                _omission_detail(key, display_name, "", partial_output=False)
-            )
-            continue
-
-        available = max(0, content_budget - used - later_reserve)
-        if key == "todos" and todo_display is not None:
-            fitted = fit_todos(todo_display, available)
-            todo_index = len(output)
-            output.append(fitted.text)
-            emitted_sections[key] = fitted.text
-            if count_tokens_approx(fitted.text) <= available:
-                used += count_tokens_approx(fitted.text)
-            else:
-                todo_summary_tokens = count_tokens_approx(fitted.text) + 1
-            if fitted.hidden:
-                priority_exhausted = True
-            continue
-        section_tokens = count_tokens_approx(text)
-        if section_tokens <= available:
-            output.append(text)
-            emitted_sections[key] = text
-            complete.append(display_name)
-            used += section_tokens
-            continue
-
-        if key in atomic_sections:
-            omitted.append(
-                _omission_detail(key, display_name, "", partial_output=False)
-            )
-            priority_exhausted = True
-            continue
-
-        prefix = _prefix_within_token_budget(text, available)
-        if prefix:
-            output.append(prefix)
-            emitted_sections[key] = prefix
-            partial.append(
-                _omission_detail(key, display_name, prefix, partial_output=True)
-            )
-            used += count_tokens_approx(prefix)
-        else:
-            omitted.append(
-                _omission_detail(key, display_name, "", partial_output=False)
-            )
-        priority_exhausted = True
-
-    notice_lines = ["已按 boot 预算截断："]
-    if partial:
-        notice_lines.append("- 部分截断：" + "、".join(partial))
-    if omitted:
-        notice_lines.append("- 未输出：" + "、".join(omitted))
-    notice = "\n".join(notice_lines)
-    notice_budget = max(0, truncation_notice_tokens - todo_summary_tokens)
-    if count_tokens_approx(notice) > notice_budget:
-        if omission_item_refs and (todo_display is None or notice_budget >= 100):
-            overflow = (
-                "\n- 截断说明的 ID 清单仅列前缀；未完整输出的钉选项"
-                "另见完整 TG summary recovery receipts。"
-                if "pinned" in omission_item_ends else
-                "\n- 省略 ID 清单超出本次 TG 预算；仅列出前缀，"
-                "未列出的稳定 ID 无法在当前紧凑输出中完整列出。"
-            )
-            notice = (
-                _prefix_within_token_budget(
-                    notice,
-                    max(0, notice_budget - count_tokens_approx(overflow)),
-                )
-                + overflow
-            )
-        else:
-            notice = _prefix_within_token_budget(
-                notice,
-                notice_budget,
-            )
-    output.append(notice)
-    if todo_index is not None:
-        def _measure_final_todos(text: str) -> int:
-            candidate_output = list(output)
-            candidate_output[todo_index] = text
-            return count_tokens_approx("\n\n".join(candidate_output))
-
-        # Reclaim unused lower-section/notice budget without changing any other
-        # emitted text. The page was captured before fitting and CAS retries.
-        fitted = fit_todos(todo_display, max_tokens, measure=_measure_final_todos)
-        output[todo_index] = fitted.text
-        emitted_sections["todos"] = fitted.text
-    body = "\n\n".join(output)
-    return (body, emitted_sections) if return_sections else body
 
 
 TG_RECOVERY_HEADER = "=== boot: TG summary recovery receipts ==="
@@ -3498,15 +2846,6 @@ def _fit_tg_boot_sections(
             receipt_text = receipts(all_ids)
             return join(receipt_text, TG_RECOVERY_OVER_BUDGET), {}
         return join(body, receipt_text), emitted
-
-
-def _boot_delta_locator(bucket: dict) -> str:
-    """Return a bounded stable locator without exposing bucket content."""
-    meta = bucket.get("metadata", {})
-    name = str(meta.get("name", bucket.get("id", ""))).strip()
-    if len(name) > 80:
-        name = name[:77].rstrip() + "..."
-    return f"[bucket_id:{bucket['id']}] {name or bucket['id']}"
 
 
 def _format_boot_delta(
