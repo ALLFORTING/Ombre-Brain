@@ -479,7 +479,7 @@ NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
     ("decay_engine.py", "_has_unresolved_todos", "text.replace", "string_normalization"),
     ("server.py", "_dream_summary_line", "replace", "string_formatting"),
     ("server_common.py", "_normalize_todos", "text.replace", "string_normalization"),
-    ("server.py", "_days_since", "dt.replace", "datetime_timezone"),
+    ("server_digest.py", "_days_since", "dt.replace", "datetime_timezone"),
     ("server.py", "format_active_matches", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
     ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
     ("server.py", "_breath_impl", "bucket_mgr.touch", "incidental_bucket_activation_or_explicit_dormant_wake"),
