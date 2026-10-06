@@ -30,6 +30,11 @@ logger = logging.getLogger("ombre_brain.decay")
 
 _PROTECTED_TYPES = frozenset({"permanent", "feel", "i", "plan", "letter"})
 
+# Short-term → long-term weight transition window (days), centred on day 3.
+# 短期→长期权重过渡窗口（天），以第 3 天为中心。
+_BLEND_START_DAYS = 2.0
+_BLEND_END_DAYS = 4.0
+
 
 def _parse_decay_age(metadata: dict, *keys: str) -> float | None:
     """Return age in days, or None when no usable decay timestamp exists."""
@@ -131,6 +136,22 @@ class DecayEngine:
     # Permanent buckets never decay / 固化桶永远不衰减
     # ---------------------------------------------------------
     # ---------------------------------------------------------
+    # Short-term → long-term blend: smoothstep over [2, 4] days
+    # 短期→长期权重过渡：在 [2, 4] 天内用 smoothstep 平滑插值
+    # ≤2 天 = 纯短期权重，≥4 天 = 纯长期权重，3 天处各占一半。
+    # smoothstep 在窗口两端斜率为 0，分数连续且没有折角。
+    # ---------------------------------------------------------
+    @staticmethod
+    def _calc_long_term_blend(days_since: float) -> float:
+        """
+        Fraction of the long-term weight mix: 0.0 before the window, 1.0 after.
+        长期权重占比：窗口前为 0，窗口后为 1，中间 smoothstep 过渡。
+        """
+        x = (days_since - _BLEND_START_DAYS) / (_BLEND_END_DAYS - _BLEND_START_DAYS)
+        x = max(0.0, min(1.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
+    # ---------------------------------------------------------
     # Freshness bonus: continuous exponential decay
     # 新鲜度加成：连续指数衰减
     # bonus = 1.0 + 1.0 × e^(-t/36), t in hours
@@ -152,10 +173,12 @@ class DecayEngine:
 
         New model: short-term vs long-term weight separation.
         新模型：短期/长期权重分离。
-        - Short-term (≤3 days): time_weight dominates, emotion amplifies
-        - Long-term (>3 days): emotion_weight dominates, time decays to floor
-        短期（≤3天）：时间权重主导，情感放大
-        长期（>3天）：情感权重主导，时间衰减到底线
+        - Short-term (≤2 days): time_weight dominates, emotion amplifies
+        - Long-term (≥4 days): emotion_weight dominates, time decays to floor
+        - 2~4 days: smooth blend between the two, centred on day 3
+        短期（≤2天）：时间权重主导，情感放大
+        长期（≥4天）：情感权重主导，时间衰减到底线
+        2~4 天：两者平滑过渡，3 天处各占一半
         """
         if not isinstance(metadata, dict):
             return 0.0
@@ -198,14 +221,15 @@ class DecayEngine:
         time_weight = self._calc_time_weight(days_since)
 
         # --- Short-term vs Long-term weight separation ---
-        # 短期（≤3天）：time_weight 占 70%，emotion 占 30%
-        # 长期（>3天）：emotion 占 70%，time_weight 占 30%
-        if days_since <= 3.0:
-            # Short-term: time dominates, emotion amplifies
-            combined_weight = time_weight * 0.7 + emotion_weight * 0.3
-        else:
-            # Long-term: emotion dominates, time provides baseline
-            combined_weight = emotion_weight * 0.7 + time_weight * 0.3
+        # 短期（≤2天）：time_weight 占 70%，emotion 占 30%
+        # 长期（≥4天）：emotion 占 70%，time_weight 占 30%
+        # 2~4 天之间平滑过渡，避免 3 天处分数跳变
+        # Short-term: time dominates, emotion amplifies
+        short_term_weight = time_weight * 0.7 + emotion_weight * 0.3
+        # Long-term: emotion dominates, time provides baseline
+        long_term_weight = emotion_weight * 0.7 + time_weight * 0.3
+        blend = self._calc_long_term_blend(days_since)
+        combined_weight = (1.0 - blend) * short_term_weight + blend * long_term_weight
 
         # --- Base score ---
         base_score = (
