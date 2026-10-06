@@ -391,9 +391,6 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_run_import": "guarded_storage_components",
         "api_import_review": "excluded_transient_import_upload_cleanup",
     },
-    "remember_me_import_adapter.py": {
-        "__init__": "guarded_caller_only",
-    },
     "remember_me_cutover_migration.py": {
         "_atomic_json_write": "isolated_offline_workspace",
         "initialize_cutover": "isolated_offline_workspace",
@@ -414,10 +411,6 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_ensure_schema": "isolated_offline_workspace",
         "_write_record": "isolated_offline_workspace",
     },
-    "remember_me_migration_rehearsal.py": {
-        "prepare_rehearsal_workspace": "isolated_offline_workspace",
-        "_atomic_write_json": "isolated_offline_workspace",
-    },
     "scripts/backup_v2_key_tool.py": {
         "generate": "isolated_offline_key_workspace",
         "_exclusive_write": "offline_key_no_replace_publish",
@@ -435,12 +428,6 @@ GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     },
     ("asset_store.py", "_clean_image"): {("asset_store.py", "_prepare_candidate")},
     ("asset_store.py", "_prepare_candidate"): {("asset_store.py", "_persist_upload_unchecked")},
-    ("remember_me_import_adapter.py", "__init__"): {
-        ("remember_me_migration_runner.py", "run_migration_batch"),
-        ("remember_me_migration_rehearsal.py", "run_rehearsal"),
-        ("remember_me_migration_runner.py", "__init__"),
-        ("remember_me_migration_rehearsal.py", "__init__"),
-    },
     ("asset_cutover_state.py", "_update_state"): {
         ("asset_cutover_state.py", "set_rm_available"),
         ("asset_cutover_state.py", "acquire_freeze"),
@@ -473,7 +460,6 @@ NON_PATH_CALL_ALLOWLIST: tuple[tuple[str, str, str, str], ...] = (
     ("production_backup_capture.py", "_now", "value.replace", "datetime_timezone"),
     ("remember_me_core_adapter.py", "_normalize_timestamp", "replace", "datetime_timezone"),
     ("remember_me_core_adapter.py", "_normalize_timestamp", "parsed.replace", "datetime_timezone"),
-    ("remember_me_migration_acceptance.py", "_timestamp", "value.replace", "datetime_timezone"),
     ("remember_me_mcp_presenter.py", "_verified_image", "Image.open", "pillow_image_read"),
     ("remember_me_vector_provider.py", "_normalized_backend", "replace", "string_normalization"),
     ("server.py", "breath_hook", "bucket_mgr.touch", "incidental_bucket_activation"),
