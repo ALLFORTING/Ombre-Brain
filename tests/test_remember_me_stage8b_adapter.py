@@ -254,7 +254,10 @@ def test_fixed_dependency_stanza_rejects_missing_duplicate_or_malformed(change):
 def test_dependency_path_does_not_depend_on_cwd(tmp_path):
     import json
     script = "import json; from remember_me_dependency import DEPENDENCY; print(json.dumps(DEPENDENCY.__dict__))"
-    output = subprocess.check_output([sys.executable, "-c", script], cwd=tmp_path, env=os.environ.copy(), text=True)
+    # The child runs from an empty cwd, so it can only import the module via PYTHONPATH.
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT), env.get("PYTHONPATH")]))
+    output = subprocess.check_output([sys.executable, "-c", script], cwd=tmp_path, env=env, text=True)
     assert json.loads(output) == DEPENDENCY.__dict__
     assert not list(tmp_path.iterdir())
 
