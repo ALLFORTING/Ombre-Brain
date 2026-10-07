@@ -192,9 +192,12 @@ breath(query="实习", domain="成长", valence=0.7, arousal=0.5)
 
 **返回结果**：
 ```
-[prov=...] [bucket_id:abc123] [显示=压缩摘要·非原文] 实习 offer 获得：...
+[prov=...] [bucket_id:abc123] ... [显示=压缩摘要·非原文] 📌 记忆桶: 实习 offer [主题:工作] [情感:V0.8/A0.6]
+{"core_facts":["获得实习 offer"],"keywords":["实习","offer"],"summary":"实习 offer 获得：..."}
 共匹配 1 / 前页已消费 0 / 本次显示 1 / 因组装失败省略 0 / 后续剩余 0 / ...
 ```
+
+压缩摘要正文就是脱水结果校验后的紧凑 JSON（`core_facts` / `keywords` / `summary`），原样展示，不再改写成自然语句。
 
 ---
 
