@@ -319,13 +319,44 @@ def _todo_drop_argument_error(arguments: dict) -> str | None:
     return None
 
 
+# Stateless HTTP ties each tool call to its own HTTP request, so a client
+# disconnect would cancel the call mid-write. Run every call to completion
+# instead, as stateful sessions already do; only the waiter is cancelled and
+# HTTP shutdown drains the rest. Tests switch it off to reach the durable
+# cancellation paths directly.
+_SHIELD_STATELESS_TOOL_CALLS = True
+_STATELESS_TOOL_CALL_TASKS = set()
+
+
+def _finish_stateless_tool_call(task):
+    _STATELESS_TOOL_CALL_TASKS.discard(task)
+    if task.cancelled():
+        logger.error("stateless tool call cancelled before completion")
+        return
+    error = task.exception()  # Retrieved here even when the waiter is gone.
+    if error is not None and getattr(task, "_ob_waiter_gone", False):
+        logger.warning("stateless tool call failed after client disconnect: %s",
+                       type(error).__name__)
+
+
 class _TodoDropGuardFastMCP(FastMCP):
     async def call_tool(self, name: str, arguments: dict):
         if name == "trace":
             error = _todo_drop_argument_error(arguments)
             if error:
                 return CallToolResult(isError=True, content=[TextContent(type="text", text=error)])
-        return await super().call_tool(name, arguments)
+        if not (self.settings.stateless_http and _SHIELD_STATELESS_TOOL_CALLS):
+            return await super().call_tool(name, arguments)
+        task = asyncio.create_task(super().call_tool(name, arguments))
+        _STATELESS_TOOL_CALL_TASKS.add(task)
+        task.add_done_callback(_finish_stateless_tool_call)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                task._ob_waiter_gone = True
+                logger.info("client left during tool %s; finishing it without a reply", name)
+            raise
 
 
 def _guard_todo_drop_presence(fn):
@@ -466,11 +497,15 @@ DIAGNOSTIC_TOOL_NAMES = frozenset({
 def build_streamable_http_app():
     """Build once at startup; MCP 1.29.1 reads this setting, not a method kwarg.
 
-    The OB flag controls only this HTTP builder. SSE and stdio do not use it.
-    Authentication, CORS and diagnostics are installed by the entrypoints.
+    Stateless by default, so a restart cannot strand clients on a dead
+    Mcp-Session-Id. OMBRE_MCP_STATELESS_HTTP=false/0/no/off restores stateful
+    sessions. The OB flag controls only this HTTP builder; SSE and stdio do
+    not use it. Authentication, CORS and diagnostics are installed by the
+    entrypoints.
     """
-    mcp.settings.stateless_http = _env_flag_enabled(
-        os.getenv("OMBRE_MCP_STATELESS_HTTP", "false")
+    mcp.settings.stateless_http = (
+        os.getenv("OMBRE_MCP_STATELESS_HTTP", "").strip().lower()
+        not in {"0", "false", "no", "off"}
     )
     app = mcp.streamable_http_app()
     original_lifespan = app.router.lifespan_context
@@ -484,7 +519,8 @@ def build_streamable_http_app():
                 # Forced loop/process termination is outside this guarantee.
                 import anyio
                 with anyio.CancelScope(shield=True):
-                    pending = [task for task in _LEGACY_POST_EFFECT_TASKS
+                    pending = [task for task in (*_LEGACY_POST_EFFECT_TASKS,
+                                                 *_STATELESS_TOOL_CALL_TASKS)
                                if task.get_loop() is asyncio.get_running_loop()]
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
