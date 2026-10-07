@@ -194,10 +194,13 @@ async def test_sha_change_during_capture_releases_freeze(tmp_path, monkeypatch):
     request_id = str(uuid.uuid4())
     await c.create_capture(request_id=request_id, expected_runtime_commit=COMMIT,
                            expected_recipient_fingerprint="none", claims=claims())
-    result = await c.wait_for_terminal(request_id, claims())
+    await asyncio.shield(c._tasks[request_id])
+    result = c._jobs[request_id].public()
     assert result["state"] == "failed" and result["failure_code"] == "capture_identity_mismatch"
     assert c.coordinator.status().state == "open" and c._active_request_id is None
     assert not list(c.workspace.bundles_root.iterdir())
+    with pytest.raises(capture.CaptureChannelError, match="capture_identity_mismatch"):
+        c.get_job(request_id, claims())
     with pytest.raises(capture.CaptureChannelError, match="capture_identity_mismatch"):
         await c.create_capture(request_id=str(uuid.uuid4()), expected_runtime_commit=COMMIT,
                                expected_recipient_fingerprint="none", claims=claims())
@@ -361,3 +364,249 @@ async def test_plain_failure_worker_exits_and_releases_freeze(tmp_path, monkeypa
     assert c._active_workers == 0
     assert not list(c.workspace.bundles_root.iterdir())
     assert not list(c.workspace.temp_root.iterdir())
+
+
+@pytest.fixture
+def registered_auto(tmp_path, monkeypatch):
+    server = _server(tmp_path)
+    seed(Path(server.config["buckets_dir"]))
+    async def verified(self, request):
+        return claims()
+    monkeypatch.setattr(GitHubActionsBackupV2OidcVerifier, "verify_request", verified)
+    c = auto.register_backup_auto_if_enabled(server, "streamable-http", environ=env(tmp_path))
+    return server, c
+
+
+def auto_app(server):
+    from starlette.routing import Route
+    return Starlette(routes=[Route(r.path, r.endpoint, methods=list(r.methods))
+                             for r in server.mcp._custom_starlette_routes])
+
+
+def request_action(client, action, request_id):
+    path = auto.PREFIX + "/captures/" + request_id
+    if action == "metadata":
+        return client.get(auto.PREFIX + "/metadata")
+    if action == "create":
+        return client.post(auto.PREFIX + "/captures",
+                           json={"request_id": str(uuid.uuid4()), "expected_runtime_commit": COMMIT})
+    if action == "ack":
+        return client.post(path + "/ack")
+    return client.get(path + ("/bundle" if action == "download" else ""))
+
+
+@pytest.mark.parametrize("action", ["metadata", "create", "status", "download", "ack"])
+@pytest.mark.parametrize("drift", ["replacement", "coordinator", "unpublished"])
+def test_auto_all_routes_reject_runtime_drift_without_initializing(registered_auto, monkeypatch, action, drift):
+    server, c = registered_auto
+    with TestClient(auto_app(server)) as client:
+        request_id, _, path = client.portal.call(ready, c)
+        if drift == "replacement":
+            server._backup_auto_controller = object()
+        elif drift == "coordinator":
+            c.coordinator = MaintenanceWriteCoordinator()
+        else:
+            server._runtime_components = None
+        monkeypatch.setattr(server, "_get_runtime_components",
+                            lambda: pytest.fail("query initialized runtime"), raising=False)
+        result = request_action(client, action, request_id)
+        assert result.status_code == 400
+        assert result.json() == {"status": "capture_runtime_unavailable"}
+        assert path.exists() and c._jobs[request_id].state == "ready"
+        assert not c._active_deliveries
+
+
+@pytest.mark.parametrize("action", ["metadata", "create", "status", "download", "ack"])
+def test_auto_all_routes_recheck_after_oidc_await(registered_auto, monkeypatch, action):
+    server, c = registered_auto
+    with TestClient(auto_app(server)) as client:
+        request_id, _, path = client.portal.call(ready, c)
+        async def drifting(self, request):
+            await asyncio.sleep(0)
+            server._backup_auto_controller = object()
+            return claims()
+        monkeypatch.setattr(GitHubActionsBackupV2OidcVerifier, "verify_request", drifting)
+        result = request_action(client, action, request_id)
+        assert result.json() == {"status": "capture_runtime_unavailable"}
+        assert path.exists() and c._jobs[request_id].state == "ready"
+
+
+@pytest.mark.parametrize("action", ["create", "download", "ack"])
+@pytest.mark.asyncio
+async def test_auto_rechecks_after_job_lock_wait(registered_auto, action):
+    server, c = registered_auto
+    request_id, _, path = await ready(c)
+    async def operation():
+        if action == "create":
+            return await c.create_capture(request_id=str(uuid.uuid4()), expected_runtime_commit=COMMIT,
+                                          expected_recipient_fingerprint="none", claims=claims())
+        if action == "ack":
+            return await c.acknowledge(request_id, claims())
+        async with c.delivery(request_id, claims()):
+            pytest.fail("drifted download admitted")
+    async with c._job_lock:
+        pending = asyncio.create_task(operation())
+        await asyncio.sleep(0)
+        server._backup_auto_controller = object()
+    with pytest.raises(capture.CaptureChannelError, match="capture_runtime_unavailable"):
+        await pending
+    assert path.exists() and not c._active_deliveries
+
+
+@pytest.mark.parametrize("phase", ["drain", "worker"])
+@pytest.mark.asyncio
+async def test_auto_capture_drift_releases_existing_lease(registered_auto, monkeypatch, phase):
+    server, c = registered_auto
+    original_coordinator = c.coordinator
+    if phase == "drain":
+        original_wait = original_coordinator._wait_for_writers
+        def drift_after_drain(timeout):
+            result = original_wait(timeout)
+            server._backup_auto_controller = object()
+            return result
+        monkeypatch.setattr(original_coordinator, "_wait_for_writers", drift_after_drain)
+    else:
+        original_capture = capture.capture_external_source
+        def drift_after_capture(*args, **kwargs):
+            result = original_capture(*args, **kwargs)
+            c.coordinator = MaintenanceWriteCoordinator()
+            return result
+        monkeypatch.setattr(capture, "capture_external_source", drift_after_capture)
+    request_id = str(uuid.uuid4())
+    await c.create_capture(request_id=request_id, expected_runtime_commit=COMMIT,
+                           expected_recipient_fingerprint="none", claims=claims())
+    await asyncio.shield(c._tasks[request_id])
+    job = c._jobs[request_id]
+    assert job.state == "failed" and job.failure_code == "capture_runtime_unavailable"
+    assert original_coordinator.status().state == "open"
+    assert c._active_request_id is None and c._active_workers == 0
+    assert not list(c.workspace.bundles_root.iterdir())
+    assert not list(c.workspace.temp_root.iterdir())
+
+
+@pytest.mark.parametrize("operation", ["ttl", "ack"])
+@pytest.mark.parametrize("damage", ["content", "workspace", "bundle_id", "outside", "symlink"])
+@pytest.mark.asyncio
+async def test_auto_delete_preserves_unproven_material(tmp_path, operation, damage):
+    now = [datetime.now(timezone.utc)]
+    c = controller(tmp_path, clock=lambda: now[0])
+    request_id, _, path = await ready(c)
+    retained = path
+    if damage == "content":
+        path.write_bytes(b"SYNTHETIC REPLACEMENT")
+    elif damage == "workspace":
+        for name in (bundles.WORKSPACE_MANIFEST, bundles.WORKSPACE_MARKER):
+            marker = c.workspace.root / name
+            record = json.loads(marker.read_text())
+            record["workspace_id"] = "b" * 32
+            marker.write_text(json.dumps(record))
+    elif damage == "bundle_id":
+        c._jobs[request_id].bundle_id = "b" * 32
+    elif damage == "outside":
+        retained = c.workspace.root / "foreign.obplain.tar"
+        retained.write_bytes(b"KEEP")
+        c._jobs[request_id].bundle_name = "../foreign.obplain.tar"
+    else:
+        retained = c.workspace.root / "foreign.obplain.tar"
+        path.rename(retained)
+        path.symlink_to(retained)
+    before = retained.read_bytes()
+    now[0] += timedelta(seconds=6)
+    with pytest.raises(capture.CaptureChannelError, match="bundle_invalid"):
+        if operation == "ttl":
+            await c.cleanup_stale()
+        else:
+            await c.acknowledge(request_id, claims())
+    assert retained.read_bytes() == before
+    assert c._jobs[request_id].state == "ready"
+
+
+@pytest.mark.parametrize("operation", ["ttl", "ack", "download"])
+@pytest.mark.asyncio
+async def test_auto_rechecks_after_bundle_hash_await(registered_auto, monkeypatch, operation):
+    from dataclasses import replace
+    server, c = registered_auto
+    request_id, _, path = await ready(c)
+    c.limits = replace(c.limits, ready_ttl_seconds=0.001)
+    await asyncio.sleep(0.01)
+    name = "_hash_handle" if operation == "download" else "_hash_file"
+    original = getattr(capture, name)
+    def drift(*args):
+        result = original(*args)
+        server._backup_auto_controller = object()
+        return result
+    monkeypatch.setattr(capture, name, drift)
+    with pytest.raises(capture.CaptureChannelError, match="capture_runtime_unavailable"):
+        if operation == "ttl":
+            await c.cleanup_stale()
+        elif operation == "ack":
+            await c.acknowledge(request_id, claims())
+        else:
+            async with c.delivery(request_id, claims()):
+                pytest.fail("drifted delivery admitted")
+    assert path.exists() and c._jobs[request_id].state == "ready"
+    assert not c._active_deliveries
+
+
+@pytest.mark.asyncio
+async def test_auto_ack_lost_response_is_confirmed_by_original_job(tmp_path):
+    c = controller(tmp_path)
+    request_id, _, path = await ready(c)
+    first = await c.acknowledge(request_id, claims())
+    assert first["state"] == "consumed" and not path.exists()
+    assert c.get_job(request_id, claims()) == first
+    assert await c.acknowledge(request_id, claims()) == first
+    with pytest.raises(capture.CaptureChannelError, match="capture_not_found"):
+        await c.acknowledge(request_id, {**claims(), "run_attempt": "2"})
+
+
+@pytest.mark.parametrize("operation", ["ttl", "ack"])
+@pytest.mark.parametrize("damage", ["workspace", "same_bytes_new_file"])
+@pytest.mark.asyncio
+async def test_auto_delete_revalidates_ownership_after_hash(tmp_path, monkeypatch, operation, damage):
+    now = [datetime.now(timezone.utc)]
+    c = controller(tmp_path, clock=lambda: now[0])
+    request_id, _, path = await ready(c)
+    original = capture._hash_file
+    def changed(target):
+        result = original(target)
+        if damage == "workspace":
+            for name in (bundles.WORKSPACE_MANIFEST, bundles.WORKSPACE_MARKER):
+                marker = c.workspace.root / name
+                record = json.loads(marker.read_text())
+                record["nonce"] = "b" * 64
+                marker.write_text(json.dumps(record))
+        else:
+            replacement = path.with_name("foreign.part")
+            replacement.write_bytes(path.read_bytes())
+            replacement.replace(path)
+        return result
+    monkeypatch.setattr(capture, "_hash_file", changed)
+    now[0] += timedelta(seconds=6)
+    with pytest.raises(capture.CaptureChannelError, match="bundle_invalid"):
+        if operation == "ttl":
+            await c.cleanup_stale()
+        else:
+            await c.acknowledge(request_id, claims())
+    assert path.exists() and c._jobs[request_id].state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_auto_stream_runtime_drift_releases_delivery(registered_auto):
+    server, c = registered_auto
+    request_id, _, path = await ready(c)
+    route = next(r for r in server.mcp._custom_starlette_routes if r.path.endswith("/bundle"))
+    scope = {"type": "http", "method": "GET", "path_params": {"request_id": request_id},
+             "headers": [], "query_string": b"", "asgi": {"spec_version": "2.4"}}
+    response = await route.endpoint(Request(scope))
+    events = []
+    async def send(message):
+        events.append(message)
+        if message["type"] == "http.response.body":
+            server._backup_auto_controller = object()
+    async def receive():
+        return {"type": "http.request", "body": b""}
+    with pytest.raises(capture.CaptureChannelError, match="capture_runtime_unavailable"):
+        await response(scope, receive, send)
+    assert not any(event.get("more_body") is False for event in events if event["type"] == "http.response.body")
+    assert path.exists() and not c._active_deliveries

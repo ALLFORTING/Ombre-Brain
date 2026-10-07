@@ -113,8 +113,13 @@ def register_backup_auto_if_enabled(server_module, transport, *, environ=None):
     policy = ProductionDirectoryPolicy(source, workspace_root)
 
     def current_commit():
-        require_runtime_coordinator(server_module)
-        return resolve_runtime_commit(env)
+        if vars(server_module).get("_backup_auto_controller") is not controller:
+            raise CaptureChannelError("capture_runtime_unavailable")
+        try:
+            require_runtime_coordinator(server_module, controller, published_only=True)
+            return resolve_runtime_commit(env)
+        except BackupV2RuntimeConfigError:
+            raise CaptureChannelError("capture_runtime_unavailable") from None
 
     controller = ProductionBackupCaptureController(
         enabled=True, worker_count=1, coordinator=coordinator, source_root=source,
@@ -126,6 +131,7 @@ def register_backup_auto_if_enabled(server_module, transport, *, environ=None):
     async def verify(request):
         controller._check_runtime_commit()
         claims = await verifier.verify_request(request)
+        controller._check_runtime_commit()
         controller.oidc_policy.verify(claims)
         return claims
 
@@ -133,6 +139,7 @@ def register_backup_auto_if_enabled(server_module, transport, *, environ=None):
         try:
             claims = await verify(request)
             return _json({"format": PLAIN_FORMAT, "runtime_commit": current_commit(),
+                          "ready_ttl_seconds": controller.limits.ready_ttl_seconds,
                           **controller.oidc_policy.verify(claims)})
         except Exception as exc:
             return _route_error(exc)

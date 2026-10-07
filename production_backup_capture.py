@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import threading
 import inspect
 from typing import Any, AsyncIterator, Awaitable, BinaryIO, Callable, Mapping
@@ -40,6 +41,7 @@ from offline_backup_bundle import (
     load_backup_workspace,
     ProductionDirectoryPolicy,
     PLAIN_SUFFIX,
+    _path_contains_reparse_point,
 )
 
 
@@ -334,6 +336,7 @@ class ProductionBackupCaptureController:
         ):
             raise CaptureChannelError("capture_identity_mismatch")
         async with self._job_lock:
+            self._check_runtime_commit()
             with self._status_lock:
                 existing = self._jobs.get(canonical_id)
                 if existing is not None:
@@ -389,12 +392,14 @@ class ProductionBackupCaptureController:
             finally:
                 with self._status_lock:
                     self._active_workers -= 1
+            self._check_runtime_commit()
             self._set_state(job, "draining")
             async with self.coordinator.freeze(
                 reason="encrypted_backup_capture",
                 drain_timeout_seconds=self.limits.freeze_timeout_seconds,
                 max_freeze_seconds=self.limits.max_freeze_seconds,
             ) as lease:
+                self._check_runtime_commit()
                 self._set_state(job, "capturing")
                 abort_signal = CaptureAbortSignal(
                     deadline=lease.deadline,
@@ -429,6 +434,7 @@ class ProductionBackupCaptureController:
                         abort_signal,
                         lease.deadline,
                     )
+                    self._check_runtime_commit()
                     self.coordinator.validate_lease(lease)
                 finally:
                     with self._status_lock:
@@ -541,16 +547,19 @@ class ProductionBackupCaptureController:
         timeout: float = 30,
     ) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
+        self._check_runtime_commit()
         with self._status_lock:
             job = self._owned_job(request_id, identity)
             task = self._tasks.get(job.request_id)
         if task is not None:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        self._check_runtime_commit()
         with self._status_lock:
             return job.public()
 
     def get_job(self, request_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
+        self._check_runtime_commit()
         with self._status_lock:
             job = self._owned_job(request_id, identity)
             return job.public()
@@ -565,6 +574,7 @@ class ProductionBackupCaptureController:
         canonical_id = _request_id(request_id)
         handle = None
         async with self._job_lock:
+            self._check_runtime_commit()
             with self._status_lock:
                 job = self._owned_job(canonical_id, identity)
                 if job.state != "ready" or not job.bundle_name:
@@ -600,6 +610,7 @@ class ProductionBackupCaptureController:
             finally:
                 with self._status_lock:
                     self._active_workers -= 1
+            self._check_runtime_commit()
             handle.seek(0)
             if size != encrypted_size or digest != encrypted_sha256:
                 raise CaptureChannelError("bundle_invalid")
@@ -629,14 +640,19 @@ class ProductionBackupCaptureController:
     async def acknowledge(self, request_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
         async with self._job_lock:
+            self._check_runtime_commit()
             with self._status_lock:
                 job = self._owned_job(request_id, identity)
+                if self.plaintext and job.state == "consumed":
+                    return job.public()
                 if job.state != "ready" or not job.bundle_name:
                     raise CaptureChannelError("capture_not_ready")
                 if job.request_id in self._active_deliveries:
                     raise CaptureChannelError("capture_delivery_active")
                 bundle_name = job.bundle_name
             path = self.workspace.bundles_root / bundle_name
+            if self.plaintext:
+                path = await self._validate_owned_plain_bundle(job)
             try:
                 path.unlink()
             except OSError as exc:
@@ -648,11 +664,12 @@ class ProductionBackupCaptureController:
                 return job.public()
 
     async def cleanup_stale(self) -> int:
-        if self.directory_policy is not None:
+        if self.directory_policy is not None and not self.plaintext:
             load_backup_workspace(self.workspace.root, directory_policy=self.directory_policy)
         now = self._now()
         cleaned = 0
         async with self._job_lock:
+            self._check_runtime_commit()
             with self._status_lock:
                 jobs = tuple(self._jobs.values())
             for job in jobs:
@@ -675,10 +692,8 @@ class ProductionBackupCaptureController:
                             or path.resolve(strict=False).parent != self.workspace.bundles_root
                             or bundle_name != f"{job.bundle_id}{self.bundle_suffix}"):
                         raise CaptureChannelError("bundle_invalid")
-                    if self.plaintext and path.exists():
-                        size, digest = await asyncio.to_thread(_hash_file, path)
-                        if size != job.encrypted_size or digest != job.encrypted_sha256:
-                            raise CaptureChannelError("bundle_invalid")
+                    if self.plaintext:
+                        path = await self._validate_owned_plain_bundle(job)
                     path.unlink(missing_ok=True)
                 except OSError as exc:
                     raise CaptureChannelError("internal_error") from exc
@@ -688,6 +703,47 @@ class ProductionBackupCaptureController:
                     self._set_state(job, "stale", updated_at=updated_at)
                 cleaned += 1
         return cleaned
+
+    async def _validate_owned_plain_bundle(self, job: CaptureJob) -> Path:
+        """Caller holds _job_lock; never acquire it again or delete uncertain material."""
+        def validate_workspace():
+            loaded = load_backup_workspace(self.workspace.root, directory_policy=self.directory_policy)
+            if loaded != self.workspace:
+                raise CaptureChannelError("bundle_invalid")
+
+        def file_identity(path):
+            if (not job.bundle_id or re.fullmatch(r"[0-9a-f]{32}", job.bundle_id) is None
+                    or job.bundle_name != f"{job.bundle_id}{self.bundle_suffix}"
+                    or path.parent != self.workspace.bundles_root
+                    or _path_contains_reparse_point(path)
+                    or path.resolve(strict=True).parent != self.workspace.bundles_root):
+                raise CaptureChannelError("bundle_invalid")
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != job.encrypted_size:
+                raise CaptureChannelError("bundle_invalid")
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        try:
+            self._check_runtime_commit()
+            validate_workspace()
+            path = self.workspace.bundles_root / (job.bundle_name or "")
+            before = file_identity(path)
+            worker = asyncio.create_task(asyncio.to_thread(_hash_file, path))
+            try:
+                size, digest = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await self._wait_worker_exit(worker)
+                raise
+            self._check_runtime_commit()
+            validate_workspace()
+            if (file_identity(path) != before or size != job.encrypted_size
+                    or digest != job.encrypted_sha256):
+                raise CaptureChannelError("bundle_invalid")
+            return path
+        except CaptureChannelError:
+            raise
+        except (OSError, RuntimeError, BackupBundleError):
+            raise CaptureChannelError("bundle_invalid") from None
 
     def _preflight(self, abort_signal: CaptureAbortSignal | None = None) -> None:
         self._check_runtime_commit()
@@ -905,6 +961,7 @@ def build_backup_v2_routes(
                 try:
                     while True:
                         await asyncio.sleep(0)
+                        controller._check_runtime_commit()
                         block = delivery.handle.read(1024 * 1024)
                         if not block:
                             break
