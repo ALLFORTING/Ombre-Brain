@@ -460,6 +460,8 @@ def _require_backup_v2_status_auth(request):
 
 def _register_backup_v2(transport):
     from backup_v2_runtime import register_backup_v2_if_enabled
+    from backup_auto_runtime import register_backup_auto_if_enabled
+    register_backup_auto_if_enabled(sys.modules[__name__], transport)
     # __main__ is the actual running module; never import a second server.
     return register_backup_v2_if_enabled(sys.modules[__name__], transport)
 
@@ -611,6 +613,8 @@ def build_streamable_http_app():
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
     app.router.lifespan_context = lifespan
+    from backup_auto_runtime import install_backup_auto_lifespan
+    install_backup_auto_lifespan(app, sys.modules[__name__])
     return app
 
 

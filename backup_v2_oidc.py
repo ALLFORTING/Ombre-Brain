@@ -29,7 +29,9 @@ class GitHubActionsBackupV2OidcVerifier:
         jwk_client: Any | None = None,
         jwk_client_factory: Callable[[], Any] | None = None,
         decoder: Callable[[str, Any], Mapping[str, Any]] | None = None,
+        audience: str = V2_AUDIENCE,
     ) -> None:
+        self.audience = audience
         self._jwk_client = jwk_client
         self._jwk_client_factory = jwk_client_factory or (
             lambda: PyJWKClient(OIDC_JWKS_URL, cache_keys=True)
@@ -45,7 +47,7 @@ class GitHubActionsBackupV2OidcVerifier:
             raise
         except Exception as exc:
             raise CaptureChannelError("oidc_denied") from exc
-        if not isinstance(claims, Mapping) or claims.get("aud") != V2_AUDIENCE:
+        if not isinstance(claims, Mapping) or claims.get("aud") != self.audience:
             raise CaptureChannelError("oidc_denied")
         return dict(claims)
 
@@ -54,8 +56,7 @@ class GitHubActionsBackupV2OidcVerifier:
             self._jwk_client = self._jwk_client_factory()
         return self._jwk_client
 
-    @staticmethod
-    def _decode_token(token: str, jwk_client: Any) -> Mapping[str, Any]:
+    def _decode_token(self, token: str, jwk_client: Any) -> Mapping[str, Any]:
         try:
             header = jwt.get_unverified_header(token)
             if header.get("alg") != "RS256":
@@ -65,7 +66,7 @@ class GitHubActionsBackupV2OidcVerifier:
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
-                audience=V2_AUDIENCE,
+                audience=self.audience,
                 issuer=OIDC_ISSUER,
                 options={"require": ["exp", "iat", "nbf", "iss", "aud"]},
             )

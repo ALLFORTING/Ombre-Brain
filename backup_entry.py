@@ -10,6 +10,7 @@ import server
 from backfill_embeddings import backfill_batch
 from backup_export import backup_payload_json, verify_github_oidc
 from backup_v2_runtime import register_backup_v2_if_enabled
+from backup_auto_runtime import register_backup_auto_if_enabled
 
 
 logger = logging.getLogger("ombre_brain.backup")
@@ -117,6 +118,7 @@ def run() -> None:
     logger.info("Ombre Brain starting with backup export | transport: %s", transport)
 
     register_backup_v2_if_enabled(server, transport)
+    register_backup_auto_if_enabled(server, transport)
 
     if transport not in ("sse", "streamable-http"):
         server.mcp.run(transport=transport)

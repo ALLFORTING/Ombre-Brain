@@ -39,6 +39,7 @@ from offline_backup_bundle import (
     capture_external_source,
     load_backup_workspace,
     ProductionDirectoryPolicy,
+    PLAIN_SUFFIX,
 )
 
 
@@ -104,6 +105,10 @@ class CaptureJob:
     def public(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("bundle_name", None)
+        if self.recipient_fingerprint == "none":
+            payload.pop("recipient_fingerprint")
+            payload["bundle_size"] = payload.pop("encrypted_size")
+            payload["bundle_sha256"] = payload.pop("encrypted_sha256")
         return payload
 
 
@@ -229,6 +234,8 @@ class ProductionBackupCaptureController:
         clock: Callable[[], datetime] | None = None,
         disk_usage: Callable[[Path], Any] = shutil.disk_usage,
         directory_policy: ProductionDirectoryPolicy | None = None,
+        plaintext: bool = False,
+        runtime_commit_resolver: Callable[[], str] | None = None,
     ) -> None:
         if not enabled:
             raise CaptureChannelError("capture_disabled")
@@ -237,15 +244,18 @@ class ProductionBackupCaptureController:
         limits.validate()
         if _COMMIT_PATTERN.fullmatch(runtime_commit or "") is None:
             raise CaptureChannelError("capture_config_invalid")
-        if not isinstance(recipient_public_key, X25519PublicKey):
+        if not plaintext and not isinstance(recipient_public_key, X25519PublicKey):
             raise CaptureChannelError("capture_key_invalid")
-        derived = public_key_fingerprint(recipient_public_key)
+        derived = "none" if plaintext else public_key_fingerprint(recipient_public_key)
         if (
-            _FINGERPRINT_PATTERN.fullmatch(recipient_fingerprint or "") is None
+            (not plaintext and _FINGERPRINT_PATTERN.fullmatch(recipient_fingerprint or "") is None)
             or not secrets.compare_digest(derived, recipient_fingerprint)
         ):
             raise CaptureChannelError("capture_key_invalid")
         self.coordinator = coordinator
+        self.plaintext = plaintext
+        self.bundle_suffix = PLAIN_SUFFIX if plaintext else BUNDLE_SUFFIX
+        self.runtime_commit_resolver = runtime_commit_resolver
         self.directory_policy = directory_policy
         if directory_policy is not None:
             directory_policy.validate(Path(source_root), source=True)
@@ -311,6 +321,7 @@ class ProductionBackupCaptureController:
     ) -> dict[str, Any]:
         canonical_id = _request_id(request_id)
         identity = self.oidc_policy.verify(claims)
+        self._check_runtime_commit()
         parameters = (
             expected_runtime_commit,
             expected_recipient_fingerprint,
@@ -392,7 +403,7 @@ class ProductionBackupCaptureController:
                 with self._status_lock:
                     self._abort_signals[job.request_id] = abort_signal
                 worker = asyncio.create_task(asyncio.to_thread(
-                    capture_external_source,
+                    self._capture_source,
                     self.workspace.root,
                     self.source_root,
                     self.source_root,
@@ -569,7 +580,7 @@ class ProductionBackupCaptureController:
                 fingerprint = job.recipient_fingerprint
             try:
                 path = (self.workspace.bundles_root / bundle_name).resolve(strict=True)
-                if path.parent != self.workspace.bundles_root or path.suffix != BUNDLE_SUFFIX:
+                if path.parent != self.workspace.bundles_root or not path.name.endswith(self.bundle_suffix):
                     raise CaptureChannelError("bundle_invalid")
                 handle = path.open("rb")
             except (OSError, RuntimeError) as exc:
@@ -637,6 +648,8 @@ class ProductionBackupCaptureController:
                 return job.public()
 
     async def cleanup_stale(self) -> int:
+        if self.directory_policy is not None:
+            load_backup_workspace(self.workspace.root, directory_policy=self.directory_policy)
         now = self._now()
         cleaned = 0
         async with self._job_lock:
@@ -648,6 +661,8 @@ class ProductionBackupCaptureController:
                         job.state != "ready"
                         or not job.bundle_name
                         or job.request_id in self._active_deliveries
+                        or job.request_id in self._tasks
+                        or job.request_id == self._active_request_id
                     ):
                         continue
                     updated = datetime.fromisoformat(job.updated_at)
@@ -656,8 +671,15 @@ class ProductionBackupCaptureController:
                     continue
                 path = self.workspace.bundles_root / bundle_name
                 try:
-                    if path.parent == self.workspace.bundles_root:
-                        path.unlink(missing_ok=True)
+                    if (path.is_symlink() or path.parent != self.workspace.bundles_root
+                            or path.resolve(strict=False).parent != self.workspace.bundles_root
+                            or bundle_name != f"{job.bundle_id}{self.bundle_suffix}"):
+                        raise CaptureChannelError("bundle_invalid")
+                    if self.plaintext and path.exists():
+                        size, digest = await asyncio.to_thread(_hash_file, path)
+                        if size != job.encrypted_size or digest != job.encrypted_sha256:
+                            raise CaptureChannelError("bundle_invalid")
+                    path.unlink(missing_ok=True)
                 except OSError as exc:
                     raise CaptureChannelError("internal_error") from exc
                 updated_at = self._timestamp()
@@ -668,6 +690,7 @@ class ProductionBackupCaptureController:
         return cleaned
 
     def _preflight(self, abort_signal: CaptureAbortSignal | None = None) -> None:
+        self._check_runtime_commit()
         if self.directory_policy is not None:
             self.directory_policy.validate(self.source_root, source=True)
             load_backup_workspace(self.workspace.root, directory_policy=self.directory_policy)
@@ -687,18 +710,30 @@ class ProductionBackupCaptureController:
         if self._disk_usage(self.workspace.temp_root).free < required:
             raise CaptureChannelError("capture_space_insufficient")
 
+    def _check_runtime_commit(self) -> None:
+        if self.runtime_commit_resolver is not None and self.runtime_commit_resolver() != self.runtime_commit:
+            raise CaptureChannelError("capture_identity_mismatch")
+
+    def _capture_source(self, *args, **kwargs):
+        self._check_runtime_commit()
+        if self.plaintext:
+            kwargs["plaintext"] = True
+        return capture_external_source(*args, **kwargs)
+
     def _record_owned_bundle(self, job: CaptureJob, result: CaptureResult) -> None:
         with self._status_lock:
             job.bundle_id = result.bundle_id
             job.bundle_name = result.bundle_name
 
     def _finish_bundle(self, job: CaptureJob) -> None:
+        self._check_runtime_commit()
         with self._status_lock:
             bundle_name = job.bundle_name
         if not bundle_name:
             raise CaptureChannelError("internal_error")
         path = self.workspace.bundles_root / bundle_name
         size, digest = _hash_file(path)
+        self._check_runtime_commit()
         if size > self.limits.max_bundle_bytes:
             raise CaptureChannelError("capture_bundle_too_large")
         try:
@@ -798,20 +833,24 @@ class ProductionBackupCaptureController:
 def build_backup_v2_routes(
     controller: ProductionBackupCaptureController,
     claim_verifier: Callable[[Request], Any],
+    *,
+    prefix: str = "/api/backup/v2",
+    plaintext: bool = False,
 ) -> list[Route]:
     """Build unregistered routes; callers must explicitly mount them later."""
 
     async def create(request: Request):
         try:
             body = await request.json()
-            if not isinstance(body, dict) or set(body) != {
-                "request_id", "expected_runtime_commit", "expected_recipient_fingerprint"
-            }:
+            expected_fields = {"request_id", "expected_runtime_commit"}
+            if not plaintext:
+                expected_fields.add("expected_recipient_fingerprint")
+            if not isinstance(body, dict) or set(body) != expected_fields:
                 raise CaptureChannelError("request_invalid")
             result = await controller.create_capture(
                 request_id=body["request_id"],
                 expected_runtime_commit=body["expected_runtime_commit"],
-                expected_recipient_fingerprint=body["expected_recipient_fingerprint"],
+                expected_recipient_fingerprint=("none" if plaintext else body["expected_recipient_fingerprint"]),
                 claims=await _verify_request_claims(claim_verifier, request),
             )
             return _json(result, 202)
@@ -887,7 +926,7 @@ def build_backup_v2_routes(
                     release=release_delivery,
                     headers={
                         "Cache-Control": "no-store",
-                        "Content-Disposition": f'attachment; filename="{delivery.bundle_id}.obbackup"',
+                        "Content-Disposition": f'attachment; filename="{delivery.bundle_id}{controller.bundle_suffix}"',
                         "Content-Length": str(delivery.encrypted_size),
                         "X-Backup-Bundle-Id": delivery.bundle_id,
                         "X-Backup-SHA256": delivery.encrypted_sha256,
@@ -914,10 +953,10 @@ def build_backup_v2_routes(
             return _route_error(exc)
 
     return [
-        Route("/api/backup/v2/captures", create, methods=["POST"]),
-        Route("/api/backup/v2/captures/{request_id}", status, methods=["GET"]),
-        Route("/api/backup/v2/captures/{request_id}/bundle", download, methods=["GET"]),
-        Route("/api/backup/v2/captures/{request_id}/ack", acknowledge, methods=["POST"]),
+        Route(f"{prefix}/captures", create, methods=["POST"]),
+        Route(f"{prefix}/captures/{{request_id}}", status, methods=["GET"]),
+        Route(f"{prefix}/captures/{{request_id}}/bundle", download, methods=["GET"]),
+        Route(f"{prefix}/captures/{{request_id}}/ack", acknowledge, methods=["POST"]),
     ]
 
 
