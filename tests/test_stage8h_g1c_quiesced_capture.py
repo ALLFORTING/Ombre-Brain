@@ -609,6 +609,10 @@ async def test_controller_drains_then_blocks_real_storage_components(tmp_path, m
             break
         await asyncio.sleep(0.01)
     assert coordinator.status().state == "draining"
+    snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+    assert snapshot["controller_busy"] is True
+    assert snapshot["coordinator"]["lease_present"] is False
+    assert snapshot["coordinator"]["state"] == "draining"
     writer_release.set()
     await asyncio.to_thread(capture_entered.wait, 5)
     assert coordinator.status().state == "frozen"
@@ -1286,10 +1290,10 @@ async def test_ready_metadata_failure_cleans_owned_bundle(tmp_path, monkeypatch)
     (source / "one.bin").write_bytes(b"synthetic")
     original_set_state = controller._set_state
 
-    def fail_ready(job, state):
+    def fail_ready(job, state, **kwargs):
         if state == "ready":
             raise RuntimeError("synthetic metadata failure")
-        return original_set_state(job, state)
+        return original_set_state(job, state, **kwargs)
 
     monkeypatch.setattr(controller, "_set_state", fail_ready)
     request_id = str(uuid.uuid4())
@@ -1863,3 +1867,163 @@ async def test_repeated_cancellation_during_response_failure_releases_delivery(
     async with controller.delivery(request_id, _claims()) as retry:
         assert retry.handle.read(1)
     assert (await controller.acknowledge(request_id, _claims()))["state"] == "consumed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication", ["ready", "failed"])
+async def test_operator_snapshot_cannot_observe_half_publication(tmp_path, monkeypatch, publication):
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    request_id = str(uuid.uuid4())
+    job = CaptureJob(request_id, "123", "1", COMMIT, controller.recipient_fingerprint,
+                     "capturing", controller._timestamp(), controller._timestamp(),
+                     bundle_id="a" * 32, bundle_name="a" * 32 + ".obbackup")
+    (workspace.bundles_root / job.bundle_name).write_bytes(b"synthetic")
+    with controller._status_lock:
+        controller._jobs[request_id] = job
+    entered = threading.Event()
+    release = threading.Event()
+    reader_started = threading.Event()
+    original = CaptureJob.__setattr__
+    field = "encrypted_size" if publication == "ready" else "orphan_present"
+
+    def pause_group(instance, name, value):
+        original(instance, name, value)
+        if instance is job and name == field:
+            assert controller._status_lock._is_owned()
+            entered.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(CaptureJob, "__setattr__", pause_group)
+
+    def publish():
+        if publication == "ready":
+            controller._finish_bundle(job)
+        else:
+            asyncio.run(controller._fail_and_cleanup(job, "capture_cancelled"))
+
+    def read():
+        reader_started.set()
+        return asyncio.run(controller.operator_status(
+            request_id, "123", "1", validate_registered=lambda: None))
+
+    writer = asyncio.create_task(asyncio.to_thread(publish))
+    reader = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        reader = asyncio.create_task(asyncio.to_thread(read))
+        assert await asyncio.to_thread(reader_started.wait, 5)
+        await asyncio.sleep(.02)
+        assert not reader.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(writer, 5)
+    snapshot = await asyncio.wait_for(reader, 5)
+    data = snapshot["job"]
+    assert data["state"] == publication
+    if publication == "ready":
+        assert data["encrypted_size"] == len(b"synthetic")
+        assert data["encrypted_sha256"] == hashlib.sha256(b"synthetic").hexdigest()
+    else:
+        assert data["failure_code"] == "capture_cancelled"
+        assert data["orphan_present"] is False
+        assert job.bundle_name is None
+
+
+@pytest.mark.asyncio
+async def test_operator_busy_covers_preflight_and_cancelled_worker_exit(tmp_path, monkeypatch):
+    controller, _, _, _, _ = _controller(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def preflight(abort_signal):
+        entered.set()
+        assert release.wait(5)
+        abort_signal.raise_if_aborted()
+
+    monkeypatch.setattr(controller, "_preflight", preflight)
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(request_id=request_id, expected_runtime_commit=COMMIT,
+                                    expected_recipient_fingerprint=controller.recipient_fingerprint,
+                                    claims=_claims())
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+        assert snapshot["controller_busy"] is True
+        assert snapshot["coordinator"]["state"] == "open"
+        assert snapshot["coordinator"]["lease_present"] is False
+        controller._tasks[request_id].cancel()
+        await asyncio.sleep(0)
+        snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+        assert snapshot["controller_busy"] is True
+    finally:
+        release.set()
+    terminal = await _terminal(controller, request_id)
+    assert terminal["state"] == "failed" and terminal["failure_code"] == "capture_cancelled"
+    snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+    assert snapshot["controller_busy"] is False
+    assert snapshot["coordinator"]["state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_operator_lease_presence_expiry_generation_and_lock_order(tmp_path, monkeypatch):
+    now = [10.0]
+    coordinator = MaintenanceWriteCoordinator(monotonic=lambda: now[0])
+    controller, _, _, _, _ = _controller(tmp_path, coordinator=coordinator)
+    request_id = str(uuid.uuid4())
+    from contextlib import contextmanager
+    original = coordinator.operator_snapshot_scope
+
+    @contextmanager
+    def ordered():
+        assert controller._job_lock.locked()
+        assert controller._status_lock._is_owned()
+        with original() as snapshot:
+            assert coordinator._condition._is_owned()
+            yield snapshot
+
+    monkeypatch.setattr(coordinator, "operator_snapshot_scope", ordered)
+    generation = coordinator.status().generation
+    for _ in range(2):
+        async with coordinator.freeze(reason="synthetic_private_reason", drain_timeout_seconds=2,
+                                      max_freeze_seconds=5) as lease:
+            now[0] += 6
+            before = coordinator.status()
+            snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+            assert snapshot["coordinator"]["lease_present"] is True
+            assert snapshot["coordinator"]["state"] == "frozen"
+            assert snapshot["coordinator"]["freeze_reason"] == "other"
+            assert snapshot["coordinator"]["generation"] == generation
+            assert coordinator._lease is lease and lease._released is False
+            assert coordinator.status() == before
+            assert snapshot["original_job_lease_release"] == "unknown"
+        snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+        assert snapshot["coordinator"]["lease_present"] is False
+        assert snapshot["coordinator"]["generation"] == generation
+
+
+@pytest.mark.asyncio
+async def test_operator_busy_during_delivery_then_ack_and_stale(tmp_path):
+    controller, source, workspace, _, _ = _controller(tmp_path)
+    (source / "synthetic.bin").write_bytes(b"synthetic")
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(request_id=request_id, expected_runtime_commit=COMMIT,
+                                    expected_recipient_fingerprint=controller.recipient_fingerprint,
+                                    claims=_claims())
+    assert (await _terminal(controller, request_id))["state"] == "ready"
+    async with controller.delivery(request_id, _claims()):
+        snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+        assert snapshot["controller_busy"] is True
+        with pytest.raises(CaptureChannelError, match="capture_delivery_active"):
+            await controller.acknowledge(request_id, _claims())
+    await controller.acknowledge(request_id, _claims())
+    snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+    assert snapshot["controller_busy"] is False and snapshot["job"]["state"] == "consumed"
+    request_id = str(uuid.uuid4())
+    await controller.create_capture(request_id=request_id, expected_runtime_commit=COMMIT,
+                                    expected_recipient_fingerprint=controller.recipient_fingerprint,
+                                    claims=_claims())
+    await _terminal(controller, request_id)
+    controller._clock = lambda: datetime.now(timezone.utc) + timedelta(seconds=120)
+    assert await controller.cleanup_stale() == 1
+    snapshot = await controller.operator_status(request_id, "123", "1", validate_registered=lambda: None)
+    assert snapshot["job"]["state"] == "stale" and snapshot["controller_busy"] is False

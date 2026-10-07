@@ -60,6 +60,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_capture_source_into_bundle": "frozen_external_or_workspace_capture",
         "capture_external_source": "invalid_lease_bundle_cleanup",
         "verify_bundle": "isolated_temporary_verification",
+        "_stage_recovery_report": "isolated_temporary_verification",
         "restore_bundle": "isolated_restore_and_no_replace_publish",
         "write_test_private_key": "test_key_only",
         "write_test_public_key": "test_key_only",
@@ -79,6 +80,10 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_fsync_file": "formal_bundle_no_replace",
         "_safe_rmtree": "contained_temporary_cleanup",
         "_remove_file": "contained_temporary_cleanup",
+    },
+    "scripts/backup_closeout/local_prepare.py": {
+        "write_new_json": "isolated_offline_workspace",
+        "stage_recovery": "isolated_offline_workspace",
     },
     "portable_export.py": {
         "_write_payload": "isolated_offline_workspace",

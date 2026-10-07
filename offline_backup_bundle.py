@@ -655,49 +655,43 @@ def inspect_bundle(
 
 
 def verify_bundle(
-    workspace_path: str | Path,
-    bundle_name: str,
-    recipient_private_key: X25519PrivateKey,
-    *,
-    chunk_size: int = CHUNK_SIZE,
+    workspace_path: str | Path, bundle_name: str, recipient_private_key: X25519PrivateKey,
+    *, chunk_size: int = CHUNK_SIZE, report_name: str | None = None,
+    association: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Authenticate and verify a bundle without publishing restored data."""
+    """Authenticate and verify, optionally publishing an isolated report."""
     workspace = load_backup_workspace(workspace_path)
     _validate_private_key(recipient_private_key)
     _validate_chunk_size(chunk_size)
     bundle = _bundle_path(workspace, bundle_name)
+    report_target = _recovery_report_target(workspace, report_name, "verify")
     operation_root = Path(tempfile.mkdtemp(prefix="verify-", dir=workspace.temp_root))
     try:
-        result = _decrypt_and_validate(
-            workspace,
-            bundle,
-            recipient_private_key,
-            operation_root,
-            chunk_size=chunk_size,
-        )
-        return {
-            "status": "success",
-            "authenticated": True,
-            "metadata_trust": "authenticated_bundle",
-            "bundle_id": result["manifest"]["bundle_id"],
-            "capture_workspace_id": result["manifest"]["capture_workspace_id"],
-            "manifest_sha256": result["manifest"]["manifest_sha256"],
-            "entry_count": result["manifest"]["entry_count"],
-            "total_plaintext_bytes": result["manifest"]["total_plaintext_bytes"],
-        }
+        result = _decrypt_and_validate(workspace, bundle, recipient_private_key,
+                                       operation_root, chunk_size=chunk_size)
+        if report_target is not None:
+            staged_report = _stage_recovery_report(operation_root, result, bundle, "verify", association)
+            _publish_directory_no_replace(staged_report, report_target)
+        response = {"status": "success", "authenticated": True,
+                "metadata_trust": "authenticated_bundle",
+                "bundle_id": result["manifest"]["bundle_id"],
+                "capture_workspace_id": result["manifest"]["capture_workspace_id"],
+                "manifest_sha256": result["manifest"]["manifest_sha256"],
+                "entry_count": result["manifest"]["entry_count"],
+                "total_plaintext_bytes": result["manifest"]["total_plaintext_bytes"]}
+        if report_target is not None:
+            response["report_path"] = str(report_target)
+        return response
     finally:
         _safe_rmtree(workspace, operation_root)
 
 
 def restore_bundle(
-    workspace_path: str | Path,
-    bundle_name: str,
-    recipient_private_key: X25519PrivateKey,
-    *,
-    restore_name: str | None = None,
-    chunk_size: int = CHUNK_SIZE,
+    workspace_path: str | Path, bundle_name: str, recipient_private_key: X25519PrivateKey,
+    *, restore_name: str | None = None, chunk_size: int = CHUNK_SIZE,
+    report_name: str | None = None, association: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Restore only after complete authentication into an isolated root."""
+    """Restore after complete authentication; never replace a target or report."""
     workspace = load_backup_workspace(workspace_path)
     _validate_private_key(recipient_private_key)
     _validate_chunk_size(chunk_size)
@@ -707,34 +701,30 @@ def restore_bundle(
     if _BUNDLE_ID_PATTERN.fullmatch(target_name) is None:
         raise BackupBundleError("restore_target_invalid")
     final_root = workspace.restored_root / target_name
+    report_target = _recovery_report_target(workspace, report_name, "restore")
     with _exclusive_operation_lock(workspace, "restore"):
         if final_root.exists():
             raise BackupBundleError("restore_target_invalid")
-        operation_root = Path(tempfile.mkdtemp(
-            prefix=f"restore-{target_name}-", dir=workspace.temp_root
-        ))
+        operation_root = Path(tempfile.mkdtemp(prefix=f"restore-{target_name}-", dir=workspace.temp_root))
         try:
-            result = _decrypt_and_validate(
-                workspace,
-                bundle,
-                recipient_private_key,
-                operation_root,
-                chunk_size=chunk_size,
-            )
-            staged_restore = result["restore_root"]
-            _publish_directory_no_replace(staged_restore, final_root)
-            return {
-                "status": "success",
-                "authenticated": True,
-                "metadata_trust": "authenticated_bundle",
-                "bundle_id": result["manifest"]["bundle_id"],
-                "capture_workspace_id": result["manifest"][
-                    "capture_workspace_id"
-                ],
-                "manifest_sha256": result["manifest"]["manifest_sha256"],
-                "entry_count": result["manifest"]["entry_count"],
-                "restore_name": target_name,
-            }
+            result = _decrypt_and_validate(workspace, bundle, recipient_private_key,
+                                           operation_root, chunk_size=chunk_size)
+            staged_report = None
+            if report_target is not None:
+                staged_report = _stage_recovery_report(operation_root, result, bundle, "restore", association)
+            _publish_directory_no_replace(result["restore_root"], final_root)
+            if staged_report is not None:
+                # If this publication fails, restored data stays intact, but the caller fails.
+                _publish_directory_no_replace(staged_report, report_target)
+            response = {"status": "success", "authenticated": True,
+                    "metadata_trust": "authenticated_bundle",
+                    "bundle_id": result["manifest"]["bundle_id"],
+                    "capture_workspace_id": result["manifest"]["capture_workspace_id"],
+                    "manifest_sha256": result["manifest"]["manifest_sha256"],
+                    "entry_count": result["manifest"]["entry_count"], "restore_name": target_name}
+            if report_target is not None:
+                response["report_path"] = str(report_target)
+            return response
         except BackupBundleError:
             raise
         except Exception as exc:
@@ -742,6 +732,60 @@ def restore_bundle(
         finally:
             _safe_rmtree(workspace, operation_root)
 
+def _recovery_report_target(workspace: BackupWorkspace, name: str | None, operation: str) -> Path | None:
+    if name is None:
+        return None
+    if not isinstance(name, str) or re.fullmatch(r"[0-9a-f]{32}\." + operation, name) is None:
+        raise BackupBundleError("restore_target_invalid")
+    target = workspace.reports_root / name
+    if target.exists() or target.is_symlink():
+        raise BackupBundleError("restore_target_invalid")
+    return target
+
+
+def _stage_recovery_report(operation_root: Path, result: dict[str, Any], bundle: Path,
+                           operation: str, association: dict[str, Any] | None) -> Path:
+    # Called only after GCM authentication, complete file hashes and SQLite checks.
+    manifest = result["manifest"]
+    checks = result["file_checks"]
+    if len(checks) != manifest["entry_count"]:
+        raise BackupBundleError("manifest_invalid")
+    allowed = {"request_id", "run_id", "run_attempt", "artifact_id", "artifact_digest",
+               "workflow_commit", "runtime_commit", "bundle_id", "encrypted_size",
+               "encrypted_sha256", "independent_copy_verified"}
+    receipt = dict(association or {})
+    if set(receipt) - allowed:
+        raise BackupBundleError("manifest_invalid")
+    size, digest = _hash_file(bundle, chunk_size=CHUNK_SIZE)
+    for field, actual in (("bundle_id", manifest["bundle_id"]), ("runtime_commit", manifest["ob_commit_sha"]),
+                          ("encrypted_size", size), ("encrypted_sha256", digest)):
+        if field in receipt and receipt[field] != actual:
+            raise BackupBundleError("manifest_invalid")
+    receipt["original_job_lease_release"] = "unknown"
+    receipt["task_binding"] = "provided_receipt" if association else "unproven"
+    categories: dict[str, list[str]] = {}
+    for entry in manifest["entries"]:
+        categories.setdefault(_category(entry["relative_path"]), []).append(entry["relative_path"])
+    payload = {"schema_version": 1, "operation": operation, "authenticated": True,
+               "status": "validated", "bundle_id": manifest["bundle_id"],
+               "encrypted_size": size, "encrypted_sha256": digest,
+               "manifest_sha256": manifest["manifest_sha256"], "file_checks": checks,
+               "database_checks": [item for item in checks if item["database"] is not None],
+               "coverage": {"basis": "authenticated_manifest", "entry_count": len(checks),
+                            "categories": categories, "exclusions": manifest["exclusions"]},
+               "complete_acceptance": False}
+    stage = operation_root / "report"
+    try:
+        stage.mkdir()
+        with (stage / "manifest.json").open("xb") as handle:
+            handle.write(_canonical_json_bytes(manifest))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _atomic_write_json(stage / "verification.json", payload)
+        _atomic_write_json(stage / "association.json", receipt)
+    except OSError as exc:
+        raise BackupBundleError("restore_failed") from exc
+    return stage
 
 def generate_test_keypair() -> tuple[X25519PrivateKey, X25519PublicKey]:
     """Generate an ephemeral test-only recipient keypair."""
@@ -1501,8 +1545,9 @@ def _decrypt_and_validate(
     except OSError as exc:
         raise BackupBundleError("bundle_invalid") from exc
     restore_root.mkdir()
+    file_checks: list[dict[str, Any]] = []
     manifest = _validate_and_extract_archive(
-        archive_path, restore_root, chunk_size=chunk_size
+        archive_path, restore_root, chunk_size=chunk_size, file_checks=file_checks
     )
     matching_fields = (
         "bundle_format_version",
@@ -1516,7 +1561,8 @@ def _decrypt_and_validate(
         raise BackupBundleError("manifest_invalid")
     if manifest["recipient_key_fingerprint"] != expected_fingerprint:
         raise BackupBundleError("manifest_invalid")
-    return {"header": header, "manifest": manifest, "restore_root": restore_root}
+    return {"header": header, "manifest": manifest, "restore_root": restore_root,
+            "file_checks": file_checks}
 
 
 def _read_header(bundle: Path) -> tuple[dict[str, Any], bytes, int, int]:
@@ -1589,6 +1635,7 @@ def _validate_and_extract_archive(
     restore_root: Path,
     *,
     chunk_size: int,
+    file_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
         with tarfile.open(archive_path, mode="r:") as archive:
@@ -1654,8 +1701,13 @@ def _validate_and_extract_archive(
                     os.fsync(writer.fileno())
                 if size != entry["size_bytes"] or digest.hexdigest() != entry["sha256"]:
                     raise BackupBundleError("manifest_invalid")
+                database = None
                 if entry["entry_type"] == "sqlite_snapshot":
-                    _verify_restored_sqlite(destination, entry)
+                    database = _verify_restored_sqlite(destination, entry)
+                if file_checks is not None:
+                    file_checks.append({"relative_path": relative, "size_bytes": size,
+                                        "sha256": digest.hexdigest(), "status": "passed",
+                                        "database": database})
             return manifest
     except BackupBundleError:
         raise
@@ -1821,7 +1873,7 @@ def _validate_manifest_entries(manifest: dict[str, Any]) -> None:
         raise BackupBundleError("manifest_invalid")
 
 
-def _verify_restored_sqlite(path: Path, entry: dict[str, Any]) -> None:
+def _verify_restored_sqlite(path: Path, entry: dict[str, Any]) -> dict[str, Any]:
     try:
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
         try:
@@ -1854,6 +1906,8 @@ def _verify_restored_sqlite(path: Path, entry: dict[str, Any]) -> None:
         or schema_hash != entry["schema_sha256"]
     ):
         raise BackupBundleError("manifest_invalid")
+    return {"quick_check": "ok", "page_size": page_size, "page_count": page_count,
+            "user_version": user_version, "schema_sha256": schema_hash}
 
 
 def _validate_prepare_root(path: str | Path, *, directory_policy: ProductionDirectoryPolicy | None = None) -> Path:

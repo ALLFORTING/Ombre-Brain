@@ -387,6 +387,77 @@ def _backup_v2_initialization_scope():
     return DEFAULT_WRITE_COORDINATOR.writer_scope("backup_v2_runtime_initialization")
 
 
+class _BackupV2StatusRateLimiter:
+    """One shared process-local bucket; no credentials or client IP storage."""
+
+    def __init__(self, monotonic=time.monotonic):
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._tokens = 5.0
+        self._last = monotonic()
+
+    def retry_after(self):
+        import math
+        with self._lock:
+            now = self._monotonic()
+            self._tokens = min(5.0, self._tokens + max(0.0, now - self._last) / 2.0)
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return 0
+            return max(1, math.ceil((1.0 - self._tokens) * 2.0))
+
+
+_backup_v2_status_rate_limiter = _BackupV2StatusRateLimiter()
+
+
+def _backup_v2_status_token_bytes(value):
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value + "=")
+    except (ValueError, binascii.Error):
+        return None
+    if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != value:
+        return None
+    return raw
+
+
+def _require_backup_v2_status_auth(request):
+    """Purpose-limited auth; all attempts count before any business locks."""
+    from starlette.responses import JSONResponse
+
+    def denied(code, status, headers=None):
+        return JSONResponse({"status": code}, status_code=status,
+                            headers={"Cache-Control": "no-store", **(headers or {})})
+
+    # A successful entry check is reusable only within this ASGI request.
+    # Identity cannot be supplied through headers, query parameters or cookies.
+    if request.scope.get("_ombre_backup_v2_status_authenticated") is _require_backup_v2_status_auth:
+        return None
+    retry_after = _backup_v2_status_rate_limiter.retry_after()
+    if retry_after:
+        return denied("rate_limited", 429, {"Retry-After": str(retry_after)})
+    expected = _backup_v2_status_token_bytes(os.environ.get("OMBRE_BACKUP_V2_STATUS_TOKEN"))
+    if expected is None:
+        return denied("status_unavailable", 503)
+    headers = [value for name, value in request.scope.get("headers", ())
+               if name.lower() == b"authorization"]
+    candidate = None
+    if len(headers) == 1:
+        try:
+            value = headers[0].decode("ascii")
+        except (UnicodeError, AttributeError):
+            value = ""
+        if re.fullmatch(r"(?i:Bearer) [A-Za-z0-9_-]{43}", value):
+            candidate = _backup_v2_status_token_bytes(value[7:])
+    if candidate is None or not secrets.compare_digest(
+            hashlib.sha256(candidate).digest(), hashlib.sha256(expected).digest()):
+        return denied("unauthorized", 401, {"WWW-Authenticate": "Bearer"})
+    request.scope["_ombre_backup_v2_status_authenticated"] = _require_backup_v2_status_auth
+    return None
+
+
 def _register_backup_v2(transport):
     from backup_v2_runtime import register_backup_v2_if_enabled
     # __main__ is the actual running module; never import a second server.
@@ -5312,6 +5383,43 @@ from mcp_prompts import register_prompts
 register_prompts(mcp)
 
 
+def add_backup_v2_status_entry_middleware(app):
+    # add_middleware inserts at the front: this guard runs before CORS can
+    # answer a preflight. All other paths retain their existing CORS behavior.
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    class BackupV2StatusEntryMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if (scope["type"] == "http" and re.fullmatch(
+                    r"/api/backup/v2/operator-status/[^/]+", scope.get("path", ""))):
+                denied = _require_backup_v2_status_auth(Request(scope))
+                if denied is not None:
+                    await denied(scope, receive, send)
+                    return
+                if scope["method"] != "GET":
+                    response = JSONResponse({"status": "method_not_allowed"}, status_code=405,
+                                            headers={"Cache-Control": "no-store"})
+                    await response(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
+
+    app.add_middleware(BackupV2StatusEntryMiddleware)
+    return app
+
+
+def add_http_transport_middleware(app):
+    """Shared assembly retaining the current HTTP security and stateless app."""
+    add_mcp_auth_middleware(app)
+    add_http_cors_middleware(app)
+    add_backup_v2_status_entry_middleware(app)
+    add_mcp_diagnostic_middleware(app)
+    return app
+
+
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     _register_backup_v2(transport)
@@ -5354,9 +5462,7 @@ if __name__ == "__main__":
             _app = build_streamable_http_app()
         else:
             _app = mcp.sse_app()
-        add_mcp_auth_middleware(_app)
-        add_http_cors_middleware(_app)
-        add_mcp_diagnostic_middleware(_app)
+        add_http_transport_middleware(_app)
         install_uvicorn_access_log_redaction()
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)

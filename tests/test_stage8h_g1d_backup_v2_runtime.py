@@ -220,7 +220,7 @@ def test_windows_case_only_workspace_aliases_are_rejected_deterministically():
     )
 
 
-def test_valid_configuration_registers_exactly_four_routes_once(tmp_path):
+def test_valid_configuration_registers_exactly_five_routes_once(tmp_path):
     server = _server(tmp_path)
     env = _key_env(tmp_path)
     result = backup_v2_runtime.register_backup_v2_if_enabled(
@@ -228,10 +228,10 @@ def test_valid_configuration_registers_exactly_four_routes_once(tmp_path):
     )
     assert result.enabled is True
     assert result.registered is True
-    assert result.route_count == 4
+    assert result.route_count == 5
     assert _route_signatures(server) == backup_v2_runtime.V2_ROUTE_SIGNATURES
     backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
-    assert len(server.mcp._custom_starlette_routes) == 4
+    assert len(server.mcp._custom_starlette_routes) == 5
 
 
 def test_server_import_alone_does_not_register_v2_routes(tmp_path, monkeypatch):
@@ -493,7 +493,23 @@ def test_enabled_real_initialization_and_rm_share_boundary(tmp_path, monkeypatch
         stages.append(DEFAULT_WRITE_COORDINATOR.status().active_writers)
         return bootstrap(*args)
     monkeypatch.setattr(server, "_bootstrap_remember_me_host", rm)
-    components = server._get_runtime_components()
+    try:
+        components = server._get_runtime_components()
+    except RuntimeError as exc:
+        # Keep the genuine initialization failure visible; verify its precise boundary.
+        assert server._runtime_components is None
+        assert DEFAULT_WRITE_COORDINATOR.status().state == "open"
+        assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
+        from importlib.metadata import version
+        from remember_me_adapter import validate_remember_me_contract, RememberMeAdapterError
+        from remember_me_dependency import DEPENDENCY
+        exc.add_note(f"installed remember-me={version('remember-me')}; repository pin={DEPENDENCY.version}")
+        try:
+            validate_remember_me_contract()
+        except RememberMeAdapterError as contract_error:
+            exc.add_note(str(contract_error))
+        exc.add_note("runtime components unpublished; coordinator open; active_writers=0")
+        raise
     assert stages == [1, 1]
     assert components["remember_me_host_bundle"] is not None
     assert backup_v2_runtime.require_runtime_coordinator(server) is DEFAULT_WRITE_COORDINATOR
@@ -632,3 +648,28 @@ async def test_real_rm_and_background_writes_are_blocked_then_thaw(monkeypatch, 
     assert result["asset_id"]
     assert await manager.create("synthetic background memory")
     assert DEFAULT_WRITE_COORDINATOR.status().active_writers == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_rechecks_registered_identity_after_waiting_for_job_lock(tmp_path):
+    from starlette.requests import Request as StarletteRequest
+    server = _server(tmp_path)
+    env = _key_env(tmp_path)
+    server._require_backup_v2_status_auth = lambda request: None
+    backup_v2_runtime.register_backup_v2_if_enabled(server, "streamable-http", environ=env)
+    controller = server._backup_v2_controller
+    route = next(route for route in server.mcp._custom_starlette_routes if "operator-status" in route.path)
+    request = StarletteRequest({"type": "http", "method": "GET", "headers": [],
+                                "path_params": {"request_id": "12345678-1234-1234-1234-123456789abc"},
+                                "query_string": b"original_run_id=123&original_run_attempt=1"})
+    await controller._job_lock.acquire()
+    pending = asyncio.create_task(route.endpoint(request))
+    try:
+        await asyncio.sleep(0)
+        assert not pending.done()
+        server._backup_v2_controller = object()
+    finally:
+        controller._job_lock.release()
+    response = await asyncio.wait_for(pending, 3)
+    assert response.status_code == 503
+    assert response.body == b'{"status":"status_unavailable"}'

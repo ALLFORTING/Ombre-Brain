@@ -46,7 +46,8 @@ def load_encrypted_key(path: Path) -> X25519PrivateKey:
 
 
 def recover(operation: str, workspace_path: Path, bundle_name: str,
-            private_key_path: Path, target: Path | None = None) -> dict:
+            private_key_path: Path, target: Path | None = None, *,
+            report_name: str | None = None, association: dict | None = None) -> dict:
     workspace = load_backup_workspace(workspace_path)
     restore_name = None
     if operation == "restore":
@@ -62,8 +63,9 @@ def recover(operation: str, workspace_path: Path, bundle_name: str,
         raise RecoveryError("operation_invalid")
     key = load_encrypted_key(private_key_path)
     if operation == "verify":
-        return verify_bundle(workspace.root, bundle_name, key)
-    return restore_bundle(workspace.root, bundle_name, key, restore_name=restore_name)
+        return verify_bundle(workspace.root, bundle_name, key, report_name=report_name, association=association)
+    return restore_bundle(workspace.root, bundle_name, key, restore_name=restore_name,
+                          report_name=report_name, association=association)
 
 
 def main(argv: list[str] | None = None) -> int:

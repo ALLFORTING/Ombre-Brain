@@ -257,6 +257,34 @@ class MaintenanceWriteCoordinator:
                 freeze_reason=lease.reason if lease is not None else None,
             )
 
+    @contextmanager
+    def operator_snapshot_scope(self) -> Iterator[dict]:
+        """Read memory only; caller holds status lock before this condition.
+
+        Never call back into a controller, await, or release/validate a lease here.
+        Generation is a writer counter, not a snapshot version or release proof.
+        """
+        with self._condition:
+            lease = self._lease
+            snapshot = {
+                "state": self._state,
+                "active_writers": self._active_writers,
+                "generation": self._generation,
+                "lease_present": lease is not None,
+                "freeze_started_at": lease.started_time if lease is not None else None,
+                "freeze_deadline": lease.deadline_time if lease is not None else None,
+                "freeze_reason": (None if lease is None else
+                                  "encrypted_backup_capture" if lease.reason == "encrypted_backup_capture"
+                                  else "other"),
+            }
+            if (self._state not in {"open", "draining", "frozen"}
+                    or type(self._active_writers) is not int or self._active_writers < 0
+                    or type(self._generation) is not int or self._generation < 0
+                    or (self._state in {"open", "draining"} and lease is not None)
+                    or (self._state == "frozen" and (lease is None or self._active_writers != 0))):
+                raise MaintenanceWriteError("snapshot_conflict")
+            yield snapshot
+
     def monotonic(self) -> float:
         """Return the coordinator clock used by lease deadlines."""
         return self._monotonic()

@@ -32,6 +32,7 @@ V2_ROUTE_SIGNATURES = frozenset({
     ("GET", "/api/backup/v2/captures/{request_id}"),
     ("GET", "/api/backup/v2/captures/{request_id}/bundle"),
     ("POST", "/api/backup/v2/captures/{request_id}/ack"),
+    ("GET", "/api/backup/v2/operator-status/{request_id}"),
 })
 NUMERIC_BOUNDS = {
     "OMBRE_BACKUP_V2_FREEZE_TIMEOUT_SECONDS": (1, 600),
@@ -94,7 +95,7 @@ def register_backup_v2_if_enabled(
                 or getattr(server_module, "_backup_v2_config", None) != config):
             raise BackupV2RuntimeConfigError("backup_v2_route_conflict")
         require_runtime_coordinator(server_module, previous)
-        return BackupV2RegistrationResult(enabled=True, registered=True, route_count=4)
+        return BackupV2RegistrationResult(enabled=True, registered=True, route_count=5)
 
     from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
     from offline_backup_bundle import ProductionDirectoryPolicy, load_backup_workspace, prepare_backup_workspace
@@ -160,6 +161,7 @@ def register_backup_v2_if_enabled(
         return await verifier.verify_request(request)
 
     routes = build_backup_v2_routes(controller, verify_runtime_request)
+    routes.append(_build_operator_status_route(server_module, controller, env))
     _register_routes_once(server_module.mcp, routes)
     server_module._backup_v2_controller = controller
     server_module._backup_v2_config = config
@@ -169,6 +171,57 @@ def register_backup_v2_if_enabled(
         fingerprint,
     )
     return BackupV2RegistrationResult(enabled=True, registered=True, route_count=len(routes))
+
+
+def _build_operator_status_route(server_module, controller, env):
+    from starlette.routing import Route
+    from production_backup_capture import CaptureChannelError, _request_id, _json
+    from maintenance_write_gate import MaintenanceWriteError
+
+    def validate_registered():
+        if vars(server_module).get("_backup_v2_controller") is not controller:
+            raise BackupV2RuntimeConfigError("status_unavailable")
+        require_runtime_coordinator(server_module, controller, published_only=True)
+
+    async def endpoint(request):
+        try:
+            # Inject only the running module's purpose-limited auth function.
+            denied = server_module._require_backup_v2_status_auth(request)
+            if denied is not None:
+                return denied
+            if request.method != "GET":
+                return _json({"status": "method_not_allowed"}, 405)
+            request_id = _request_id(request.path_params["request_id"])
+            pairs = request.query_params.multi_items()
+            if (len(pairs) != 2 or {key for key, value in pairs} !=
+                    {"original_run_id", "original_run_attempt"}
+                    or any(_POSITIVE_ID.fullmatch(value) is None for key, value in pairs)):
+                raise CaptureChannelError("request_invalid")
+            identity = dict(pairs)
+            validate_registered()
+            # Provenance can perform file I/O: always outside synchronous locks.
+            if resolve_runtime_commit(env) != controller.runtime_commit:
+                raise BackupV2RuntimeConfigError("status_unavailable")
+            payload = await controller.operator_status(
+                request_id, identity["original_run_id"], identity["original_run_attempt"],
+                validate_registered=validate_registered)
+            return _json(payload)
+        except CaptureChannelError:
+            return _json({"status": "request_invalid"}, 400)
+        except BackupV2RuntimeConfigError:
+            return _json({"status": "status_unavailable"}, 503)
+        except MaintenanceWriteError:
+            return _json({"status": "snapshot_conflict"}, 409)
+        except Exception:
+            return _json({"status": "internal_error"}, 500)
+
+    class OperatorStatusRoute(Route):
+        async def handle(self, scope, receive, send):
+            # Also authenticate/rate-limit rejected verbs and give stable no-store errors.
+            # Router still advertises GET/HEAD; endpoint never returns status for other verbs.
+            await self.app(scope, receive, send)
+
+    return OperatorStatusRoute("/api/backup/v2/operator-status/{request_id}", endpoint, methods=["GET"])
 
 
 def _parse_enabled_config(server_module: Any, env: Mapping[str, str]) -> dict[str, Any]:
@@ -301,6 +354,11 @@ def _register_routes_once(mcp: Any, routes: list[Any]) -> None:
             include_in_schema=False,
         )
         decorator(route.endpoint)
+        if route.path == "/api/backup/v2/operator-status/{request_id}":
+            # FastMCP constructs a plain Route. Preserve this endpoint's rejection handler.
+            registered = next(item for item in mcp._custom_starlette_routes
+                              if item.path == route.path and item.endpoint is route.endpoint)
+            registered.handle = route.handle
 
 
 def _custom_route_signatures(mcp: Any) -> set[tuple[str, str]]:
@@ -356,9 +414,25 @@ def resolve_runtime_commit(env: Mapping[str, str], *, metadata_path: Path | None
     return commits[0]
 
 
-def require_runtime_coordinator(server_module: Any, controller: Any = None):
+def require_runtime_coordinator(server_module: Any, controller: Any = None, *, published_only=False):
     """Reject a partially initialized or split write boundary on every request."""
     from maintenance_write_gate import DEFAULT_WRITE_COORDINATOR
+    if published_only:
+        from types import SimpleNamespace
+        published = vars(server_module)
+        if "_runtime_components" in published:
+            if published["_runtime_components"] is None:
+                raise BackupV2RuntimeConfigError("backup_v2_coordinator_mismatch")
+            # Resolve only known lazy proxies from already published components.
+            # Explicit module overrides must still undergo identity checks.
+            runtime = published["_runtime_components"]
+            proxy_type = published.get("_LazyRuntimeComponent")
+            published = dict(published)
+            for name, component in runtime.items():
+                if (name not in published or
+                        (isinstance(proxy_type, type) and isinstance(published[name], proxy_type))):
+                    published[name] = component
+        server_module = SimpleNamespace(**published)
     try:
         components = {
             name: getattr(server_module, name)

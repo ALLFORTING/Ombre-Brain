@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import threading
 import inspect
 from typing import Any, AsyncIterator, Awaitable, BinaryIO, Callable, Mapping
 import uuid
@@ -263,6 +264,9 @@ class ProductionBackupCaptureController:
         self._jobs: dict[str, CaptureJob] = {}
         self._parameters: dict[str, tuple[str, str, str, str]] = {}
         self._job_lock = asyncio.Lock()
+        # Order: async job lock -> status RLock -> coordinator condition.
+        # Never await or perform I/O inside the synchronous locks.
+        self._status_lock = threading.RLock()
         self._active_request_id: str | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._abort_signals: dict[str, CaptureAbortSignal] = {}
@@ -319,38 +323,42 @@ class ProductionBackupCaptureController:
         ):
             raise CaptureChannelError("capture_identity_mismatch")
         async with self._job_lock:
-            existing = self._jobs.get(canonical_id)
-            if existing is not None:
-                if self._parameters[canonical_id] != parameters:
-                    raise CaptureChannelError("capture_request_conflict")
-                return existing.public()
-            if self._active_request_id is not None:
-                raise CaptureChannelError("capture_busy")
+            with self._status_lock:
+                existing = self._jobs.get(canonical_id)
+                if existing is not None:
+                    if self._parameters[canonical_id] != parameters:
+                        raise CaptureChannelError("capture_request_conflict")
+                    return existing.public()
+                if self._active_request_id is not None:
+                    raise CaptureChannelError("capture_busy")
             now = self._timestamp()
-            job = CaptureJob(
-                request_id=canonical_id,
-                oidc_run_id=identity["run_id"],
-                oidc_run_attempt=identity["run_attempt"],
-                runtime_commit=self.runtime_commit,
-                recipient_fingerprint=self.recipient_fingerprint,
-                state="accepted",
-                created_at=now,
-                updated_at=now,
-            )
-            self._jobs[canonical_id] = job
-            self._parameters[canonical_id] = parameters
-            self._active_request_id = canonical_id
+            with self._status_lock:
+                job = CaptureJob(
+                    request_id=canonical_id,
+                    oidc_run_id=identity["run_id"],
+                    oidc_run_attempt=identity["run_attempt"],
+                    runtime_commit=self.runtime_commit,
+                    recipient_fingerprint=self.recipient_fingerprint,
+                    state="accepted",
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._jobs[canonical_id] = job
+                self._parameters[canonical_id] = parameters
+                self._active_request_id = canonical_id
             task = asyncio.create_task(
                 self._run_capture_job(job),
                 name=f"backup-capture-{canonical_id}",
             )
-            self._tasks[canonical_id] = task
+            with self._status_lock:
+                self._tasks[canonical_id] = task
             task.add_done_callback(
                 lambda completed, request_id=canonical_id: self._task_completed(
                     request_id, completed
                 )
             )
-        return job.public()
+        with self._status_lock:
+            return job.public()
 
     async def _run_capture_job(self, job: CaptureJob) -> None:
         try:
@@ -358,7 +366,8 @@ class ProductionBackupCaptureController:
             preflight_worker = asyncio.create_task(asyncio.to_thread(
                 self._preflight, preflight_abort
             ))
-            self._active_workers += 1
+            with self._status_lock:
+                self._active_workers += 1
             try:
                 try:
                     await asyncio.shield(preflight_worker)
@@ -367,7 +376,8 @@ class ProductionBackupCaptureController:
                     await self._wait_worker_exit(preflight_worker)
                     raise
             finally:
-                self._active_workers -= 1
+                with self._status_lock:
+                    self._active_workers -= 1
             self._set_state(job, "draining")
             async with self.coordinator.freeze(
                 reason="encrypted_backup_capture",
@@ -379,7 +389,8 @@ class ProductionBackupCaptureController:
                     deadline=lease.deadline,
                     monotonic=self.coordinator.monotonic,
                 )
-                self._abort_signals[job.request_id] = abort_signal
+                with self._status_lock:
+                    self._abort_signals[job.request_id] = abort_signal
                 worker = asyncio.create_task(asyncio.to_thread(
                     capture_external_source,
                     self.workspace.root,
@@ -398,7 +409,8 @@ class ProductionBackupCaptureController:
                     disk_usage=self._disk_usage,
                     directory_policy=self.directory_policy,
                 ))
-                self._active_workers += 1
+                with self._status_lock:
+                    self._active_workers += 1
                 try:
                     result = await self._await_capture_worker(
                         worker,
@@ -408,8 +420,9 @@ class ProductionBackupCaptureController:
                     )
                     self.coordinator.validate_lease(lease)
                 finally:
-                    self._active_workers -= 1
-                    self._abort_signals.pop(job.request_id, None)
+                    with self._status_lock:
+                        self._active_workers -= 1
+                        self._abort_signals.pop(job.request_id, None)
             self._finish_bundle(job)
         except asyncio.CancelledError:
             await self._fail_and_cleanup(job, "capture_cancelled")
@@ -426,8 +439,9 @@ class ProductionBackupCaptureController:
             await self._fail_and_cleanup(job, "internal_error")
         finally:
             async with self._job_lock:
-                if self._active_request_id == job.request_id:
-                    self._active_request_id = None
+                with self._status_lock:
+                    if self._active_request_id == job.request_id:
+                        self._active_request_id = None
 
     async def _join_task(
         self,
@@ -499,8 +513,9 @@ class ProductionBackupCaptureController:
             )
 
     def _task_completed(self, request_id: str, task: asyncio.Task[None]) -> None:
-        if self._tasks.get(request_id) is task:
-            self._tasks.pop(request_id, None)
+        with self._status_lock:
+            if self._tasks.get(request_id) is task:
+                self._tasks.pop(request_id, None)
         if not task.cancelled():
             try:
                 task.exception()
@@ -515,16 +530,19 @@ class ProductionBackupCaptureController:
         timeout: float = 30,
     ) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
-        job = self._owned_job(request_id, identity)
-        task = self._tasks.get(job.request_id)
+        with self._status_lock:
+            job = self._owned_job(request_id, identity)
+            task = self._tasks.get(job.request_id)
         if task is not None:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        return job.public()
+        with self._status_lock:
+            return job.public()
 
     def get_job(self, request_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
-        job = self._owned_job(request_id, identity)
-        return job.public()
+        with self._status_lock:
+            job = self._owned_job(request_id, identity)
+            return job.public()
 
     @asynccontextmanager
     async def delivery(
@@ -536,24 +554,32 @@ class ProductionBackupCaptureController:
         canonical_id = _request_id(request_id)
         handle = None
         async with self._job_lock:
-            job = self._owned_job(canonical_id, identity)
-            if job.state != "ready" or not job.bundle_name:
-                raise CaptureChannelError("capture_not_ready")
-            if canonical_id in self._active_deliveries:
-                raise CaptureChannelError("capture_delivery_active")
-            if self.coordinator.status().state != "open":
-                raise CaptureChannelError("maintenance_in_progress")
+            with self._status_lock:
+                job = self._owned_job(canonical_id, identity)
+                if job.state != "ready" or not job.bundle_name:
+                    raise CaptureChannelError("capture_not_ready")
+                if canonical_id in self._active_deliveries:
+                    raise CaptureChannelError("capture_delivery_active")
+                if self.coordinator.status().state != "open":
+                    raise CaptureChannelError("maintenance_in_progress")
+                bundle_name = job.bundle_name
+                bundle_id = job.bundle_id
+                encrypted_size = job.encrypted_size
+                encrypted_sha256 = job.encrypted_sha256
+                fingerprint = job.recipient_fingerprint
             try:
-                path = (self.workspace.bundles_root / job.bundle_name).resolve(strict=True)
+                path = (self.workspace.bundles_root / bundle_name).resolve(strict=True)
                 if path.parent != self.workspace.bundles_root or path.suffix != BUNDLE_SUFFIX:
                     raise CaptureChannelError("bundle_invalid")
                 handle = path.open("rb")
             except (OSError, RuntimeError) as exc:
                 raise CaptureChannelError("bundle_invalid") from exc
-            self._active_deliveries.add(canonical_id)
+            with self._status_lock:
+                self._active_deliveries.add(canonical_id)
         try:
             hash_worker = asyncio.create_task(asyncio.to_thread(_hash_handle, handle))
-            self._active_workers += 1
+            with self._status_lock:
+                self._active_workers += 1
             try:
                 try:
                     size, digest = await asyncio.shield(hash_worker)
@@ -561,17 +587,18 @@ class ProductionBackupCaptureController:
                     await self._wait_worker_exit(hash_worker)
                     raise
             finally:
-                self._active_workers -= 1
+                with self._status_lock:
+                    self._active_workers -= 1
             handle.seek(0)
-            if size != job.encrypted_size or digest != job.encrypted_sha256:
+            if size != encrypted_size or digest != encrypted_sha256:
                 raise CaptureChannelError("bundle_invalid")
             yield BundleDelivery(
                 request_id=canonical_id,
                 handle=handle,
-                bundle_id=str(job.bundle_id),
-                encrypted_size=int(job.encrypted_size),
-                encrypted_sha256=str(job.encrypted_sha256),
-                recipient_fingerprint=job.recipient_fingerprint,
+                bundle_id=str(bundle_id),
+                encrypted_size=int(encrypted_size),
+                encrypted_sha256=str(encrypted_sha256),
+                recipient_fingerprint=fingerprint,
             )
         finally:
             if handle is not None:
@@ -585,47 +612,58 @@ class ProductionBackupCaptureController:
             handle.close()
         finally:
             async with self._job_lock:
-                self._active_deliveries.discard(request_id)
+                with self._status_lock:
+                    self._active_deliveries.discard(request_id)
 
     async def acknowledge(self, request_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
         identity = self.oidc_policy.verify(claims)
         async with self._job_lock:
-            job = self._owned_job(request_id, identity)
-            if job.state != "ready" or not job.bundle_name:
-                raise CaptureChannelError("capture_not_ready")
-            if job.request_id in self._active_deliveries:
-                raise CaptureChannelError("capture_delivery_active")
-            path = self.workspace.bundles_root / job.bundle_name
+            with self._status_lock:
+                job = self._owned_job(request_id, identity)
+                if job.state != "ready" or not job.bundle_name:
+                    raise CaptureChannelError("capture_not_ready")
+                if job.request_id in self._active_deliveries:
+                    raise CaptureChannelError("capture_delivery_active")
+                bundle_name = job.bundle_name
+            path = self.workspace.bundles_root / bundle_name
             try:
                 path.unlink()
             except OSError as exc:
                 raise CaptureChannelError("internal_error") from exc
-            job.bundle_name = None
-            self._set_state(job, "consumed")
-            return job.public()
+            updated_at = self._timestamp()
+            with self._status_lock:
+                job.bundle_name = None
+                self._set_state(job, "consumed", updated_at=updated_at)
+                return job.public()
 
     async def cleanup_stale(self) -> int:
         now = self._now()
         cleaned = 0
         async with self._job_lock:
-            for job in tuple(self._jobs.values()):
-                if (
-                    job.state != "ready"
-                    or not job.bundle_name
-                    or job.request_id in self._active_deliveries
-                ):
-                    continue
-                updated = datetime.fromisoformat(job.updated_at)
+            with self._status_lock:
+                jobs = tuple(self._jobs.values())
+            for job in jobs:
+                with self._status_lock:
+                    if (
+                        job.state != "ready"
+                        or not job.bundle_name
+                        or job.request_id in self._active_deliveries
+                    ):
+                        continue
+                    updated = datetime.fromisoformat(job.updated_at)
+                    bundle_name = job.bundle_name
                 if now - updated < timedelta(seconds=self.limits.ready_ttl_seconds):
                     continue
-                path = self.workspace.bundles_root / job.bundle_name
+                path = self.workspace.bundles_root / bundle_name
                 try:
                     if path.parent == self.workspace.bundles_root:
                         path.unlink(missing_ok=True)
                 except OSError as exc:
                     raise CaptureChannelError("internal_error") from exc
-                job.bundle_name = None
-                self._set_state(job, "stale")
+                updated_at = self._timestamp()
+                with self._status_lock:
+                    job.bundle_name = None
+                    self._set_state(job, "stale", updated_at=updated_at)
                 cleaned += 1
         return cleaned
 
@@ -650,13 +688,16 @@ class ProductionBackupCaptureController:
             raise CaptureChannelError("capture_space_insufficient")
 
     def _record_owned_bundle(self, job: CaptureJob, result: CaptureResult) -> None:
-        job.bundle_id = result.bundle_id
-        job.bundle_name = result.bundle_name
+        with self._status_lock:
+            job.bundle_id = result.bundle_id
+            job.bundle_name = result.bundle_name
 
     def _finish_bundle(self, job: CaptureJob) -> None:
-        if not job.bundle_name:
+        with self._status_lock:
+            bundle_name = job.bundle_name
+        if not bundle_name:
             raise CaptureChannelError("internal_error")
-        path = self.workspace.bundles_root / job.bundle_name
+        path = self.workspace.bundles_root / bundle_name
         size, digest = _hash_file(path)
         if size > self.limits.max_bundle_bytes:
             raise CaptureChannelError("capture_bundle_too_large")
@@ -664,44 +705,85 @@ class ProductionBackupCaptureController:
             path.chmod(0o600)
         except OSError as exc:
             raise CaptureChannelError("internal_error") from exc
-        job.encrypted_size = size
-        job.encrypted_sha256 = digest
-        self._set_state(job, "ready")
+        updated_at = self._timestamp()
+        with self._status_lock:
+            job.encrypted_size = size
+            job.encrypted_sha256 = digest
+            self._set_state(job, "ready", updated_at=updated_at)
 
     async def _fail_and_cleanup(self, job: CaptureJob, code: str) -> None:
         final_code = code
-        if job.bundle_name:
-            path = self.workspace.bundles_root / job.bundle_name
+        with self._status_lock:
+            bundle_name = job.bundle_name
+            orphan_present = job.orphan_present
+        removed = False
+        if bundle_name:
+            path = self.workspace.bundles_root / bundle_name
             try:
                 if path.parent != self.workspace.bundles_root:
                     raise OSError
                 path.unlink(missing_ok=True)
-                job.bundle_name = None
-                job.orphan_present = False
+                removed = True
+                orphan_present = False
             except OSError:
-                job.orphan_present = True
+                orphan_present = True
                 final_code = "internal_error"
-        self._fail(job, final_code)
+        updated_at = self._timestamp()
+        with self._status_lock:
+            if removed:
+                job.bundle_name = None
+            job.orphan_present = orphan_present
+            self._fail(job, final_code, updated_at=updated_at)
 
     def _owned_job(self, request_id: str, identity: Mapping[str, str]) -> CaptureJob:
-        job = self._jobs.get(_request_id(request_id))
-        if (
-            job is None
-            or job.oidc_run_id != identity["run_id"]
-            or job.oidc_run_attempt != identity["run_attempt"]
-        ):
-            raise CaptureChannelError("capture_not_found")
-        return job
+        canonical_id = _request_id(request_id)
+        with self._status_lock:
+            job = self._jobs.get(canonical_id)
+            if (
+                job is None
+                or job.oidc_run_id != identity["run_id"]
+                or job.oidc_run_attempt != identity["run_attempt"]
+            ):
+                raise CaptureChannelError("capture_not_found")
+            return job
 
-    def _set_state(self, job: CaptureJob, state: str) -> None:
+    def _set_state(self, job: CaptureJob, state: str, *, updated_at: str | None = None) -> None:
         if state not in _REQUEST_STATES:
             raise CaptureChannelError("internal_error")
-        job.state = state
-        job.updated_at = self._timestamp()
+        timestamp = updated_at if updated_at is not None else self._timestamp()
+        with self._status_lock:
+            job.state = state
+            job.updated_at = timestamp
 
-    def _fail(self, job: CaptureJob, code: str) -> None:
-        job.failure_code = code if re.fullmatch(r"[a-z0-9_]{1,64}", code or "") else "internal_error"
-        self._set_state(job, "failed")
+    def _fail(self, job: CaptureJob, code: str, *, updated_at: str | None = None) -> None:
+        timestamp = updated_at if updated_at is not None else self._timestamp()
+        with self._status_lock:
+            job.failure_code = code if re.fullmatch(r"[a-z0-9_]{1,64}", code or "") else "internal_error"
+            self._set_state(job, "failed", updated_at=timestamp)
+
+    async def operator_status(self, request_id: str, run_id: str, run_attempt: str,
+                              *, validate_registered: Callable[[], None]) -> dict[str, Any]:
+        async with self._job_lock:
+            with self._status_lock:
+                # Identity validation must only inspect already published memory.
+                validate_registered()
+                with self.coordinator.operator_snapshot_scope() as coordinator:
+                    job = self._jobs.get(request_id)
+                    matched = (job is not None and job.oidc_run_id == run_id
+                               and job.oidc_run_attempt == run_attempt)
+                    return {
+                        "schema_version": 1,
+                        "status": "ok",
+                        "runtime_commit": self.runtime_commit,
+                        "observed_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                        "snapshot_consistent": True,
+                        "controller_busy": (self._active_request_id is not None
+                                            or bool(self._active_deliveries)),
+                        "job_lookup": "matched" if matched else "not_found",
+                        "job": job.public() if matched else None,
+                        "coordinator": coordinator,
+                        "original_job_lease_release": "unknown",
+                    }
 
     def _now(self) -> datetime:
         value = self._clock()

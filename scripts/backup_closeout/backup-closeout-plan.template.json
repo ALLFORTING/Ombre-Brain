@@ -1,0 +1,12 @@
+{
+  "operator_base_url": "https://ombre-brain-forting.zeabur.app",
+  "client_worktree": "D:\\Codex\\projects\\ob-backup-client-offline-20261005",
+  "ob_source_commit": "PENDING_LOCAL_IMPLEMENTATION_COMMIT",
+  "ob_source_worktree": "D:\\Codex\\projects\\Ombre-Brain-backup-closeout-20261007",
+  "session_name": "closeout-0e06509931824c7cb9a1e0ed61c96692",
+  "schema_version": 1,
+  "client_commit": "a78711f63609552fddb18f2d7128194476a9aff8",
+  "independent_bundle_path": "PENDING_INDEPENDENT_BUNDLE_PATH",
+  "final_deployment_sha": "PENDING_FINAL_DEPLOYMENT_SHA",
+  "independent_medium_confirmed": false
+}
