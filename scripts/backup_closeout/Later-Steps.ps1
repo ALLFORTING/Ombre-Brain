@@ -53,30 +53,72 @@ function Assert-IdleSnapshot($Snapshot) {
     }
 }
 
+function Assert-DownloadIdentity($Binding, $Original, [switch]$RequireAttempt) {
+    if ([string]$Binding.run_id -cne $Original.run_id) { throw 'Download run identity mismatch; original identity unknown' }
+    $attempt=[string]$Binding.run_attempt
+    if (($RequireAttempt -or $attempt) -and $attempt -cne $Original.run_attempt) {
+        throw 'Download attempt mismatch; no binding or success'
+    }
+}
+
+function Get-OriginalRunIdentity([string]$Session, $Binding) {
+    # Only saved original evidence establishes an attempt; never the current API value.
+    $evidence=@()
+    $identityPath=Join-Path $Session 'run-identity.json'
+    if (Test-Path -LiteralPath $identityPath) {
+        $saved=Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json
+        $evidence+=@{run_id=[string]$saved.run_id;run_attempt=[string]$saved.run_attempt}
+    }
+    $requestPath=Join-Path $Session 'request.json'
+    if (Test-Path -LiteralPath $requestPath) {
+        $saved=Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+        if ($saved.request_id -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Original request identity unknown' }
+        $evidence+=@{run_id=[string]$saved.oidc_run_id;run_attempt=[string]$saved.oidc_run_attempt}
+    }
+    $originalPath=Join-Path $Session 'download\run-binding.json'
+    if (-not (Test-Path -LiteralPath $originalPath)) { throw 'Original run/attempt evidence unknown; zero download' }
+    $download=Get-Content -LiteralPath $originalPath -Raw | ConvertFrom-Json
+    if ([string]$download.run_id -cnotmatch '^[1-9][0-9]{0,19}$') { throw 'Original run identity unknown; zero download' }
+    if ($download.PSObject.Properties.Name -contains 'run_attempt') {
+        $evidence+=@{run_id=[string]$download.run_id;run_attempt=[string]$download.run_attempt}
+    }
+    if ($evidence.Count -eq 0) { throw 'Original run/attempt evidence unknown; zero download' }
+    $original=$evidence[0]
+    foreach ($item in $evidence) {
+        if ($item.run_id -cnotmatch '^[1-9][0-9]{0,19}$' -or $item.run_attempt -cnotmatch '^[1-9][0-9]{0,19}$' -or
+            $item.run_id -cne $original.run_id -or $item.run_attempt -cne $original.run_attempt) {
+            throw 'Original run/attempt evidence inconsistent; identity unknown'
+        }
+    }
+    Assert-DownloadIdentity $download $original
+    Assert-DownloadIdentity $Binding $original
+    return $original
+}
+
+function Assert-CurrentRunIdentity($Original) {
+    $raw=& gh api ('repos/ALLFORTING/ob-backup/actions/runs/'+$Original.run_id)
+    if ($LASTEXITCODE -ne 0) { throw 'Original run lookup failed; identity unknown, no retry' }
+    $run=($raw -join "`n") | ConvertFrom-Json
+    if ([string]$run.id -cne $Original.run_id -or [string]$run.run_attempt -cne $Original.run_attempt) {
+        throw 'Original run attempt changed; identity unknown, stop'
+    }
+}
+
 function Save-RequestEvidence([string]$Session, [string]$Download) {
     $bindingPath=Join-Path $Download 'run-binding.json'
     if (-not (Test-Path -LiteralPath $bindingPath)) { throw 'No returned run ID; inspect GitHub without dispatching again' }
     $binding=Get-Content -LiteralPath $bindingPath -Raw | ConvertFrom-Json
-    if ([string]$binding.run_id -cnotmatch '^[1-9][0-9]*$') { throw 'Exact run binding missing' }
-    $runRaw=& gh api ('repos/ALLFORTING/ob-backup/actions/runs/'+$binding.run_id)
-    if ($LASTEXITCODE -ne 0) { throw 'Bound run lookup failed; no retry' }
-    $run=($runRaw -join "`n") | ConvertFrom-Json
-    if ([string]$run.id -cne [string]$binding.run_id -or [string]$run.run_attempt -cnotmatch '^[1-9][0-9]*$') { throw 'Run identity rejected' }
-    $identityPath=Join-Path $Session 'run-identity.json'
-    if (-not (Test-Path -LiteralPath $identityPath)) {
-        Write-NewCloseoutJson $identityPath @{run_id=[string]$run.id;run_attempt=[string]$run.run_attempt;original_job_lease_release='unknown'}
-    } else {
-        $old=Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json
-        if ($old.run_id -cne [string]$run.id -or $old.run_attempt -cne [string]$run.run_attempt) { throw 'Run attempt changed; stop' }
-    }
-    $logs=& gh run view ([string]$run.id) --repo ALLFORTING/ob-backup --attempt ([string]$run.run_attempt) --log
+    $original=Get-OriginalRunIdentity $Session $binding
+    Assert-CurrentRunIdentity $original
+    $logs=& gh run view $original.run_id --repo ALLFORTING/ob-backup --attempt $original.run_attempt --log
     if ($LASTEXITCODE -ne 0) { throw 'Original attempt log unavailable; request identity unknown' }
     $candidates=@{}
     foreach ($line in $logs) {
         if ($line -match '(\{"oidc_run_attempt":.*\})\s*$') {
             try { $item=$Matches[1] | ConvertFrom-Json -ErrorAction Stop } catch { continue }
             if ((($item.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'oidc_run_attempt,oidc_run_id,request_id') { continue }
-            if ($item.oidc_run_id -cne [string]$run.id -or $item.oidc_run_attempt -cne [string]$run.run_attempt) { throw 'Request evidence attempt mismatch' }
+            if ($item.oidc_run_id -cne $original.run_id -or $item.oidc_run_attempt -cne $original.run_attempt -or
+                $item.request_id -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Request evidence identity mismatch' }
             $candidates[$item.request_id]=$item
         }
     }
@@ -85,8 +127,16 @@ function Save-RequestEvidence([string]$Session, [string]$Download) {
     $request=@($candidates.Values)[0]
     if (Test-Path -LiteralPath $requestPath) {
         $old=Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
-        if ($old.request_id -cne $request.request_id) { throw 'Request evidence changed' }
-    } else { Write-NewCloseoutJson $requestPath $request }
+        if ($old.request_id -cne $request.request_id -or $old.oidc_run_id -cne $request.oidc_run_id -or
+            $old.oidc_run_attempt -cne $request.oidc_run_attempt) { throw 'Request evidence changed' }
+    }
+    # Validate everything, including a rerun during log retrieval, before first publication.
+    Assert-CurrentRunIdentity $original
+    if (-not (Test-Path -LiteralPath $requestPath)) { Write-NewCloseoutJson $requestPath $request }
+    $identityPath=Join-Path $Session 'run-identity.json'
+    if (-not (Test-Path -LiteralPath $identityPath)) {
+        Write-NewCloseoutJson $identityPath @{run_id=$original.run_id;run_attempt=$original.run_attempt;original_job_lease_release='unknown'}
+    }
 }
 
 function Invoke-BackupTransport($Plan, [string]$Output, [string]$ExistingRun) {
@@ -130,6 +180,7 @@ function Invoke-Closeout([string]$Action) {
         $main=& gh api repos/ALLFORTING/ob-backup/git/ref/heads/main --jq .object.sha
         if ($LASTEXITCODE -ne 0 -or $main -cne $plan.client_commit) { throw 'Client main changed' }
         $runId=$null
+        $original=$null
         if ($Action -eq 'Dispatch') {
             if (Test-Path -LiteralPath $session) { throw 'Session already exists; do not dispatch again' }
             $expected=& gh api repos/ALLFORTING/ob-backup/actions/variables/OMBRE_BACKUP_V2_EXPECTED_COMMIT --jq .value
@@ -147,16 +198,23 @@ function Invoke-Closeout([string]$Action) {
             if (Test-Path -LiteralPath (Join-Path $session 'download-selection.json')) { throw 'A verified download is already selected' }
             $binding=Get-Content -LiteralPath (Join-Path $session 'download\run-binding.json') -Raw | ConvertFrom-Json
             $runId=[string]$binding.run_id
-            if ($runId -cnotmatch '^[1-9][0-9]*$') { throw 'Exact original run ID missing' }
+            $original=Get-OriginalRunIdentity $session $binding
+            Assert-CurrentRunIdentity $original
+            $runId=$original.run_id
             $output=Join-Path $session ('resume-'+[guid]::NewGuid().ToString('N'))
         }
         try { Invoke-BackupTransport $plan $output $runId } catch {
             try { Save-RequestEvidence $session $output } catch { Write-Warning $_.Exception.Message }
             throw
         }
-        Save-RequestEvidence $session $output
         $record=Get-Content -LiteralPath (Join-Path $output 'run-binding.json') -Raw | ConvertFrom-Json
+        $bound=Get-OriginalRunIdentity $session $record
+        if ($null -ne $original) { Assert-DownloadIdentity $bound $original -RequireAttempt }
+        else { $original=$bound }
+        Assert-DownloadIdentity $record $original -RequireAttempt
         if ($record.workflow_commit -cne $plan.client_commit) { throw 'Downloaded workflow revision mismatch' }
+        Save-RequestEvidence $session $output
+        Assert-CurrentRunIdentity $original
         Write-NewCloseoutJson (Join-Path $session 'download-selection.json') @{download_directory=$output}
     } finally { $env:GH_TOKEN=$priorToken; $taskToken=$null }
 }

@@ -131,3 +131,51 @@ OB_BACKUP_V2_REFERENCE_REPO=/mnt/d/Codex/projects/Ombre-Brain-backup-v2-director
 ```
 
 39 tests/0.729s/OK；15 tests/0.538s/OK，退出均 0，无 skip。
+## 2026-10-07：独立审查后原 attempt 最小修复
+
+基线为 250bd914cdef2fcf45ad7a6245806e26dd03e931，新增独立提交，不 amend。
+只修改 Later-Steps.ps1、既有 PowerShell 收尾测试及本文档；服务器、客户端、
+恢复 core 和 local_prepare.py 均保持原提交内容。
+
+ResumeDownload 在调用 helper 前，从本会话原 download/run-binding.json、
+已有 run-identity.json 和 request.json 取得确切原 run/attempt，并交叉核对。
+原下载收据只有 run_id 时，必须另有一致的既存身份或 request 证据；
+没有确切 attempt 就停止并报告 unknown，不默认 1，不用 API 当前 attempt 补建原身份。
+API 只比较当前值是否仍与原证据一致；缺证据或变化时 helper 调用次数为零。
+下载前取得的身份继续用于下载后比较，返回收据必须包含同一 run/attempt。
+
+Save-RequestEvidence 在首次建档前检查原证据、下载收据、原 attempt 日志中的唯一
+request 及既有 request 全部一致；日志读取前后各核对当前 attempt。
+不一致不发布新的身份/request 文件，不覆盖已有记录。只有下载收据、workflow
+commit、request 和最终 attempt 核对全部通过，才建立 download-selection.json。
+失败保留本次材料，零自动重发，不进入恢复或声明成功；历史 lease 仍 unknown。
+初次 Dispatch 失败后若仅有 run_id 而缺原 attempt，取证保持 unknown，不能采用当前
+API 值来恢复下载。另有确切原证据时才允许以后显式 ResumeDownload。
+
+必要验证使用 PowerShell 7.6.5：
+
+```powershell
+& D:\Codex\projects\Ombre-Brain-backup-closeout-20261007\tests\test_backup_closeout.ps1
+& D:\Codex\projects\ob-backup-client-offline-20261005\tests\test_backup_v2_first_backup.ps1
+```
+
+结果：收尾 15 组断言通过，helper 24 offline assertions passed，退出均 0。
+新增回归包括原 run42/attempt1 且无身份文件时 API attempt2 拒绝且零下载、
+缺原 attempt 时 unknown/零下载、收据或 request 不一致、日志读取期间 rerun、
+下载期间 attempt 变化，以及一致时成功且已有身份文件 SHA256 不变。
+所有测试仅使用合成文件与桩，没有实际 GitHub、HTTP、Dispatch 或密钥操作。
+
+尝试受影响 Python 回归：
+
+```powershell
+wsl -d Ubuntu -- /home/ting/.venvs/ombre/bin/python -B -m pytest -q -p no:cacheprovider tests/test_backup_closeout.py tests/test_backup_v2_recovery.py --tb=short --color=no
+```
+
+WSL 启动阶段返回 Wsl/Service/E_ACCESSDENIED，退出 1；pytest 未执行。
+未改用 Windows Python 跑 OB 套件；此前 200/20 passed 仅保留为原提交的历史记录。
+没有新增 Python 生产改动。git diff --check 通过。
+
+准备目录 Later-Steps.ps1 同步仓库字节，local_prepare.py 继续核对一致；
+本地 ob_source_commit 更新为新提交。final_deployment_sha 仍为
+PENDING_FINAL_DEPLOYMENT_SHA，独立介质仍 pending，历史 lease unknown。
+未推送、部署、采集或改云端配置；提交后停止待复审。

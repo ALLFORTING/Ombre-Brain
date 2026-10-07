@@ -6,7 +6,7 @@ $null=New-Item -ItemType Directory -Path $testRoot
 $passes=0
 $priorToken=$env:GH_TOKEN
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message } }
-function MustFail([scriptblock]$Action,[string]$Message) { try { & $Action } catch { return }; throw $Message }
+function MustFail([scriptblock]$Action,[string]$Message,[string]$Pattern) { try { & $Action } catch { if ($Pattern -and $_.Exception.Message -notlike $Pattern) { throw }; return }; throw $Message }
 try {
     . (Join-Path $root 'scripts\backup_closeout\Later-Steps.ps1') -Step Status
     $CloseoutRoot=$testRoot
@@ -91,6 +91,113 @@ try {
     $observation=Get-Content -LiteralPath $statusFile.FullName -Raw | ConvertFrom-Json
     Assert ($observation.request_binding -ceq 'unknown_query_placeholder' -and $observation.original_job_lease_release -ceq 'unknown') 'Placeholder confused with original job evidence'
     $passes++
+    # Exercise the real resume/evidence functions with synthetic original receipts only.
+    . (Join-Path $root 'scripts\backup_closeout\Later-Steps.ps1') -Step Status
+    $CloseoutRoot=$testRoot
+    function Get-CloseoutPlan { return $script:resumePlan }
+    function New-ResumeCase([switch]$MissingAttempt) {
+        $script:resumePlan=[pscustomobject]@{session_name='closeout-'+[guid]::NewGuid().ToString('N');
+            client_commit='a78711f63609552fddb18f2d7128194476a9aff8';final_deployment_sha='1'*40}
+        $script:resumeSession=Join-Path $testRoot $script:resumePlan.session_name
+        $download=Join-Path $script:resumeSession 'download'
+        $null=New-Item -ItemType Directory -Path $download
+        $binding=@{run_id='42';workflow_commit=$script:resumePlan.client_commit}
+        if (-not $MissingAttempt) { $binding.run_attempt=1 }
+        Write-NewCloseoutJson (Join-Path $download 'run-binding.json') $binding
+        $script:transportCalls=0; $script:runQueries=0
+        $script:apiAttempt='1'; $script:logAttempt='1'; $script:transportMode='normal'
+        $script:rerunDuringLogs=$false
+    }
+    function Assert-NoResumeSuccess {
+        Assert (-not (Test-Path (Join-Path $script:resumeSession 'download-selection.json'))) 'Rejected download reported success'
+        Assert (-not (Test-Path (Join-Path $script:resumeSession 'run-identity.json'))) 'Rejected evidence published identity'
+        Assert (-not (Test-Path (Join-Path $script:resumeSession 'request.json'))) 'Rejected evidence published request'
+    }
+    function gh {
+        $global:LASTEXITCODE=0
+        if ($args[0] -eq 'auth') { return 'synthetic-test-credential' }
+        if ($args[0] -eq 'api') {
+            if ($args[1] -eq 'user') { return 'ALLFORTING' }
+            if ($args[1] -like '*git/ref*') { return $script:resumePlan.client_commit }
+            if ($args[1] -eq 'repos/ALLFORTING/ob-backup/actions/runs/42') {
+                $script:runQueries++
+                return (@{id=42;run_attempt=[int]$script:apiAttempt} | ConvertTo-Json -Compress)
+            }
+        }
+        if ($args[0] -eq 'run') {
+            Assert ($args[2] -ceq '42' -and $args[6] -ceq '1') 'Logs queried a substituted attempt'
+            if ($script:rerunDuringLogs) { $script:apiAttempt='2' }
+            return ('Capture step {"oidc_run_attempt":"'+$script:logAttempt+'","oidc_run_id":"42","request_id":"11111111-1111-4111-8111-111111111111"}')
+        }
+        throw 'Unexpected synthetic gh query'
+    }
+    function Invoke-BackupTransport($Plan,[string]$Output,[string]$ExistingRun) {
+        Assert ($ExistingRun -ceq '42') 'Resume dispatched or changed the original run'
+        $script:transportCalls++
+        $null=New-Item -ItemType Directory -Path $Output
+        $attempt=1
+        if ($script:transportMode -eq 'wrong-receipt') { $attempt=2 }
+        Write-NewCloseoutJson (Join-Path $Output 'run-binding.json') @{
+            run_id='42';run_attempt=$attempt;workflow_commit=$Plan.client_commit}
+        if ($script:transportMode -eq 'rerun') { $script:apiAttempt='2' }
+    }
+    New-ResumeCase
+    $script:apiAttempt='2'
+    MustFail { Invoke-Closeout ResumeDownload } 'Original attempt 1 replaced by API attempt 2' '*attempt changed*'
+    Assert ($script:transportCalls -eq 0) 'Changed attempt invoked helper'
+    Assert-NoResumeSuccess
+    $passes++
+
+    New-ResumeCase -MissingAttempt
+    $message=$null
+    try { Invoke-Closeout ResumeDownload } catch { $message=$_.Exception.Message }
+    Assert ($message -like '*unknown*') 'Missing original attempt did not remain unknown'
+    Assert ($script:transportCalls -eq 0 -and $script:runQueries -eq 0) 'Missing attempt downloaded or adopted API identity'
+    Assert-NoResumeSuccess
+    $passes++
+
+    New-ResumeCase
+    $bad=Join-Path $script:resumeSession 'synthetic-receipt'
+    $null=New-Item -ItemType Directory -Path $bad
+    Write-NewCloseoutJson (Join-Path $bad 'run-binding.json') @{run_id='42';run_attempt=2}
+    MustFail { Save-RequestEvidence $script:resumeSession $bad } 'Mismatched receipt created first identity' '*Download attempt mismatch*'
+    Assert-NoResumeSuccess
+    $passes++
+
+    New-ResumeCase
+    $script:logAttempt='2'
+    MustFail { Save-RequestEvidence $script:resumeSession (Join-Path $script:resumeSession 'download') } 'Mismatched request created first identity' '*Request evidence identity mismatch*'
+    Assert-NoResumeSuccess
+    $passes++
+
+    New-ResumeCase
+    $script:rerunDuringLogs=$true
+    MustFail { Save-RequestEvidence $script:resumeSession (Join-Path $script:resumeSession 'download') } 'Rerun during logs created first identity' '*attempt changed*'
+    Assert-NoResumeSuccess
+    $passes++
+
+    foreach ($mode in @('wrong-receipt','rerun')) {
+        New-ResumeCase
+        $script:transportMode=$mode
+        $pattern=if ($mode -eq 'wrong-receipt') { '*Download attempt mismatch*' } else { '*attempt changed*' }
+        MustFail { Invoke-Closeout ResumeDownload } 'Download receipt or current attempt changed but succeeded' $pattern
+        Assert ($script:transportCalls -eq 1) 'Failed download automatically retried'
+        Assert-NoResumeSuccess
+        $passes++
+    }
+
+    New-ResumeCase
+    $identityPath=Join-Path $script:resumeSession 'run-identity.json'
+    Write-NewCloseoutJson $identityPath @{run_id='42';run_attempt='1';original_job_lease_release='unknown';keep='original bytes'}
+    $before=(Get-FileHash -LiteralPath $identityPath).Hash
+    Invoke-Closeout ResumeDownload
+    Assert ($script:transportCalls -eq 1) 'Matching original attempt did not download exactly once'
+    Assert (Test-Path (Join-Path $script:resumeSession 'download-selection.json')) 'Matching download not selected'
+    Assert ((Get-FileHash -LiteralPath $identityPath).Hash -ceq $before) 'Existing identity was overwritten'
+    $request=Get-Content (Join-Path $script:resumeSession 'request.json') -Raw | ConvertFrom-Json
+    Assert ($request.oidc_run_id -ceq '42' -and $request.oidc_run_attempt -ceq '1') 'Successful request binding changed'
+    $passes++
+
     Write-Output "Closeout PowerShell: $passes assertions passed; zero real cloud/dispatch/key operations"
 } finally {
     $env:GH_TOKEN=$priorToken
