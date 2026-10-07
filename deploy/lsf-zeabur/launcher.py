@@ -9,7 +9,7 @@ def build(ob, rows):
     ob.add_http_cors_middleware(app)
     ob.add_mcp_diagnostic_middleware(app)
     ob.install_uvicorn_access_log_redaction()
-    assert ob.mcp.settings.stateless_http is False
+    assert ob.mcp.settings.stateless_http is True
     assert ob.mcp.settings.json_response is False
     assert not ob.OMBRE_HOOK_URL and ob.OMBRE_HOOK_SKIP
     return Observe(app, rows)

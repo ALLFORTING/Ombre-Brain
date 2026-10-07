@@ -26,7 +26,7 @@ def configure(token, root, port):
         "OMBRE_RM_DATA_ROOT": str(root / "remember-me"),
         "OMBRE_RAW_EVIDENCE_ROOT": str(root / "raw-evidence"),
         "OMBRE_RM_RUNTIME_ENABLED": "false", "OMBRE_ASSET_AUTHORITY": "legacy",
-        "OMBRE_MCP_STATELESS_HTTP": "false", "OMBRE_MCP_ALLOW_ANONYMOUS_HTTP": "false",
+        "OMBRE_MCP_ALLOW_ANONYMOUS_HTTP": "false",
         "OMBRE_MCP_ALLOW_QUERY_TOKEN": "true", "OMBRE_MCP_QUERY_TOKEN": token,
         "OMBRE_HOOK_SKIP": "true", "OMBRE_DIAG_TOOLS": "false",
         "OMBRE_API_KEY": "synthetic-no-external-permission",

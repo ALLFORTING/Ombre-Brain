@@ -41,7 +41,7 @@
   },
   {
     "path": "c2-source-hashes.json",
-    "sha256": "511be8ce112cfa9a2315c4477118221027a20e6f4dbecd7134936b43bebd04dd"
+    "sha256": "984651fca1f5b4c75e226ae66c3da9dabe24481b9e1312da66308a0e8e52eafe"
   },
   {
     "path": "c2_audit.py",
@@ -57,7 +57,7 @@
   },
   {
     "path": "environment.py",
-    "sha256": "a381a99a73e043ac64f4670f323963dbffdc51e576617c574ad3c2137c9dab09"
+    "sha256": "5470b25138db15ff39ba97a89919c26974cb195629052b47bec5cd1841b867c1"
   },
   {
     "path": "evidence/audit-1-failure.json",
@@ -97,7 +97,7 @@
   },
   {
     "path": "launcher.py",
-    "sha256": "3db8de9f1233ccc025d667d41a28f4fe69d9da361d71a9585e601b841ecc2b7e"
+    "sha256": "e63b3bfac1f4c3bf99d0b87892ce0f3a06244870a38fbe8ffa4199922670b102"
   },
   {
     "path": "observe.py",
