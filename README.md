@@ -544,9 +544,9 @@ boot、todos 和 feel echo 默认排除完整、精确匹配 `test` 的 tag；�
 
 带 ID 的请求先持久化固定 bucket/name/date/正文 plan，再原子发布最终 archived 文件，依据文件、SQLite receipt、vector digest 和 emotion snapshot 恢复后续阶段。成功重试返回原结果，不刷新时间或重复 letter、emotion、boot event，也不恢复后来合法修改或删除的 bucket。journal 不自动过期；磁盘证据矛盾时拒绝继续，不执行自动 repair。Embedding 保持 best-effort，sealed session 不产生普通 vector；外部 provider 调用不能承诺 exactly-once，并发或中断可能再次调用 provider，但 durable vector 只接受一个结果。
 
-不传 ID 的旧调用保持兼容，使用直接 archived 发布，但 response-loss retry 仍会创建新的 session，无法提供请求去重保证。S-3 的恢复和幂等保证适用于携带稳定 ID 的调用。`OMBRE_MCP_STATELESS_HTTP` 仍默认关闭；S-5 正式上线前还需真实 Claude connector 验证 retry/reconnect 是否稳定复用 `operation_id`。
+不传 ID 的旧调用保持兼容，使用直接 archived 发布，但 response-loss retry 仍会创建新的 session，无法提供请求去重保证。S-3 的恢复和幂等保证适用于携带稳定 ID 的调用。`OMBRE_MCP_STATELESS_HTTP` 现已默认开启（`false` 回退 stateful）；真实 Claude connector 的 retry/reconnect 是否稳定复用 `operation_id` 仍待观察。
 
-The only required argument remains `summary`. Generate the optional case-sensitive `operation_id` before the first call and reuse it on retry/reconnect. The ID accepts 1–128 ASCII characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`, without trimming. The same ID and canonical payload resume/replay the fixed session; changed parameters conflict; different IDs with identical content create independent sessions. Durable evidence supports process restart and response-loss retry without duplicate mailbox letters, emotion snapshots or boot events. Legacy callers without an ID remain compatible and create another session on response-loss retry. Embedding remains best-effort; external provider calls do not have an exactly-once guarantee. Stateless HTTP stays default-off; S-5 still requires a real Claude connector retry/reconnect check.
+The only required argument remains `summary`. Generate the optional case-sensitive `operation_id` before the first call and reuse it on retry/reconnect. The ID accepts 1–128 ASCII characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`, without trimming. The same ID and canonical payload resume/replay the fixed session; changed parameters conflict; different IDs with identical content create independent sessions. Durable evidence supports process restart and response-loss retry without duplicate mailbox letters, emotion snapshots or boot events. Legacy callers without an ID remain compatible and create another session on response-loss retry. Embedding remains best-effort; external provider calls do not have an exactly-once guarantee. Stateless HTTP is now the default (`OMBRE_MCP_STATELESS_HTTP=false` restores stateful sessions); a real Claude connector retry/reconnect check is still pending.
 
 新的 sealed session 归档不写入普通情绪时间线；普通归档的 timeline 记录关联其 bucket ID。ordinary portable export 只导出能验证来源属于非 sealed 桶的 timeline 记录，旧无来源记录仍保留在源文件和私有完整备份中，不导入 ordinary portable export。
 
@@ -1538,7 +1538,8 @@ Conflicting relation edits block recovery instead of overwriting newer state.
 Internal reverse/backfill/delete/merge/repair/recovery writes preserve activity
 and `updated_at`; the explicit source can refresh them on an actual edge change.
 This addresses S-4 relation consistency only; append retry and other writers
-remain outside W-8. Keep `OMBRE_MCP_STATELESS_HTTP=false` or unset.
+remain outside W-8. Stateless HTTP now finishes each started tool call even if
+the client disconnects.
 
 Historical repair is a separate operator action, never startup graph repair:
 

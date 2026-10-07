@@ -36,11 +36,37 @@ def ob(tmp_path, monkeypatch):
     module.decay_engine.ensure_started = AsyncMock(return_value=None)
     # All persistent business writes stay in tmp_path; no provider/network calls.
     module.bucket_mgr.embedding_engine = None
+    # These tests drive real disconnect cancellation into the durable write
+    # paths; the production shield is covered by the tests that re-enable it.
+    module._SHIELD_STATELESS_TOOL_CALLS = False
     names = ("mcp.server.streamable_http_manager", "mcp.server.streamable_http", "mcp.server.sse")
     filters = {name: list(logging.getLogger(name).filters) for name in names}
     yield module
     for name, original in filters.items():
         logging.getLogger(name).filters[:] = original
+
+
+def reload_server(monkeypatch):
+    """A fresh server module stands in for a restarted process: no SDK session survives."""
+    sys.modules.pop("server", None)
+    module = importlib.import_module("server")
+    module.decay_engine.ensure_started = AsyncMock(return_value=None)
+    module.bucket_mgr.embedding_engine = None
+    return module
+
+
+async def settle_sse_shutdown_watcher():
+    """Let the previous server's sse-starlette shutdown watcher finish.
+
+    The watcher is per thread and polls every 0.5 s. A second in-process server
+    started before it notices the first shutdown would have its streams drained.
+    """
+    from sse_starlette import sse
+    state = sse._get_shutdown_state()
+    async with asyncio.timeout(5):
+        while state.watcher_started:
+            await asyncio.sleep(0.05)
+    AppStatus.should_exit = False
 
 
 def build(ob):
@@ -146,8 +172,9 @@ async def initialize(client):
 
 
 @pytest.mark.parametrize("value,enabled", [
-    (None, False), ("", False), ("false", False), ("0", False), ("junk", False),
-    ("true", True), ("  TRUE ", True), ("1", True), ("yes", True), ("on", True),
+    (None, True), ("", True), ("junk", True), ("true", True), ("  TRUE ", True),
+    ("1", True), ("yes", True), ("on", True),
+    ("false", False), (" FALSE ", False), ("0", False), ("no", False), ("off", False),
 ])
 def test_flag_and_shared_entrypoints(ob, monkeypatch, value, enabled):
     if value is not None:
@@ -875,9 +902,14 @@ async def test_s4e_confirmed_delete_tcp_disconnect_and_stable_replay(ob,monkeypa
 
 
 @pytest.mark.asyncio
-async def test_s4e_stateless_stays_default_off(ob,monkeypatch):
-    monkeypatch.delenv('OMBRE_MCP_STATELESS_HTTP',raising=False)
+async def test_stateless_is_default_and_false_restores_sessions(ob, monkeypatch):
+    monkeypatch.delenv('OMBRE_MCP_STATELESS_HTTP', raising=False)
     async with live(ob) as client:
+        assert await initialize(client) is None
+    await settle_sse_shutdown_watcher()
+    monkeypatch.setenv('OMBRE_MCP_STATELESS_HTTP', 'false')
+    restarted = reload_server(monkeypatch)
+    async with live(restarted) as client:
         assert await initialize(client)
 
 
@@ -1177,3 +1209,81 @@ async def test_encoded_query_access_log_real_http(ob, monkeypatch, caplog, state
                             root=ob.config["buckets_dir"], port=port,
                             server_task_stopped=True, port_closed=True, scope_unchanged=True,
                             requests=evidence), indent=2), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before", ["false", "true"])
+async def test_old_session_id_after_restart_keeps_working(ob, monkeypatch, before):
+    # A client keeps the Mcp-Session-Id it was handed before a redeploy (by a
+    # stateful build) or one it still carries from an even earlier deploy.
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", before)
+    async with live(ob) as client:
+        old = await initialize(client) or "id-from-an-earlier-deploy"
+        assert "未找到记忆桶" in text(await call(client, "trace", {"bucket_id": "restart-missing"}))
+    await settle_sse_shutdown_watcher()
+    monkeypatch.delenv("OMBRE_MCP_STATELESS_HTTP")
+    restarted = reload_server(monkeypatch)
+    bucket = await restarted.bucket_mgr.create("survives the restart")
+    async with live(restarted) as client:
+        headers = {"Mcp-Session-Id": old}
+        tools = result(await rpc(client, "tools/list", headers=headers))
+        assert "breath" in {tool["name"] for tool in tools["tools"]}
+        response = await call(client, "trace", {"bucket_id": bucket, "importance": 7}, headers=headers)
+        assert "mcp-session-id" not in response.headers
+        text(response)
+    assert (await restarted.bucket_mgr.get(bucket))["metadata"]["importance"] == 7
+
+
+@pytest.mark.asyncio
+async def test_stateless_disconnect_finishes_tool_and_shutdown_waits(ob, monkeypatch):
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
+    ob._SHIELD_STATELESS_TOOL_CALLS = True
+    started, release, cancelled, continued = [asyncio.Event() for _ in range(4)]
+    @ob.mcp.tool()
+    async def s5_slow() -> str:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        continued.set()
+        return "completed"
+    async with live(ob) as client:
+        await initialize(client)
+        assert await disconnect_call(client, "s5_slow", {}, started)
+        result(await rpc(client, "tools/list"))
+        assert not cancelled.is_set() and not continued.is_set()
+        assert len(ob._STATELESS_TOOL_CALL_TASKS) == 1
+        # Shutdown starts while the call still waits; the drain lets it finish.
+        asyncio.get_running_loop().call_later(0.2, release.set)
+    assert continued.is_set() and not cancelled.is_set()
+    assert not ob._STATELESS_TOOL_CALL_TASKS
+
+
+@pytest.mark.asyncio
+async def test_stateless_unkeyed_trace_disconnect_still_links_both_ways(ob, monkeypatch):
+    monkeypatch.setenv("OMBRE_MCP_STATELESS_HTTP", "true")
+    ob._SHIELD_STATELESS_TOOL_CALLS = True
+    left = await ob.bucket_mgr.create("original left")
+    right = await ob.bucket_mgr.create("original right")
+    started, release = asyncio.Event(), asyncio.Event()
+    async def pause_refresh(bucket_id, content):
+        if bucket_id == left:
+            started.set()
+            await release.wait()
+    monkeypatch.setattr(ob.bucket_mgr, "embedding_engine", SimpleNamespace(
+        enabled=True, generate_and_store=pause_refresh,
+    ))
+    async with live(ob) as client:
+        await initialize(client)
+        await disconnect_call(client, "trace", {
+            "bucket_id": left, "content": "appended fragment", "append": True, "related": right,
+        }, started)
+        result(await rpc(client, "tools/list"))
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*ob._STATELESS_TOOL_CALL_TASKS), 5)
+    left_bucket, right_bucket = await ob.bucket_mgr.get(left), await ob.bucket_mgr.get(right)
+    assert right in left_bucket["metadata"].get("related_buckets", "")
+    assert left in right_bucket["metadata"].get("related_buckets", "")
+    assert left_bucket["content"].count("appended fragment") == 1

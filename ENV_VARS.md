@@ -5,7 +5,7 @@
 | `OMBRE_API_KEY` | 是 | — | Gemini / OpenAI-compatible API Key，用于脱水(dehydration)和向量嵌入 |
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
-| `OMBRE_MCP_STATELESS_HTTP` | 否 | `false` | 仅影响 `streamable-http`；`true` 会禁用 transport session tracking。候选开关，断连会取消当前工具；不提供 exactly-once 或幂等保障。SSE / stdio 不受影响。 |
+| `OMBRE_MCP_STATELESS_HTTP` | 否 | `true` | 仅影响 `streamable-http`；默认禁用 transport session tracking，重启后旧 `Mcp-Session-Id` 不再 404。`false` 恢复 stateful session。客户端断连不取消已开始的工具调用；不提供 exactly-once 或幂等保障。SSE / stdio 不受影响。 |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
 | `OMBRE_AUTH_TOKEN` | 否 | 无 | HTTP MCP（`/mcp`、`/mcp/*`、SSE 的 `/sse` 与 `/messages`）的首选认证；只接受 `Authorization: Bearer <token>`，Bearer 未设置或不匹配时拒绝访问 |
 | `OMBRE_MCP_ALLOW_QUERY_TOKEN` | 否 | 关闭 | URL-only MCP 客户端的显式 query-token 兼容开关；默认关闭。启用后 URL 凭据可能被客户端、代理、历史记录或访问日志保留 |
@@ -36,15 +36,17 @@
 | `OMBRE_EMBEDDING_API_KEY` | 否 | — | 独立的向量 API key；设置后不会复用主 LLM key |
 | `OMBRE_CONFLICT_DETECTION_ENABLED` | 否 | `true` | 独立控制 `hold`/`grow` 矛盾检测；关闭时跳过候选选择和模型调用。开启时仍需可用的 digest API 配置才能实际调用模型 |
 
-## Stateless HTTP candidate (S-2)
+## Stateless HTTP（默认开启）
 
-`OMBRE_MCP_STATELESS_HTTP` 默认 `false`；未设置、空值、无效值和 false-like 值保持现有 stateful 行为。与其他 OB 开关一致，仅 `1`、`true`、`yes`、`on`（忽略大小写和首尾空白）开启。
+`OMBRE_MCP_STATELESS_HTTP` 默认开启：未设置、空值和无法识别的值都按 stateless 处理；只有 `0`、`false`、`no`、`off`（忽略大小写和首尾空白）恢复 stateful session，作为回退开关。
 
-示例：`OMBRE_TRANSPORT=streamable-http`、`OMBRE_MCP_STATELESS_HTTP=false`。设为 `true` 会禁用 transport session tracking，不返回 `Mcp-Session-Id`，但不会把 confirmation、cursor 或磁盘 operation state 移入 transport。进程内 token/cursor 仍不能跨进程、重启或任意多副本共享。
+原因：stateful session 只存在进程内存，Zeabur 重新部署或重启后全部失效，客户端/代理继续携带旧 `Mcp-Session-Id` 会得到 404 且不会自动重新 initialize。stateless 下服务器忽略该请求头，旧 ID 请求正常返回 200。
+
+示例：`OMBRE_TRANSPORT=streamable-http`（stateless）；回退时加 `OMBRE_MCP_STATELESS_HTTP=false`。stateless 会禁用 transport session tracking，不返回 `Mcp-Session-Id`，但不会把 confirmation、cursor 或磁盘 operation state 移入 transport。进程内 token/cursor 仍不能跨进程、重启或任意多副本共享。
 
 MCP 1.29.1 的 `streamable_http_app()` 无此关键字参数；共享 builder 在首次构造前设置 `mcp.settings.stateless_http`。开关仅在启动构造时生效，修改后需重启。`json_response` 继续 false，认证、CORS 和 session diagnostics 保持原样。
 
-这是默认关闭的候选实现，尚不建议线上启用。stateless 客户端断连会取消工具任务；开关本身不提供 exactly-once、请求幂等或重试去重保障。[S-2 验证报告](docs/S2_STATELESS_HTTP_VALIDATION.md) 保留 2026-09-26 当时的 partial-write 风险与 FAIL 判定，后续限定修复见下节，不能把旧风险概括为当前所有写路径的状态。
+S-2 当时阻断上线的原因是 stateless 客户端断连会取消正在执行的工具任务。现在 stateless 下每个工具调用在独立 task 中跑完，断连只取消等待方（与 stateful 一致，结果无法送达），HTTP 关闭时 lifespan 会等这些调用结束。开关本身仍不提供 exactly-once、请求幂等或重试去重保障。[S-2 验证报告](docs/S2_STATELESS_HTTP_VALIDATION.md) 保留 2026-09-26 当时的 partial-write 风险与 FAIL 判定，后续限定修复见下节，不能把旧风险概括为当前所有写路径的状态。
 
 ## 当前限定可靠性与日志边界
 
@@ -54,7 +56,7 @@ MCP 1.29.1 的 `streamable_http_app()` 无此关键字参数；共享 builder �
 - 后续 legacy asset metadata/reindex 修复保留旧向量并标为 stale；无 key archive 与 pinned hold 的取消后续步骤已补修；Raw Evidence 取消后释放 runner 并允许已有入口重新接手。进度提交依次为 [dd07983](https://github.com/ALLFORTING/Ombre-Brain/commit/dd07983)、[dc7327e](https://github.com/ALLFORTING/Ombre-Brain/commit/dc7327e)、[8b83608](https://github.com/ALLFORTING/Ombre-Brain/commit/8b83608)。这些限定修复不新增进程退出后的自动恢复；无 key 响应丢失后重试仍可重复。旧 FAIL 和历史测试数字保持原样，不代表最终 HEAD 一次 full suite 全绿。
 - 日志：[cc1ed93](https://github.com/ALLFORTING/Ombre-Brain/commit/cc1ed93) 遮蔽已验证的 L/R upload/download 四类票据路径；[654577e](https://github.com/ALLFORTING/Ombre-Brain/commit/654577e) 补齐 query 名称单次 unquote_plus 解码后匹配 token 的值遮蔽（含 to%6ben、%74oken、重复项、空值和值内等号），并保留既有大小写兼容。只修改 Uvicorn access LogRecord.args 路径参数副本，不改变 ASGI scope、认证或请求 query；原始名称、顺序、非目标参数和编码保留。双重编码名称单次解码后不是 token，保持原样且不能作为 token 认证；裸名称无值可遮蔽。非目标参数无任意凭据脱敏保证。
 - 以上日志保证仅限已验证的 Uvicorn 根路由/formatter 调用链及现有 MCP diagnostics，不覆盖所有代理、root_path 挂载、其他 formatter、异常或 provider 错误日志。Query token 仍可能被客户端、代理或浏览器历史保留，首选 Bearer。
-- S-5 整体未通过，真实 Claude connector 尚未验收；stateless 默认关闭。dream.touch / boot.preview 仍延后，原 P/D 建议不自动采纳；旧日雪同步已取消。
+- S-5：stateless 已改为默认开启，真实 Claude connector 的重连/重试仍待线上观察。dream.touch / boot.preview 仍延后，原 P/D 建议不自动采纳；旧日雪同步已取消。
 
 源码及测试节点是实现定位，历史动态证据仍以各阶段原报告为准；不得用文档修订替代真实 connector 或后续独立验收。
 
