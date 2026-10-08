@@ -1712,6 +1712,74 @@
           "bucket_id"
         ]
       }
+    },
+    {
+      "name": "list_revisions",
+      "primitive": "tool",
+      "category": "memory_revisions",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "read_only",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "properties": {
+          "bucket_id": {
+            "type": "string"
+          },
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bucket_id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "restore_revision",
+      "primitive": "tool",
+      "category": "memory_revisions",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "destructive",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "properties": {
+          "bucket_id": {
+            "type": "string"
+          },
+          "confirm_token": {
+            "default": "",
+            "type": "string"
+          },
+          "include_sealed": {
+            "default": false,
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_id",
+          "revision"
+        ],
+        "type": "object"
+      }
     }
   ],
   "resources": [

@@ -35,10 +35,32 @@ class DurableDeleteAdmission:
                 sql += ' AND bucket_id=?'; args.append(bucket_id)
             return [dict(row) for row in conn.execute(sql,args)]
 
+    def restorations(self, bucket_id=None):
+        path = self.root / 'bucket_history.sqlite3'
+        if not path.exists():
+            return []
+        with closing(sqlite3.connect(path.as_uri()+'?mode=ro', uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='ob_bucket_restorations'").fetchone():
+                return []
+            sql = 'SELECT restore_id,bucket_id,status,covered_delete_ids_json FROM ob_bucket_restorations'
+            args = []
+            if bucket_id is not None:
+                sql += ' WHERE bucket_id=?'; args.append(bucket_id)
+            return [dict(row) for row in conn.execute(sql,args)]
+
+    def covered_delete_ids(self, bucket_id):
+        """Completed deletes superseded by a published restore of the same identity."""
+        return {delete_id for row in self.restorations(bucket_id) if row['status'] in ('published','completed')
+                for delete_id in json.loads(row['covered_delete_ids_json'] or '[]')}
+
     def active(self, bucket_id, references=()):
         protected = {row['bucket_id'] for row in self.rows() if row['status'] != 'completed'}
         if bucket_id in protected or protected.intersection(references):
             raise DeleteAdmissionError('confirmed_delete_source_pending')
+        restoring = {row['bucket_id'] for row in self.restorations() if row['status'] == 'pending'}
+        if bucket_id in restoring or restoring.intersection(references):
+            raise DeleteAdmissionError('bucket_restore_pending')
 
     def capture(self, bucket_id):
         inventory = scan_relation_store(self.root); inventory.require_complete()
@@ -70,13 +92,15 @@ class DurableDeleteAdmission:
             raise DeleteAdmissionError('confirmed_delete_root_conflict')
         self.active(bucket_id,references)
         completed_rows = [r for r in self.rows(bucket_id) if r['status']=='completed']
-        self._check_deleted_incarnation(expected_source, completed_rows)
-        if allow_missing and expected_source is None and not completed_rows:
+        covered = self.covered_delete_ids(bucket_id) if completed_rows else set()
+        uncovered = [r for r in completed_rows if r['delete_id'] not in covered]
+        self._check_deleted_incarnation(expected_source, completed_rows, uncovered)
+        if allow_missing and expected_source is None and not uncovered:
             return None  # Legacy non-bucket session IDs, after durable active admission.
         try:
             current = self.capture(bucket_id)
         except DeleteAdmissionError:
-            if allow_missing and not completed_rows and not (expected_source or {}).get('incarnation'):
+            if allow_missing and not uncovered and not (expected_source or {}).get('incarnation'):
                 return None
             raise
         # The API classifier rereads current metadata after its provider await.
@@ -95,12 +119,16 @@ class DurableDeleteAdmission:
         return current
 
     @staticmethod
-    def _check_deleted_incarnation(expected_source, completed_rows):
+    def _check_deleted_incarnation(expected_source, completed_rows, uncovered=None):
         completed = [json.loads(row['plan_json'])['source_guard'] for row in completed_rows]
         # A delayed caller without an incarnation cannot distinguish old work
         # from work for a replacement. In particular, an old archive publish
         # must not resurrect its file after its publication receipt was lost.
-        if completed and (not expected_source or 'incarnation' not in expected_source):
+        # Only an explicit restore covers a delete; deleted incarnations and
+        # captures taken before any delete stay refused below either way.
+        if uncovered is None:
+            uncovered = completed_rows
+        if uncovered and (not expected_source or 'incarnation' not in expected_source):
             raise DeleteAdmissionError('confirmed_delete_source_identity_required')
         if expected_source and any(g['incarnation'] == expected_source.get('incarnation') for g in completed):
             raise DeleteAdmissionError('confirmed_delete_incarnation_deleted')
@@ -116,8 +144,10 @@ class DurableDeleteAdmission:
         the same root mutex before any new effect or checkpoint.
         """
         self.active(bucket_id)
-        self._check_deleted_incarnation(expected_source,
-            [r for r in self.rows(bucket_id) if r['status']=='completed'])
+        completed_rows = [r for r in self.rows(bucket_id) if r['status']=='completed']
+        covered = self.covered_delete_ids(bucket_id) if completed_rows else set()
+        self._check_deleted_incarnation(expected_source, completed_rows,
+            [r for r in completed_rows if r['delete_id'] not in covered])
         current = self.capture(bucket_id)
         if expected_source and (
                 not expected_source.get('incarnation')

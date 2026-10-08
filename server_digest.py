@@ -108,7 +108,15 @@ def _digest_bucket_state(bucket: dict) -> dict:
         "last_active": str(metadata.get("last_active", "")),
         "updated_at": str(metadata.get("updated_at", "")),
         "content_sha256": hashlib.sha256(str(bucket.get("content", "")).encode("utf-8")).hexdigest(),
+        # Recorded so a digest can be undone; consolidation overwrites it.
+        "source_bucket": metadata.get("source_bucket"),
     }
+
+
+def _digest_state_matches(bucket: dict, state: dict) -> bool:
+    # Plans persisted before a field joined the state still compare on theirs.
+    current = _digest_bucket_state(bucket)
+    return all(current.get(key) == value for key, value in state.items())
 
 
 def _digest_timestamp_sort_key(bucket: dict) -> tuple[int, tuple[int, ...]]:
@@ -318,7 +326,7 @@ async def _digest_require_source(state: dict, step: str, operation: dict) -> dic
     bucket = await bucket_mgr.get(state["bucket_id"])
     if not bucket:
         raise RuntimeError(f"digest source missing: {state['bucket_id']}")
-    if step not in operation["completed"] and _digest_bucket_state(bucket) != state:
+    if step not in operation["completed"] and not _digest_state_matches(bucket, state):
         marker = bucket_mgr.inspect_import_operation(_digest_step_key(operation["operation_id"], step))
         if not marker or not marker["marker"]:
             raise RuntimeError(f"digest source changed: {state['bucket_id']}")

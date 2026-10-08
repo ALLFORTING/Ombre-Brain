@@ -43,6 +43,7 @@ from related_integrity import (RelationStore, RelatedError, RelatedAdmissionDefe
                                plan_delete, parse_related, digest as related_digest)
 from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from confirmed_delete_admission import DeleteAdmissionError
+from bucket_revisions import BucketRevisionMixin, RevisionCaptureError, revision_snapshot
 from uuid import UUID, uuid4
 from datetime import datetime
 from pathlib import Path
@@ -543,7 +544,7 @@ def _tg_summary_metadata(post) -> tuple[str, str, str]:
     return state, source_hash, summary.strip()
 
 
-class BucketManager:
+class BucketManager(BucketRevisionMixin):
     """
     Memory bucket manager — entry point for all bucket CRUD operations.
     Buckets are stored as Markdown files with YAML frontmatter for metadata
@@ -611,6 +612,7 @@ class BucketManager:
                                             admission_resolver=self._confirmed_relation_admission)
         self.recover_related_operations()
         self.recover_confirmed_deletes()
+        self.recover_restorations()
 
     def confirmed_delete_rows(self, *, token_hash=None, delete_id=None, active=False):
         """Receipt lookup never creates a table or initializes another subsystem."""
@@ -1023,8 +1025,12 @@ class BucketManager:
             receipts = row['receipts']
             history_id = conn.execute('INSERT INTO bucket_history(bucket_id,old_content,changed_at,change_type) VALUES(?,?,?,?)',
                 (row['bucket_id'],frontmatter.load(Path(self.base_dir)/source.path).content,row['accepted_at'],'delete')).lastrowid
+            revision_id = self._insert_revision(conn, row['bucket_id'],
+                revision_snapshot(frontmatter.load(Path(self.base_dir)/source.path), source.path),
+                'delete', row['delete_id'], captured_at=row['accepted_at'])
             receipts['history'] = {'history_id':history_id,'effect_key':self.confirmed_delete_key(row['delete_id'],'history'),
-                'snapshot_digest':hashlib.sha256(frontmatter.load(Path(self.base_dir)/source.path).content.encode()).hexdigest()}
+                'snapshot_digest':hashlib.sha256(frontmatter.load(Path(self.base_dir)/source.path).content.encode()).hexdigest(),
+                'revision_id':revision_id}
             self._confirmed_fence(context); self._confirmed_validate(row)
             conn.execute('UPDATE ob_confirmed_delete_operations SET receipts_json=? WHERE delete_id=?',(json.dumps(receipts),row['delete_id']))
             self.confirmed_delete_checkpoint('before_history_commit',context)
@@ -1183,6 +1189,11 @@ class BucketManager:
         return self.relation_store.preview(source_id, **kwargs)
 
     def mutate_related(self, source_id, **kwargs):
+        # Validate first so rejected and no-op requests leave history untouched.
+        # Neighbor edges are derived from the source; only its pre-image is kept.
+        if (self.relation_store.preview(source_id, **kwargs)['steps']
+                and not self._capture_current_revision(source_id, "related")):
+            raise RelatedError("related_revision_capture_failed")
         return self.relation_store.mutate(source_id, **kwargs)
 
     def apply_related_plan(self, plan, *, operation_key=None):
@@ -1353,6 +1364,7 @@ class BucketManager:
                         for profile in _BOOT_DELTA_PROFILES
                     ],
                 )
+            self._init_revision_schema(conn)
 
     def _ensure_import_operation_table(self) -> None:
         """Lazily ensure the shared journal and nullable receipt capability."""
@@ -2167,6 +2179,11 @@ class BucketManager:
             request = plan['relation']
             if not request['add'] and not request['remove']:
                 return {'status': 'not_requested'}
+            if (self.relation_store.lookup(plan['keys']['relation']) is None
+                    and self.relation_store.preview(request['source'], add=request['add'], remove=request['remove'],
+                                                    origin=request['origin'])['steps']
+                    and not self._capture_current_revision(request['source'], 'related', plan['keys']['relation'])):
+                raise RelatedError('related_revision_capture_failed')
             return self.relation_store.commit(lambda inv: plan_mutation(inv, request['source'],
                 add=request['add'], remove=request['remove'], origin=request['origin']),
                 operation_key=plan['keys']['relation'], request_digest=related_digest(mutation_request(
@@ -3497,14 +3514,16 @@ class BucketManager:
             if not authorize(plan):
                 return {"status": "confirmation_invalid"}
             records = reconcile_todo_provenance(post.get("todos"), post.get("todo_provenance"), strict=True)
+            pre_image = revision_snapshot(post, self._relative_bucket_path(path))
             done_at = now_iso()
             for record in records:
                 if record.get("id") == todo_id:
                     record.update(_merge_todo_terminal_state(record, {"done_at": done_at}))
             post["todo_provenance"] = records
             try:
-                self._write_post_atomic(path, post)
-            except OSError:
+                self.write_with_revision(bucket_id, pre_image, "todo_done", todo_id,
+                                         lambda: self._write_post_atomic(path, post))
+            except (OSError, RevisionCaptureError):
                 return {"status": "write_failed"}
             return {"status": "completed", "done_at": done_at}
 
@@ -3533,14 +3552,16 @@ class BucketManager:
             if not authorize(plan):
                 return {"status": "confirmation_invalid"}
             records = reconcile_todo_provenance(post.get("todos"), post.get("todo_provenance"), strict=True)
+            pre_image = revision_snapshot(post, self._relative_bucket_path(path))
             dropped_at = now_iso()
             for record in records:
                 if record.get("id") == todo_id:
                     record.update(_merge_todo_terminal_state(record, {"dropped_at": dropped_at}))
             post["todo_provenance"] = records
             try:
-                self._write_post_atomic(path, post)
-            except OSError:
+                self.write_with_revision(bucket_id, pre_image, "todo_drop", todo_id,
+                                         lambda: self._write_post_atomic(path, post))
+            except (OSError, RevisionCaptureError):
                 return {"status": "write_failed"}
             return {"status": "dropped", "dropped_at": dropped_at}
 
@@ -3717,6 +3738,14 @@ class BucketManager:
                 already_satisfied = current.get("digested") is True and (
                     model_valence is None or current.get("model_valence") == model_valence
                 )
+                try:
+                    self.record_revision(source_id, current, "feel_source",
+                                         _s4_effect['key'] if _s4_effect is not None else None,
+                                         file_path=path)
+                except Exception as exc:
+                    logger.error("Refusing feel source mark because revision capture failed for %s: %s",
+                                 source_id, exc)
+                    return {"status": "write_failed"}
                 draft = copy.deepcopy(current)
                 draft["digested"] = True
                 if model_valence is not None:
@@ -3880,6 +3909,9 @@ class BucketManager:
         更新桶的内容或元数据字段。
         """
         expected_source = kwargs.pop('_expected_source', None)
+        revision_op = kwargs.pop('_revision_op', None)
+        # Background runtime writers (decay, delivery bookkeeping) opt out.
+        skip_revision = kwargs.pop('_skip_revision', False)
         s4_context = kwargs.pop('_s4_context', None)
         legacy_context = kwargs.pop('_legacy_import_context', None)
         if legacy_context is not None and set(kwargs) - {
@@ -4020,6 +4052,8 @@ class BucketManager:
                         catalog, bucket_id, post, kwargs["superseded_by"])
                     for neighbor_path, _, original in reverse_updates:
                         self.assert_confirmed_delete_writable(original.get('id',Path(neighbor_path).stem))
+            revision_pre = (None if skip_revision else
+                            revision_snapshot(post, self._relative_bucket_path(file_path)))
 
             requested_permanent = kwargs.pop("permanent", None)
             if requested_permanent is not None:
@@ -4216,6 +4250,20 @@ class BucketManager:
                 post['last_active'] = legacy_plan['logical_time']
                 post['updated_at'] = _date_only(legacy_plan['logical_time'])
 
+            if revision_pre is not None:
+                op_kind, op_id = self._derive_revision_op(
+                    revision_op, o5b_operation_key, history_change_type if content_changed else None)
+                items = [(bucket_id, revision_pre, op_kind, op_id)]
+                items += [(original.get("id", Path(neighbor_path).stem),
+                           revision_snapshot(original, self._relative_bucket_path(neighbor_path)),
+                           "supersession_reverse", op_id)
+                          for neighbor_path, _, original in reverse_updates]
+                try:
+                    self.record_revision_snapshots(items)
+                except Exception as exc:
+                    logger.error("Refusing update because revision capture failed for %s: %s", bucket_id, exc)
+                    return False
+
             applied_supersession = []
             try:
                 if paired_supersession or operation is not None or content_changed or prepared_todos is not None or requested_permanent is not None or kwargs.get("pinned"):
@@ -4363,14 +4411,16 @@ class BucketManager:
             if current_source_sha256 != source_sha256:
                 return "source_hash_mismatch", current_source_sha256
 
+            pre_image = revision_snapshot(post, self._relative_bucket_path(file_path))
             post["tg_summary"] = summary
             post["tg_summary_source_hash"] = current_source_sha256
             post["tg_summary_updated_at"] = now_iso()
             post["last_active"] = now_iso()
             post["updated_at"] = _date_only()
             try:
-                self._write_post_atomic(file_path, post)
-            except OSError as exc:
+                self.write_with_revision(bucket_id, pre_image, "tg_summary", None,
+                                         lambda: self._write_post_atomic(file_path, post))
+            except (OSError, RevisionCaptureError) as exc:
                 logger.error(
                     "Failed to write TG summary refresh for %s: %s", bucket_id, exc
                 )
@@ -4457,6 +4507,8 @@ class BucketManager:
                     return False
                 self.record_history(bucket_id, post.content, "delete",
                                     _expected_source=self.delete_admission.capture(bucket_id))
+                self.record_revision(bucket_id, post, "delete", _relation_operation_key,
+                                     file_path=file_path)
             except Exception as exc:
                 logger.error(f"Failed to snapshot bucket {bucket_id}: {exc}")
                 return False
