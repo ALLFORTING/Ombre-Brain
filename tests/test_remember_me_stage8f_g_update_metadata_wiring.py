@@ -588,13 +588,13 @@ asyncio.run(main())
     env.pop("OMBRE_RM_DATA_ROOT", None)
     output = subprocess.check_output([sys.executable, "-c", script], cwd=ROOT, env=env, text=True)
     names = json.loads(output.strip().splitlines()[-1])
-    assert len(names) == 27
+    assert len(names) == 29
 
     diag_env = dict(env)
     diag_env["OMBRE_DIAG_TOOLS"] = "true"
     output = subprocess.check_output([sys.executable, "-c", script], cwd=ROOT, env=diag_env, text=True)
     diag_names = json.loads(output.strip().splitlines()[-1])
-    assert len(diag_names) == 42
+    assert len(diag_names) == 44
 
 
 @pytest.mark.asyncio

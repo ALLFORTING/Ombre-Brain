@@ -16,7 +16,22 @@ COVERAGE_SCHEMA_VERSION = 3
 # unregistered capture controller can exist; transient entries are excluded
 # capture staging/upload files and never formal bucket state.
 REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
-    "confirmed_delete_admission.py": {"rows": "dynamic_sql_read_only"},
+    "confirmed_delete_admission.py": {
+        "rows": "dynamic_sql_read_only",
+        "restorations": "dynamic_sql_read_only",
+    },
+    "bucket_revisions.py": {
+        "_init_revision_schema": "startup_initialization",
+        "_insert_revision": "guarded_caller_only",
+        "record_revision_snapshots": "guarded_mutation",
+        "write_with_revision": "guarded_mutation",
+        "restoration_rows": "dynamic_sql_read_only",
+        "pending_effects": "dynamic_sql_read_only",
+        "_restoration_update": "guarded_caller_only",
+        "_publish_restore": "guarded_mutation",
+        "_restore_step": "guarded_mutation",
+        "recover_restorations": "guarded_mutation",
+    },
     "archive_session_operations.py": {
         "lookup_or_plan": "guarded_mutation",
         "_sealed_cleanup": "guarded_caller_only",
@@ -38,6 +53,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "apply_repair": "guarded_mutation",
     },
     "scripts/related_integrity.py": {"main": "standalone_maintenance_script"},
+    "scripts/backfill_revision_baseline.py": {"migrate": "standalone_maintenance_script"},
     "bucket_write_lock.py": {"initialize_bucket_write_lock": "guarded_mutation"},
     "add_timestamps.py": {"main": "standalone_maintenance_script"},
     "migrate_to_domains.py": {"migrate": "standalone_maintenance_script"},
@@ -434,6 +450,18 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
 }
 
 GUARDED_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
+    ("bucket_revisions.py", "_insert_revision"): {
+        ("bucket_revisions.py", "record_revision_snapshots"),
+        ("bucket_revisions.py", "write_with_revision"),
+        ("bucket_revisions.py", "_publish_restore"),
+        ("bucket_manager.py", "_confirmed_history"),
+        ("scripts/backfill_revision_baseline.py", "migrate"),
+    },
+    ("bucket_revisions.py", "_restoration_update"): {
+        ("bucket_revisions.py", "_publish_restore"),
+        ("bucket_revisions.py", "_restore_step"),
+        ("bucket_revisions.py", "recover_restorations"),
+    },
     ("asset_dashboard.py", "on_part_data"): {("asset_dashboard.py", "parse_upload")},
     ("asset_dashboard.py", "parse_upload"): {("server_dashboard_api.py", "api_assets")},
     ("asset_dashboard.py", "create_asset"): {("server_dashboard_api.py", "api_assets")},

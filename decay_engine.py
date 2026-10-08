@@ -345,6 +345,7 @@ class DecayEngine:
                         success = await self.bucket_mgr.update(
                             bucket["id"],
                             tags=list(dict.fromkeys(tags + ["compressed"])),
+                            _skip_revision=True,
                         )
                         if success:
                             compressed += 1
@@ -368,7 +369,7 @@ class DecayEngine:
                 days_since = activity_age
                 if imp <= 4 and days_since > 30:
                     try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
+                        await self.bucket_mgr.update(bucket["id"], resolved=True, _skip_revision=True)
                         meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
                         auto_resolved += 1
                         logger.info(
