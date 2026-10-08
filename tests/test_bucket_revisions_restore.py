@@ -521,3 +521,25 @@ async def test_pending_effects_do_not_block_restoring_a_live_bucket(server):
                                      payload={"kwargs": {"importance": 2}})
     plan = manager.plan_restore(a, ref_of(server, a, "replace"))
     assert plan["mode"] == "existing" and not plan["blocked"] and plan["pending_effects"] == []
+
+
+@pytest.mark.asyncio
+async def test_completed_keyed_trace_residue_does_not_block_resurrect(server):
+    # A keyed relation-only trace completes without applying its memory child,
+    # which stays 'planned'; a completed parent request makes it final.
+    manager = server.bucket_mgr
+    a = await manager.create(content="keyed relation only")
+    b = await manager.create(content="keyed partner")
+    await server.trace(a, related=b, operation_id="undo-accept-relate-only")
+    with sqlite3.connect(manager.history_db_path) as conn:
+        assert conn.execute("SELECT status FROM ob_s4_requests WHERE operation_id=?",
+                            ("undo-accept-relate-only",)).fetchone()[0] == "completed"
+        residue = conn.execute("SELECT operation_key FROM ob_import_operations "
+                               "WHERE status='planned' AND target_bucket_id=?", (a,)).fetchall()
+    assert residue  # the record that used to block resurrect
+    await delete(server, a)
+    ref = ref_of(server, a, "delete")
+    assert manager.pending_effects(a) == []
+    await restore(server, a, ref)
+    assert (await manager.get(a))["content"] == "keyed relation only"
+    assert b in (await manager.get(a))["metadata"]["related_buckets"]

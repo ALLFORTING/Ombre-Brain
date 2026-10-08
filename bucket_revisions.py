@@ -111,6 +111,10 @@ PENDING_EFFECT_QUERIES = (
     ("confirmed_delete", "ob_confirmed_delete_operations",
      "SELECT delete_id FROM ob_confirmed_delete_operations WHERE status<>'completed' AND bucket_id=?1"),
 )
+# A keyed request that completed without applying a child (e.g. relation-only
+# trace) leaves that child 'planned' for good; its completed parent makes it final.
+COMPLETED_PARENT_CHILD = (" AND NOT EXISTS (SELECT 1 FROM ob_s4_requests r WHERE r.status='completed' "
+                          "AND instr(r.plan_json, ob_import_operations.operation_key) > 0)")
 
 
 class RevisionCaptureError(RuntimeError):
@@ -387,6 +391,8 @@ class BucketRevisionMixin:
             for kind, table, sql in PENDING_EFFECT_QUERIES:
                 if not self._table_exists(conn, table):
                     continue
+                if kind == "import_operation" and self._table_exists(conn, "ob_s4_requests"):
+                    sql += COMPLETED_PARENT_CHILD
                 found.extend({"kind": kind, "id": str(row[0])}
                              for row in conn.execute(sql, (bucket_id,)).fetchall())
         return found
