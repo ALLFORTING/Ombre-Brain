@@ -23,6 +23,7 @@
 !backup_v2_runtime.py
 !boot_todos.py
 !bucket_manager.py
+!bucket_revisions.py
 !bucket_write_lock.py
 !check_buckets.py
 !check_icloud_conflicts.py

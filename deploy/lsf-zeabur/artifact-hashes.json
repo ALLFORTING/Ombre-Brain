@@ -25,7 +25,7 @@
   },
   {
     "path": "Dockerfile.dockerignore",
-    "sha256": "e674297de080cba6c1b1935435bc7a95b7c123c64afc30f5a95ed58c791da664"
+    "sha256": "ce870ed6eab21831e7e33ee73b8e3f039ff0521935c91ed756d889b62677e543"
   },
   {
     "path": "FIRST_GROUP_CLAUDE_INSTRUCTIONS.md",
@@ -41,7 +41,7 @@
   },
   {
     "path": "c2-source-hashes.json",
-    "sha256": "984651fca1f5b4c75e226ae66c3da9dabe24481b9e1312da66308a0e8e52eafe"
+    "sha256": "d25e7c294a5bcdbec33bbf4e591cc6a1840e5c6e0dd39a35f509bb6dc5da4b02"
   },
   {
     "path": "c2_audit.py",

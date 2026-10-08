@@ -2,7 +2,7 @@
   "baseline": "6be6e84d11f3942061aa6061ea9f431155b5d29b",
   "newline": "LF-normalized",
   "sha256": {
-    "c2-source-hashes.json": "984651fca1f5b4c75e226ae66c3da9dabe24481b9e1312da66308a0e8e52eafe",
+    "c2-source-hashes.json": "d25e7c294a5bcdbec33bbf4e591cc6a1840e5c6e0dd39a35f509bb6dc5da4b02",
     "c3_run.py": "07c3fa2012be788b1e45293dd559f3622f399ab8e7173e355efc858d37f19009",
     "c3_provider.py": "29f2b57b58c817283470da54028fa21d0159b8857ec63559e838162aa478be47",
     "c3_inputs.py": "f9843c44728d2973990890b8add5ff4c28687ad21ae09180cb11a308460d5ce2",
@@ -11,7 +11,7 @@
     "c3-fixed-inputs.json": "42c681348f7e08915a4cb1ea47bb5f0166b6234af22c4a6ad2d45b9267471f1c",
     "test_c3.py": "83c3ce12ed4b09da90ddde90c3508454e6ad9a323617b420280f3e206e56086b",
     "Dockerfile": "dacb8f1be1946a632cb1b64e8b822a7fccaffccc821a183539f9e550e3015942",
-    "Dockerfile.dockerignore": "29d049242d8979a347a4a9c6c7d9cffa8232fedf3610854a981e4313bfa8baf3"
+    "Dockerfile.dockerignore": "ce870ed6eab21831e7e33ee73b8e3f039ff0521935c91ed756d889b62677e543"
   },
   "delivery_sha256": {
     "C3_CLAUDE_INSTRUCTIONS.md": "59016c647fa00604f801148f890bc69b977a4f48016efaf68950b9232bb9a06a",
