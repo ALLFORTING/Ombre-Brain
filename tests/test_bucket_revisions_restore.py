@@ -445,3 +445,79 @@ async def test_sealed_result_cleans_vector_first_and_skips_refresh(server, monke
     cleanup.assert_awaited_with(bucket)
     refresh.assert_not_awaited()
     assert (await manager.get(bucket))["metadata"]["sealed"] == 1
+
+
+# ------------------------------------------------- pending effects on resurrect
+def _import_status(manager, key):
+    with sqlite3.connect(manager.history_db_path) as conn:
+        return conn.execute("SELECT status FROM ob_import_operations WHERE operation_key=?", (key,)).fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_resurrect_is_refused_while_pending_effects_reference_the_id(server):
+    manager = server.bucket_mgr
+    a = await manager.create(content="stale target")
+    key = "o5b:stale-update"
+    manager._ensure_import_operation(key, operation_kind="update", target_bucket_id=a,
+                                     payload={"kwargs": {"importance": 3}})
+    await delete(server, a)
+    ref = ref_of(server, a, "delete")
+    preview = await server.restore_revision(a, ref)
+    assert "no confirm_token issued" in preview and "confirm_token:" not in preview
+    assert "import_operation: 1 条" in preview and key in preview
+    plan = manager.plan_restore(a, ref)
+    assert plan["blocked"] and plan["pending_effects"] == [{"kind": "import_operation", "id": key}]
+    with pytest.raises(server.RestoreError, match="resurrect_blocked_by_pending_effects"):
+        await manager.execute_restore(plan)
+    assert await manager.get(a) is None
+    assert _import_status(manager, key) == "planned"  # never voided or deleted
+
+    manager._mark_import_operation_applied(key)
+    await restore(server, a, ref)
+    assert (await manager.get(a))["content"] == "stale target"
+
+
+@pytest.mark.asyncio
+async def test_unfinished_digest_and_merge_records_block_resurrect(server):
+    manager = server.bucket_mgr
+    a = await manager.create(content="digest source")
+    state = server._digest_bucket_state(await manager.get(a))
+    manager.write_digest_operation("d1", "rebalance", {"importance_rebalance": [state]},
+                                   owner="gone", status="failed")
+    await delete(server, a)
+    preview = await server.restore_revision(a, ref_of(server, a, "delete"))
+    assert "digest_operation: 1 条" in preview and "confirm_token:" not in preview
+
+    b = await manager.create(content="merge source")
+    await delete(server, b)
+    manager.write_merge_operation("m1", {"target_id": "t0", "source_id": b, "relations": []},
+                                  status="failed", completed=[], create=True)
+    assert "merge_operation: 1 条" in await server.restore_revision(b, ref_of(server, b, "delete"))
+
+
+@pytest.mark.asyncio
+async def test_pending_effect_appearing_after_preview_invalidates_token_and_publish(server):
+    manager = server.bucket_mgr
+    a = await manager.create(content="race")
+    await delete(server, a)
+    ref = ref_of(server, a, "delete")
+    preview = await server.restore_revision(a, ref)
+    plan = manager.plan_restore(a, ref)
+    manager._ensure_import_operation("o5b:late", operation_kind="update", target_bucket_id=a,
+                                     payload={"kwargs": {"importance": 2}})
+    late = await server.restore_revision(a, ref, confirm_token=token(preview))
+    assert "no confirm_token issued" in late and "o5b:late" in late
+    with pytest.raises(server.RestoreError, match="resurrect_blocked_by_pending_effects"):
+        manager._publish_restore(plan, "test")
+    assert await manager.get(a) is None and manager.restoration_rows(a) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_effects_do_not_block_restoring_a_live_bucket(server):
+    manager = server.bucket_mgr
+    a = await manager.create(content="live v1")
+    await server.trace(a, content="live v2")
+    manager._ensure_import_operation("o5b:live", operation_kind="update", target_bucket_id=a,
+                                     payload={"kwargs": {"importance": 2}})
+    plan = manager.plan_restore(a, ref_of(server, a, "replace"))
+    assert plan["mode"] == "existing" and not plan["blocked"] and plan["pending_effects"] == []

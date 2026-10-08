@@ -26,6 +26,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "record_revision_snapshots": "guarded_mutation",
         "write_with_revision": "guarded_mutation",
         "restoration_rows": "dynamic_sql_read_only",
+        "pending_effects": "dynamic_sql_read_only",
         "_restoration_update": "guarded_caller_only",
         "_publish_restore": "guarded_mutation",
         "_restore_step": "guarded_mutation",

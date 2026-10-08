@@ -3773,6 +3773,21 @@ async def restore_revision(
         return f"restore rejected: {exc.code}; no changes made."
     except (RelatedError, BucketWriteLockError) as exc:
         return f"restore rejected: {getattr(exc, 'code', type(exc).__name__)}; no changes made."
+    if plan["blocked"]:
+        counts = {}
+        for effect in plan["pending_effects"]:
+            counts[effect["kind"]] = counts.get(effect["kind"], 0) + 1
+        lines = [f"restore preview: no changes made; no confirm_token issued. bucket_id={bucket_id} "
+                 f"revision={plan['ref']}",
+                 "无法复活：这个已删除的 id 上还有未完成的挂起效果。其中有些执行器在落地时不核对文件身份，"
+                 "复活后可能落到新文件上，所以先拒绝。记录本身保留，不作废、不删除。",
+                 f"挂起效果共 {len(plan['pending_effects'])} 条："]
+        lines.extend(f"  {kind}: {count} 条" for kind, count in sorted(counts.items()))
+        lines.extend(f"  - {effect['kind']} {effect['id']}" for effect in plan["pending_effects"][:20])
+        if len(plan["pending_effects"]) > 20:
+            lines.append(f"  ... 另有 {len(plan['pending_effects']) - 20} 条")
+        lines.append("先让这些操作完成或由 operator 处理，再重新预览。")
+        return "\n".join(lines)
     payload = bucket_mgr.restore_confirmation_payload(plan)
     show_body = include_sealed or not (plan["result_sealed"])
     if not (confirm_token or "").strip():
