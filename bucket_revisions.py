@@ -87,6 +87,31 @@ RUNTIME_FIELDS = (
 RUNTIME_TAGS = ("compressed",)
 RELATION_FIELDS = ("related_buckets", "superseded_by", "superseded_at", "supersedes")
 
+# Durable journals whose unfinished records may still apply an effect to a
+# bucket identity later. Several executors admit such effects without a source
+# incarnation, so a resurrect is refused while any of them still references the
+# deleted id; the records themselves are never edited or removed.
+PENDING_EFFECT_QUERIES = (
+    ("import_operation", "ob_import_operations",
+     "SELECT operation_key FROM ob_import_operations WHERE status='planned' "
+     "AND (target_bucket_id=?1 OR result_id=?1 OR instr(payload_json, ?1) > 0)"),
+    ("keyed_request", "ob_s4_requests",
+     "SELECT operation_id FROM ob_s4_requests WHERE status<>'completed' "
+     "AND (instr(payload_json, ?1) > 0 OR instr(plan_json, ?1) > 0 OR instr(resolutions_json, ?1) > 0)"),
+    ("merge_operation", "merge_operations",
+     "SELECT operation_id FROM merge_operations WHERE status<>'complete' "
+     "AND (target_id=?1 OR source_id=?1 OR instr(plan_json, ?1) > 0)"),
+    ("digest_operation", "digest_operations",
+     "SELECT operation_id FROM digest_operations WHERE status<>'complete' AND instr(plan_json, ?1) > 0"),
+    ("archive_session_operation", "ob_archive_session_operations",
+     "SELECT operation_id FROM ob_archive_session_operations WHERE status<>'completed' AND bucket_id=?1"),
+    ("relation_operation", "ob_related_operations",
+     "SELECT operation_id FROM ob_related_operations "
+     "WHERE coalesce(json_extract(payload, '$.status'), '')<>'complete' AND instr(payload, ?1) > 0"),
+    ("confirmed_delete", "ob_confirmed_delete_operations",
+     "SELECT delete_id FROM ob_confirmed_delete_operations WHERE status<>'completed' AND bucket_id=?1"),
+)
+
 
 class RevisionCaptureError(RuntimeError):
     def __init__(self, code: str):
@@ -352,6 +377,20 @@ class BucketRevisionMixin:
                 "WHERE bucket_id=? ORDER BY id DESC LIMIT ?", (bucket_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
+    def pending_effects(self, bucket_id: str) -> list[dict]:
+        """Unfinished journal records that still reference ``bucket_id``."""
+        conn = self._open_history_read()
+        if conn is None:
+            return []
+        found = []
+        with closing(conn):
+            for kind, table, sql in PENDING_EFFECT_QUERIES:
+                if not self._table_exists(conn, table):
+                    continue
+                found.extend({"kind": kind, "id": str(row[0])}
+                             for row in conn.execute(sql, (bucket_id,)).fetchall())
+        return found
+
     def restoration_rows(self, bucket_id: str | None = None) -> list[dict]:
         conn = self._open_history_read()
         if conn is None:
@@ -522,8 +561,10 @@ class BucketRevisionMixin:
         covered = {delete_id for row in self.restoration_rows(bucket_id)
                    if row["status"] in ("published", "completed")
                    for delete_id in (row["covered_delete_ids"] or [])}
+        pending = self.pending_effects(bucket_id) if mode == "resurrect" else []
         plan = {
             "bucket_id": bucket_id, "ref": f"{kind}{number}", "mode": mode,
+            "pending_effects": pending, "blocked": bool(pending),
             "source_digest": source_digest, "current_sha256": current_sha,
             "result_sealed": result_sealed, "content": source_content, "metadata": metadata,
             "target_relative_path": self._relative_bucket_path(target_path),
@@ -540,7 +581,7 @@ class BucketRevisionMixin:
     def restore_confirmation_payload(plan: dict) -> dict:
         """The exact facts a confirm_token is bound to."""
         return {key: plan[key] for key in (
-            "bucket_id", "ref", "mode", "source_digest", "current_sha256", "result_sealed",
+            "bucket_id", "ref", "mode", "pending_effects", "source_digest", "current_sha256", "result_sealed",
             "target_relative_path", "related", "forward", "skipped", "covered_delete_ids")} | {
             "metadata_sha256": hashlib.sha256(_metadata_json(plan["metadata"]).encode("utf-8")).hexdigest(),
             "content_sha256": hashlib.sha256(plan["content"].encode("utf-8")).hexdigest()}
@@ -575,6 +616,8 @@ class BucketRevisionMixin:
                 raise RestoreError("restore_plan_stale")
             elif target.exists():
                 raise RestoreError("restore_target_occupied")
+            elif self.pending_effects(bucket_id):
+                raise RestoreError("resurrect_blocked_by_pending_effects")
             from bucket_manager import _date_only
             post = frontmatter.Post(plan["content"])
             post.metadata.update(copy.deepcopy(plan["metadata"]))
@@ -688,6 +731,8 @@ class BucketRevisionMixin:
     @guarded_async_mutation("bucket_restore_execute")
     async def execute_restore(self, plan: dict, *, actor: str = "mcp") -> dict:
         """Execute a previously previewed plan; the caller verified its token."""
+        if plan.get("blocked"):
+            raise RestoreError("resurrect_blocked_by_pending_effects")
         if plan["result_sealed"]:
             await self._delete_ordinary_embedding(plan["bucket_id"])
         restore_id = self._publish_restore(plan, actor)
