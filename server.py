@@ -112,6 +112,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, ImageContent, TextContent
 
+from bucket_revisions import RestoreError
 from bucket_manager import (
     BucketManager,
     BucketIdempotencyError,
@@ -881,7 +882,8 @@ async def _merge_or_create(
                     existing_todos, metadata.get("todo_provenance")
                 ):
                     writes["todo_provenance"] = merged_provenance
-            if writes and not await bucket_mgr.update(bucket["id"], **writes):
+            if writes and not await bucket_mgr.update(bucket["id"], **writes,
+                                                      _revision_op=("hold_reuse", None)):
                 raise RuntimeError(f"failed to update duplicate bucket {bucket['id']}")
             if outcome_out is not None:
                 outcome_out.update(bucket_id=bucket["id"], reused=True,
@@ -1552,12 +1554,12 @@ async def _merge_bucket_into_target(
         "source_metadata_sha256": _merge_metadata_digest(source_meta),
         "target_update": target_update,
         "relations": [
-            {"bucket_id": bucket_id, "updates": update,
+            {"bucket_id": bucket_id, "updates": update, "restore": restore,
              "before_sha256": _merge_metadata_digest(next(
                  bucket["metadata"] for bucket in all_buckets
                  if bucket["id"] == bucket_id
              ))}
-            for bucket_id, update, _ in relation_operations
+            for bucket_id, update, restore in relation_operations
         ],
     }
     payload = {
@@ -2438,6 +2440,8 @@ def _format_boot_delta(
                 if payload.get("mode") == "none"
                 else "已标记 superseded"
             )
+        elif event_type == "restored":
+            detail = "已从历史版本还原" if payload.get("mode") != "resurrect" else "已从删除中还原"
         else:
             continue
         importance = int(bucket.get("metadata", {}).get("importance", 0) or 0)
@@ -3685,6 +3689,144 @@ async def dismiss_note(
 
 
 # =============================================================
+# Revisions and two-stage restore
+# 历史版本与两阶段还原
+# =============================================================
+_REVISION_TOOL_RULE = "Use only when Ting explicitly asks in the current conversation."
+
+
+def _revision_preview_text(text: str, limit: int = 60) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _revision_value_text(value, limit: int = 80) -> str:
+    rendered = _json_lib.dumps(value, ensure_ascii=False, default=str)
+    return rendered if len(rendered) <= limit else rendered[:limit] + "…"
+
+
+@mcp.tool()
+async def list_revisions(
+    bucket_id: str,
+    limit: Annotated[int, Field(description="Maximum entries per section, 1-200.")] = 20,
+    include_sealed: bool = False,
+) -> str:
+    """List restorable versions of one bucket, including a deleted bucket: full revisions (r<id>, body plus metadata) and legacy body-only history (h<id>). Sealed bodies stay hidden unless include_sealed=True. Read-only. Use only when Ting explicitly asks in the current conversation."""
+    bucket_id = (bucket_id or "").strip()
+    if not bucket_id:
+        return "请提供有效的 bucket_id。"
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        return "limit must be an integer within 1-200."
+    current = await bucket_mgr.get(bucket_id)
+    revisions = bucket_mgr.list_bucket_revisions(bucket_id, limit=limit)
+    history = bucket_mgr.list_history_rows(bucket_id, limit=limit)
+    if current is None and not revisions and not history:
+        return f"没有找到 {bucket_id} 的桶或历史版本。"
+    if current is not None:
+        current_sealed = _is_sealed(current)
+        state = "存在" + ("（sealed）" if current_sealed else "")
+        legacy_sealed = current_sealed
+    else:
+        state = "已删除"
+        # Legacy rows carry no sealed flag; without a revision the state is unknown.
+        legacy_sealed = (not revisions) or bool(revisions[0]["sealed_at_capture"])
+    lines = [f"bucket {bucket_id} 当前状态：{state}",
+             "=== 完整版本（正文 + metadata）==="]
+    for item in revisions:
+        meta = item["metadata"]
+        # Either side sealed hides the body, matching the restore sealed rule.
+        hidden = (item["sealed_at_capture"] or legacy_sealed) and not include_sealed
+        preview = "[sealed 正文已隐藏]" if hidden else _revision_preview_text(item["content"])
+        name = "" if hidden else f" name={meta.get('name', '')}"
+        lines.append(f"- {item['ref']} | {item['captured_at']} | op={item['op_kind']} | "
+                     f"sealed={item['sealed_at_capture']}{name} | {preview}")
+    if not revisions:
+        lines.append("（无）")
+    lines.append("=== 旧版正文历史（仅正文，无 metadata）===")
+    for row in history:
+        hidden = legacy_sealed and not include_sealed
+        preview = "[正文已隐藏：桶当前为 sealed 或 sealed 状态未知]" if hidden else _revision_preview_text(row["old_content"])
+        lines.append(f"- h{row['id']} | {row['changed_at']} | {row['change_type']} | {preview}")
+    if not history:
+        lines.append("（无）")
+    lines.append("还原：restore_revision(bucket_id, revision=<r或h编号>) 先预览，再带 confirm_token 执行。")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def restore_revision(
+    bucket_id: str,
+    revision: Annotated[str, Field(description="Version reference from list_revisions: r<id> (full revision) or h<id> (legacy body-only history, existing buckets only).")],
+    confirm_token: Annotated[str, Field(description="Two-stage confirmation, same level as delete. First call without a token to preview; then repeat the same call with the issued short-lived, one-shot token. Expired, used or mismatched tokens are rejected.")] = "",
+    include_sealed: bool = False,
+) -> str:
+    """Restore one bucket to a listed version; a deleted bucket comes back with its original bucket_id. The preview shows body and metadata diffs, relations that will be skipped, and whether the result is sealed (sealed if either version is sealed). Runtime fields such as last_active keep their current values. The current version is saved first, so a restore can itself be undone. Use only when Ting explicitly asks in the current conversation."""
+    bucket_id = (bucket_id or "").strip()
+    if not bucket_id:
+        return "请提供有效的 bucket_id。"
+    try:
+        await bucket_mgr.resume_restorations(bucket_id)
+        plan = bucket_mgr.plan_restore(bucket_id, revision)
+    except RestoreError as exc:
+        return f"restore rejected: {exc.code}; no changes made."
+    except (RelatedError, BucketWriteLockError) as exc:
+        return f"restore rejected: {getattr(exc, 'code', type(exc).__name__)}; no changes made."
+    payload = bucket_mgr.restore_confirmation_payload(plan)
+    show_body = include_sealed or not (plan["result_sealed"])
+    if not (confirm_token or "").strip():
+        token = _issue_mutation_confirmation("restore.revision", payload)
+        mode = "复活已删除的桶（保留原 bucket_id）" if plan["mode"] == "resurrect" else "还原现存的桶"
+        lines = [f"restore preview: no changes made. bucket_id={bucket_id} revision={plan['ref']}",
+                 f"模式：{mode}",
+                 f"结果 sealed：{'是' if plan['result_sealed'] else '否'}"]
+        if plan["covered_delete_ids"]:
+            lines.append(f"将覆盖删除记录：{len(plan['covered_delete_ids'])} 条")
+        lines.append("metadata 变化：")
+        for change in plan["metadata_diff"] or []:
+            if show_body:
+                lines.append(f"  {change['field']}: {_revision_value_text(change['current'])} → "
+                             f"{_revision_value_text(change['restored'])}")
+            else:
+                lines.append(f"  {change['field']}: [sealed，已隐藏]")
+        if not plan["metadata_diff"]:
+            lines.append("  （无）")
+        lines.append("正文变化：" + ("（无）" if not plan["body_changed"] else ""))
+        if plan["body_changed"]:
+            if show_body:
+                lines.extend("  " + line for line in plan["content_diff"])
+            else:
+                lines.append("  [sealed 正文差异已隐藏；include_sealed=True 才显示]")
+        lines.append("将跳过的关系：")
+        for item in plan["skipped"]:
+            lines.append(f"  {item['kind']} → {item['target']}（{item['reason']}）")
+        if not plan["skipped"]:
+            lines.append("  （无）")
+        lines.append(f"有效期 {_MUTATION_CONFIRM_TTL_SECONDS} 秒；用相同 bucket_id、revision 和 confirm_token 再次调用才会执行。")
+        lines.append(f"confirm_token: {token}")
+        return "\n".join(lines)
+    if not _consume_mutation_confirmation("restore.revision", payload, confirm_token):
+        return "restore confirmation invalid, expired, used, or stale; preview again."
+    try:
+        result = await bucket_mgr.execute_restore(plan, actor="mcp")
+    except RestoreError as exc:
+        return f"restore rejected: {exc.code}; preview again."
+    except Exception as exc:
+        logger.error("Restore failed for %s: %s", bucket_id, type(exc).__name__)
+        return f"restore failed: {getattr(exc, 'code', type(exc).__name__)}"
+    report = result["report"]
+    lines = [f"已还原 {bucket_id} → {plan['ref']}（restore_id: {result['restore_id']}）"]
+    if result["pre_revision_id"]:
+        lines.append(f"还原前的版本已存为 r{result['pre_revision_id']}，可用它再撤销。")
+    skipped = report.get("skipped") or []
+    if skipped:
+        lines.append("已跳过：")
+        lines.extend(f"  {item['kind']} → {item['target']}（{item['reason']}）" for item in skipped)
+    return "\n".join(lines)
+
+
+# =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
 # Also handles deletion (delete=True)
@@ -4722,7 +4864,7 @@ async def boot(
         for bucket_id, end_offset in trigger_items:
             if end_offset <= len(emitted_triggers):
                 try:
-                    await bucket_mgr.update(bucket_id, trigger_last_seen=today)
+                    await bucket_mgr.update(bucket_id, trigger_last_seen=today, _skip_revision=True)
                 except Exception:
                     logger.exception("Boot trigger delivery state update failed")
     return response
