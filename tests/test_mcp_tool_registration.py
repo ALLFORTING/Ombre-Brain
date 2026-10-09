@@ -361,6 +361,7 @@ def test_w16_tool_descriptions_and_unchanged_public_parameters(tmp_path):
                    "boot_delivered_at", "pending notes may be skipped", "without marking seen", "Repeated boot"):
         assert phrase in boot
     assert "preview" not in tools["boot"]["input_schema"]["properties"]
-    assert "touch" not in tools["dream"]["input_schema"]["properties"]
+    # W-16 kept dream without touch; the read-only dream(touch=False) came later and defaults to True.
+    assert tools["dream"]["input_schema"]["properties"]["touch"]["default"] is True
     for name in ("boot", "dream", "breath", "trace", "todos"):
         assert _normalize_schema(tools[name]["input_schema"]) == _normalize_schema(TOOL_SCHEMA_CONTRACTS[name])
