@@ -91,8 +91,10 @@ async def worker(action, root):
             url = 'http://127.0.0.1:18993/mcp?token='+TOKEN
             response = await client.post(url,json=dict(jsonrpc='2.0',id=1,method='initialize',params=dict(protocolVersion='2025-03-26',capabilities={},clientInfo=dict(name='C3-local',version='1'))))
             assert response.status_code==200, response.status_code
-            session = response.headers['mcp-session-id']
-            client.headers.update({'Mcp-Session-Id':session,'Mcp-Protocol-Version':'2025-03-26'})
+            # Stateless HTTP sends no session id; echo it only when the server issues one.
+            session = response.headers.get('mcp-session-id')
+            session_line = f'Mcp-Session-Id: {session}\r\n' if session else ''
+            client.headers.update({'Mcp-Protocol-Version':'2025-03-26',**({'Mcp-Session-Id':session} if session else {})})
             assert (await client.post(url,json=dict(jsonrpc='2.0',method='notifications/initialized'))).status_code==202
             number = 1
             async def call(name, arguments):
@@ -146,7 +148,7 @@ async def worker(action, root):
                 if name == 'disconnect':
                     reader, writer = await asyncio.open_connection('127.0.0.1',18993)
                     payload = json.dumps(dict(jsonrpc='2.0',id=777,method='tools/call',params=dict(name='hold',arguments=args))).encode()
-                    header = f'POST /mcp?token={TOKEN} HTTP/1.1\r\nHost: 127.0.0.1:18993\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nMcp-Protocol-Version: 2025-03-26\r\nContent-Length: {len(payload)}\r\n\r\n'.encode()
+                    header = f'POST /mcp?token={TOKEN} HTTP/1.1\r\nHost: 127.0.0.1:18993\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\n{session_line}Mcp-Protocol-Version: 2025-03-26\r\nContent-Length: {len(payload)}\r\n\r\n'.encode()
                     writer.write(header+payload)
                     await writer.drain()
                     async with asyncio.timeout(45):

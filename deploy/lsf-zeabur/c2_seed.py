@@ -5,6 +5,7 @@ is intentionally left after failure: restart refuses partial batches, never heal
 """
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -18,6 +19,37 @@ BATCH = "c2-v1"
 IDS = [f"c200000000{i:02d}" for i in range(1, 22)]
 NAME = ".c2-v1.json"
 MODEL = "synthetic-embedding-4-v1"
+DIMENSION = 4
+
+# Volume identity binds only the files that decide what gets seeded. Business code
+# (bucket_manager.py, embedding_engine.py) is checked for compatibility instead.
+SEED_FILES = ("c2_seed.py", "c2_vectors.py", "provider_stub.py")
+BUSINESS_FILES = ("bucket_manager.py", "embedding_engine.py")
+IDENTITY_KEYS = {
+    1: ("format", "batch", "baseline", "group", "source_hashes"),
+    2: ("format", "batch", "baseline", "group", "seed_hashes"),
+}
+# Reviewed historical identities. Each entry is a complete identity copied from a
+# real volume marker, with the source commit and evidence that justified it.
+# Entries are added only by an approved review; startup never adds or derives one.
+KNOWN_COMPATIBLE = (
+    # Volume ob-lsf-synthetic-20261008, seeded 2026-10-08 by run.py at afc74ae.
+    dict(identity=dict(format=1, batch="c2-v1", baseline="ab7a348b11e6c7d8725d8d0c4ad1f0a26e19cec6",
+                       group="L-SF", source_hashes={
+        "bucket_manager.py": "41346c498a16dfc0f99fa471fd5166acc63b0f91b3fcbf39705f3935307ae6e8",
+        "deploy/lsf-zeabur/c2_seed.py": "198a7888b57c3a3586f02192e57b6fe49727ae60450b8eeaa9906ce3eab4ac45",
+        "deploy/lsf-zeabur/c2_vectors.py": "0b416f6f082d32c655ffaaf56ed877c44135ef0d39246d8e77e4be835ca75942",
+        "deploy/lsf-zeabur/provider_stub.py": "cce12a975b0886c9ed2169ff7905855ae0732647e6d3ab75168ad0562cdf5766",
+        "embedding_engine.py": "2b5c569c006b531f203f4178d3751b774055ad017001e4ba39cb8cc2365c5dc9"}),
+         source_commit="afc74aeac474729191d3ba7de405f16c48a25fde",
+         evidence="Zeabur runtime log 2026-10-09T06:59:52Z printed this marker identity read-only; "
+                  "all five hashes equal the raw blobs at afc74ae. Identity only; data acceptance "
+                  "is recorded separately. Approved by Ting on Astra's review, 2026-10-09."),
+)
+# Reads (touch) and time ripple rewrite these two fields on fixture files. A fixture
+# whose bytes differ is accepted only if nothing else differs; marker hashes stay as
+# recorded, so integrity means "body and fixed metadata unchanged", not file bytes.
+RUNTIME_FIELDS = ("activation_count", "last_active")
 
 def require(condition, code):
     if not condition:
@@ -85,11 +117,93 @@ def definitions(today):
     return rows
 
 def source_identity():
+    """Raw hashes of seed and business files; provenance only since format 2."""
     here = Path(__file__).resolve().parent
     source = here.parents[1]
-    paths = [here/n for n in ("c2_seed.py","c2_vectors.py","provider_stub.py")]
-    paths += [source/n for n in ("bucket_manager.py","embedding_engine.py")]
+    paths = [here/n for n in SEED_FILES] + [source/n for n in BUSINESS_FILES]
     return {str(p.relative_to(source)):digest(p.read_bytes()) for p in paths}
+
+def seed_identity():
+    here = Path(__file__).resolve().parent
+    source = here.parents[1]
+    return {str((here/n).relative_to(source)):digest((here/n).read_bytes()) for n in SEED_FILES}
+
+def current_identity():
+    return dict(format=2,batch=BATCH,baseline=BASELINE,group="L-SF",seed_hashes=seed_identity())
+
+def identity_of(state):
+    keys = IDENTITY_KEYS.get(state.get("format"))
+    if keys is None or not all(k in state for k in keys):
+        return None
+    return {k:state[k] for k in keys}
+
+def check_known_compatible(entries=None):
+    """Whitelist shape: complete identities only, never per-file fragments."""
+    for entry in KNOWN_COMPATIBLE if entries is None else entries:
+        require(set(entry) == {"identity","source_commit","evidence"}, "c2_known_compatible_invalid")
+        identity = entry["identity"]
+        keys = IDENTITY_KEYS.get(identity.get("format"))
+        require(keys is not None and set(identity) == set(keys), "c2_known_compatible_invalid")
+        hashes = identity["source_hashes" if identity["format"] == 1 else "seed_hashes"]
+        expected = {f"deploy/lsf-zeabur/{n}" for n in SEED_FILES}
+        if identity["format"] == 1:
+            expected |= set(BUSINESS_FILES)
+        require(set(hashes) == expected and all(len(h) == 64 and set(h) <= set("0123456789abcdef")
+                                                for h in hashes.values()),
+                "c2_known_compatible_invalid")
+        require(len(entry["source_commit"]) == 40 and set(entry["source_commit"]) <= set("0123456789abcdef")
+                and entry["evidence"], "c2_known_compatible_invalid")
+
+def identity_accepted(state):
+    identity = identity_of(state)
+    if identity is None:
+        return False
+    if identity == current_identity():
+        return True
+    check_known_compatible()
+    return any(entry["identity"] == identity for entry in KNOWN_COMPATIBLE)
+
+async def check_compatibility(ob, state, buckets, engine):
+    """Read-only: current code must read the stored fixtures with the recorded meaning."""
+    from utils import apply_display_aliases, apply_display_aliases_to_value
+    for row in state["buckets"]:
+        recorded = row["metadata"]
+        loaded = await ob.bucket_mgr.get(row["id"])
+        require(loaded is not None and loaded["id"] == row["id"], "c2_compat_metadata")
+        require(Path(loaded["path"]).resolve() == (buckets/row["path"]).resolve(), "c2_compat_metadata")
+        meta = loaded["metadata"]
+        for key in ("type","domain","importance","pinned","valence","arousal","created",
+                    "superseded_by","supersedes","topics"):
+            require(meta.get(key) == recorded.get(key), "c2_compat_metadata")
+        require(bool(meta.get("dormant")) == bool(recorded.get("dormant", False)), "c2_compat_metadata")
+        require(meta.get("sealed") == (1 if int(recorded.get("sealed", 0) or 0) == 1 else 0),
+                "c2_compat_metadata")
+        require(meta.get("name") == apply_display_aliases(recorded.get("name")), "c2_compat_metadata")
+        require(meta.get("tags") == apply_display_aliases_to_value(recorded.get("tags")), "c2_compat_metadata")
+        require(digest(frontmatter.load(buckets/row["path"]).content.encode()) == row["body_sha256"],
+                "c2_compat_metadata")
+    with sqlite3.connect(engine.db_path) as vectors:
+        columns = {r[1] for r in vectors.execute("PRAGMA table_info(embeddings)")}
+    require({"bucket_id","embedding","model","updated_at"} <= columns, "c2_compat_schema")
+    for bid, _, model, _ in state["vectors"]:
+        require(model == MODEL == engine.model, "c2_compat_vector")
+        value = await engine.get_embedding(bid)
+        require(isinstance(value, list) and len(value) == DIMENSION and valid_unit(value), "c2_compat_vector")
+
+def runtime_only_change(path, post):
+    try:
+        disk = frontmatter.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raise RuntimeError("c2_fixture_changed") from None
+    require(disk.content == post.content and set(disk.metadata) == set(post.metadata), "c2_fixture_changed")
+    count, active = disk.get("activation_count"), disk.get("last_active")
+    require(type(count) in (int, float) and math.isfinite(count) and count >= 0, "c2_fixture_runtime_invalid")
+    try:
+        require(isinstance(active, str) and datetime.fromisoformat(active) is not None, "c2_fixture_runtime_invalid")
+    except ValueError:
+        raise RuntimeError("c2_fixture_runtime_invalid") from None
+    restored = frontmatter.Post(disk.content, **{**disk.metadata, **{k: post[k] for k in RUNTIME_FIELDS}})
+    require(frontmatter.dumps(restored) == frontmatter.dumps(post), "c2_fixture_changed")
 
 def sql_rows(connection, table):
     key = "bucket_id" if table == "embeddings" else "id"
@@ -106,8 +220,7 @@ async def initialize_c2(ob, root, lock):
     require(Path(ob.config["buckets_dir"]) == buckets, "c2_root_mismatch")
     marker = root/NAME
     require(not (root/".c2-v1-complete.tmp").exists(), "c2_partial_requires_review")
-    identity = dict(format=1,batch=BATCH,baseline=BASELINE,group="L-SF",
-                    source_hashes=source_identity())
+    identity = current_identity()
     db = Path(ob.bucket_mgr.history_db_path)
     engine = ob.bucket_mgr.embedding_engine
     require(engine and engine.enabled and engine.model == MODEL, "c2_embedding_configuration")
@@ -120,7 +233,7 @@ async def initialize_c2(ob, root, lock):
                     "c2_schema_mismatch")
         if marker.exists():
             state = json.loads(marker.read_text())
-            require(all(state.get(k)==v for k,v in identity.items()), "c2_identity_conflict")
+            require(identity_accepted(state), "c2_identity_conflict")
             require(state.get("status")=="complete", "c2_partial_requires_review")
             require([r["id"] for r in state["buckets"]]==IDS, "c2_manifest_conflict")
             require(set(state["sql_rows"])=={"letters","bucket_history"} and
@@ -128,16 +241,20 @@ async def initialize_c2(ob, root, lock):
                     len(state["sql_rows"]["bucket_history"])==1 and
                     [r[0] for r in state["vectors"]]==[bid for bid in IDS if bid != IDS[7]],
                     "c2_incomplete_manifest")
-            expected={post["id"]:(path.as_posix(),digest(frontmatter.dumps(post).encode()))
-                      for path,post in definitions(state["today"])}
+            fixtures={post["id"]:(path,post) for path,post in definitions(state["today"])}
+            expected={bid:(path.as_posix(),digest(frontmatter.dumps(post).encode()))
+                      for bid,(path,post) in fixtures.items()}
             found=[str(frontmatter.load(p).get("id","")) for p in buckets.rglob("*.md")]
             require(all(found.count(bid)==1 for bid in IDS), "c2_id_collision")
+            runtime_drift=[]
             for row in state["buckets"]:
                 require((row["path"],row["file_sha256"])==expected[row["id"]], "c2_manifest_conflict")
                 path = buckets/row["path"]
                 require(path.resolve().is_relative_to(buckets), "c2_manifest_path")
-                require(path.is_file() and digest(path.read_bytes())==row["file_sha256"],
-                        "c2_fixture_changed")
+                require(path.is_file(), "c2_fixture_changed")
+                if digest(path.read_bytes())!=row["file_sha256"]:
+                    runtime_only_change(path, fixtures[row["id"]][1])
+                    runtime_drift.append(row["id"])
             for table, records in state["sql_rows"].items():
                 require(table in ("letters","bucket_history"), "c2_manifest_table")
                 for row in records:
@@ -147,7 +264,8 @@ async def initialize_c2(ob, root, lock):
                 for row in state["vectors"]:
                     require(vectors.execute("SELECT bucket_id,embedding,model,updated_at FROM embeddings WHERE bucket_id=?",
                                              (row[0],)).fetchone()==tuple(row), "c2_index_changed")
-            return dict(initialized=False,today=state["today"],bucket_count=21)
+            await check_compatibility(ob, state, buckets, engine)
+            return dict(initialized=False,today=state["today"],bucket_count=21,runtime_drift=runtime_drift)
 
         require(not any((buckets/k/BATCH).exists() for k in ("dynamic","archive","feel","permanent")),
                 "c2_directory_collision")
@@ -166,7 +284,8 @@ async def initialize_c2(ob, root, lock):
         seed_bytes = seed_marker.read_bytes()
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         fixtures = definitions(today)
-        state = dict(identity,status="started",today=today,buckets=[])
+        state = dict(identity,status="started",today=today,buckets=[],
+                     seeded_source_hashes=source_identity())
         write_new(marker,json.dumps(state,sort_keys=True).encode())
         for path,post in fixtures:
             target = buckets/path

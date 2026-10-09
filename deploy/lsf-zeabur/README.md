@@ -6,7 +6,7 @@
 C2指定起点：ab7a348b11e6c7d8725d8d0c4ad1f0a26e19cec6。
 C2隔离分支：codex/lsf-c2-20261003。
 本次结果、样例和指令见 [C2验证](C2_VALIDATION.md)、[21桶清单](C2_FIXTURES.md)、[分批Claude指令](C2_CLAUDE_INSTRUCTIONS.md)。
-原复用来源：D:/Codex/projects/OB-Claude-Synthetic-20261002-LSF-Local；历史来源 hash 保留在 reuse-provenance.json。observe.py、seed.py 继续原样；provider_stub.py 仅新增 C2 输入短摘要和差异4维单位向量，非C2行为保留。原 audit.py/evidence 是历史记录，C2 使用 c2_audit.py、test_c2.py 和 C2_VALIDATION.md。
+原复用来源：D:/Codex/projects/OB-Claude-Synthetic-20261002-LSF-Local；历史来源 hash 保留在 reuse-provenance.json。observe.py、seed.py 继续原样；provider_stub.py 仅新增 C2 输入短摘要和差异4维单位向量，非C2行为保留。原 audit.py/evidence 是历史记录，C2 使用 c2_audit.py、test_c2.py 和 C2_VALIDATION.md。当前审计入口见下文「C2 卷身份与兼容检查」。
 
 ## 婷需要填写的内容
 
@@ -64,6 +64,16 @@ Python 基础镜像3.12.14；沿用原 requirements.txt 和 Linux constraints，
 全新根只创建公开c10000000001和sealed c10000000002两桶，沿用原synthetic正文。首次seed写到同卷staging，再发布并写持久标记；已有正确标记仅复用，不覆盖正文、不再seed。无标记但已有buckets/staging、标记不匹配或symlink都会停止；不自动删除或repair。中断初始化的根须先保留证据、另行人工审阅，禁止自动重跑覆盖。
 
 同服务保持单实例/副本，关闭自动扩容，不启动多个worker，不同时运行两服务指向同一实际目录。卷锁会拒绝第二个进程。Zeabur挂卷服务采用停止旧实例再启动的Recreate策略，重启会有短暂停机，不保证旧MCP transport session跨进程可用。[官方卷说明](https://zeabur.com/docs/en-US/operations/data/volumes)、[官方健康检查](https://zeabur.com/docs/en-US/operations/monitoring/health-checks)。
+
+## C2 卷身份与兼容检查（2026.10.09）
+
+- 卷身份（marker format 2）只绑定 c2_seed.py、c2_vectors.py、provider_stub.py 三个播种文件。bucket_manager.py、embedding_engine.py 移出身份，记在 seeded_source_hashes 仅作来源记录；改它们不再需要换卷。
+- 已存在的卷仍先过身份，再过原有全部数据校验（桶文件、指定 SQL 行、向量、完整标记），最后过兼容检查：当前代码读出的桶 id/路径/关键元数据与 marker 记录一致、正文哈希一致、embeddings 表结构、向量模型与维度。任一项失败拒绝启动；全程只读，不重新播种、不改 manifest、不修数据、不重建向量。
+- 夹具完整性标准是「正文与固定元数据不变」，不再是整个文件字节不变：读取（touch）和时间涟漪会改写 activation_count、last_active，只允许这两个字段变化，且须为有限非负数值和 ISO 时间；正文、ID、路径、字段集合及其他元数据（含 sealed、dormant、related_buckets）严格匹配。marker 里的原文件哈希保留作历史证据，不重写。放过的桶在返回的 runtime_drift 中列出。运行态会影响评分与排序，依赖分数的测试须从新播种状态出发。
+- 旧身份只能通过 c2_seed.py 的 KNOWN_COMPATIBLE 放行：每条是从真实卷 marker 原样抄出的完整身份组合，附来源 commit 和核对依据，不能拼接各文件旧哈希，启动时不自动收录。新增条目须婷或她明确授权的审查者批准。首批一条：ob-lsf-synthetic-20261008（afc74ae，Zeabur runtime log 2026-10-09T06:59:52Z 只读打印核对）。身份认可与数据认可分别记录。
+- 旧卷通过兼容检查，只说明当前版本能兼容该卷；新功能仍需各自的小范围验证。
+- 当前审计入口：`python deploy/lsf-zeabur/lsf_audit.py`（只读）；设施提交刷新哈希用 `--refresh`，只更新已登记文件的值。audit.py、c2_audit.py、c3_audit.py 钉死一次性交付基线，退役为历史记录，不再作为当前验收入口；artifact-hashes.json 同属 C2 交付历史清单。
+- 启动失败日志的 error_code 现已包含 c2_* 校验码，仍只输出阶段、码和位置。
 
 ## 未来 C2 更新顺序（本轮不执行）
 
