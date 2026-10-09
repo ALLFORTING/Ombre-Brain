@@ -257,7 +257,11 @@ async def test_frozen_reuse_target_conflict_never_switches(setup, monkeypatch, c
 
 async def test_same_process_concurrent_resume_and_heartbeat(setup, monkeypatch):
     engine, manager, embedding, config = setup
-    monkeypatch.setattr(import_memory, '_LEGACY_LEASE_SECONDS', .15)
+    # Item processing runs without yielding to the heartbeat; on slow hosts it took
+    # ~0.11s and expired a 0.15s lease. The wait below stays twice the lease, so the
+    # claim check still proves the heartbeat renewed it.
+    lease = 1.0
+    monkeypatch.setattr(import_memory, '_LEGACY_LEASE_SECONDS', lease)
     entered, release = asyncio.Event(), asyncio.Event()
     async def blocked(*args):
         entered.set()
@@ -268,7 +272,7 @@ async def test_same_process_concurrent_resume_and_heartbeat(setup, monkeypatch):
     await asyncio.wait_for(entered.wait(), 5)
     other, _, _ = make_engine(config)
     second = asyncio.create_task(other.start(SOURCE, 'source.txt', resume=True))
-    await asyncio.sleep(.3)
+    await asyncio.sleep(2 * lease)
     assert engine.state.claim(state_of(engine)['run_id'], 'other-owner') is None
     assert (await other.start(SOURCE, 'source.txt'))['error'] == 'Import already running'
     release.set()
