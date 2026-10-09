@@ -171,3 +171,82 @@ async def test_pulse_default_touch_still_marks_dormant(tmp_path, monkeypatch):
 
     assert (await _metadata(server, bucket_id))["dormant"] is True
     server.decay_engine.ensure_started.assert_awaited_once()
+
+
+async def _snapshot(server, *bucket_ids):
+    return {bid: (await _metadata(server, bid)) for bid in bucket_ids}
+
+
+@pytest.mark.asyncio
+async def test_dream_details_touch_false_leaves_target_and_neighbours_unchanged(
+    tmp_path, monkeypatch
+):
+    server = _load_server(tmp_path, monkeypatch)
+    target = await server.bucket_mgr.create(content="dream read only target")
+    neighbour = await server.bucket_mgr.create(content="dream read only neighbour")
+    before = await _snapshot(server, target, neighbour)
+
+    result = await server.dream(detail_ids=target, touch=False)
+
+    assert "dream read only target" in result
+    assert await _snapshot(server, target, neighbour) == before
+    server.decay_engine.ensure_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dream_recent_touch_false_leaves_buckets_unchanged(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    ids = [await server.bucket_mgr.create(content=f"dream recent {n}") for n in range(3)]
+    before = await _snapshot(server, *ids)
+
+    await server.dream(touch=False)
+
+    assert await _snapshot(server, *ids) == before
+    server.decay_engine.ensure_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dream_touch_false_overrides_wake_dormant(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create(content="dream dormant read only")
+    await server.bucket_mgr.set_dormant(bucket_id, True)
+    before = await _metadata(server, bucket_id)
+
+    await server.dream(detail_ids=bucket_id, wake_dormant=True, touch=False)
+
+    assert await _metadata(server, bucket_id) == before
+
+
+@pytest.mark.asyncio
+async def test_dream_default_touch_still_activates_and_ripples(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    target = await server.bucket_mgr.create(content="dream default target")
+    neighbour = await server.bucket_mgr.create(content="dream default neighbour")
+    before = await _snapshot(server, target, neighbour)
+
+    await server.dream(detail_ids=target)
+
+    after = await _snapshot(server, target, neighbour)
+    assert after[target]["activation_count"] > before[target]["activation_count"]
+    assert after[neighbour]["activation_count"] > before[neighbour]["activation_count"]
+    server.decay_engine.ensure_started.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_time_ripple_skips_sealed_neighbours(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    target = await server.bucket_mgr.create(content="ripple source")
+    sealed = await server.bucket_mgr.create(content="ripple sealed neighbour")
+    plain = await server.bucket_mgr.create(content="ripple plain neighbour")
+    path = server.bucket_mgr._find_bucket_file(sealed)
+    post = frontmatter.load(path)
+    post["sealed"] = 1
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(frontmatter.dumps(post))
+    sealed_bytes = open(path, "rb").read()
+    before = await _metadata(server, plain)
+
+    await server.bucket_mgr.touch(target)
+
+    assert open(path, "rb").read() == sealed_bytes
+    assert (await _metadata(server, plain))["activation_count"] > before["activation_count"]
