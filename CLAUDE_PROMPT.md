@@ -119,7 +119,7 @@ talk / code 的 pinned 和最近归档截断同样给 ID、显示/总字符数�
 - 其他过滤：`domain`（逗号分隔精确匹配；`feel` / `session` 进入专用模式）`valence`/`arousal` `recent_days` `date_from` `date_to` `tags_filter` `topic_filter`（列表）`importance_min` `feels` `include_dormant` `include_sealed` `emotion_trend` `mailbox` `mailbox_limit`
 - 第一次没命中就换说法再查。
 
-**dream**：`dream(detail_ids="id1,id2")` 读全文，逗号分隔；无参数给最近概览。默认 surfacing 会更新 activation metadata 并触发时间涟漪；核对、维护时用 `touch=False`，不写 activation、不涟漪、不唤醒、不启动 decay。`wake_dormant=True` 才会唤醒 dormant，`touch=False` 时不生效。
+**dream**：`dream(detail_ids="id1,id2")` 读全文，逗号分隔；无参数给最近概览。**没有 touch 参数**，surfacing 会更新 activation metadata；`wake_dormant=True` 才会唤醒 dormant。
 
 **get_letter**：`get_letter(letter_id)` 拿完整全文。sealed 默认读不到，返回 `letter_id not found`，**跟这封信不存在时一模一样**。`include_sealed=True` 才能读到。对用户应表述为「当前读不到，可能不存在，也可能是 sealed」。
 
