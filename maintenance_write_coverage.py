@@ -78,6 +78,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "verify_bundle": "isolated_temporary_verification",
         "_stage_recovery_report": "isolated_temporary_verification",
         "restore_bundle": "isolated_restore_and_no_replace_publish",
+        "restore_plain_bundle": "isolated_restore_and_no_replace_publish",
         "write_test_private_key": "test_key_only",
         "write_test_public_key": "test_key_only",
         "_copy_regular_file_stable": "capture_staging",
@@ -85,6 +86,7 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_snapshot_sqlite": "capture_staging",
         "_build_archive": "capture_staging",
         "_encrypt_archive": "encrypted_bundle_staging_and_publish",
+        "_publish_plain_archive": "plaintext_bundle_staging_and_no_replace_publish",
         "write_bounded": "capture_staging",
         "_decrypt_and_validate": "isolated_temporary_restore",
         "_validate_and_extract_archive": "isolated_temporary_restore",
@@ -96,6 +98,12 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "_fsync_file": "formal_bundle_no_replace",
         "_safe_rmtree": "contained_temporary_cleanup",
         "_remove_file": "contained_temporary_cleanup",
+    },
+    "backup_auto_runtime.py": {
+        "register_backup_auto_if_enabled": "isolated_workspace_factory",
+    },
+    "backup_reconciliation.py": {
+        "snapshot_reconciliation": "dynamic_sql_read_only",
     },
     "scripts/backup_closeout/local_prepare.py": {
         "write_new_json": "isolated_offline_workspace",

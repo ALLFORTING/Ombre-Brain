@@ -50,6 +50,8 @@ WORKSPACE_MANIFEST = "workspace-manifest.json"
 WORKSPACE_MARKER = ".ombre-stage8h-g1b-backup"
 ARCHIVE_MANIFEST_PATH = "manifest.json"
 BUNDLE_SUFFIX = ".obbackup"
+PLAIN_FORMAT = "ob-backup-plain-v1"
+PLAIN_SUFFIX = ".obplain.tar"
 PRIVATE_KEY_SUFFIX = ".obx25519-private"
 PUBLIC_KEY_SUFFIX = ".obx25519-public"
 CAPTURE_MODE = "offline_quiesced_source_required"
@@ -453,6 +455,7 @@ def capture_external_source(
     frozen_limits: FrozenCaptureLimits | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     directory_policy: ProductionDirectoryPolicy | None = None,
+    plaintext: bool = False,
 ) -> CaptureResult:
     """Capture one explicitly authorized external root under a live freeze."""
     workspace = load_backup_workspace(workspace_path, directory_policy=directory_policy)
@@ -463,7 +466,8 @@ def capture_external_source(
         authorized_source_root,
         directory_policy=directory_policy,
     )
-    _validate_public_key(recipient_public_key)
+    if not plaintext:
+        _validate_public_key(recipient_public_key)
     if _GIT_SHA_PATTERN.fullmatch(ob_commit_sha) is None:
         raise BackupBundleError("workspace_invalid")
     if remember_me_version != EXPECTED_REMEMBER_ME_VERSION:
@@ -482,6 +486,7 @@ def capture_external_source(
         frozen_limits=frozen_limits,
         disk_usage=disk_usage,
         directory_policy=directory_policy,
+        plaintext=plaintext,
     )
     try:
         coordinator.validate_lease(freeze_lease)
@@ -507,9 +512,10 @@ def _capture_source_into_bundle(
     frozen_limits: FrozenCaptureLimits | None = None,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     directory_policy: ProductionDirectoryPolicy | None = None,
+    plaintext: bool = False,
 ) -> CaptureResult:
     bundle_id = secrets.token_hex(16)
-    bundle_name = f"{bundle_id}{BUNDLE_SUFFIX}"
+    bundle_name = f"{bundle_id}{PLAIN_SUFFIX if plaintext else BUNDLE_SUFFIX}"
     final_bundle = workspace.bundles_root / bundle_name
     if final_bundle.exists():
         raise BackupBundleError("bundle_invalid")
@@ -566,12 +572,20 @@ def _capture_source_into_bundle(
             created_at=created_at,
             ob_commit_sha=ob_commit_sha,
             remember_me_version=remember_me_version,
-            recipient_fingerprint=_public_key_fingerprint(recipient_public_key),
+            recipient_fingerprint=("none" if plaintext else _public_key_fingerprint(recipient_public_key)),
             entries=entries,
             exclusions=exclusions,
         )
+        if plaintext:
+            from backup_reconciliation import snapshot_reconciliation
+            manifest.pop("encryption_profile")
+            manifest.pop("recipient_key_fingerprint")
+            manifest.pop("manifest_sha256")
+            manifest["format"] = PLAIN_FORMAT
+            manifest["reconciliation"] = snapshot_reconciliation(staging_root, entries, abort_signal=abort_signal)
+            manifest["manifest_sha256"] = hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest()
         manifest_bytes = _canonical_json_bytes(manifest)
-        _validate_manifest(manifest_bytes)
+        (_validate_plain_manifest if plaintext else _validate_manifest)(manifest_bytes)
         _call_abortable(
             _build_archive,
             archive_path,
@@ -585,22 +599,28 @@ def _capture_source_into_bundle(
         if directory_policy is not None:
             directory_policy.validate(source_root, source=True)
             load_backup_workspace(workspace.root, directory_policy=directory_policy)
-        _call_abortable(
-            _encrypt_archive,
-            archive_path,
-            final_bundle,
-            recipient_public_key,
-            capture_workspace_id=workspace.workspace_id,
-            bundle_id=bundle_id,
-            created_at=created_at,
-            chunk_size=chunk_size,
-            abort_signal=abort_signal,
-            max_output_bytes=(
-                frozen_limits.max_bundle_bytes
-                if frozen_limits is not None
-                else None
-            ),
-        )
+        if plaintext:
+            if frozen_limits is not None and archive_path.stat().st_size > frozen_limits.max_bundle_bytes:
+                raise BackupBundleError("capture_bundle_too_large")
+            archive_path.chmod(0o600)
+            _publish_plain_archive(archive_path, final_bundle, abort_signal=abort_signal)
+        else:
+            _call_abortable(
+                _encrypt_archive,
+                archive_path,
+                final_bundle,
+                recipient_public_key,
+                capture_workspace_id=workspace.workspace_id,
+                bundle_id=bundle_id,
+                created_at=created_at,
+                chunk_size=chunk_size,
+                abort_signal=abort_signal,
+                max_output_bytes=(
+                    frozen_limits.max_bundle_bytes
+                    if frozen_limits is not None
+                    else None
+                ),
+            )
         try:
             _check_abort(abort_signal)
             if directory_policy is not None:
@@ -630,6 +650,18 @@ def _capture_source_into_bundle(
         raise BackupBundleError("internal_error") from exc
     finally:
         _safe_rmtree(workspace, operation_root)
+
+
+def _publish_plain_archive(archive_path: Path, final_bundle: Path, *, abort_signal=None) -> None:
+    temporary = final_bundle.with_name(f".{final_bundle.name}.{secrets.token_hex(8)}.part")
+    try:
+        _copy_regular_file_stable(archive_path, temporary, chunk_size=CHUNK_SIZE,
+                                 abort_signal=abort_signal)
+        temporary.chmod(0o600)
+        _check_abort(abort_signal)
+        _publish_file_no_replace(temporary, final_bundle)
+    finally:
+        _remove_file(temporary)
 
 
 def inspect_bundle(
@@ -1164,6 +1196,7 @@ def _copy_regular_file_stable(
     *,
     chunk_size: int,
     abort_signal: CaptureAbortSignal | None = None,
+    maximum_bytes: int | None = None,
 ) -> tuple[int, str]:
     before = _file_identity(source)
     digest = hashlib.sha256()
@@ -1175,6 +1208,8 @@ def _copy_regular_file_stable(
                 block = reader.read(chunk_size)
                 if not block:
                     break
+                if maximum_bytes is not None and size + len(block) > maximum_bytes:
+                    raise BackupBundleError("bundle_invalid")
                 writer.write(block)
                 digest.update(block)
                 size += len(block)
@@ -1636,6 +1671,7 @@ def _validate_and_extract_archive(
     *,
     chunk_size: int,
     file_checks: list[dict[str, Any]] | None = None,
+    plaintext: bool = False,
 ) -> dict[str, Any]:
     try:
         with tarfile.open(archive_path, mode="r:") as archive:
@@ -1646,6 +1682,8 @@ def _validate_and_extract_archive(
             collision_keys: set[str] = set()
             for member in members:
                 _validate_archive_member(member)
+                if plaintext and member.sparse is not None:
+                    raise BackupBundleError("manifest_invalid")
                 if member.name in names:
                     raise BackupBundleError("manifest_invalid")
                 names.add(member.name)
@@ -1665,7 +1703,9 @@ def _validate_and_extract_archive(
             manifest_bytes = manifest_stream.read(MAX_MANIFEST_BYTES + 1)
             if len(manifest_bytes) > MAX_MANIFEST_BYTES:
                 raise BackupBundleError("manifest_invalid")
-            manifest = _validate_manifest(manifest_bytes)
+            manifest = (_validate_plain_manifest if plaintext else _validate_manifest)(manifest_bytes)
+            if plaintext and manifest["total_plaintext_bytes"] > archive_path.stat().st_size:
+                raise BackupBundleError("manifest_invalid")
             expected_names = [ARCHIVE_MANIFEST_PATH] + [
                 f"data/{entry['relative_path']}" for entry in manifest["entries"]
             ]
@@ -1708,6 +1748,10 @@ def _validate_and_extract_archive(
                     file_checks.append({"relative_path": relative, "size_bytes": size,
                                         "sha256": digest.hexdigest(), "status": "passed",
                                         "database": database})
+            if plaintext:
+                from backup_reconciliation import snapshot_reconciliation
+                if snapshot_reconciliation(restore_root, manifest["entries"]) != manifest["reconciliation"]:
+                    raise BackupBundleError("manifest_invalid")
             return manifest
     except BackupBundleError:
         raise
@@ -1721,6 +1765,86 @@ def _validate_archive_member(member: tarfile.TarInfo) -> None:
         raise BackupBundleError("manifest_invalid")
     if member.name != ARCHIVE_MANIFEST_PATH and not member.name.startswith("data/"):
         raise BackupBundleError("manifest_invalid")
+
+
+def _validate_plain_manifest(raw: bytes) -> dict[str, Any]:
+    try:
+        if len(raw) > MAX_MANIFEST_BYTES:
+            raise ValueError()
+        manifest = json.loads(raw.decode("utf-8"))
+        if (raw != _canonical_json_bytes(manifest) or manifest["format"] != PLAIN_FORMAT
+                or not isinstance(manifest["reconciliation"], dict)
+                or set(manifest["reconciliation"]) != {"schema_version", "buckets", "stores"}
+                or manifest["reconciliation"]["schema_version"] != 1
+                or "encryption_profile" in manifest or "recipient_key_fingerprint" in manifest):
+            raise ValueError()
+        unsigned = dict(manifest)
+        digest = unsigned.pop("manifest_sha256")
+        if hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest() != digest:
+            raise ValueError()
+        # Reuse the exact legacy structural, safe-path and SQLite entry validator.
+        legacy = dict(unsigned)
+        legacy.pop("format")
+        legacy.pop("reconciliation")
+        if any(entry["relative_path"] == ".ob-plain-restore-receipt.json" for entry in legacy["entries"]):
+            raise ValueError()
+        legacy["encryption_profile"] = ENCRYPTION_PROFILE
+        legacy["recipient_key_fingerprint"] = "x25519-sha256:" + "0" * 64
+        legacy["manifest_sha256"] = hashlib.sha256(_canonical_json_bytes(legacy)).hexdigest()
+        _validate_manifest(_canonical_json_bytes(legacy))
+        return manifest
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        raise BackupBundleError("manifest_invalid") from None
+
+
+def restore_plain_bundle(workspace_path: str | Path, bundle_name: str, *,
+                         expected_sha256: str, expected_size: int,
+                         restore_name: str, maximum_bytes: int) -> dict[str, Any]:
+    """Strict isolated restore; hashes provide integrity, not sender authentication."""
+    workspace = load_backup_workspace(workspace_path)
+    if (not isinstance(bundle_name, str) or
+            re.fullmatch(r"[0-9a-f]{32}" + re.escape(PLAIN_SUFFIX), bundle_name) is None
+            or _BUNDLE_ID_PATTERN.fullmatch(restore_name or "") is None
+            or not isinstance(expected_sha256, str) or _SHA256_PATTERN.fullmatch(expected_sha256) is None
+            or isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes <= 0
+            or isinstance(expected_size, bool) or not isinstance(expected_size, int)
+            or expected_size <= 0 or expected_size > maximum_bytes):
+        raise BackupBundleError("restore_target_invalid")
+    bundle = workspace.bundles_root / bundle_name
+    if bundle.is_symlink() or _path_contains_reparse_point(bundle):
+        raise BackupBundleError("bundle_invalid")
+    if bundle.stat().st_size != expected_size:
+        raise BackupBundleError("bundle_invalid")
+    target = workspace.restored_root / restore_name
+    with _exclusive_operation_lock(workspace, "restore"):
+        if target.exists() or target.is_symlink():
+            raise BackupBundleError("restore_target_invalid")
+        operation = Path(tempfile.mkdtemp(prefix="plain-restore-", dir=workspace.temp_root))
+        try:
+            archive = operation / "payload.tar"
+            size, digest = _copy_regular_file_stable(bundle, archive, chunk_size=CHUNK_SIZE,
+                                                    maximum_bytes=expected_size)
+            if size != expected_size or digest != expected_sha256:
+                raise BackupBundleError("bundle_invalid")
+            restored = operation / "restored"
+            restored.mkdir()
+            checks = []
+            manifest = _validate_and_extract_archive(archive, restored, chunk_size=CHUNK_SIZE,
+                                                     file_checks=checks, plaintext=True)
+            if manifest["bundle_id"] != bundle_name.removesuffix(PLAIN_SUFFIX):
+                raise BackupBundleError("manifest_invalid")
+            report = {"status": "success", "format": PLAIN_FORMAT, "authenticated": False,
+                      "bundle_id": manifest["bundle_id"], "bundle_sha256": digest,
+                      "manifest_sha256": manifest["manifest_sha256"],
+                      "ob_commit_sha": manifest["ob_commit_sha"], "restore_name": restore_name,
+                      "entry_count": manifest["entry_count"], "file_checks": checks,
+                      "reconciliation": manifest["reconciliation"], "reconciliation_matched": True}
+            # Receipt is part of the same no-replace publication as the isolated data.
+            _atomic_write_json(restored / ".ob-plain-restore-receipt.json", report)
+            _publish_directory_no_replace(restored, target)
+            return report
+        finally:
+            _safe_rmtree(workspace, operation)
 
 
 def _validate_manifest(raw: bytes) -> dict[str, Any]:
