@@ -40,7 +40,8 @@ _SAFE_CODES = frozenset({
     'c2_identity_conflict', 'c2_known_compatible_invalid', 'c2_manifest_conflict',
     'c2_incomplete_manifest', 'c2_id_collision', 'c2_manifest_path',
     'c2_fixture_changed', 'c2_manifest_table', 'c2_receipt_changed',
-    'c2_index_changed', 'c2_compat_metadata', 'c2_compat_schema', 'c2_compat_vector',
+    'c2_index_changed', 'c2_fixture_runtime_invalid', 'c2_compat_metadata',
+    'c2_compat_schema', 'c2_compat_vector',
 })
 _SAFE_FILES = frozenset({
     'c3_run.py', 'run.py', 'environment.py', 'initialize.py',

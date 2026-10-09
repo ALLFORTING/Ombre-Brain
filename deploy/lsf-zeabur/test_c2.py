@@ -106,6 +106,11 @@ async def worker(params):
                 return loaded
             ob.bucket_mgr._load_bucket = drifted
         result = await initialize_c2(ob,root,lock)
+        if params["action"]=="ripple":
+            # Real business path: a read touches one bucket and ripples onto neighbours.
+            await ob.hold("obweb-ls ripple probe",tags="ripple",operation_id="obweb-ls-c2-ripple")
+            probe=[b for b in await ob.bucket_mgr.list_all() if b["content"]=="obweb-ls ripple probe"][0]
+            await ob.dream(detail_ids=probe["id"])
         state = json.loads((root/".c2-v1.json").read_text())
         assert len(state["buckets"])==21 and len(state["vectors"])==20
         assert not await ob.embedding_engine.get_embedding(IDS[7])
@@ -356,6 +361,67 @@ def test_refusal_leaves_volume_unchanged(seeded, tmp_path, case):
     refused = child(root,"initialize",False,**extra)
     assert refused["error"]==code
     assert all_files(root)==before
+
+def edit_fixture(root, state, bid, **changes):
+    import frontmatter
+    row = next(r for r in state["buckets"] if r["id"]==bid)
+    path = root/"buckets"/row["path"]
+    post = frontmatter.load(path)
+    for key, value in changes.items():
+        post[key] = value
+    path.write_text(frontmatter.dumps(post))
+
+def test_runtime_fields_from_real_ripple_are_accepted(seeded, tmp_path):
+    root, marker, state = volume(seeded, tmp_path)
+    child(root,"ripple")
+    drifted = [r["id"] for r in state["buckets"]
+               if hashlib.sha256((root/"buckets"/r["path"]).read_bytes()).hexdigest()!=r["file_sha256"]]
+    assert drifted
+    before = json.loads(json.dumps(snapshot(root)))
+    result = child(root,"initialize")
+    assert sorted(result["runtime_drift"])==sorted(drifted)
+    assert result["snapshot"]==before
+    assert json.loads(marker.read_text())==state
+
+def test_runtime_fields_edited_are_accepted(seeded, tmp_path):
+    root, marker, state = volume(seeded, tmp_path)
+    from c2_seed import IDS
+    edit_fixture(root, state, IDS[6], activation_count=2.6, last_active="2026-10-09T14:57:26")
+    edit_fixture(root, state, IDS[7], activation_count=0.3)
+    result = child(root,"initialize")
+    assert result["runtime_drift"]==[IDS[6],IDS[7]]
+
+@pytest.mark.parametrize("case",["dormant","sealed","related","importance","extra_key","dropped_key",
+                                 "count_text","count_nan","count_negative","time_text","time_bad"])
+def test_fixture_changes_beyond_runtime_fields_refuse(seeded, tmp_path, case):
+    root, marker, state = volume(seeded, tmp_path)
+    from c2_seed import IDS
+    changes = {"dormant":dict(dormant=False),"sealed":dict(sealed=0),"related":dict(related_buckets=IDS[0]),
+               "importance":dict(importance=9),"extra_key":dict(note="x"),
+               "count_text":dict(activation_count="0.3"),"count_nan":dict(activation_count=float("nan")),
+               "count_negative":dict(activation_count=-1),"time_text":dict(last_active="yesterday"),
+               "time_bad":dict(last_active=20261009)}.get(case, {})
+    bid = IDS[7] if case=="sealed" else IDS[6]
+    if case=="dropped_key":
+        import frontmatter
+        row = next(r for r in state["buckets"] if r["id"]==bid)
+        path = root/"buckets"/row["path"]
+        post = frontmatter.load(path)
+        del post["trigger_date"]
+        path.write_text(frontmatter.dumps(post))
+    else:
+        edit_fixture(root, state, bid, activation_count=1.3, **changes) if not case.startswith("count") \
+            else edit_fixture(root, state, bid, **changes)
+    before = all_files(root)
+    refused = child(root,"initialize",False)
+    code = "c2_fixture_runtime_invalid" if case.startswith(("count","time")) else "c2_fixture_changed"
+    assert refused["error"]==code
+    assert all_files(root)==before
+
+def test_known_compatible_entries_are_complete_identities():
+    from c2_seed import KNOWN_COMPATIBLE, check_known_compatible
+    check_known_compatible()
+    assert all(e["identity"]["format"]==1 for e in KNOWN_COMPATIBLE)
 
 def test_run_uses_one_lock_before_public_socket():
     import ast
