@@ -34,6 +34,13 @@ _SAFE_CODES = frozenset({
     'test_volume_identity_mismatch', 'incomplete_seed_requires_review',
     'c3_background_drain_timeout', 'test_service_unexpected_exit',
     'c3_shutdown_failed',
+    # c2_seed.py volume validation; fixed strings, never exception payloads.
+    'c2_caller_lock_required', 'c2_path_redirected', 'c2_root_mismatch',
+    'c2_partial_requires_review', 'c2_embedding_configuration', 'c2_schema_mismatch',
+    'c2_identity_conflict', 'c2_known_compatible_invalid', 'c2_manifest_conflict',
+    'c2_incomplete_manifest', 'c2_id_collision', 'c2_manifest_path',
+    'c2_fixture_changed', 'c2_manifest_table', 'c2_receipt_changed',
+    'c2_index_changed', 'c2_compat_metadata', 'c2_compat_schema', 'c2_compat_vector',
 })
 _SAFE_FILES = frozenset({
     'c3_run.py', 'run.py', 'environment.py', 'initialize.py',

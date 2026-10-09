@@ -48,8 +48,11 @@ async def worker(params):
                         "protocolVersion":"2025-03-26","capabilities":{},
                         "clientInfo":{"name":"C2-local-validation","version":"1"}}})
                 assert response.status_code==200
-                session=response.headers["mcp-session-id"]
-                client.headers.update({"Mcp-Session-Id":session,"Mcp-Protocol-Version":"2025-03-26"})
+                # Stateless HTTP sends no session id; stateful servers still get it echoed.
+                session=response.headers.get("mcp-session-id")
+                client.headers.update({"Mcp-Protocol-Version":"2025-03-26"})
+                if session:
+                    client.headers["Mcp-Session-Id"]=session
                 response=await client.post("/mcp",params={"token":token},json={
                     "jsonrpc":"2.0","method":"notifications/initialized"})
                 assert response.status_code==202
@@ -91,7 +94,17 @@ async def worker(params):
             old = [b for b in await ob.bucket_mgr.list_all() if b["content"]=="obweb-ls-preserved-write"][0]
             ob.bucket_mgr.record_letter("obweb-ls-preserved-letter",old["id"])
             return dict(snapshot=snapshot(root),old_id=old["id"])
+        import c2_seed
         from c2_seed import initialize_c2, IDS
+        c2_seed.KNOWN_COMPATIBLE = tuple(params.get("known", ()))
+        if params.get("reader_drift"):
+            original = ob.bucket_mgr._load_bucket
+            def drifted(path):
+                loaded = original(path)
+                if loaded:
+                    loaded["metadata"]["domain"] = ["c2-drifted"]
+                return loaded
+            ob.bucket_mgr._load_bucket = drifted
         result = await initialize_c2(ob,root,lock)
         state = json.loads((root/".c2-v1.json").read_text())
         assert len(state["buckets"])==21 and len(state["vectors"])==20
@@ -184,9 +197,9 @@ async def worker(params):
         await stop(handle)
         lock.close()
 
-def child(root, action, ok=True):
+def child(root, action, ok=True, **extra):
     proc = subprocess.run([sys.executable,"-B",str(__file__),"--worker"],
-        input=json.dumps(dict(root=str(root),action=action)),text=True,capture_output=True,timeout=60)
+        input=json.dumps(dict(root=str(root),action=action,**extra)),text=True,capture_output=True,timeout=60)
     result = json.loads(proc.stdout)
     assert bool(proc.returncode==0)==ok, result
     return result
@@ -244,6 +257,105 @@ def test_fail_closed(tmp_path,failure):
     assert refused["error"]==expected[failure]
     after={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file()}
     assert after==before
+
+def all_files(root):
+    return {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in root.rglob("*") if p.is_file()}
+
+def old_identity(state, business="1"*64):
+    """Format-1 marker shape: five raw source hashes, no seed_hashes."""
+    old = {k:v for k,v in state.items() if k not in ("seed_hashes","seeded_source_hashes")}
+    old.update(format=1,source_hashes={**state["seed_hashes"],
+        "bucket_manager.py":business,"embedding_engine.py":"2"*64})
+    return old
+
+def entry(state):
+    keys = ("format","batch","baseline","group","source_hashes")
+    return dict(identity={k:state[k] for k in keys},source_commit="0"*40,evidence="test fixture")
+
+@pytest.fixture(scope="module")
+def seeded(tmp_path_factory):
+    root = tmp_path_factory.mktemp("seeded")/"lsf"
+    child(root,"prepare")
+    child(root,"read")
+    return root
+
+def volume(seeded, tmp_path):
+    import shutil
+    root = tmp_path/"lsf"
+    shutil.copytree(seeded, root)
+    return root, root/".c2-v1.json", json.loads((root/".c2-v1.json").read_text())
+
+def test_new_volume_marker_binds_seed_files_only(seeded, tmp_path):
+    root, marker, state = volume(seeded, tmp_path)
+    from c2_seed import SEED_FILES
+    assert state["format"]==2 and "source_hashes" not in state
+    assert set(state["seed_hashes"])=={f"deploy/lsf-zeabur/{n}" for n in SEED_FILES}
+    assert {"bucket_manager.py","embedding_engine.py"} <= set(state["seeded_source_hashes"])
+    # A business file that changed since seeding is provenance, not identity.
+    state["seeded_source_hashes"]["bucket_manager.py"]="0"*64
+    marker.write_text(json.dumps(state))
+    before = json.loads(json.dumps(snapshot(root)))
+    result = child(root,"initialize")
+    assert not result["initialized"] and result["snapshot"]==before
+
+def test_approved_old_volume_is_accepted_unchanged(seeded, tmp_path):
+    root, marker, state = volume(seeded, tmp_path)
+    old = old_identity(state)
+    marker.write_text(json.dumps(old))
+    before = json.loads(json.dumps(snapshot(root)))
+    result = child(root,"initialize",known=[entry(old)])
+    assert not result["initialized"] and result["snapshot"]==before
+
+@pytest.mark.parametrize("case",["unapproved_old","mixed","unknown_seed","fragment_entry",
+                                 "vector_row","vector_dimension","vector_model","reader_drift"])
+def test_refusal_leaves_volume_unchanged(seeded, tmp_path, case):
+    root, marker, state = volume(seeded, tmp_path)
+    extra, code = {}, "c2_identity_conflict"
+    if case=="unapproved_old":
+        marker.write_text(json.dumps(old_identity(state)))
+    elif case=="mixed":
+        # Two reviewed combinations; the marker splices files from both.
+        first, second = old_identity(state), old_identity(state, business="3"*64)
+        second["source_hashes"]["deploy/lsf-zeabur/c2_vectors.py"]="4"*64
+        spliced = json.loads(json.dumps(first))
+        spliced["source_hashes"]["deploy/lsf-zeabur/c2_vectors.py"]="4"*64
+        marker.write_text(json.dumps(spliced))
+        extra["known"]=[entry(first),entry(second)]
+    elif case=="unknown_seed":
+        state["seed_hashes"]["deploy/lsf-zeabur/c2_seed.py"]="f"*64
+        marker.write_text(json.dumps(state))
+    elif case=="fragment_entry":
+        old = old_identity(state)
+        marker.write_text(json.dumps(old))
+        fragment = entry(old)
+        del fragment["identity"]["source_hashes"]["bucket_manager.py"]
+        extra["known"]=[fragment]
+        code = "c2_known_compatible_invalid"
+    elif case.startswith("vector"):
+        bid = state["vectors"][0][0]
+        with sqlite3.connect(root/"buckets/embeddings.db") as conn:
+            if case=="vector_row":
+                conn.execute("UPDATE embeddings SET embedding=? WHERE bucket_id=?",("[1.0, 0.0, 0.0, 0.0]",bid))
+                code = "c2_index_changed"
+            else:
+                # Marker and store agree, so only the compatibility check can refuse.
+                embedding, model = state["vectors"][0][1], state["vectors"][0][2]
+                if case=="vector_dimension":
+                    embedding = "[0.0, 0.6, 0.8]"
+                else:
+                    model = "synthetic-embedding-other"
+                conn.execute("UPDATE embeddings SET embedding=?, model=? WHERE bucket_id=?",(embedding,model,bid))
+                state["vectors"][0][1], state["vectors"][0][2] = embedding, model
+                marker.write_text(json.dumps(state))
+                code = "c2_compat_vector"
+    else:
+        extra["reader_drift"]=True
+        code = "c2_compat_metadata"
+    before = all_files(root)
+    refused = child(root,"initialize",False,**extra)
+    assert refused["error"]==code
+    assert all_files(root)==before
 
 def test_run_uses_one_lock_before_public_socket():
     import ast

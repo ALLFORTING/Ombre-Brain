@@ -18,6 +18,20 @@ BATCH = "c2-v1"
 IDS = [f"c200000000{i:02d}" for i in range(1, 22)]
 NAME = ".c2-v1.json"
 MODEL = "synthetic-embedding-4-v1"
+DIMENSION = 4
+
+# Volume identity binds only the files that decide what gets seeded. Business code
+# (bucket_manager.py, embedding_engine.py) is checked for compatibility instead.
+SEED_FILES = ("c2_seed.py", "c2_vectors.py", "provider_stub.py")
+BUSINESS_FILES = ("bucket_manager.py", "embedding_engine.py")
+IDENTITY_KEYS = {
+    1: ("format", "batch", "baseline", "group", "source_hashes"),
+    2: ("format", "batch", "baseline", "group", "seed_hashes"),
+}
+# Reviewed historical identities. Each entry is a complete identity copied from a
+# real volume marker, with the source commit and evidence that justified it.
+# Entries are added only by an approved review; startup never adds or derives one.
+KNOWN_COMPATIBLE = ()
 
 def require(condition, code):
     if not condition:
@@ -85,11 +99,78 @@ def definitions(today):
     return rows
 
 def source_identity():
+    """Raw hashes of seed and business files; provenance only since format 2."""
     here = Path(__file__).resolve().parent
     source = here.parents[1]
-    paths = [here/n for n in ("c2_seed.py","c2_vectors.py","provider_stub.py")]
-    paths += [source/n for n in ("bucket_manager.py","embedding_engine.py")]
+    paths = [here/n for n in SEED_FILES] + [source/n for n in BUSINESS_FILES]
     return {str(p.relative_to(source)):digest(p.read_bytes()) for p in paths}
+
+def seed_identity():
+    here = Path(__file__).resolve().parent
+    source = here.parents[1]
+    return {str((here/n).relative_to(source)):digest((here/n).read_bytes()) for n in SEED_FILES}
+
+def current_identity():
+    return dict(format=2,batch=BATCH,baseline=BASELINE,group="L-SF",seed_hashes=seed_identity())
+
+def identity_of(state):
+    keys = IDENTITY_KEYS.get(state.get("format"))
+    if keys is None or not all(k in state for k in keys):
+        return None
+    return {k:state[k] for k in keys}
+
+def check_known_compatible(entries=None):
+    """Whitelist shape: complete identities only, never per-file fragments."""
+    for entry in KNOWN_COMPATIBLE if entries is None else entries:
+        require(set(entry) == {"identity","source_commit","evidence"}, "c2_known_compatible_invalid")
+        identity = entry["identity"]
+        keys = IDENTITY_KEYS.get(identity.get("format"))
+        require(keys is not None and set(identity) == set(keys), "c2_known_compatible_invalid")
+        hashes = identity["source_hashes" if identity["format"] == 1 else "seed_hashes"]
+        expected = {f"deploy/lsf-zeabur/{n}" for n in SEED_FILES}
+        if identity["format"] == 1:
+            expected |= set(BUSINESS_FILES)
+        require(set(hashes) == expected and all(len(h) == 64 and set(h) <= set("0123456789abcdef")
+                                                for h in hashes.values()),
+                "c2_known_compatible_invalid")
+        require(len(entry["source_commit"]) == 40 and set(entry["source_commit"]) <= set("0123456789abcdef")
+                and entry["evidence"], "c2_known_compatible_invalid")
+
+def identity_accepted(state):
+    identity = identity_of(state)
+    if identity is None:
+        return False
+    if identity == current_identity():
+        return True
+    check_known_compatible()
+    return any(entry["identity"] == identity for entry in KNOWN_COMPATIBLE)
+
+async def check_compatibility(ob, state, buckets, engine):
+    """Read-only: current code must read the stored fixtures with the recorded meaning."""
+    from utils import apply_display_aliases, apply_display_aliases_to_value
+    for row in state["buckets"]:
+        recorded = row["metadata"]
+        loaded = await ob.bucket_mgr.get(row["id"])
+        require(loaded is not None and loaded["id"] == row["id"], "c2_compat_metadata")
+        require(Path(loaded["path"]).resolve() == (buckets/row["path"]).resolve(), "c2_compat_metadata")
+        meta = loaded["metadata"]
+        for key in ("type","domain","importance","pinned","valence","arousal","created",
+                    "superseded_by","supersedes","topics"):
+            require(meta.get(key) == recorded.get(key), "c2_compat_metadata")
+        require(bool(meta.get("dormant")) == bool(recorded.get("dormant", False)), "c2_compat_metadata")
+        require(meta.get("sealed") == (1 if int(recorded.get("sealed", 0) or 0) == 1 else 0),
+                "c2_compat_metadata")
+        require(meta.get("name") == apply_display_aliases(recorded.get("name")), "c2_compat_metadata")
+        require(meta.get("tags") == apply_display_aliases_to_value(recorded.get("tags")), "c2_compat_metadata")
+        require(digest(frontmatter.load(buckets/row["path"]).content.encode()) == row["body_sha256"],
+                "c2_compat_metadata")
+    with sqlite3.connect(engine.db_path) as vectors:
+        columns = {r[1] for r in vectors.execute("PRAGMA table_info(embeddings)")}
+    require({"bucket_id","embedding","model","updated_at"} <= columns, "c2_compat_schema")
+    for bid, _, model, _ in state["vectors"]:
+        require(model == MODEL == engine.model, "c2_compat_vector")
+        value = await engine.get_embedding(bid)
+        require(isinstance(value, list) and len(value) == DIMENSION and valid_unit(value), "c2_compat_vector")
 
 def sql_rows(connection, table):
     key = "bucket_id" if table == "embeddings" else "id"
@@ -106,8 +187,7 @@ async def initialize_c2(ob, root, lock):
     require(Path(ob.config["buckets_dir"]) == buckets, "c2_root_mismatch")
     marker = root/NAME
     require(not (root/".c2-v1-complete.tmp").exists(), "c2_partial_requires_review")
-    identity = dict(format=1,batch=BATCH,baseline=BASELINE,group="L-SF",
-                    source_hashes=source_identity())
+    identity = current_identity()
     db = Path(ob.bucket_mgr.history_db_path)
     engine = ob.bucket_mgr.embedding_engine
     require(engine and engine.enabled and engine.model == MODEL, "c2_embedding_configuration")
@@ -120,7 +200,7 @@ async def initialize_c2(ob, root, lock):
                     "c2_schema_mismatch")
         if marker.exists():
             state = json.loads(marker.read_text())
-            require(all(state.get(k)==v for k,v in identity.items()), "c2_identity_conflict")
+            require(identity_accepted(state), "c2_identity_conflict")
             require(state.get("status")=="complete", "c2_partial_requires_review")
             require([r["id"] for r in state["buckets"]]==IDS, "c2_manifest_conflict")
             require(set(state["sql_rows"])=={"letters","bucket_history"} and
@@ -147,6 +227,7 @@ async def initialize_c2(ob, root, lock):
                 for row in state["vectors"]:
                     require(vectors.execute("SELECT bucket_id,embedding,model,updated_at FROM embeddings WHERE bucket_id=?",
                                              (row[0],)).fetchone()==tuple(row), "c2_index_changed")
+            await check_compatibility(ob, state, buckets, engine)
             return dict(initialized=False,today=state["today"],bucket_count=21)
 
         require(not any((buckets/k/BATCH).exists() for k in ("dynamic","archive","feel","permanent")),
@@ -166,7 +247,8 @@ async def initialize_c2(ob, root, lock):
         seed_bytes = seed_marker.read_bytes()
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         fixtures = definitions(today)
-        state = dict(identity,status="started",today=today,buckets=[])
+        state = dict(identity,status="started",today=today,buckets=[],
+                     seeded_source_hashes=source_identity())
         write_new(marker,json.dumps(state,sort_keys=True).encode())
         for path,post in fixtures:
             target = buckets/path
