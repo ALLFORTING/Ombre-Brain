@@ -154,11 +154,15 @@ async def worker(action, root):
                     async with asyncio.timeout(45):
                         while not any(e['event']=='waiting' and e['scenario']==name for e in controller.events):
                             await asyncio.sleep(.02)
+                        # 593ef8d binds release to one request: mark it before closing, release by id.
+                        request_id = controller.target_request
+                        assert request_id and not controller.unaccepted
+                        await control('mark-operation',{'request_id':request_id})
                         writer.close()
                         await writer.wait_closed()
                         while not any(e['event']=='http.disconnect' and e['scenario']==name for e in controller.events):
                             await asyncio.sleep(.02)
-                        await control('release',{})
+                        await control('release',{'request_id':request_id})
                         while not (row:=controller.ob.bucket_mgr.inspect_trace_request(fixed['operation_id'])) or row['status']!='completed':
                             await asyncio.sleep(.02)
                     first = row['result_text']
