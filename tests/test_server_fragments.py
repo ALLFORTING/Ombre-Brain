@@ -34,7 +34,7 @@ FRAGMENTS = {
     "server_breath.py": ("_auto_link_related", "digest", "_breath_impl"),
     "server_assets.py": ("_auto_link_related", "digest", "_selected_asset_backend"),
     "server_breath_tool.py": ("related_backfill", "_format_hold_created", "breath"),
-    "server_dashboard_api.py": ("dream", None, "api_system_status"),
+    "server_dashboard_api.py": ("dream", "add_backup_v2_status_entry_middleware", "api_system_status"),
 }
 
 DEFAULT_TOOL_ORDER = [

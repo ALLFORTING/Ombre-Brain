@@ -1,3 +1,4 @@
+import ast
 import importlib
 import logging
 import sys
@@ -297,7 +298,21 @@ def test_both_http_entrypoints_use_shared_cors_policy():
     server_source = effective_server_source()
     backup_source = (root / "backup_entry.py").read_text(encoding="utf-8")
 
-    assert "add_http_cors_middleware(_app)" in server_source
+    assert "add_http_transport_middleware(_app)" in server_source
+    helper = next(
+        node for node in ast.parse(server_source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "add_http_transport_middleware"
+    )
+    helper_app = helper.args.args[0].arg
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "add_http_cors_middleware"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == helper_app
+        for node in ast.walk(helper)
+    )
     assert "server.add_http_cors_middleware(app)" in backup_source
     assert "install_uvicorn_access_log_redaction()" in server_source
     assert "server.install_uvicorn_access_log_redaction()" in backup_source

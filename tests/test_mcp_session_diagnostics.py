@@ -275,17 +275,34 @@ def test_real_stateful_sdk_creation_termination_and_expired_request_are_private(
 
 def test_both_http_entrypoints_install_shared_helper_before_uvicorn():
     root = Path(__file__).parents[1]
-    for filename in ("server.py", "backup_entry.py"):
-        tree = ast.parse((root / filename).read_text(encoding="utf-8-sig"))
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-        installs = [node for node in calls if (
-            isinstance(node.func, ast.Name) and node.func.id == "add_mcp_diagnostic_middleware"
-        ) or (
-            isinstance(node.func, ast.Attribute) and node.func.attr == "add_mcp_diagnostic_middleware"
+
+    def calls_to(node, name):
+        return [call for call in ast.walk(node) if isinstance(call, ast.Call) and (
+            isinstance(call.func, ast.Name) and call.func.id == name
+            or isinstance(call.func, ast.Attribute) and call.func.attr == name
         )]
-        runs = [node for node in calls if isinstance(node.func, ast.Attribute)
+
+    # server.py installs through add_http_transport_middleware (250bd91);
+    # backup_entry.py still calls the diagnostic helper directly.
+    for filename, installer in (
+        ("server.py", "add_http_transport_middleware"),
+        ("backup_entry.py", "add_mcp_diagnostic_middleware"),
+    ):
+        tree = ast.parse((root / filename).read_text(encoding="utf-8-sig"))
+        diagnostics = calls_to(tree, "add_mcp_diagnostic_middleware")
+        installs = calls_to(tree, installer)
+        runs = [node for node in calls_to(tree, "run") if isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "uvicorn" and node.func.attr == "run"]
-        assert len(installs) == len(runs) == 1
+                and node.func.value.id == "uvicorn"]
+        assert len(diagnostics) == len(installs) == len(runs) == 1
         assert installs[0].lineno < runs[0].lineno
         assert ast.dump(installs[0].args[0]) == ast.dump(runs[0].args[0])
+        if installer != "add_mcp_diagnostic_middleware":
+            helper = next(
+                node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == installer
+            )
+            assert diagnostics[0] in list(ast.walk(helper))
+            assert ast.dump(diagnostics[0].args[0]) == ast.dump(
+                ast.Name(id=helper.args.args[0].arg, ctx=ast.Load())
+            )
