@@ -791,6 +791,10 @@
             "default": "",
             "type": "string"
           },
+          "touch": {
+            "default": true,
+            "type": "boolean"
+          },
           "wake_dormant": {
             "default": false,
             "type": "boolean"

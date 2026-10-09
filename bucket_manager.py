@@ -4629,8 +4629,10 @@ class BucketManager(BucketRevisionMixin):
             if allowed_ids is not None and bucket["id"] not in allowed_ids:
                 continue
             meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel
+            # Skip pinned/permanent/feel, and sealed: reading a neighbour never writes a sealed bucket
             if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
+                continue
+            if int(meta.get("sealed", 0) or 0) == 1:
                 continue
 
             created_str = meta.get("created", meta.get("last_active", ""))

@@ -5381,9 +5381,13 @@ async def pulse(
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
-    """Optional reflection readout: recent memory summaries, or full details for selected buckets."""
-    await decay_engine.ensure_started()
+async def dream(detail_ids: str = "", wake_dormant: bool = False, touch: bool = True) -> str:
+    """Optional reflection readout: recent memory summaries, or full details for selected buckets.
+
+    touch=False reads without activation, time ripple, waking or decay startup.
+    """
+    if touch:
+        await decay_engine.ensure_started()
 
     requested_ids = list(dict.fromkeys(_parse_csv_ids(detail_ids)))
     if requested_ids:
@@ -5410,10 +5414,11 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
                 f"ID: {bucket_id}\n"
                 f"{detail_prefix}{strip_wikilinks(bucket.get('content', ''))}"
             )
-            await bucket_mgr.touch(
-                bucket_id,
-                wake_dormant=wake_dormant,
-            )
+            if touch:
+                await bucket_mgr.touch(
+                    bucket_id,
+                    wake_dormant=wake_dormant,
+                )
         return "=== Dream Details ===\n" + "\n---\n".join(details)
 
     try:
@@ -5438,7 +5443,7 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
         reverse=True,
     )
     recent = candidates[:5]
-    for bucket in recent:
+    for bucket in recent if touch else ():
         await bucket_mgr.touch(
             bucket["id"],
             wake_dormant=wake_dormant,
