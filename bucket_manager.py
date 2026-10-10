@@ -3448,12 +3448,9 @@ class BucketManager(BucketRevisionMixin):
             except DeleteAdmissionError as exc:
                 raise BucketIdempotencyError(exc.code) from exc
             try:
+                self._write_post_atomic(file_path, post)
                 if operation is not None:
-                    self._write_post_atomic(file_path, post)
                     self._mark_import_operation_applied(_o5b_operation_key)
-                else:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
             except OSError as e:
                 logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
                 raise
@@ -4266,13 +4263,9 @@ class BucketManager(BucketRevisionMixin):
 
             applied_supersession = []
             try:
-                if paired_supersession or operation is not None or content_changed or prepared_todos is not None or requested_permanent is not None or kwargs.get("pinned"):
-                    self._write_post_atomic(file_path, post)
-                    if operation is not None:
-                        self._mark_import_operation_applied(o5b_operation_key)
-                else:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
+                self._write_post_atomic(file_path, post)
+                if operation is not None:
+                    self._mark_import_operation_applied(o5b_operation_key)
                 if supersession_original is not None:
                     applied_supersession.append((bucket_id, file_path, supersession_original))
                 for neighbor_path, draft, original in reverse_updates:
@@ -4571,8 +4564,7 @@ class BucketManager(BucketRevisionMixin):
                 if wake_dormant:
                     post["dormant"] = False
 
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
+                self._write_post_atomic(file_path, post)
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -4597,8 +4589,7 @@ class BucketManager(BucketRevisionMixin):
             try:
                 post = frontmatter.load(file_path)
                 post["dormant"] = bool(dormant)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
+                self._write_post_atomic(file_path, post)
                 return True
             except Exception as e:
                 logger.warning(f"Failed to set dormant for {bucket_id}: {e}")
@@ -4657,8 +4648,7 @@ class BucketManager(BucketRevisionMixin):
                         current_count = post.get("activation_count", 1)
                         # Store as float for fractional increments; calculate_score handles it
                         post["activation_count"] = round(current_count + 0.3, 1)
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            f.write(frontmatter.dumps(post))
+                        self._write_post_atomic(file_path, post)
                         rippled += 1
                     except Exception:
                         logger.warning("Failed to persist time ripple for %s", bucket["id"])
@@ -5248,8 +5238,7 @@ class BucketManager(BucketRevisionMixin):
 
                 # Update type marker then move file / 更新类型标记后移动文件
                 post["type"] = "archived"
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
+                self._write_post_atomic(file_path, post)
 
                 # Use shutil.move for cross-filesystem safety
                 # 使用 shutil.move 保证跨文件系统安全
