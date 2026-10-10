@@ -561,6 +561,12 @@ The only required argument remains `summary`. Generate the optional case-sensiti
 - `digest(mode="dedupe")` 的 `M` 是所选目录中的原始 `.md` 文件数，`N` 是关联到范围内未 sealed 桶、且当前模型 JSON 为有限非空一维向量的可用行数；`K=M-N` 只是两个不同口径的算术差，不表示“缺失 embedding”。archive 是否纳入由 `include_archive` 决定；sealed、无效、元数据不可读与 orphan 行分别计数，orphan 只报数量而不输出 ID。
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
 
+#### 写入回执的引号提醒 / Quote reminder in write receipts
+
+`hold`、`grow`、`trace`（正文替换或追加）和 `archive_session` 成功写入的正文（archive_session 含 summary、highlights、mood、letter）若含成对的 `「」` 或 `“”`，回执末尾追加一行：`正文有 N 处引号（「」或 “”）。请确认是不是逐字原话；不是就去掉引号。` 只是提醒：不改正文、provenance 或读取格式；被拒或失败的写入没有这行；同一 `operation_id` 重放返回相同提醒。
+
+On a successful body write by `hold`, `grow`, `trace` (content replace/append), or `archive_session`, paired `「」`/`“”` quotes add one reminder line to the receipt asking the writer to confirm the quoted text is verbatim. It changes nothing stored; rejected writes get no line, and an `operation_id` replay returns the same line.
+
 #### `hold` similarity and conflict warnings
 
 `hold` performs a read-only similarity check before it creates a bucket. It uses the normal visible retrieval corpus (non-archived, non-sealed, non-dormant buckets) and reports a reminder only when the best embedding cosine similarity reaches `0.80`. The reminder never blocks the write and never creates relations, merges buckets, or sets supersession metadata. If embedding is disabled, its provider fails, or no usable index exists, `hold` explicitly reports that the similarity check was not run.
@@ -919,6 +925,7 @@ Sensitive config via env vars:
 | `OMBRE_DASHBOARD_SETUP_TOKEN` | 否 / No | — | Operator-provided one-time token for first browser setup; required only when the auth store is missing and `OMBRE_DASHBOARD_PASSWORD` is not being used |
 | `OMBRE_HOOK_URL` | 否 / No | — | breath/dream 后异步 POST 的 webhook / Webhook target after breath/dream |
 | `OMBRE_HOOK_SKIP` | 否 / No | `false` | 临时禁用 webhook / Temporarily disable webhook |
+| `OMBRE_BACKUP_AUTO_ENABLED` | 否 / No | `false` | 注册自动备份 v1 入口；为 true 时还需七项 `OMBRE_BACKUP_AUTO_*`，见[自动备份](#自动备份--automatic-github-backup) / Registers automatic backup v1; seven more `OMBRE_BACKUP_AUTO_*` settings are then required |
 
 `OMBRE_AUTH_TOKEN` 示例 / `OMBRE_AUTH_TOKEN` example:
 
@@ -973,20 +980,26 @@ A local CLI can create a portable directory export of ordinary unsealed memory o
 
 ### 自动备份 / Automatic GitHub Backup
 
-Ombre Brain 支持通过 GitHub Actions 每日导出完整库快照到私有备份仓库（推荐名 `ob-backup`）。备份内容包括所有桶、archive、feel、情绪时间线、信箱/历史 SQLite 等支持文件；文件按日期保存为 `backups/YYYY-MM-DD.json`，保留全部历史版本。
+当前入口是自动备份 v1：私有仓库 `ALLFORTING/ob-backup` 的 `.github/workflows/backup-auto.yml` 用 GitHub OIDC 调服务端 `/api/backup/auto/v1/*`，拿到完整采集包后上传为该仓库的 Release asset。服务端契约（OIDC 绑定、状态机、错误码、明文格式）见 [backup-auto-server-contract](docs/backup-auto-server-contract.md)。
 
-Ombre Brain can export a complete daily snapshot to a private GitHub backup repository (recommended: `ob-backup`) through GitHub Actions. Backups include all buckets, archive, feel, emotion timeline, mailbox/history SQLite support files, and are stored as `backups/YYYY-MM-DD.json` with full history retained.
+Automatic backup v1: `backup-auto.yml` in the private `ALLFORTING/ob-backup` repository authenticates with GitHub OIDC to `/api/backup/auto/v1/*`, captures a full bundle, and uploads it as a Release asset. See [backup-auto-server-contract](docs/backup-auto-server-contract.md) for OIDC binding, states, error codes, and the plaintext format.
 
-基本配置 / Basic setup:
+**服务端 / Server**（默认关闭；单进程单 worker、`streamable-http`）：
 
-1. 创建私有仓库，例如 `ALLFORTING/ob-backup` / Create a private repo, e.g. `ALLFORTING/ob-backup`.
-2. 在备份仓库中放置 `.github/workflows/backup.yml`，每天定时触发，也可 `workflow_dispatch` 手动触发 / Add `.github/workflows/backup.yml` in the backup repo; schedule daily and allow manual dispatch.
-3. Render 服务需要暴露 `/api/backup/export`，该端点只接受 GitHub OIDC token，校验调用方仓库、分支和 workflow 路径 / Render exposes `/api/backup/export`; it only accepts GitHub OIDC tokens and validates repository, branch, and workflow path.
-4. 备份 workflow 只应 `git add backups/`，不要在运行时自我修改 workflow 文件，避免 `GITHUB_TOKEN` 缺少 workflows 权限导致 push 被拒 / The workflow should only `git add backups/`; do not self-modify workflow files at runtime, or pushes may be rejected because `GITHUB_TOKEN` lacks workflow permission.
+- `OMBRE_BACKUP_AUTO_ENABLED=true` 才注册入口；另需 `OMBRE_BACKUP_AUTO_` 前缀的 `WORKSPACE_ROOT`、`FREEZE_TIMEOUT_SECONDS`、`MAX_FREEZE_SECONDS`、`MAX_SOURCE_BYTES`、`MAX_BUNDLE_BYTES`、`MINIMUM_FREE_BYTES`、`READY_TTL_SECONDS`，取值约束见契约。Zeabur 保存变量后需 Restart 才生效。
+- OIDC audience `ombre-brain-backup-auto-v1`，精确绑定仓库、`refs/heads/main` 和 workflow 路径；token 带 `job_workflow_ref` 时必须等于 `ALLFORTING/ob-backup/.github/workflows/backup-auto.yml@refs/heads/main`。
+- 采集期间进程内写入冻结：新的 MCP/HTTP 写入以 `maintenance_in_progress` 拒绝（HTTP 为 503），breath/dream 的附带写跳过；冻结上限为 `MAX_FREEZE_SECONDS`，下载和上传在释放之后。外部直接文件写不受协调器约束。
 
-默认允许的备份仓库是 `ALLFORTING/ob-backup`；如需改名，设置 `OMBRE_BACKUP_REPOSITORY`。
+**客户端 / Client**（`ALLFORTING/ob-backup`）：
 
-The default allowed backup repository is `ALLFORTING/ob-backup`; override with `OMBRE_BACKUP_REPOSITORY` if needed.
+- 定时 `17 19 * * *` UTC（上海 03:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
+- Repository variables：`OMBRE_BACKUP_AUTO_ENABLED`（GitHub 侧调度开关，与服务端同名变量独立；为 false 时定时与普通手动运行都跳过）、`OMBRE_BACKUP_AUTO_MODE`（默认 `full`，当前用 `simple`）、`OMBRE_BACKUP_AUTO_MAX_DOWNLOAD_BYTES`、`OMBRE_BACKUP_AUTO_POLL_TIMEOUT_SECONDS`；secret `OMBRE_BACKUP_AUTO_ENDPOINT` 填服务 origin。
+- `metadata_only=true` 的手动运行即使开关为 false 也只做一次 metadata 认证探测，不采集。
+- `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；跳过恢复演练和保留删除，库存会持续增长。
+
+旧 `/api/backup/export`（`backups/YYYY-MM-DD.json`）只在 Render 入口 `backup_entry.py` 注册（允许仓库默认 `ALLFORTING/ob-backup`，可用 `OMBRE_BACKUP_REPOSITORY` 改），Docker/Zeabur 的 `server.py` 不提供；旧人工加密 v2（`OMBRE_BACKUP_V2_*`）继续兼容。
+
+The legacy `/api/backup/export` (`backups/YYYY-MM-DD.json`) is registered only by the Render entry `backup_entry.py` (allowed repository `ALLFORTING/ob-backup`, overridable with `OMBRE_BACKUP_REPOSITORY`), not by Docker/Zeabur `server.py`. The manual encrypted v2 path (`OMBRE_BACKUP_V2_*`) remains compatible.
 
 ## Dashboard 认证 / Dashboard Auth
 
