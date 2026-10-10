@@ -42,7 +42,10 @@ class StrictBackupAutoOidcPolicy:
                 or claims.get("event_name") not in {"schedule", "workflow_dispatch"}
                 or any(not isinstance(claims.get(k), str) or _RUN_ID_PATTERN.fullmatch(claims[k]) is None
                        for k in ("run_id", "run_attempt"))
-                or "job_workflow_ref" in claims or "environment" in claims):
+                or ("job_workflow_ref" in claims and
+                    (not isinstance(claims["job_workflow_ref"], str)
+                     or claims["job_workflow_ref"] != AUTO_WORKFLOW_REF))
+                or "environment" in claims):
             if not isinstance(claims, dict):
                 mismatches = ["claims"]
             else:
@@ -54,7 +57,12 @@ class StrictBackupAutoOidcPolicy:
                     k for k in ("run_id", "run_attempt")
                     if not isinstance(claims.get(k), str) or _RUN_ID_PATTERN.fullmatch(claims[k]) is None
                 )
-                mismatches.extend(k for k in ("job_workflow_ref", "environment") if k in claims)
+                if ("job_workflow_ref" in claims and
+                        (not isinstance(claims["job_workflow_ref"], str)
+                         or claims["job_workflow_ref"] != AUTO_WORKFLOW_REF)):
+                    mismatches.append("job_workflow_ref")
+                if "environment" in claims:
+                    mismatches.append("environment")
             _log_oidc_denial("auto_policy", fields=mismatches)
             raise CaptureChannelError("oidc_denied")
         return {k: claims[k] for k in ("run_id", "run_attempt")}

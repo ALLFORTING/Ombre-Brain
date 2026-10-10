@@ -610,3 +610,69 @@ async def test_auto_stream_runtime_drift_releases_delivery(registered_auto):
         await response(scope, receive, send)
     assert not any(event.get("more_body") is False for event in events if event["type"] == "http.response.body")
     assert path.exists() and not c._active_deliveries
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+@pytest.mark.parametrize("present", [False, True])
+def test_auto_oidc_job_workflow_ref_absent_or_exact_is_accepted(caplog, event, present):
+    data = {**claims(), "event_name": event}
+    if present:
+        data["job_workflow_ref"] = auto.AUTO_WORKFLOW_REF
+    assert auto.StrictBackupAutoOidcPolicy().verify(data) == {"run_id": "123", "run_attempt": "1"}
+    assert not [record for record in caplog.records if record.name == "ombre_brain.backup_oidc"]
+
+
+@pytest.mark.parametrize("value", [
+    "", "attacker/ob-backup/.github/workflows/backup-auto.yml@refs/heads/main",
+    "ALLFORTING/ob-backup/.github/workflows/other.yml@refs/heads/main",
+    "ALLFORTING/ob-backup/.github/workflows/backup-auto.yml@refs/heads/other",
+    "ALLFORTING/ob-backup/.github/workflows/backup-auto.yml@refs/tags/main",
+    "ALLFORTING/ob-backup/.github/workflows/backup-auto.yml@" + "a" * 40,
+    auto.AUTO_WORKFLOW_REF + " ", " " + auto.AUTO_WORKFLOW_REF,
+    auto.AUTO_WORKFLOW_REF.lower(), None, True, False, 0, 1, 1.0, [], {},
+    [auto.AUTO_WORKFLOW_REF], {"ref": auto.AUTO_WORKFLOW_REF},
+])
+def test_auto_oidc_job_workflow_ref_wrong_reference_or_type_is_denied(caplog, value):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ombre_brain.backup_oidc")
+    data = {**claims(), "job_workflow_ref": value}
+    with pytest.raises(capture.CaptureChannelError, match="oidc_denied") as denied:
+        auto.StrictBackupAutoOidcPolicy().verify(data)
+    response = capture._route_error(denied.value)
+    assert response.status_code == 400 and response.body == b'{"status":"oidc_denied"}'
+    records = [record for record in caplog.records if record.name == "ombre_brain.backup_oidc"]
+    assert len(records) == 1
+    assert records[0].getMessage() == "oidc_denied stage=auto_policy exception=none fields=job_workflow_ref"
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("repository", "attacker/ob-backup"), ("repository_id", "1"),
+    ("repository_owner", "attacker"), ("repository_owner_id", "1"),
+    ("repository_visibility", "public"), ("ref", "refs/heads/other"),
+    ("workflow_ref", "ALLFORTING/ob-backup/.github/workflows/other.yml@refs/heads/main"),
+    ("aud", capture.V2_AUDIENCE), ("event_name", "pull_request"),
+    ("run_id", "0"), ("run_attempt", "0"), ("run_attempt", 1),
+    ("environment", "production"),
+])
+def test_matching_job_workflow_ref_never_bypasses_other_identity_checks(caplog, field, value):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ombre_brain.backup_oidc")
+    data = {**claims(), "job_workflow_ref": auto.AUTO_WORKFLOW_REF, field: value}
+    with pytest.raises(capture.CaptureChannelError, match="oidc_denied") as denied:
+        auto.StrictBackupAutoOidcPolicy().verify(data)
+    response = capture._route_error(denied.value)
+    assert response.status_code == 400 and response.body == b'{"status":"oidc_denied"}'
+    records = [record for record in caplog.records if record.name == "ombre_brain.backup_oidc"]
+    assert len(records) == 1 and records[0].getMessage().endswith("fields=" + field)
+    assert "job_workflow_ref" not in records[0].getMessage()
+
+
+@pytest.mark.parametrize("value", ["PRIVATE_SENTINEL_DO_NOT_LOG", {"PRIVATE_SENTINEL_DO_NOT_LOG": True}])
+def test_denied_job_workflow_ref_values_never_enter_diagnostics(caplog, value):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ombre_brain.backup_oidc")
+    with pytest.raises(capture.CaptureChannelError, match="oidc_denied"):
+        auto.StrictBackupAutoOidcPolicy().verify({**claims(), "job_workflow_ref": value})
+    assert "PRIVATE_SENTINEL_DO_NOT_LOG" not in caplog.text
+    assert "fields=job_workflow_ref" in caplog.text
