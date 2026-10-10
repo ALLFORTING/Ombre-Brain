@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 import json
+import logging
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -18,6 +19,16 @@ OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 OIDC_JWKS_URL = f"{OIDC_ISSUER}/.well-known/jwks"
 MAX_OIDC_TOKEN_BYTES = 8192
 _TOKEN_FIELD_NAMES = {"token", "access_token", "authorization"}
+logger = logging.getLogger("ombre_brain.backup_oidc")
+
+
+def _log_oidc_denial(stage: str, *, exception: Exception | None = None, fields=()) -> None:
+    """Only fixed stages/field names and exception types; never values or traceback."""
+    logger.warning(
+        "oidc_denied stage=%s exception=%s fields=%s",
+        stage, type(exception).__name__ if exception is not None else "none",
+        ",".join(fields) or "none",
+    )
 
 
 class GitHubActionsBackupV2OidcVerifier:
@@ -39,15 +50,33 @@ class GitHubActionsBackupV2OidcVerifier:
         self._decoder = decoder or self._decode_token
 
     async def verify_request(self, request: Any) -> dict[str, Any]:
-        token = _extract_bearer_token(request)
-        await _reject_body_token_location(request)
         try:
-            claims = await asyncio.to_thread(self._decoder, token, self._client())
+            token = _extract_bearer_token(request)
+        except CaptureChannelError as exc:
+            _log_oidc_denial("request_bearer", exception=exc)
+            raise
+        try:
+            await _reject_body_token_location(request)
+        except CaptureChannelError as exc:
+            _log_oidc_denial("request_body", exception=exc)
+            raise
+        try:
+            client = self._client()
+        except CaptureChannelError as exc:
+            _log_oidc_denial("jwks_client", exception=exc)
+            raise
+        except Exception as exc:
+            _log_oidc_denial("jwks_client", exception=exc)
+            raise CaptureChannelError("oidc_denied") from exc
+        try:
+            claims = await asyncio.to_thread(self._decoder, token, client)
         except CaptureChannelError:
             raise
         except Exception as exc:
+            _log_oidc_denial("jwt_decode", exception=exc)
             raise CaptureChannelError("oidc_denied") from exc
         if not isinstance(claims, Mapping) or claims.get("aud") != self.audience:
+            _log_oidc_denial("decoded_claims", fields=("claims",) if not isinstance(claims, Mapping) else ("aud",))
             raise CaptureChannelError("oidc_denied")
         return dict(claims)
 
@@ -57,11 +86,15 @@ class GitHubActionsBackupV2OidcVerifier:
         return self._jwk_client
 
     def _decode_token(self, token: str, jwk_client: Any) -> Mapping[str, Any]:
+        stage = "jwt_header"
         try:
             header = jwt.get_unverified_header(token)
+            stage = "jwt_algorithm"
             if header.get("alg") != "RS256":
                 raise CaptureChannelError("oidc_denied")
+            stage = "jwks_key"
             signing_key = jwk_client.get_signing_key_from_jwt(token)
+            stage = "jwt_claims"
             claims = jwt.decode(
                 token,
                 signing_key.key,
@@ -70,11 +103,14 @@ class GitHubActionsBackupV2OidcVerifier:
                 issuer=OIDC_ISSUER,
                 options={"require": ["exp", "iat", "nbf", "iss", "aud"]},
             )
-        except CaptureChannelError:
+        except CaptureChannelError as exc:
+            _log_oidc_denial(stage, exception=exc)
             raise
         except Exception as exc:
+            _log_oidc_denial(stage, exception=exc)
             raise CaptureChannelError("oidc_denied") from exc
         if not isinstance(claims, Mapping):
+            _log_oidc_denial("decoded_claims", fields=("claims",))
             raise CaptureChannelError("oidc_denied")
         return claims
 

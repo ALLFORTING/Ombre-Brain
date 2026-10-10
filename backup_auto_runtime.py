@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 
-from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
+from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier, _log_oidc_denial
 from backup_v2_runtime import (
     BackupV2RuntimeConfigError, _custom_route_signatures, _parse_bounded_int,
     _require_single_worker, _validate_workspace_root, require_runtime_coordinator,
@@ -43,6 +43,19 @@ class StrictBackupAutoOidcPolicy:
                 or any(not isinstance(claims.get(k), str) or _RUN_ID_PATTERN.fullmatch(claims[k]) is None
                        for k in ("run_id", "run_attempt"))
                 or "job_workflow_ref" in claims or "environment" in claims):
+            if not isinstance(claims, dict):
+                mismatches = ["claims"]
+            else:
+                mismatches = [k for k, v in exact.items() if claims.get(k) != v]
+                event = claims.get("event_name")
+                if not isinstance(event, str) or event not in {"schedule", "workflow_dispatch"}:
+                    mismatches.append("event_name")
+                mismatches.extend(
+                    k for k in ("run_id", "run_attempt")
+                    if not isinstance(claims.get(k), str) or _RUN_ID_PATTERN.fullmatch(claims[k]) is None
+                )
+                mismatches.extend(k for k in ("job_workflow_ref", "environment") if k in claims)
+            _log_oidc_denial("auto_policy", fields=mismatches)
             raise CaptureChannelError("oidc_denied")
         return {k: claims[k] for k in ("run_id", "run_attempt")}
 
