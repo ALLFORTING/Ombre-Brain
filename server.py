@@ -9893,6 +9893,50 @@ async def _format_hold_created(bucket_id: str) -> str:
     )
 
 
+_QUOTE_PAIR_RE = re.compile(r"「[^「」]*」|“[^“”]*”")
+_GROW_DIGEST_RECEIPT_RE = re.compile(r"(\d+)条\|新建(\d+)/复用(\d+)")
+
+
+def _quote_reminder_line(*texts) -> str:
+    """Count paired 「」/“” quotes in written body text; reminder only, body untouched."""
+    count = sum(len(_QUOTE_PAIR_RE.findall(text)) for text in texts if isinstance(text, str))
+    if not count:
+        return ""
+    return f"正文有 {count} 处引号（「」或 “”）。请确认是不是逐字原话；不是就去掉引号。"
+
+
+def _with_quote_reminder(texts, wrote):
+    """Append the quote reminder to successful body-write receipts.
+
+    Computed from request arguments plus the returned receipt, so an
+    operation_id replay of the same payload returns the same reminder.
+    """
+    def decorate(fn):
+        signature = inspect.signature(fn)
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            result = await fn(*args, **kwargs)
+            if not isinstance(result, str) or not wrote(result):
+                return result
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            line = _quote_reminder_line(*texts(bound.arguments))
+            return f"{result}\n{line}" if line else result
+        return wrapper
+    return decorate
+
+
+def _hold_grow_wrote(result: str) -> bool:
+    digest = _GROW_DIGEST_RECEIPT_RE.match(result)
+    if digest:
+        return int(digest[2]) + int(digest[3]) > 0
+    return result.startswith(("新建", "复用了已匹配到的相同内容桶", "🫧feel→", "📌", "fact evolved in place:"))
+
+
+def _trace_wrote_content(result: str) -> bool:
+    return result.startswith("已修改记忆桶 ") and ("content=已替换" in result or "content=已追加" in result)
+
+
 def _format_hold_feel_source_receipt(bucket_id: str, source_id: str, error: str) -> str:
     """Append six stable fields; JSON IDs cannot inject receipt lines."""
     return (
@@ -10436,6 +10480,7 @@ def _hold_grow_item_response(payload, parent, ordinal, resolutions):
 
 
 @mcp.tool()
+@_with_quote_reminder(lambda a: (a["content"],), _hold_grow_wrote)
 async def hold(
     content: str,
     tags: str = "",
@@ -10680,6 +10725,7 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
+@_with_quote_reminder(lambda a: (a["content"],), _hold_grow_wrote)
 async def grow(content: str, operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
     description="Opaque retry identity shared with trace/hold. Frozen ordered digest items resume without another digest. None preserves legacy behavior.")] | None = None) -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
@@ -11126,6 +11172,7 @@ async def _trace_keyed(operation_id, values):
 
 @_guard_todo_drop_presence
 @mcp.tool()
+@_with_quote_reminder(lambda a: (a["content"],), _trace_wrote_content)
 async def trace(
     bucket_id: str,
     name: Annotated[str, Field(description="An empty string leaves the bucket name unchanged. Batch trace rejects a non-empty name.")] = "",
@@ -11551,6 +11598,9 @@ async def seal_letter(letter_id: int, sealed: int = 1) -> str:
 # Tool 5: archive_session — Archive a conversation summary
 # =============================================================
 @mcp.tool()
+@_with_quote_reminder(
+    lambda a: (a["summary"], a["highlights"], a["mood"], a["letter"]),
+    lambda result: result.startswith("已归档本次对话:"))
 async def archive_session(
     summary: str,
     highlights: str = "",
