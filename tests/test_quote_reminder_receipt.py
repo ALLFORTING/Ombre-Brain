@@ -150,3 +150,13 @@ async def test_archive_session_reminder(manager, operation_id):
 
 async def test_archive_session_rejected_has_no_reminder(manager):
     assert_no_reminder(await server.archive_session('   ', highlights=QUOTED))
+
+
+@pytest.mark.parametrize('operation_id', [None, 'reuse-op'])
+async def test_hold_and_grow_reuse_path_reminder(manager, operation_id):
+    await manager.create(content=QUOTED, tags=[], domain=['work'])
+    held = await server.hold(QUOTED, operation_id=operation_id)
+    assert held.startswith('复用了已匹配到的相同内容桶') and held.endswith('\n' + reminder(2))
+    await manager.create(content='她说「好」', tags=[], domain=['work'])
+    grown = await server.grow('她说「好」', operation_id=operation_id and 'reuse-grow')
+    assert grown.startswith('复用了已匹配到的相同内容桶') and grown.endswith('\n' + reminder(1))
