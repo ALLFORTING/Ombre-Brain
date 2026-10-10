@@ -15,6 +15,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 import backup_auto_runtime as auto
+import backup_v2_oidc as oidc
 from backup_v2_oidc import GitHubActionsBackupV2OidcVerifier
 from production_backup_capture import CaptureChannelError, _route_error
 from tests.test_backup_auto_server import claims
@@ -220,3 +221,69 @@ def test_diagnostics_preserve_short_circuit_denial_for_multiple_invalid_claims(c
         auto.StrictBackupAutoOidcPolicy().verify(data)
     assert _route_error(denied.value).status_code == 400
     assert_safe(caplog, "auto_policy", fields="repository_id,event_name")
+
+
+@pytest.mark.parametrize("sink", ["warning", "filter", "handler"])
+@pytest.mark.parametrize("phase", ["request", "decode", "policy"])
+def test_logging_failure_preserves_original_http_denial(monkeypatch, caplog, sink, phase):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    def broken(*args, **kwargs):
+        raise RuntimeError(SECRET)
+    if sink == "warning":
+        monkeypatch.setattr(oidc.logger, "warning", broken)
+    elif sink == "filter":
+        monkeypatch.setattr(oidc.logger, "filters", [SimpleNamespace(filter=broken)])
+    else:
+        handler = logging.Handler()
+        monkeypatch.setattr(handler, "emit", broken)
+        monkeypatch.setattr(oidc.logger, "handlers", [handler])
+    def decode(*args):
+        if phase == "decode":
+            raise jwt.InvalidAudienceError(SECRET)
+        return {**claims(), "repository_id": SECRET}
+    verifier = GitHubActionsBackupV2OidcVerifier(jwk_client=object(), audience=auto.AUTO_AUDIENCE,
+                                               decoder=decode)
+    async def metadata(req):
+        try:
+            auto.StrictBackupAutoOidcPolicy().verify(await verifier.verify_request(req))
+        except Exception as exc:
+            assert isinstance(exc, CaptureChannelError) and exc.code == "oidc_denied"
+            return _route_error(exc)
+        pytest.fail("invalid identity accepted")
+    with TestClient(Starlette(routes=[Route(auto.PREFIX + "/metadata", metadata)])) as client:
+        headers = {} if phase == "request" else {"Authorization": "Bearer " + SECRET}
+        response = client.get(auto.PREFIX + "/metadata", headers=headers)
+    assert response.status_code == 400 and response.json() == {"status": "oidc_denied"}
+    assert SECRET not in response.text and SECRET not in caplog.text
+    assert not any(record.exc_info or record.stack_info for record in caplog.records)
+
+
+@pytest.mark.parametrize("base", [Exception, RuntimeError, jwt.InvalidAudienceError])
+def test_unknown_exception_type_name_is_redacted_and_response_unchanged(caplog, base):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    # Even a subclass of an allowed type must not publish its arbitrary name.
+    unknown_type = type(SECRET, (base,), {})
+    def decode(*args):
+        raise unknown_type(SECRET)
+    verifier = GitHubActionsBackupV2OidcVerifier(jwk_client=object(), audience=auto.AUTO_AUDIENCE,
+                                               decoder=decode)
+    async def metadata(req):
+        try:
+            await verifier.verify_request(req)
+        except Exception as exc:
+            assert isinstance(exc, CaptureChannelError) and exc.code == "oidc_denied"
+            return _route_error(exc)
+        pytest.fail("unknown decoder failure accepted")
+    with TestClient(Starlette(routes=[Route(auto.PREFIX + "/metadata", metadata)])) as client:
+        response = client.get(auto.PREFIX + "/metadata", headers={"Authorization": "Bearer " + SECRET})
+    assert response.status_code == 400 and response.json() == {"status": "oidc_denied"}
+    assert SECRET not in response.text
+    assert_safe(caplog, "jwt_decode", exception="OtherException")
+
+
+def test_diagnostic_helper_preserves_base_exception(monkeypatch):
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(oidc.logger, "warning", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        oidc._log_oidc_denial("jwt_decode", exception=RuntimeError(SECRET))

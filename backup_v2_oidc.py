@@ -22,13 +22,39 @@ _TOKEN_FIELD_NAMES = {"token", "access_token", "authorization"}
 logger = logging.getLogger("ombre_brain.backup_oidc")
 
 
+_DIAGNOSTIC_EXCEPTION_NAMES = {
+    CaptureChannelError: "CaptureChannelError",
+    RuntimeError: "RuntimeError",
+    ValueError: "ValueError",
+    TypeError: "TypeError",
+    jwt.InvalidTokenError: "InvalidTokenError",
+    jwt.DecodeError: "DecodeError",
+    jwt.InvalidSignatureError: "InvalidSignatureError",
+    jwt.ExpiredSignatureError: "ExpiredSignatureError",
+    jwt.InvalidAudienceError: "InvalidAudienceError",
+    jwt.InvalidIssuerError: "InvalidIssuerError",
+    jwt.ImmatureSignatureError: "ImmatureSignatureError",
+    jwt.InvalidIssuedAtError: "InvalidIssuedAtError",
+    jwt.MissingRequiredClaimError: "MissingRequiredClaimError",
+    jwt.InvalidAlgorithmError: "InvalidAlgorithmError",
+    jwt.PyJWKClientError: "PyJWKClientError",
+    jwt.PyJWKClientConnectionError: "PyJWKClientConnectionError",
+    jwt.PyJWKError: "PyJWKError",
+}
+
+
 def _log_oidc_denial(stage: str, *, exception: Exception | None = None, fields=()) -> None:
-    """Only fixed stages/field names and exception types; never values or traceback."""
-    logger.warning(
-        "oidc_denied stage=%s exception=%s fields=%s",
-        stage, type(exception).__name__ if exception is not None else "none",
-        ",".join(fields) or "none",
-    )
+    """Best-effort fixed diagnostics; logging errors never replace authentication errors."""
+    try:
+        exception_name = ("none" if exception is None else
+                          _DIAGNOSTIC_EXCEPTION_NAMES.get(type(exception), "OtherException"))
+        logger.warning(
+            "oidc_denied stage=%s exception=%s fields=%s",
+            stage, exception_name, ",".join(fields) or "none",
+        )
+    except Exception:
+        # No fallback logging: the diagnostic sink itself may be broken.
+        pass
 
 
 class GitHubActionsBackupV2OidcVerifier:
