@@ -6,6 +6,8 @@ from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ImageContent
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp_action_tools import ACTION_TOOLS
@@ -22,6 +24,14 @@ ARGS = {
 }
 
 
+def _reference_server(module):
+    """Independent test-only SDK surface for retained private implementations."""
+    reference = FastMCP("private-sdk-reference")
+    for name, action, old in CASES:
+        reference._tool_manager._tools[old] = module.mcp._tool_manager.get_tool(name).targets[action]
+    return reference
+
+
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
@@ -33,7 +43,7 @@ def server(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name,action,old", CASES)
 async def test_each_action_keeps_wire_and_exact_sdk_arguments(server, monkeypatch, name, action, old):
-    target = server.mcp._tool_manager.get_tool(old)
+    target = server.mcp._tool_manager.get_tool(name).targets[action]
     if old in {"rm_asset_view", "rm_asset_inspect"}:
         content = [TextContent(type="text", text='"exact receipt"')]
         if old == "rm_asset_inspect":
@@ -48,7 +58,12 @@ async def test_each_action_keeps_wire_and_exact_sdk_arguments(server, monkeypatc
         return result
     monkeypatch.setattr(target, "fn", business)
     async with create_connected_server_and_client_session(server.mcp) as client:
-        legacy = await client.call_tool(old, ARGS[old])
+        async with create_connected_server_and_client_session(_reference_server(server)) as reference:
+            legacy = await reference.call_tool(old, ARGS[old])
+        absent = await client.call_tool(old, ARGS[old])
+        assert absent.isError and f"Unknown tool: {old}" in absent.content[0].text
+        assert not calls[1:]
+        assert server.mcp._tool_manager.get_tool(old) is None
         merged = await client.call_tool(name, {"action": action, **ARGS[old]})
         assert merged.model_dump(by_alias=True) == legacy.model_dump(by_alias=True)
         assert not merged.isError
@@ -70,7 +85,9 @@ async def test_each_action_keeps_wire_and_exact_sdk_arguments(server, monkeypatc
             assert len(calls) == 2
         for required in target.parameters.get("required", []):
             missing = {k: v for k, v in ARGS[old].items() if k != required}
-            assert (await client.call_tool(name, {"action": action, **missing})).isError
+            rejected = await client.call_tool(name, {"action": action, **missing})
+            assert rejected.isError
+            assert rejected.content[0].text == f"{name}(action={action}): missing required parameters: {required}"
             assert len(calls) == 2
 
 
@@ -78,14 +95,14 @@ async def test_each_action_keeps_wire_and_exact_sdk_arguments(server, monkeypatc
 async def test_metadata_descriptions_and_schema(server):
     async with create_connected_server_and_client_session(server.mcp) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-        assert len(tools) == 35
-        assert tools["rm_asset_show"].meta == tools["rm_asset_view"].meta
+        assert len(tools) == 20
+        assert tools["rm_asset_show"].meta == server.mcp._tool_manager.get_tool("rm_asset_show").targets["view"].meta
         assert tools["rm_asset_show"].outputSchema is None
         assert len((await client.list_resources()).resources) == 1
     for name, action, old in CASES:
-        target = server.mcp._tool_manager.get_tool(old)
-        assert target.description.startswith(target.fn.__doc__)
-        assert f'{name}(action="{action}"' in target.description
+        target = server.mcp._tool_manager.get_tool(name).targets[action]
+        assert target.description == target.fn.__doc__
+        assert server.mcp._tool_manager.get_tool(old) is None
         schema = tools[name].inputSchema
         assert schema["required"] == ["action"]
         assert "default" not in schema["properties"]["action"]
@@ -200,7 +217,8 @@ async def test_real_legacy_image_wire_and_download_effects(tmp_path, monkeypatch
     monkeypatch.setattr(server.secrets, "token_urlsafe", lambda size: "A" * 43)
     monkeypatch.setattr(server.time, "time", lambda: 2000000000.0)
     async with create_connected_server_and_client_session(server.mcp) as client:
-        legacy = await client.call_tool(old, {"asset_id": asset["asset_id"]})
+        async with create_connected_server_and_client_session(_reference_server(server)) as reference:
+            legacy = await reference.call_tool(old, {"asset_id": asset["asset_id"]})
         before = (deepcopy(server._rm_asset_download_tokens), deepcopy(server._rm_asset_download_sources))
         server._rm_asset_download_tokens.clear()
         server._rm_asset_download_sources.clear()
@@ -215,3 +233,23 @@ async def test_real_legacy_image_wire_and_download_effects(tmp_path, monkeypatch
             assert base64.b64decode(merged.meta["rememberMe"]["imageBase64"]) == data
         else:
             assert merged.structuredContent == {"result": merged.content[0].text}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,action,old", CASES)
+async def test_required_raw_keys_order_and_explicit_null(server, monkeypatch, name, action, old):
+    tool = server.mcp._tool_manager.get_tool(name)
+    target = tool.targets[action]
+    required = target.parameters.get("required", [])
+    business = AsyncMock(return_value="receipt")
+    monkeypatch.setattr(target, "fn", business)
+    if required:
+        with pytest.raises(ToolError) as exc:
+            await tool.run({"action": action})
+        assert str(exc.value) == f"{name}(action={action}): missing required parameters: {', '.join(required)}"
+        business.assert_not_awaited()
+        for key in required:
+            with pytest.raises(Exception) as exc:
+                await tool.run({"action": action, **ARGS[old], key: None})
+            assert "missing required parameters" not in str(exc.value)
+            business.assert_not_awaited()

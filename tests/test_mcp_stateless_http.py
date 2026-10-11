@@ -1069,7 +1069,8 @@ async def test_access_log_tickets_real_http(ob, monkeypatch, caplog, stateless, 
                 secrets_seen.append(session)
             browser = json.loads(await ob.asset_browser_upload_link(
                 len(raw), hashlib.sha256(raw).hexdigest(), "synthetic.png", "image/png"))
-            upload = json.loads(text(await call(client, "rm_asset_upload_link", {
+            upload = json.loads(text(await call(client, "rm_asset_upload", {
+                "action": "link",
                 "expected_bytes": len(raw), "filename": "synthetic.png", "mime_type": "image/png"})))
             assert browser["ok"] and upload["ok"]
             # Seed a real asset for the download route; a separate ticket is used for upload.
@@ -1082,7 +1083,7 @@ async def test_access_log_tickets_real_http(ob, monkeypatch, caplog, stateless, 
                 temp.write_bytes(raw)
                 asset = backend.persist_upload(temp, hashlib.sha256(raw).hexdigest(), len(raw),
                                                "synthetic.png", "image/png", require_image=True)
-            download = json.loads(text(await call(client, "rm_asset_download_link", {"asset_id": asset["asset_id"]})))
+            download = json.loads(text(await call(client, "rm_asset_show", {"action": "download_link", "asset_id": asset["asset_id"]})))
             trial = ob._asset_new_vision_trial()
             assert ob._asset_store_vision_trial(trial)[0]
             vision = json.loads(ob._asset_create_vision_download_link(trial["trial_id"]))
@@ -1115,7 +1116,7 @@ async def test_access_log_tickets_real_http(ob, monkeypatch, caplog, stateless, 
                 expected_rows.extend([(prefix, "GET", 200), (prefix, "GET", 307),
                                       (prefix, "HEAD", head.status_code), (prefix, "PUT", 405), (prefix, "POST", post.status_code),
                                       (prefix, "GET", 404)])
-            status = json.loads(text(await call(client, "rm_asset_upload_status", {"upload_id": upload["upload_id"]})))
+            status = json.loads(text(await call(client, "rm_asset_upload", {"action": "status", "upload_id": upload["upload_id"]})))
             assert status["state"] == "completed" and status["source_sha256"] == hashlib.sha256(raw).hexdigest()
             assert json.loads(await ob.asset_browser_upload_status(browser["upload_id"]))["state"] == "completed"
             assert (await rpc(client, "tools/list", path="/mcp?mode=kept&token=private-query-log-test",

@@ -587,7 +587,7 @@ asyncio.run(main())
         capture_output=True,
         text=True,
     )
-    assert len(json.loads(completed.stdout)) == 35
+    assert len(json.loads(completed.stdout)) == 20
 
     env["OMBRE_DIAG_TOOLS"] = "true"
     completed = subprocess.run(
@@ -598,7 +598,7 @@ asyncio.run(main())
         capture_output=True,
         text=True,
     )
-    assert len(json.loads(completed.stdout)) == 50
+    assert len(json.loads(completed.stdout)) == 35
 
 
 def test_default_off_import_ignores_invalid_rm_root(tmp_path):
