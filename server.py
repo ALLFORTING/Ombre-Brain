@@ -2170,7 +2170,7 @@ def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | No
         return (
             "=== boot: 婷留言 ===\n"
             f"婷有新留言 #{candidate['note_id']}，全文请用 "
-            f"get_note(note_id={candidate['note_id']}) 读取",
+            f"note(action=\"get\", note_id={candidate['note_id']}) 读取",
             None,
         )
 
@@ -3725,16 +3725,16 @@ async def dismiss_note(
     if not (confirm_token or "").strip():
         token = _issue_mutation_confirmation("note.dismiss", note)
         return _with_response_seal(
-            f"待确认 dismiss_note：note_id:{note_id} "
+            f"待确认 note dismiss：note_id:{note_id} "
             f"preview:{_format_note_preview(note['text'])}\n"
             "确认后停止自动 boot 投递；正文和历史保留，且不标记 delivered/read。\n"
             f"请用相同 note_id、include_sealed 和 confirm_token={token} 再次调用；"
             f"有效期 {_MUTATION_CONFIRM_TTL_SECONDS} 秒。"
         )
     if not _consume_mutation_confirmation("note.dismiss", note, confirm_token):
-        return _with_response_seal("dismiss_note 确认无效、已过期或留言状态已变化；请重新预览。")
+        return _with_response_seal("note dismiss 确认无效、已过期或留言状态已变化；请重新预览。")
     if not bucket_mgr.dismiss_note(note_id, expected_note=note):
-        return _with_response_seal("dismiss_note 未执行：留言状态已变化；请重新预览。")
+        return _with_response_seal("note dismiss 未执行：留言状态已变化；请重新预览。")
     return _with_response_seal(f"已 dismiss 婷留言 note_id:{note_id}；正文和历史保留。")
 
 
@@ -3801,14 +3801,14 @@ async def list_revisions(
         lines.append(f"- h{row['id']} | {row['changed_at']} | {row['change_type']} | {preview}")
     if not history:
         lines.append("（无）")
-    lines.append("还原：restore_revision(bucket_id, revision=<r或h编号>) 先预览，再带 confirm_token 执行。")
+    lines.append("还原：revision(action=\"restore\", bucket_id=…, revision=<r或h编号>) 先预览，再带 confirm_token 执行。")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def restore_revision(
     bucket_id: str,
-    revision: Annotated[str, Field(description="Version reference from list_revisions: r<id> (full revision) or h<id> (legacy body-only history, existing buckets only).")],
+    revision: Annotated[str, Field(description="Version reference from revision(action=\"list\"): r<id> (full revision) or h<id> (legacy body-only history, existing buckets only).")],
     confirm_token: Annotated[str, Field(description="Two-stage confirmation, same level as delete. First call without a token to preview; then repeat the same call with the issued short-lived, one-shot token. Expired, used or mismatched tokens are rejected.")] = "",
     include_sealed: bool = False,
 ) -> str:

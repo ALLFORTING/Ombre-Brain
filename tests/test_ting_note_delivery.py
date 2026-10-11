@@ -174,7 +174,7 @@ async def test_budget_fallback_never_truncates_or_consumes_note_before_full_get(
     full = await server.get_note(1)
     after_read = await server.boot()
 
-    prompt = "婷有新留言 #1，全文请用 get_note(note_id=1) 读取"
+    prompt = "婷有新留言 #1，全文请用 note(action=\"get\", note_id=1) 读取"
     assert prompt in first
     assert prompt in second
     assert large_body not in first
@@ -227,9 +227,9 @@ async def test_dismiss_note_requires_exact_one_shot_confirmation(tmp_path, monke
 
     preview = await server.dismiss_note(1)
     token = preview.split("confirm_token=", 1)[1].split()[0].rstrip("；")
-    assert "待确认 dismiss_note" in preview
+    assert "待确认 note dismiss" in preview
     assert _note_rows(server)[0]["dismissed_at"] is None
-    assert "确认无效" in await server.dismiss_note(1, confirm_token="wrong")
+    assert "note dismiss 确认无效" in await server.dismiss_note(1, confirm_token="wrong")
 
     confirmed = await server.dismiss_note(1, confirm_token=token)
     row = _note_rows(server)[0]
@@ -255,7 +255,7 @@ async def test_dismiss_note_rejects_changed_plan_and_hidden_note(tmp_path, monke
     preview = await server.dismiss_note(1)
     token = preview.split("confirm_token=", 1)[1].split()[0].rstrip("；")
     await server.get_note(1)
-    assert "确认无效" in await server.dismiss_note(1, confirm_token=token)
+    assert "note dismiss 确认无效" in await server.dismiss_note(1, confirm_token=token)
     assert _note_rows(server)[0]["dismissed_at"] is None
 
 

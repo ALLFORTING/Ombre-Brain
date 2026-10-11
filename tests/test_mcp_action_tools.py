@@ -99,6 +99,10 @@ async def test_metadata_descriptions_and_schema(server):
         assert tools["rm_asset_show"].meta == server.mcp._tool_manager.get_tool("rm_asset_show").targets["view"].meta
         assert tools["rm_asset_show"].outputSchema is None
         assert len((await client.list_resources()).resources) == 1
+    revision_schema = tools["revision"].inputSchema
+    assert revision_schema["properties"]["revision"]["description"].startswith('Version reference from revision(action="list"):')
+    restore_branch = next(b for b in revision_schema["oneOf"] if b["properties"]["action"]["const"] == "restore")
+    assert restore_branch["properties"]["revision"]["description"] == revision_schema["properties"]["revision"]["description"]
     for name, action, old in CASES:
         target = server.mcp._tool_manager.get_tool(name).targets[action]
         assert target.description == target.fn.__doc__
