@@ -1970,7 +1970,7 @@
       "uri": "ui://remember-me/asset-viewer.html",
       "exposure": "default",
       "category": "remember_me_asset_viewer",
-      "purpose": "Static MCP Apps viewer resource paired with rm_asset_view.",
+      "purpose": "Static MCP Apps viewer resource paired with rm_asset_show(action=\"view\").",
       "output_kind": "resource_linked_ui",
       "mime_type": "text/html;profile=mcp-app",
       "auth_relevance": "endpoint_auth",

@@ -113,7 +113,7 @@ async def test_tg_mailbox_budget_truncation_identifies_letter_and_continuation(
     assert "=== boot: 最新信箱 ===" in result
     assert "已按 boot 预算截断" in result
     assert "letter_id:1" in result
-    assert "完整内容请用 get_letter(letter_id=1) 读取" in result
+    assert "完整内容请用 letter(action=\"get\", letter_id=1) 读取" in result
     assert hidden_tail not in result
     assert server.count_tokens_approx(result) <= server.BOOT_PROFILE_CONFIG["tg"]["max_tokens"]
 
