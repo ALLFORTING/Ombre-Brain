@@ -3,6 +3,7 @@ from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from datetime import datetime
 
 import frontmatter
+from bucket_manager import BucketManager
 from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 
@@ -49,8 +50,7 @@ def main() -> int:
                 except DeleteAdmissionError as exc:
                     print(f'skipped {path}: {exc.code}')
                     continue
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(frontmatter.dumps(post))
+                BucketManager._write_post_atomic(path, post)
                 updated += 1
     print(f"scanned={scanned} updated={updated} buckets_dir={BUCKETS_DIR}")
     return 0
