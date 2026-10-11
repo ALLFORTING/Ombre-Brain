@@ -66,7 +66,7 @@ Never expose the complete local path, complete hash, raw bytes, base64, cookies,
 
 ### 3. Obtain a signed upload endpoint
 
-Call `rm_asset_upload_link`.
+Call `rm_asset_upload(action="link")`.
 
 Provide only the source byte count and, when known, the filename and MIME type.
 Do not provide, complete, guess, or invent a SHA-256 argument. The server
@@ -97,7 +97,7 @@ Do not ask the user to paste tokens, signed URLs, or base64.
 
 ### 5. Verify identity and persistence
 
-Call `rm_asset_upload_status`.
+Call `rm_asset_upload(action="status")`.
 
 Verify:
 
@@ -111,7 +111,7 @@ must not print either complete hash to stdout or place it in chat text.
 
 On mismatch, stop and report the real failure. Do not continue to metadata or indexing.
 
-Call `rm_asset_get` and confirm that the asset is persistent.
+Call `rm_asset_find(action="get")` and confirm that the asset is persistent.
 
 ### 6. Add metadata
 
@@ -146,25 +146,25 @@ Do not dump internal IDs, hashes, signed URLs, or logs unless the user explicitl
 
 ## Find and display a saved image
 
-1. Use `rm_asset_search` with the user's natural-language description.
+1. Use `rm_asset_find(action="search")` with the user's natural-language description.
 2. Prefer semantic and metadata evidence over asking for an asset ID.
-3. When one result is clearly correct, call `rm_asset_view` and display it inline.
+3. When one result is clearly correct, call `rm_asset_show(action="view")` and display it inline.
 4. When several results are plausible, distinguish them briefly and ask the user to choose.
-5. Use `rm_asset_inspect` only when Claude itself needs to understand the stored image's real visual content.
+5. Use `rm_asset_show(action="inspect")` only when Claude itself needs to understand the stored image's real visual content.
 
-`rm_asset_view` shows the image to the user.
+`rm_asset_show(action="view")` shows the image to the user.
 
-`rm_asset_inspect` gives the model the stored image as MCP ImageContent.
+`rm_asset_show(action="inspect")` gives the model the stored image as MCP ImageContent.
 
 Do not infer contents from filename or metadata when actual visual inspection is needed.
 
 ## Claude web ImageContent compatibility
 
-Claude web may occasionally fail to parse MCP ImageContent in the same turn that `rm_asset_inspect` is called.
+Claude web may occasionally fail to parse MCP ImageContent in the same turn that `rm_asset_show(action="inspect")` is called.
 
 When that happens:
 
-- do not repeatedly call `rm_asset_inspect`;
+- do not repeatedly call `rm_asset_show(action="inspect")`;
 - in the next turn, re-examine the ImageContent already present in context;
 - never pretend to have seen details that were not visible.
 

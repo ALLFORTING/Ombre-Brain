@@ -381,19 +381,19 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 35 个默认工具、50 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 20 个默认工具、35 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 35 default tools, 50 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 20 default tools, 35 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
-### 推荐 MCP 工具与兼容窗口 / Recommended MCP tools and compatibility window
+### 推荐 MCP 工具与旧入口移除 / Recommended MCP tools and legacy entry removal
 
-当前 35 个默认入口 = 20 个推荐入口 + 15 个旧兼容入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
+本 P4 版本已取消 15 个旧公开入口注册，当前 20 个默认入口均为推荐入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
 
-The 35 default entries consist of 20 recommended tools and 15 legacy compatibility tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
+This P4 version removes the 15 legacy public registrations and exposes 20 default recommended tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
 
-旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 仍真实注册，仅供兼容；新说明与客户端调用应使用下表的新入口 + action。兼容期至少持续到 P3 文档上线后 3 天，且需婷确认 claude.ai、TG、CC 新窗口和手册均已迁移，才可在单独 P4 删除旧入口。本页不宣告上线、计时结束或允许删除。
+旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 已在本 P4 版本取消公开注册；原 Python 函数及私有 SDK 实现保留。客户端须使用下表的新入口 + action。此处说明分支版本行为，不宣告 PR 已合并、线上已部署或三天已过去。
 
-The 15 legacy entries remain registered during compatibility. Removal belongs to a separate P4, after at least three days following P3 documentation rollout and Ting's confirmation that claude.ai, TG, new CC conversations, and manuals have migrated.
+This P4 version removes the 15 legacy public entries while retaining their Python functions and private SDK implementations. Clients must use the replacement tools with action. This describes the branch version; it does not assert PR merge, live rollout, or elapsed compatibility time.
 
 这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `letter(action="seal")` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
 

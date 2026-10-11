@@ -1,6 +1,6 @@
 # Remember-Me Integration
 
-> P3 调用迁移（2026-10-11）：当前 OB MCP 操作使用 [README 的新入口 + action](../README.md#合并工具-action-示例--merged-tool-action-examples)，35 默认 = 20 推荐 + 15 旧兼容；诊断另外 15。下文 Current dependency provenance 保持当前依赖事实；Stage 8B–8F 的阶段切换与回滚描述保留其基线和真实 handler/Python 符号，各对应段落另注当前 OB 入口。Remember-Me 独立包 MCP schema/EXPECTED_MCP_TOOLS 不属于 OB 公开入口迁移。兼容期至少 P3 文档上线后 3 天且需婷确认 claude.ai/TG/CC 新窗口/手册均迁移，随后单独 P4 删除；不宣告上线或允许删除。
+> P4 公开入口迁移（2026-10-11）：本版本已取消 15 个旧 OB MCP 入口注册，当前默认 20 个推荐工具、诊断开启共 35 个工具。当前操作使用 [README 的新入口 + action](../README.md#合并工具-action-示例--merged-tool-action-examples)。原 Python 函数及私有 SDK 实现保留；下文 Current dependency provenance 和 Stage 8B–8F 历史基线、handler/Python 符号及证据继续保留。Remember-Me 独立包 MCP schema/EXPECTED_MCP_TOOLS 不属于 OB 公开入口迁移。此处说明分支版本行为，不宣告 PR 已合并、线上已部署或三天已过去。
 
 ## Current dependency provenance
 

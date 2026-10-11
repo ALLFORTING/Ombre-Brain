@@ -38,12 +38,9 @@ FRAGMENTS = {
 }
 
 DEFAULT_TOOL_ORDER = [
-    "rm_asset_upload_link", "rm_asset_upload_status", "rm_asset_get",
-    "rm_asset_update_metadata", "rm_asset_search", "rm_asset_reindex_embeddings",
-    "rm_asset_download_link", "rm_asset_view", "rm_asset_inspect",
+    "rm_asset_update_metadata", "rm_asset_reindex_embeddings",
     "digest", "related_backfill", "breath", "hold", "grow",
-    "get_letter", "list_notes", "get_note", "leave_note", "dismiss_note",
-    "list_revisions", "restore_revision", "trace", "seal_letter", "archive_session", "todos", "boot",
+    "trace", "archive_session", "todos", "boot",
     "refresh_tg_summary", "pulse", "dream",
     "note", "letter", "revision", "rm_asset_upload", "rm_asset_find", "rm_asset_show",
 ]
@@ -156,13 +153,13 @@ def _list_tools(tmp_path, diagnostics):
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def test_default_tool_registration_order_is_unchanged(tmp_path):
+def test_retained_and_action_tool_registration_order(tmp_path):
     assert _list_tools(tmp_path, diagnostics=False) == DEFAULT_TOOL_ORDER
 
 
 def test_diagnostic_tools_register_before_digest(tmp_path):
     names = _list_tools(tmp_path, diagnostics=True)
-    assert len(names) == 50
+    assert len(names) == 35
     digest_index = names.index("digest")
     diagnostic = [name for name in names if name.startswith("asset_")]
     assert len(diagnostic) == 15

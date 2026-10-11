@@ -1,6 +1,7 @@
-"""Compatibility action tools: validate raw keys, then use the original SDK tool."""
+"""Public action tools: validate raw keys, then use the original SDK tool."""
 from copy import deepcopy
 from functools import cached_property
+import re
 
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools.base import Tool
@@ -50,6 +51,9 @@ class ActionTool(Tool):
         extra = set(arguments) - {"action", *target.parameters["properties"]}
         if extra:
             raise ToolError(f"{self.name}(action={action}): unsupported parameters: {', '.join(sorted(extra))}")
+        missing = [key for key in target.parameters.get("required", []) if key not in arguments]
+        if missing:
+            raise ToolError(f"{self.name}(action={action}): missing required parameters: {', '.join(missing)}")
         # SDK required/type/range validation and original result conversion
         # run exactly once, after raw-key validation and before business code.
         return await target.run({k: v for k, v in arguments.items() if k != "action"},
@@ -58,13 +62,20 @@ class ActionTool(Tool):
 
 def register_action_tools(mcp):
     manager = mcp._tool_manager
+    public_names = {old: f'{name}(action="{action}")'
+                    for name, actions in ACTION_TOOLS.items() for action, old in actions.items()}
+
+    def public_description(description):
+        # Rewrite public guidance only; retained targets keep exact descriptions.
+        return re.sub(r"\b(" + "|".join(public_names) + r")\b",
+                      lambda match: public_names[match.group()], description)
     for name, actions in ACTION_TOOLS.items():
         targets = {action: manager.get_tool(old) for action, old in actions.items()}
         first = next(iter(targets.values()))
         fields = {field: getattr(first, field) for field in Tool.model_fields}
         fields.update(name=name, title=None, annotations=None, icons=None,
                       description="Dispatch to the original tools by required action. Parameters and receipts retain their original behavior. " +
-                                  " ".join(f"{action}: {target.description}" for action, target in targets.items()),
+                                  " ".join(f"{action}: {public_description(target.description)}" for action, target in targets.items()),
                       parameters=action_schema({action: target.parameters for action, target in targets.items()}),
                       meta=deepcopy(targets["view"].meta) if name == "rm_asset_show" else None)
         # ToolManager has no public API for a Tool subclass. Keep this single
@@ -72,5 +83,7 @@ def register_action_tools(mcp):
         if manager.get_tool(name) is not None:
             raise ValueError(f"Tool already exists: {name}")
         manager._tools[name] = ActionTool(**fields, targets=targets)
-        for action, target in targets.items():
-            target.description += f"\n\nDeprecated in a future release; use {name}(action=\"{action}\", ...) instead."
+    # Capture every target before removal; the private SDK objects remain usable.
+    for actions in ACTION_TOOLS.values():
+        for old in actions.values():
+            manager.remove_tool(old)
