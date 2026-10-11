@@ -391,7 +391,7 @@ The current MCP surface has 20 default tools, 35 tools when diagnostics are enab
 
 This P4 version removes the 15 legacy public registrations and exposes 20 default recommended tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
 
-旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 已在本 P4 版本取消公开注册；原 Python 函数及私有 SDK 实现保留。客户端须使用下表的新入口 + action。此处说明分支版本行为，不宣告 PR 已合并、线上已部署或三天已过去。
+旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 已在本 P4 版本取消公开注册；原 Python 函数及私有 SDK 实现保留。客户端须使用下表的新入口 + action。
 
 This P4 version removes the 15 legacy public entries while retaining their Python functions and private SDK implementations. Clients must use the replacement tools with action. This describes the branch version; it does not assert PR merge, live rollout, or elapsed compatibility time.
 
