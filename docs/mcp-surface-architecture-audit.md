@@ -1,5 +1,11 @@
 # MCP Surface Architecture Audit
 
+> P3 文档迁移注记（2026-10-11）：下文的阶段、audit/acceptance 结论、已执行调用、回执、数量、日期、固定 SHA 和 Python 源符号属于历史快照，保留原名，不代表当前推荐 MCP 调用。当前 OB 操作使用 [README 推荐入口与兼容窗口](../README.md#推荐-mcp-工具与兼容窗口--recommended-mcp-tools-and-compatibility-window)：note 用 leave/list/get/dismiss，letter 用 get/seal，revision 用 list/restore；RM 上传用 rm_asset_upload 的 link/status，metadata/检索用 rm_asset_find 的 get/search，显示/模型视觉/导出分别用 rm_asset_show 的 view/inspect/download_link。每次必须传 action 和该分支参数，原参数名不改，未知或无关字段严格拒绝。
+>
+> The historical recommendations below are superseded for current OB calls by the README action examples. The current default surface is 35 = 20 recommended + 15 registered compatibility entries, plus 15 optional diagnostics. Compatibility lasts at least three days after P3 documentation rollout and requires Ting's confirmation of claude.ai, TG, new CC conversations, and manual migration before separate P4 removal. No rollout completion or deletion authorization is asserted here.
+>
+> Remember-Me 独立包的 MCP schema/EXPECTED_MCP_TOOLS、内部 Python 方法、测试名和源码链接是不同标识，保留真实名称；不要把它们改写为 server.note 等不存在的 Python 方法。生产工具 description 或原业务回执中的旧名也不由本次文档迁移改写。rm_asset_show(action="view") 仍为 UI/_meta 图像与 signed-link fallback，action="inspect" 仍为 ImageContent；确认 token 预览可省，执行须取得有效 token，300 秒/一次性/状态绑定不变。
+
 Audit baseline: `6b9035f15981b8ac8227193074ea2cb367a37edb` (the Stage 3B
 merge commit on `main`).
 
@@ -149,7 +155,7 @@ functions in `server.py` unless a collaborator is explicitly named.
 | `hold` | Memory create/update; ordinary product | `content` required; tags, importance, pinned, feel, source bucket, valence/arousal, trigger date | Text status with bucket ID, reuse status, and conflict warning | Creates or reuses an eligible matched bucket with identical normalized body; `feel` writes a separate reflection class | HIGH: reuse and feel semantics | `server.py: hold`; memory write tests; README; `CLAUDE_PROMPT.md` |
 | `grow` | Diary digestion/create; ordinary product | `content` required | Text summary with each successful item's bucket ID and created/reused status | Creates or reuses one or more buckets based on identical normalized body; short input has a separate fast path | MEDIUM: overlaps `hold` at short-content boundary | `server.py: grow`; `tests/test_existing_tools_smoke.py`; README |
 | `trace` | Power mutation; ordinary or controlled operator | `bucket_id` required; metadata, content, related, append, merge, seal, and `delete` controls | Text mutation result | Update, append, replace, merge, relationship writes, seal, or delete | BREAKING for any split/rename; HIGH semantic risk because one tool is multi-operation | `server.py: trace`; trace/history/security tests; README |
-| `seal_letter` | Sealed-memory administration | `letter_id` required; `sealed=1` | Text status | Changes handoff-letter visibility | MEDIUM; narrow internal operation is default-visible | `server.py: seal_letter`; registration signature assertions; README |
+| `seal_letter`（当前 OB：`letter(action="seal")`） | Sealed-memory administration | `letter_id` required; `sealed=1` | Text status | Changes handoff-letter visibility | MEDIUM; narrow internal operation is default-visible | `server.py: seal_letter`; registration signature assertions; README |
 | `archive_session` | Session close/archive workflow | `summary` required; highlights, mood, valence/arousal (`-1` sentinel or 0–1), letter, sealed, topics | Text archive/session identifier | Creates archive bucket and may write mailbox letter | MEDIUM: workflow semantics and literal/range schema | `server.py: archive_session`; archive tests; README |
 | `todos` | Task readout; ordinary product | None | Text grouped by unresolved, non-sealed bucket | Read-only intent; overlaps the `boot` section | LOW name risk; medium discovery overlap | `server.py: todos`; todo tests; README |
 | `boot` | Startup context; model workflow | `pinned_chars=5000`, `max_tokens=16000` | Budget-capped text containing triggers, pinned items, mailbox, feel echo, sessions, todos | Read-oriented composite; records due-trigger observation | HIGH workflow significance despite small schema | `server.py: boot`; README; `CLAUDE_PROMPT.md` |
@@ -188,15 +194,15 @@ maintenance operation even though it is exposed by default.
 
 | Name | Category and audience | Inputs (required; important optional/defaults) | Output/content | Primary effect | Contract risk | Evidence |
 |---|---|---|---|---|---|---|
-| `rm_asset_upload_link` | Persistent asset ingest; ordinary product | `expected_bytes` required; filename and MIME optional | Text/JSON-like upload ticket and URL | Creates a transient upload ticket; subsequent HTTP POST persists cleaned asset data | HIGH: expected-byte contract and server-computed hash are security-sensitive | `server.py: rm_asset_upload_link`; RM upload tests; README; `skills/remember-me/SKILL.md` |
-| `rm_asset_upload_status` | Persistent upload lifecycle; ordinary product | `upload_id` required | Metadata-only text/JSON-like status | Read-only status of pending/completed asset ticket | MEDIUM lifecycle coupling | `server.py: rm_asset_upload_status`; RM upload/status tests; README |
-| `rm_asset_get` | Asset metadata retrieval; ordinary product | `asset_id` required | Metadata-only text/JSON-like result; no bytes or paths | Read-only | LOW if envelope remains stable; asset identity is sensitive | `server.py: rm_asset_get`; RM contract tests; README |
+| `rm_asset_upload_link`（当前 OB：`rm_asset_upload(action="link")`） | Persistent asset ingest; ordinary product | `expected_bytes` required; filename and MIME optional | Text/JSON-like upload ticket and URL | Creates a transient upload ticket; subsequent HTTP POST persists cleaned asset data | HIGH: expected-byte contract and server-computed hash are security-sensitive | `server.py: rm_asset_upload_link`; RM upload tests; README; `skills/remember-me/SKILL.md` |
+| `rm_asset_upload_status`（当前 OB：`rm_asset_upload(action="status")`） | Persistent upload lifecycle; ordinary product | `upload_id` required | Metadata-only text/JSON-like status | Read-only status of pending/completed asset ticket | MEDIUM lifecycle coupling | `server.py: rm_asset_upload_status`; RM upload/status tests; README |
+| `rm_asset_get`（当前 OB：`rm_asset_find(action="get")`） | Asset metadata retrieval; ordinary product | `asset_id` required | Metadata-only text/JSON-like result; no bytes or paths | Read-only | LOW if envelope remains stable; asset identity is sensitive | `server.py: rm_asset_get`; RM contract tests; README |
 | `rm_asset_update_metadata` | Asset metadata update; ordinary product | `asset_id` required; nullable title, description, tags | Metadata-only result | Updates metadata and may refresh asset embedding | HIGH: update boundary and visual-claim workflow | `server.py: rm_asset_update_metadata`; RM wiring tests; README |
-| `rm_asset_search` | Asset discovery; ordinary product | All optional: query, tags, kind, MIME, date range, `limit=20`, `offset=0` | Search result envelope, keyword plus optional semantic ranking | Read-only search; may invoke embedding provider | MEDIUM: stable ordering and fallback behavior | `server.py: rm_asset_search`; search/wiring tests; README |
+| `rm_asset_search`（当前 OB：`rm_asset_find(action="search")`） | Asset discovery; ordinary product | All optional: query, tags, kind, MIME, date range, `limit=20`, `offset=0` | Search result envelope, keyword plus optional semantic ranking | Read-only search; may invoke embedding provider | MEDIUM: stable ordering and fallback behavior | `server.py: rm_asset_search`; search/wiring tests; README |
 | `rm_asset_reindex_embeddings` | Asset maintenance; operator | `asset_id=""`, `limit=100` | Bounded counter/result envelope | Writes or rebuilds vectors; can incur embedding-provider work | HIGH administrative/data-cost semantics | `server.py: rm_asset_reindex_embeddings`; reindex tests; RM integration docs |
-| `rm_asset_download_link` | Asset export/delivery; ordinary product | `asset_id` required | Short-lived signed-link envelope | Creates transient download ticket; does not change asset bytes | HIGH: link lifetime/use-count contract | `server.py: rm_asset_download_link`; download tests; README |
-| `rm_asset_view` | User-facing asset display; ordinary product | `asset_id` required | `CallToolResult` with MCP Apps metadata and signed-link fallback | Reads cleaned image; may create transient delivery ticket | HIGH recipient distinction: display, not model inspection | `server.py: rm_asset_view`; `asset_viewer.py`; viewer tests; README |
-| `rm_asset_inspect` | Model-facing visual inspection; ordinary product | `asset_id` required | `CallToolResult` containing cleaned image `ImageContent` | Reads cleaned stored bytes for model vision; does not update metadata | HIGH data-channel distinction: inspect, not display | `server.py: rm_asset_inspect`; inspect/wiring tests; README |
+| `rm_asset_download_link`（当前 OB：`rm_asset_show(action="download_link")`） | Asset export/delivery; ordinary product | `asset_id` required | Short-lived signed-link envelope | Creates transient download ticket; does not change asset bytes | HIGH: link lifetime/use-count contract | `server.py: rm_asset_download_link`; download tests; README |
+| `rm_asset_view`（当前 OB：`rm_asset_show(action="view")`） | User-facing asset display; ordinary product | `asset_id` required | `CallToolResult` with MCP Apps metadata and signed-link fallback | Reads cleaned image; may create transient delivery ticket | HIGH recipient distinction: display, not model inspection | `server.py: rm_asset_view`; `asset_viewer.py`; viewer tests; README |
+| `rm_asset_inspect`（当前 OB：`rm_asset_show(action="inspect")`） | Model-facing visual inspection; ordinary product | `asset_id` required | `CallToolResult` containing cleaned image `ImageContent` | Reads cleaned stored bytes for model vision; does not update metadata | HIGH data-channel distinction: inspect, not display | `server.py: rm_asset_inspect`; inspect/wiring tests; README |
 
 The one resource is:
 
@@ -332,7 +338,7 @@ Important boundaries include:
   separate tool with a separate confirmation protocol;
 - `digest` and `related_backfill` default to dry-run and use explicit
   confirmation/controls, but still appear in default discovery;
-- `rm_asset_upload_link` does not accept a client-supplied source hash. The
+- `rm_asset_upload_link` (current OB call: `rm_asset_upload(action="link")`) does not accept a client-supplied source hash. The
   server computes the authoritative source hash when the browser upload is
   received. This completed Stage 3B contract must not be reopened as a new
   defect.
@@ -440,7 +446,7 @@ Client support variance is a hard constraint:
   the resource;
 - a client that lists resources but lacks MCP Apps rendering may load the HTML
   but not provide the intended inline UI;
-- a client that ignores resources still needs `rm_asset_view`'s signed-link
+- a client that ignores resources still needs `rm_asset_view` (current OB call: `rm_asset_show(action="view")`)'s signed-link
   fallback and ordinary tool descriptions;
 - a tool-only client will not receive a prompt-driven workflow automatically.
 
@@ -610,16 +616,16 @@ The current required/optional shape is:
 | `dream` | none | detail IDs |
 | `digest` | none | dry run, max groups, confirm token |
 | `related_backfill` | none | dry run, limit, threshold |
-| `seal_letter` | letter ID | sealed |
-| `rm_asset_upload_link` | expected bytes | filename, MIME type |
-| `rm_asset_upload_status` | upload ID | none |
-| `rm_asset_get` | asset ID | none |
+| `seal_letter`（当前 OB：`letter(action="seal")`） | letter ID | sealed |
+| `rm_asset_upload_link`（当前 OB：`rm_asset_upload(action="link")`） | expected bytes | filename, MIME type |
+| `rm_asset_upload_status`（当前 OB：`rm_asset_upload(action="status")`） | upload ID | none |
+| `rm_asset_get`（当前 OB：`rm_asset_find(action="get")`） | asset ID | none |
 | `rm_asset_update_metadata` | asset ID | nullable title, description, tags |
-| `rm_asset_search` | none | query, tags, kind, MIME, creation dates, limit, offset |
+| `rm_asset_search`（当前 OB：`rm_asset_find(action="search")`） | none | query, tags, kind, MIME, creation dates, limit, offset |
 | `rm_asset_reindex_embeddings` | none | asset ID, limit |
-| `rm_asset_download_link` | asset ID | none |
-| `rm_asset_view` | asset ID | tool metadata for viewer |
-| `rm_asset_inspect` | asset ID | none |
+| `rm_asset_download_link`（当前 OB：`rm_asset_show(action="download_link")`） | asset ID | none |
+| `rm_asset_view`（当前 OB：`rm_asset_show(action="view")`） | asset ID | tool metadata for viewer |
+| `rm_asset_inspect`（当前 OB：`rm_asset_show(action="inspect")`） | asset ID | none |
 
 The 15 diagnostic schemas are listed in the diagnostic table above. They are
 not public product compatibility commitments while the diagnostic profile is
@@ -875,7 +881,7 @@ Stage 3C does not:
   security registries;
 - implement, remove, rename, or reorganize MCP tools;
 - implement `OMBRE_DIAG_TOOLS` (it already exists and is verified);
-- re-open the completed `rm_asset_upload_link` hash-signature cleanup;
+- re-open the completed `rm_asset_upload_link` (current OB call: `rm_asset_upload(action="link")`) hash-signature cleanup;
 - change Remember-Me pins, storage, adapters, migration, upload/download
   contracts, or production configuration;
 - add prompts, resources, templates, profiles, aliases, or orchestration tools;

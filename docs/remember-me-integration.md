@@ -1,5 +1,7 @@
 # Remember-Me Integration
 
+> P3 调用迁移（2026-10-11）：当前 OB MCP 操作使用 [README 的新入口 + action](../README.md#合并工具-action-示例--merged-tool-action-examples)，35 默认 = 20 推荐 + 15 旧兼容；诊断另外 15。下文 Current dependency provenance 保持当前依赖事实；Stage 8B–8F 的阶段切换与回滚描述保留其基线和真实 handler/Python 符号，各对应段落另注当前 OB 入口。Remember-Me 独立包 MCP schema/EXPECTED_MCP_TOOLS 不属于 OB 公开入口迁移。兼容期至少 P3 文档上线后 3 天且需婷确认 claude.ai/TG/CC 新窗口/手册均迁移，随后单独 P4 删除；不宣告上线或允许删除。
+
 ## Current dependency provenance
 
 Ombre-Brain pins the public Remember-Me Core to:
@@ -503,6 +505,7 @@ section; no data or runtime switch is involved.
 
 ## Stage 8D MCP compatibility presenter
 
+
 Stage 8D adds `remember_me_mcp_presenter.py` as an isolated presentation layer:
 
 `Compatibility Presenter -> RememberMeCoreAdapter -> Remember-Me Core`
@@ -523,15 +526,15 @@ exposed.
 
 | Tool | Current production implementation | Stage 8D Presenter | RM Core | OB-retained capability | Future seam | Rollback |
 | --- | --- | --- | --- | --- | --- | --- |
-| `rm_asset_upload_link` | OB handler and source-aware upload Ticket store | Implemented by Stage 8F-I route flow | Yes | Authentication, 10-minute upload TTL, URL and expected-byte validation | Link creates a source-aware Ticket; route calls RM ingest only after browser upload is accepted | Restore Stage 8F-I files |
-| `rm_asset_upload_status` | OB source-aware upload Ticket lifecycle | Implemented by Stage 8F-I route flow | Yes | Pending/uploading/completed state and status envelope | Status remains source-isolated over the upload Ticket result | Restore Stage 8F-I files |
-| `rm_asset_get` | OB handler over legacy `AssetStore` | Implemented and test-only | Yes | Tool registration and JSON transport | Replace handler body with Presenter call after acceptance | Remove Stage 8D files |
+| `rm_asset_upload_link`（当前 OB：`rm_asset_upload(action="link")`） | OB handler and source-aware upload Ticket store | Implemented by Stage 8F-I route flow | Yes | Authentication, 10-minute upload TTL, URL and expected-byte validation | Link creates a source-aware Ticket; route calls RM ingest only after browser upload is accepted | Restore Stage 8F-I files |
+| `rm_asset_upload_status`（当前 OB：`rm_asset_upload(action="status")`） | OB source-aware upload Ticket lifecycle | Implemented by Stage 8F-I route flow | Yes | Pending/uploading/completed state and status envelope | Status remains source-isolated over the upload Ticket result | Restore Stage 8F-I files |
+| `rm_asset_get`（当前 OB：`rm_asset_find(action="get")`） | OB handler over legacy `AssetStore` | Implemented and test-only | Yes | Tool registration and JSON transport | Replace handler body with Presenter call after acceptance | Remove Stage 8D files |
 | `rm_asset_update_metadata` | OB handler plus embedding refresh | Implemented and test-only | Yes | Tool registration and `AssetEmbeddingIndex.index_asset` side effect | OB handler calls Presenter, then retains embedding refresh | Remove Stage 8D files |
 | `rm_asset_reindex_embeddings` | RM-enabled Presenter/Core; default-off legacy `AssetEmbeddingIndex` | Implemented by Stage 8F-J | Yes | Host provider configuration and exact four-counter MCP envelope | Presenter maps RM counters; enabled path never accesses the legacy index | Revert Stage 8F-J files |
-| `rm_asset_search` | RM-enabled async Presenter/Core; default-off legacy fusion | Implemented by Stage 8F-H/J | Yes | Host provider configuration and exact public search envelope | RM Core performs query embedding, cosine, ranking and keyword fallback | Revert Stage 8F-H/J files |
-| `rm_asset_download_link` | OB download Ticket store | Implemented with an injected seam | Yes | Five-minute download TTL, three-GET limit, Ticket, URL, authentication and headers | Inject a thin wrapper over the existing OB Ticket/URL helper | Remove Stage 8D files |
-| `rm_asset_view` | OB handler and Viewer metadata | Implemented and test-only | Yes | Tool registration, `ASSET_VIEWER_TOOL_META`, resource URI and branding | Inject OB download collaborator and retain current registration | Remove Stage 8D files |
-| `rm_asset_inspect` | OB handler over verified stored bytes | Implemented and test-only | Yes | Tool registration and external description | Replace handler body only after exact result acceptance | Remove Stage 8D files |
+| `rm_asset_search`（当前 OB：`rm_asset_find(action="search")`） | RM-enabled async Presenter/Core; default-off legacy fusion | Implemented by Stage 8F-H/J | Yes | Host provider configuration and exact public search envelope | RM Core performs query embedding, cosine, ranking and keyword fallback | Revert Stage 8F-H/J files |
+| `rm_asset_download_link`（当前 OB：`rm_asset_show(action="download_link")`） | OB download Ticket store | Implemented with an injected seam | Yes | Five-minute download TTL, three-GET limit, Ticket, URL, authentication and headers | Inject a thin wrapper over the existing OB Ticket/URL helper | Remove Stage 8D files |
+| `rm_asset_view`（当前 OB：`rm_asset_show(action="view")`） | OB handler and Viewer metadata | Implemented and test-only | Yes | Tool registration, `ASSET_VIEWER_TOOL_META`, resource URI and branding | Inject OB download collaborator and retain current registration | Remove Stage 8D files |
+| `rm_asset_inspect`（当前 OB：`rm_asset_show(action="inspect")`） | OB handler over verified stored bytes | Implemented and test-only | Yes | Tool registration and external description | Replace handler body only after exact result acceptance | Remove Stage 8D files |
 
 `RememberMeDownloadLinkCollaborator` is deliberately narrow. A test fake
 returns deterministic `.invalid` URLs and fake Tickets. A future OB
@@ -597,6 +600,8 @@ presenter. Both upload-link schemas omit the expected SHA-256 upload field.
 
 ## Stage 8F-A Host Runtime Bootstrap
 
+当前 OB 调用此段操作：`rm_asset_show(action="view")`、`rm_asset_show(action="download_link")`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+
 Stage 8F-A adds only a default-off host bundle bootstrap in `server.py`. The
 bundle can hold one Remember-Me runtime owner, a `RememberMeCoreAdapter`, the
 compatibility Presenter, and an OB download-link collaborator. No MCP handler
@@ -632,6 +637,8 @@ bootstrap assignment, tests, and this documentation.
 
 ## Stage 8F-B Download Resolver Abstraction
 
+当前 OB 调用此段操作：`rm_asset_show(action="download_link")`、`rm_asset_show(action="view")`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+
 Stage 8F-B keeps the public download Ticket shape frozen at the same three
 fields: `asset_id`, `expires_at`, and `get_count`. It adds only an in-process
 source side table keyed by token. That table is guarded by the same download
@@ -664,6 +671,8 @@ production data access is involved.
 
 ## Stage 8F-C Wire rm_asset_get Only
 
+当前 OB 调用此段操作：`rm_asset_find(action="get", asset_id=...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+
 Stage 8F-C switches only the read-only MCP `rm_asset_get` handler. With
 the Remember-Me runtime flag absent or disabled, `rm_asset_get` continues
 to use the existing `AssetStore` metadata path and keeps the legacy JSON
@@ -695,6 +704,8 @@ write, sync, Render change, or production data access.
 
 
 ## Stage 8F-D Wire rm_asset_download_link Only
+
+当前 OB 调用此段操作：`rm_asset_show(action="download_link", asset_id=...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
 
 Stage 8F-D switches only the second read-only MCP handler,
 `rm_asset_download_link`. With the Remember-Me runtime flag absent or disabled,
@@ -738,6 +749,8 @@ data migration, copy, double write, shadow write, sync, Render change, or
 production data access is involved.
 
 ## Stage 8F-E Wire rm_asset_view Only
+
+当前 OB 调用此段操作：`rm_asset_show(action="view", asset_id=...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
 
 Stage 8F-E switches only the third read-only MCP handler, `rm_asset_view`.
 With the Remember-Me runtime flag absent or disabled, the handler keeps the full
@@ -792,6 +805,8 @@ involved.
 
 ## Stage 8F-F Wire rm_asset_inspect Only
 
+当前 OB 调用此段操作：`rm_asset_show(action="inspect", asset_id=...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+
 Stage 8F-F switches only the fourth read-only MCP handler,
 `rm_asset_inspect`. With the Remember-Me runtime flag absent or disabled, the
 handler keeps the full legacy Inspect behavior: it verifies bytes through the
@@ -833,6 +848,8 @@ data migration, copy, double write, shadow write, sync, Render change, or
 production data access is involved.
 
 ## Stage 8F-G Wire rm_asset_update_metadata Only
+
+当前 OB 调用此段操作：`rm_asset_update_metadata`（入口和参数不变，不新增 action）。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。
 
 Stage 8F-G switches only `rm_asset_update_metadata`. It is the fifth wired
 MCP handler and the first write operation in the Remember-Me integration. With
@@ -876,6 +893,8 @@ change, or production data access is involved.
 
 ## Stage 8F-H Wire rm_asset_search Only
 
+当前 OB 调用此段操作：`rm_asset_find(action="search", ...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+
 Stage 8F-H switches only `rm_asset_search`. It is the sixth wired handler.
 When the RM runtime is disabled, the handler keeps the complete legacy Search
 implementation: lexical AssetStore search, optional legacy embedding semantic
@@ -918,6 +937,8 @@ updates, and this section. No data migration, copy, double write, shadow
 write, sync, Render change, or production data access is involved.
 
 ## Stage 8F-I Wire Atomic RM Browser Upload Flow
+
+当前 OB 调用此段操作：`rm_asset_upload(action="link", expected_bytes=...)`、`rm_asset_upload(action="status", upload_id=...)`。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
 
 Stage 8F-I switches `rm_asset_upload_link`, `rm_asset_upload_status`, and
 `/rm/asset-upload/{token}` together as one atomic upload flow. The link creates
