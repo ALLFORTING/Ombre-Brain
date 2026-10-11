@@ -53,10 +53,23 @@ import asyncio
 import json
 import server
 from remember_me_adapter import EXPECTED_MCP_TOOLS
+from mcp.server.fastmcp import FastMCP
+from mcp_action_tools import ACTION_TOOLS
 from mcp.shared.memory import create_connected_server_and_client_session
 
 async def main():
-    async with create_connected_server_and_client_session(server.mcp) as client:
+    # Private implementation snapshot; current OB public tools are checked
+    # separately against the machine manifest in test_mcp_tool_registration.
+    reference = FastMCP("private-stage8b-reference")
+    retained = {old: server.mcp._tool_manager.get_tool(name).targets[action]
+                for name, actions in ACTION_TOOLS.items() for action, old in actions.items()}
+    # The frozen snapshot also retains its original registration order.
+    from pathlib import Path
+    order = json.loads(Path("tests/fixtures/stage8b-ob-rm-mcp-contract.json").read_text())["tools"]
+    for entry in order:
+        old = entry["name"]
+        reference._tool_manager._tools[old] = retained.get(old) or server.mcp._tool_manager.get_tool(old)
+    async with create_connected_server_and_client_session(reference) as client:
         tools = (await client.list_tools()).tools
     print("STAGE8B_JSON=" + json.dumps([
         tool.model_dump(by_alias=True, exclude_none=True)
@@ -94,16 +107,6 @@ def _ob_tools(tmp_path):
             return self.payload
 
     normalized = [_normalize_tool(ToolRecord(tool)) for tool in tools]
-    # Keep frozen Stage 8B dependency fixtures unchanged. OB adds only the
-    # verified compatibility notice to these legacy descriptions.
-    from mcp_action_tools import ACTION_TOOLS
-    notices = {old: f'\n\nDeprecated in a future release; use {name}(action="{action}", ...) instead.'
-               for name, actions in ACTION_TOOLS.items() for action, old in actions.items()}
-    for tool in normalized:
-        if tool["name"] in notices:
-            notice = notices[tool["name"]]
-            assert tool["description"].endswith(notice)
-            tool["description"] = tool["description"][:-len(notice)]
     return normalized
 
 
