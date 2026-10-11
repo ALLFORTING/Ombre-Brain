@@ -849,7 +849,7 @@ production data access is involved.
 
 ## Stage 8F-G Wire rm_asset_update_metadata Only
 
-当前 OB 调用此段操作：`rm_asset_update_metadata`（入口不变）。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。只传选定 action 的原参数。
+当前 OB 调用此段操作：`rm_asset_update_metadata`（入口和参数不变，不新增 action）。其他旧 handler 的当前调用见上方 Tool compatibility matrix；下文阶段记录及 Python handler 符号保持真实原名。
 
 Stage 8F-G switches only `rm_asset_update_metadata`. It is the fifth wired
 MCP handler and the first write operation in the Remember-Me integration. With
