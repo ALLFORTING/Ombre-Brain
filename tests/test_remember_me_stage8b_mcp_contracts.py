@@ -52,6 +52,7 @@ OB_PROBE = r"""
 import asyncio
 import json
 import server
+from remember_me_adapter import EXPECTED_MCP_TOOLS
 from mcp.shared.memory import create_connected_server_and_client_session
 
 async def main():
@@ -59,7 +60,7 @@ async def main():
         tools = (await client.list_tools()).tools
     print("STAGE8B_JSON=" + json.dumps([
         tool.model_dump(by_alias=True, exclude_none=True)
-        for tool in tools if tool.name.startswith("rm_asset_")
+        for tool in tools if tool.name in EXPECTED_MCP_TOOLS
     ], separators=(",", ":")))
 
 asyncio.run(main())
@@ -92,7 +93,18 @@ def _ob_tools(tmp_path):
         def model_dump(self, **_kwargs):
             return self.payload
 
-    return [_normalize_tool(ToolRecord(tool)) for tool in tools]
+    normalized = [_normalize_tool(ToolRecord(tool)) for tool in tools]
+    # Keep frozen Stage 8B dependency fixtures unchanged. OB adds only the
+    # verified compatibility notice to these legacy descriptions.
+    from mcp_action_tools import ACTION_TOOLS
+    notices = {old: f'\n\nDeprecated in a future release; use {name}(action="{action}", ...) instead.'
+               for name, actions in ACTION_TOOLS.items() for action, old in actions.items()}
+    for tool in normalized:
+        if tool["name"] in notices:
+            notice = notices[tool["name"]]
+            assert tool["description"].endswith(notice)
+            tool["description"] = tool["description"][:-len(notice)]
+    return normalized
 
 
 def _safe_output_shapes(profile):
