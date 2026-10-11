@@ -45,6 +45,7 @@ DEFAULT_TOOL_ORDER = [
     "get_letter", "list_notes", "get_note", "leave_note", "dismiss_note",
     "list_revisions", "restore_revision", "trace", "seal_letter", "archive_session", "todos", "boot",
     "refresh_tg_summary", "pulse", "dream",
+    "note", "letter", "revision", "rm_asset_upload", "rm_asset_find", "rm_asset_show",
 ]
 
 
@@ -161,7 +162,7 @@ def test_default_tool_registration_order_is_unchanged(tmp_path):
 
 def test_diagnostic_tools_register_before_digest(tmp_path):
     names = _list_tools(tmp_path, diagnostics=True)
-    assert len(names) == 44
+    assert len(names) == 50
     digest_index = names.index("digest")
     diagnostic = [name for name in names if name.startswith("asset_")]
     assert len(diagnostic) == 15

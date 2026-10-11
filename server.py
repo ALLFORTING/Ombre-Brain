@@ -12,8 +12,8 @@
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
 #   - Expose the current MCP tool and resource surface:
 #     注册当前 MCP 工具与资源表面：
-#       25 default tools; 15 optional diagnostic tools
-#                25 个默认工具；15 个可选诊断工具
+#       35 default tools; 15 optional diagnostic tools
+#                35 个默认工具；15 个可选诊断工具
 #       memory/session, Remember-Me, and maintenance operations
 #                记忆/会话、Remember-Me 与维护操作
 #       one viewer resource; diagnostics via OMBRE_DIAG_TOOLS
@@ -5452,6 +5452,10 @@ _exec_server_fragment("server_dashboard_api.py")
 from mcp_prompts import register_prompts
 
 register_prompts(mcp)
+
+from mcp_action_tools import register_action_tools
+
+register_action_tools(mcp)
 
 
 if __name__ == "__main__":

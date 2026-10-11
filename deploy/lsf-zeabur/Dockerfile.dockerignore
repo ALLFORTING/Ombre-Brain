@@ -41,6 +41,7 @@
 !embedding_engine.py
 !import_memory.py
 !maintenance_write_gate.py
+!mcp_action_tools.py
 !mcp_prompts.py
 !migrate_to_domains.py
 !offline_backup_bundle.py

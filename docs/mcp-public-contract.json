@@ -1780,6 +1780,643 @@
         ],
         "type": "object"
       }
+    },
+    {
+      "name": "note",
+      "primitive": "tool",
+      "category": "memory_notes",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "leave",
+              "list",
+              "get",
+              "dismiss"
+            ]
+          },
+          "open_at": {
+            "type": "string"
+          },
+          "sealed": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          },
+          "include_sealed": {
+            "type": "boolean"
+          },
+          "limit": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "note_id": {
+            "type": "integer"
+          },
+          "confirm_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "open_at": {
+                "default": "",
+                "type": "string"
+              },
+              "sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "text": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "leave"
+              }
+            },
+            "required": [
+              "action",
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "limit": {
+                "default": 20,
+                "maximum": 100,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "list"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "note_id": {
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "get"
+              }
+            },
+            "required": [
+              "action",
+              "note_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "confirm_token": {
+                "default": "",
+                "type": "string"
+              },
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "note_id": {
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "dismiss"
+              }
+            },
+            "required": [
+              "action",
+              "note_id"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "letter",
+      "primitive": "tool",
+      "category": "memory_letters",
+      "audience": "ordinary_model_workflow",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "get",
+              "seal"
+            ]
+          },
+          "include_sealed": {
+            "type": "boolean"
+          },
+          "letter_id": {
+            "type": "integer"
+          },
+          "sealed": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "letter_id": {
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "get"
+              }
+            },
+            "required": [
+              "action",
+              "letter_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "letter_id": {
+                "type": "integer"
+              },
+              "sealed": {
+                "default": 1,
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "seal"
+              }
+            },
+            "required": [
+              "action",
+              "letter_id"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "revision",
+      "primitive": "tool",
+      "category": "memory_revisions",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "restore"
+            ]
+          },
+          "bucket_id": {
+            "type": "string"
+          },
+          "include_sealed": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "confirm_token": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "bucket_id": {
+                "type": "string"
+              },
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "limit": {
+                "default": 20,
+                "type": "integer"
+              },
+              "action": {
+                "type": "string",
+                "const": "list"
+              }
+            },
+            "required": [
+              "action",
+              "bucket_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "bucket_id": {
+                "type": "string"
+              },
+              "confirm_token": {
+                "default": "",
+                "type": "string"
+              },
+              "include_sealed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "restore"
+              }
+            },
+            "required": [
+              "action",
+              "bucket_id",
+              "revision"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_upload",
+      "primitive": "tool",
+      "category": "remember_me_assets",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth_sensitive_mutation",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "structured_json_like_text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "link",
+              "status"
+            ]
+          },
+          "expected_bytes": {
+            "type": "integer"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "upload_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "expected_bytes": {
+                "type": "integer"
+              },
+              "filename": {
+                "default": "",
+                "type": "string"
+              },
+              "mime_type": {
+                "default": "application/octet-stream",
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "link"
+              }
+            },
+            "required": [
+              "action",
+              "expected_bytes"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "upload_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "status"
+              }
+            },
+            "required": [
+              "action",
+              "upload_id"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_find",
+      "primitive": "tool",
+      "category": "remember_me_assets",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "metadata",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "get",
+              "search"
+            ]
+          },
+          "asset_id": {
+            "type": "string"
+          },
+          "created_from": {
+            "type": "string"
+          },
+          "created_to": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "asset_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "get"
+              }
+            },
+            "required": [
+              "action",
+              "asset_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "created_from": {
+                "default": "",
+                "type": "string"
+              },
+              "created_to": {
+                "default": "",
+                "type": "string"
+              },
+              "kind": {
+                "default": "",
+                "type": "string"
+              },
+              "limit": {
+                "default": 20,
+                "type": "integer"
+              },
+              "mime_type": {
+                "default": "",
+                "type": "string"
+              },
+              "offset": {
+                "default": 0,
+                "type": "integer"
+              },
+              "query": {
+                "default": "",
+                "type": "string"
+              },
+              "tags": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "action": {
+                "type": "string",
+                "const": "search"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "rm_asset_show",
+      "primitive": "tool",
+      "category": "remember_me_assets",
+      "audience": "ordinary_product",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "mixed",
+      "auth_relevance": "endpoint_auth",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "mixed",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "view",
+              "inspect",
+              "download_link"
+            ]
+          },
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "asset_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "view"
+              }
+            },
+            "required": [
+              "action",
+              "asset_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "asset_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "inspect"
+              }
+            },
+            "required": [
+              "action",
+              "asset_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "asset_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "const": "download_link"
+              }
+            },
+            "required": [
+              "action",
+              "asset_id"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
     }
   ],
   "resources": [
