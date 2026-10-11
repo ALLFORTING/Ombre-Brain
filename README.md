@@ -381,43 +381,44 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 29 个默认工具、44 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 35 个默认工具、50 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 29 default tools, 44 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 35 default tools, 50 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
-### 默认 MCP 工具 / Default MCP tools
+### 推荐 MCP 工具与兼容窗口 / Recommended MCP tools and compatibility window
 
-这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `seal_letter` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
+当前 35 个默认入口 = 20 个推荐入口 + 15 个旧兼容入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
+
+The 35 default entries consist of 20 recommended tools and 15 legacy compatibility tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
+
+旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 仍真实注册，仅供兼容；新说明与客户端调用应使用下表的新入口 + action。兼容期至少持续到 P3 文档上线后 3 天，且需婷确认 claude.ai、TG、CC 新窗口和手册均已迁移，才可在单独 P4 删除旧入口。本页不宣告上线、计时结束或允许删除。
+
+The 15 legacy entries remain registered during compatibility. Removal belongs to a separate P4, after at least three days following P3 documentation rollout and Ting's confirmation that claude.ai, TG, new CC conversations, and manuals have migrated.
+
+这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `letter(action="seal")` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
 
 | 工具 Tool | 作用与边界 Purpose and boundary |
 |-----------|-------------------------------|
 | `boot` | 推荐的有状态启动上下文：按 profile 和预算组装递送，启动 decay，并记录完整递送的 delta/trigger/note 状态 / Stateful startup context; delivery may advance profile checkpoint and shared trigger/note state |
 | `breath` | 检索或浮现记忆；`query` 用于定向检索。它是 retrieval-oriented，命中/排序可能更新 activation metadata；当前版本在每条正常结果前显示紧凑的 provenance badge / Retrieval or surfacing; targeted `query` is preferred when the topic is known, bounded activation metadata may be updated, and normal current results carry a compact provenance badge |
-| `get_letter` | 按 `letter_id` 精确读取单封 handoff letter；默认隐藏 sealed letter，需明确 `include_sealed=True` 才读取 / Read one handoff letter by exact ID; sealed letters stay hidden unless explicitly included |
-| `leave_note` | 逐字保存婷为后续 boot 留下的一封可选留言；它写入独立 notes 表，不创建 memory bucket / Store Ting's exact optional note for a later boot in the independent notes table; never creates a memory bucket |
-| `list_notes` / `get_note` | 查看历史或按 `note_id` 读取全文；sealed 与未到 `open_at` 的 note 默认按存在性隐藏。成功 `get_note` 记录实际完整读取 / List note history or read one full note by ID; sealed and not-yet-open notes are hidden by default, and a successful full get records the read |
-| `dismiss_note` | 撤回一条留言的自动递送：先预览拿短时 `confirm_token`，再带 token 确认；正文和读取历史保留，不标记已递送或已读 / Stop one note's automatic boot delivery via preview then short-lived confirm_token; body and read history are kept |
 | `hold` | 写入单条记忆或模型自己的 `feel` 反思；普通写入仅在匹配到规范化正文相同且可复用的桶时复用，不做语义合并；相似提醒与冲突检查不阻止写入 / Store one memory or a model `feel` reflection; ordinary writes reuse an eligible matched bucket only when normalized bodies match, without semantic merging; similarity and conflict warnings do not block the write |
 | `grow` | 将日记/长内容拆分并写入记忆桶；每个成功条目返回实际 `bucket_id` 和新建/复用状态，复用仅针对匹配到的相同内容桶 / Digest journal-style content into memory buckets; every successful item reports its actual `bucket_id` and created/reused status, with reuse limited to an eligible matched identical-content bucket |
-| `trace` | 混合修改工具：元数据、正文替换/追加、todo provenance、related、superseded_by、merge、seal 以及 `delete=True`。delete 必须先取得并回传短时、一次性的 confirm_token；明确成功才代表写前快照成功；撤销改动或复活已删除的桶用 `list_revisions` / `restore_revision` / Mixed mutation tool; delete requires a short-lived, one-shot confirm_token before the write-ahead snapshot and deletion can execute; undo and resurrection go through `list_revisions` / `restore_revision` |
-| `list_revisions` | 只读列出一个桶（含已删除的桶）可还原的版本：完整版本 `r<id>`（正文 + metadata）和旧版仅正文历史 `h<id>`；sealed 正文默认隐藏 / Read-only list of restorable versions of one bucket, deleted ones included: full revisions `r<id>` and legacy body-only history `h<id>`; sealed bodies hidden by default |
-| `restore_revision` | 把一个桶还原到列出的某个版本；已删除的桶以原 `bucket_id` 复活。两阶段确认（与 delete 同级）：预览显示正文/metadata 差异、将跳过的关系和结果是否 sealed（任一版本 sealed 则结果 sealed）；`last_active` 等运行态字段保留当前值；还原前先保存当前版本，所以还原本身也能撤销。删除的 id 上仍有未完成挂起效果时拒绝复活 / Restore one bucket to a listed version, resurrecting a deleted bucket under its original ID; two-stage confirmation like delete, preview shows diffs, skipped relations and sealed outcome; runtime fields keep current values; the current version is saved first so a restore can be undone; resurrection is refused while unfinished pending effects reference the deleted ID |
+| `trace` | 混合修改工具：元数据、正文替换/追加、todo provenance、related、superseded_by、merge、seal 以及 `delete=True`。delete 必须先取得并回传短时、一次性的 confirm_token；明确成功才代表写前快照成功；撤销改动或复活已删除的桶用 `revision(action="list")` / `revision(action="restore")` / Mixed mutation tool; delete requires a short-lived, one-shot confirm_token before the write-ahead snapshot and deletion can execute; undo and resurrection go through `revision(action="list")` / `revision(action="restore")` |
 | `pulse` | 系统状态和记忆桶列表；`show_all=True` 默认最多显示 50 个，可用 `limit`/`offset` 分页；listing 可能更新 bounded dormant metadata / Status and bucket listing; `show_all=True` is bounded to 50 per page by default |
 | `dream` | 可选的最近记忆反思/详情读取，不要求每次启动调用；默认会 touch 读到的桶并触发时间 ripple，`touch=False` 只读 / Optional recent-memory reflection/detail readout; not required on every startup; touches read buckets and ripples by default, `touch=False` reads without side effects |
-| `seal_letter` | sealed-memory handoff-letter maintenance：改变一封 letter 的可见性，不是普通检索 / Changes handoff-letter visibility; not ordinary retrieval |
 | `archive_session` | 归档一次会话摘要，可附 highlights/mood/VA 和 mailbox letter / Archive a session summary with optional handoff letter |
 | `todos` | 汇总未 resolved 且非 sealed 桶中的 todos；`include_provenance=True` 才按明确来源分组显示 / Summarize todos from unresolved, non-sealed buckets; explicit provenance grouping is opt-in |
 | `refresh_tg_summary` | 为钉选桶写入调用方生成的 TG 压缩版（≤1200 字），只写 metadata 不动正文；须带 TG boot 给出的 `source_hash`，正文已变则拒绝 / Store a caller-generated TG pinned summary as metadata only; requires the `source_hash` from TG boot and is rejected if the body changed |
 | `related_backfill` | 维护/回填 semantic related；默认 `dry_run=True`，执行模式会写 relation 并跳过 sealed 桶 / Maintenance backfill; `dry_run=True` by default, execution writes links |
 | `digest` | 维护/规划旧桶消化；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 / Controlled digestion maintenance; dry-run by default, confirmed execution may write results and incur provider/API cost |
-| `rm_asset_upload_link` / `rm_asset_upload_status` | Remember-Me 持久 asset 上传生命周期：短期 signed link 与 metadata-only 状态查询 / Persistent asset upload lifecycle: short-lived signed link plus metadata-only status |
-| `rm_asset_get` | 按 ID 读取持久 asset metadata，不返回 bytes / Read persistent asset metadata by ID; no file bytes |
 | `rm_asset_update_metadata` | 更新 title/description/tags，不改变 asset bytes 或 hashes / Update metadata without changing asset bytes or hashes |
-| `rm_asset_search` | 关键词、tag/filter 和可选 semantic search 的持久 asset 检索 / Persistent asset discovery through keyword, metadata, and optional semantic search |
-| `rm_asset_view` | 面向用户显示已清理图片；`rm_asset_inspect` 才是模型视觉检查 / Display a cleaned image to the user; use `rm_asset_inspect` for model vision |
-| `rm_asset_inspect` | 返回已清理图片的 MCP ImageContent，供模型实际理解，不改 metadata / Return cleaned image content for model inspection without changing metadata |
-| `rm_asset_download_link` | 创建短期 signed download link，是显式导出动作 / Create a short-lived signed download link for explicit export |
 | `rm_asset_reindex_embeddings` | Remember-Me maintenance/backfill：为缺失或过期 vector 做有界回填；不改 asset bytes 或 metadata / Bounded maintenance backfill for missing or stale vectors; asset bytes and metadata are unchanged |
+| `note` | `action="leave"` 逐字保存婷留言到独立 notes 表，不创建 memory bucket；`sealed:bool=False`、`open_at=""`。`list` 查看历史；`get` 按 `note_id` 读取全文并记录实际完整读取/递送状态。sealed 与未到 open_at 的 note 默认存在性隐藏；include_sealed 只解除 sealed 隐藏。`dismiss` 先预览再带有效 confirm_token 停止自动 boot 投递，保留正文/历史，不标记已读或已递送 / Leave, list, get, or dismiss a note with the original delivery and read semantics |
+| `letter` | `action="get"` 按 `letter_id` 精确读 handoff letter，sealed 默认隐藏，需明确 `include_sealed=True`；`action="seal"` 是受控可见性维护，`sealed:int=1`，与 note leave 的 bool 默认不同 / Exact letter read or controlled sealing |
+| `revision` | 仅在婷当前对话明确要求时使用。`action="list"` 只读列出完整 `r<id>`（正文 + metadata）及旧正文 `h<id>`，含已删除桶，sealed 正文默认隐藏。`action="restore"` 先预览再确认，显示正文/metadata 差异、跳过关系和 sealed 结果（任一版本 sealed 则结果 sealed）；保留 last_active 等运行态字段，还原前保存当前版本。删除桶用原 bucket_id 复活，但未完成挂起效果会阻止复活；h 版本仅还原现存桶 / List or restore revisions with two-stage confirmation |
+| `rm_asset_upload` | `action="link"` 用 expected_bytes 和可选 filename/MIME 创建短期 signed 上传端点，服务端算 hash；`action="status"` 用 upload_id 查询 metadata-only 状态 / Persistent upload lifecycle |
+| `rm_asset_find` | `action="get"` 按 asset_id 读 metadata，不返回 bytes；`action="search"` 用 query、tags、kind、MIME、日期和分页筛选，保留可选 semantic search / Asset metadata and discovery |
+| `rm_asset_show` | `action="view"` 面向婷显示清理后的图片：UI/_meta 图像及 signed-link fallback；`action="inspect"` 返回标准 MCP ImageContent 供模型视觉理解，不改 metadata；`action="download_link"` 创建短期 signed link，属于显式导出 / Three distinct display, inspection, and export actions |
 
 ### 诊断工具 / Diagnostic tools
 
@@ -428,6 +429,36 @@ The 15 diagnostic tools are hidden by default and are registered only when `OMBR
 `asset_attachment_context_probe`, `asset_browser_upload_link`, `asset_browser_upload_status`, `asset_export_probe`, `asset_ingest_abort`, `asset_ingest_begin`, `asset_ingest_chunk`, `asset_ingest_finish`, `asset_ingest_probe`, `asset_render_probe`, `asset_vision_challenge`, `asset_vision_download_link`, `asset_vision_export`, `asset_vision_upload_challenge`, `asset_vision_verify`.
 
 ### 工具参数速查 / Tool Parameter Quick Reference
+
+#### 合并工具 action 示例 / Merged-tool action examples
+
+以下是 MCP 调用形状；示例 ID 和 token 是占位，必须换成真实回执中的值。`action` 是新增必填参数，旧业务参数名不改。不要向一个 action 填入其他 action 的字段。
+
+```jsonl
+{"name":"note","arguments":{"action":"leave","text":"婷的逐字留言"}}
+{"name":"note","arguments":{"action":"list","limit":20}}
+{"name":"note","arguments":{"action":"get","note_id":1}}
+{"name":"note","arguments":{"action":"dismiss","note_id":1}}
+{"name":"note","arguments":{"action":"dismiss","note_id":1,"confirm_token":"<preview token>"}}
+{"name":"letter","arguments":{"action":"get","letter_id":1}}
+{"name":"letter","arguments":{"action":"seal","letter_id":1,"sealed":1}}
+{"name":"revision","arguments":{"action":"list","bucket_id":"<bucket_id>"}}
+{"name":"revision","arguments":{"action":"restore","bucket_id":"<bucket_id>","revision":"r1"}}
+{"name":"revision","arguments":{"action":"restore","bucket_id":"<bucket_id>","revision":"r1","confirm_token":"<preview token>"}}
+{"name":"rm_asset_upload","arguments":{"action":"link","expected_bytes":1024,"filename":"example.png","mime_type":"image/png"}}
+{"name":"rm_asset_upload","arguments":{"action":"status","upload_id":"<upload_id>"}}
+{"name":"rm_asset_find","arguments":{"action":"get","asset_id":"<asset_id>"}}
+{"name":"rm_asset_find","arguments":{"action":"search","query":"曾保存的图片"}}
+{"name":"rm_asset_show","arguments":{"action":"view","asset_id":"<asset_id>"}}
+{"name":"rm_asset_show","arguments":{"action":"inspect","asset_id":"<asset_id>"}}
+{"name":"rm_asset_show","arguments":{"action":"download_link","asset_id":"<asset_id>"}}
+```
+
+dismiss/restore 的 `confirm_token:str=""` 在 schema 中可省，以取得预览；执行确认必须取得有效 token，并按相同目标/计划与 include_sealed 再调用。有效期仍为 300 秒、一次性、操作及状态绑定；过期、已用或状态不匹配会拒绝。原回执有时仍提及旧名，应按相应 action 调用，不能据此绕过确认。
+
+note 全文投递不变：boot 仅在完整输出最新合格留言后记录自动递送；预算容不下全文时不截断冒充递送，较旧合格待递送留言可能被跳过。`note(action="get")` 成功全文读取会记录 read/delivery；`list` 只预览。`include_sealed=False` 默认隐藏封缄内容；notes 未到 open_at 时即使 include_sealed=True 仍隐藏。letter/revision 继续各自封缄规则；asset show 的 view、inspect、download_link 保持不同收件人和数据通道。
+
+`rm_asset_update_metadata`、`rm_asset_reindex_embeddings`、`digest`、`related_backfill` 保持原入口；`OMBRE_DIAG_TOOLS` 的 15 个诊断工具与开关规则不变。
 
 #### `boot`
 
@@ -486,9 +517,9 @@ boot、todos 和 feel echo 默认排除完整、精确匹配 `test` 的 tag；�
 - 命中桶后，输出中的 todos 会从当前 bucket metadata 重新读取并追加，仅显示 active 项；即使脱水摘要来自旧缓存，todos 也以当前 metadata 为准 / After a bucket is matched, todos are reread from current bucket metadata and appended to the output, showing only active items; current metadata remains authoritative even when the dehydrated summary comes from an older cache entry.
 - `as_of` cursor 会冻结规范化的历史时点；不能拿一个时点的 cursor 改传另一个时点。历史版本边界使用 write-ahead `changed_at`：`T < changed_at` 选快照中的旧正文，`T >= changed_at` 选后续正文；同秒连续写入无法从现有秒级快照进一步区分 / An `as_of` cursor freezes the normalized historical instant. Version boundaries use write-ahead `changed_at`: `T < changed_at` selects the snapshotted old body, while `T >= changed_at` selects the following body. The existing second-precision snapshot model cannot distinguish multiple writes within the same second.
 
-#### `get_letter`
+#### `letter`
 
-- `get_letter(letter_id, include_sealed=False)` — 按 ID 精确读取单封信；sealed letter 默认隐藏，沿用明确的 `include_sealed=True` opt-in / Read one letter by exact ID; sealed letters are hidden by default.
+- `letter(action="get", letter_id=letter_id, include_sealed=False)` — 按 ID 精确读取单封信；sealed letter 默认隐藏，沿用明确的 `include_sealed=True` opt-in / Read one letter by exact ID; sealed letters are hidden by default.
 - sealed letter 与真正不存在的 `letter_id` 返回完全相同的 not found 结果，调用方不能据此断定该信不存在；这是刻意的存在性隐藏，`include_sealed=True` 是读取 sealed 内容的显式开关 / A sealed letter and a genuinely missing `letter_id` return the same not-found result, so callers cannot conclude that the letter does not exist; this is deliberate existence hiding, and `include_sealed=True` is the explicit opt-in for reading sealed content.
 
 #### `trace`
@@ -639,7 +670,7 @@ Conflict candidate recall is broad, but the final detector returns structured `s
 
 - Stage 2 adds user-managed titles, descriptions, and normalized tags. Metadata is stored in SQLite separately from persistent file bytes.
 - `rm_asset_update_metadata(...)` changes metadata transactionally and never rewrites the asset file, `stored_sha256`, or `stored_bytes`.
-- `rm_asset_search(...)` performs local SQLite-backed structured filtering and deterministic text matching across asset ID, filename, title, description, and tags.
+- `rm_asset_find(action="search", ...)` performs local SQLite-backed structured filtering and deterministic text matching across asset ID, filename, title, description, and tags.
 - English matching is case-insensitive, tag filters require every requested tag, and Chinese phrases support substring matching.
 - Stage 2 does not generate automatic image descriptions or automatic chat attachment display.
 
@@ -657,23 +688,23 @@ Conflict candidate recall is broad, but the final detector returns structured `s
 
 #### Remember-Me Stage 3A inline asset viewer
 
-- MCP Apps-capable clients can render one RM image directly inside the conversation through `rm_asset_view(asset_id)`.
+- MCP Apps-capable clients can render one RM image directly inside the conversation through `rm_asset_show(action="view", asset_id=asset_id)`.
 - The viewer receives only the privacy-cleaned, re-encoded stored copy. Image bytes are placed in the tool result `_meta`, not in model-visible text or `structuredContent`.
 - Clients without MCP Apps receive a short-lived signed download link through the normal text fallback.
 - This stage provides a single-image viewer only; it is not a gallery or asset manager.
 - Actual inline rendering support still requires validation in the real Claude connector.
 - The embedded viewer is built with the pinned official `@modelcontextprotocol/ext-apps` browser SDK and bundled into a self-contained HTML resource with no runtime CDN dependency.
 - Loading, host connection, tool-result waiting, timeout, missing-image-data, and image-decode states are always visible; initialization failures no longer leave an empty component.
-- Use `rm_asset_inspect(asset_id)` when the model must read the actual cleaned image or text inside it. Its base64 exists only in MCP `ImageContent`; metadata updates and embedding refresh remain explicit separate operations.
-- Use `rm_asset_view(asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
+- Use `rm_asset_show(action="inspect", asset_id=asset_id)` when the model must read the actual cleaned image or text inside it. Its base64 exists only in MCP `ImageContent`; metadata updates and embedding refresh remain explicit separate operations.
+- Use `rm_asset_show(action="view", asset_id=asset_id)` when the goal is to show the image to the user. Metadata alone must not be used to guess image contents.
 - Stage 3A.2 and Stage 3B acceptance results are archived in [`docs/remember-me-stage-3-acceptance.md`](docs/remember-me-stage-3-acceptance.md).
 - The current registered-tool inventory and compatibility-first reduction plan are documented in [`docs/mcp-tool-audit.md`](docs/mcp-tool-audit.md).
 - Stage 4 attachment feasibility and the corrected standard-MCP versus Claude-container conclusion are documented in [`docs/remember-me-stage-4-attachment-feasibility.md`](docs/remember-me-stage-4-attachment-feasibility.md).
 
 #### Remember-Me Stage 4 one-upload attachment save
 
-- Stage 4B passed real Claude web acceptance: the code-execution container can read the exact current attachment and upload it through HTTPS `multipart/form-data` to the existing short-lived `rm_asset_upload_link` endpoint without a second user upload.
-- Call `rm_asset_upload_link(expected_bytes, filename="", mime_type="application/octet-stream")` without a SHA-256 argument. Claude must not complete, guess, or invent a hash. The server computes `source_sha256`; client execution code may compare it with a locally computed hash internally, but complete hashes must not be printed to chat text or stdout.
+- Stage 4B passed real Claude web acceptance: the code-execution container can read the exact current attachment and upload it through HTTPS `multipart/form-data` to the existing short-lived `rm_asset_upload_link` endpoint without a second user upload. This is a historical acceptance name; current calls use `rm_asset_upload(action="link", ...)`.
+- Call `rm_asset_upload(action="link", expected_bytes=expected_bytes, filename="", mime_type="application/octet-stream")` without a SHA-256 argument. Claude must not complete, guess, or invent a hash. The server computes `source_sha256`; client execution code may compare it with a locally computed hash internally, but complete hashes must not be printed to chat text or stdout.
 - Standard MCP/FastMCP request context still does not automatically contain the chat attachment. `asset_attachment_context_probe` remains a diagnostic for that protocol boundary.
 - Enable `Settings -> Capabilities -> Code execution and file creation -> Allow network egress`, keep the restricted domain mode, and add only the user's exact Ombre Brain hostname under `Additional allowed domains`. Do not use `All domains` or include a scheme, path, token, or signed URL.
 - Explicit save requests may proceed directly. Under standing permission Claude may autonomously save an image it genuinely wants to remember, or may ask first; neither behavior is mandatory every time, and indiscriminate collection is prohibited.

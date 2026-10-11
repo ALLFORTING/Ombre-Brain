@@ -9,11 +9,11 @@ The intended flow is:
 1. A user uploads an image once in a Claude conversation.
 2. Claude sees the image and decides whether to preserve it under the applicable authorization.
 3. Claude's code-execution container reads the exact current attachment bytes.
-4. `rm_asset_upload_link(expected_bytes, filename="", mime_type="application/octet-stream")` creates a short-lived signed upload endpoint without a client-supplied hash.
+4. `rm_asset_upload(action="link", expected_bytes=expected_bytes, filename="", mime_type="application/octet-stream")` creates a short-lived signed upload endpoint without a client-supplied hash.
 5. The container uploads the original bytes directly to Ombre Brain with HTTPS `multipart/form-data`.
 6. Ombre Brain privacy-cleans, deduplicates, and persists the image.
 7. Claude adds metadata and ensures semantic retrieval.
-8. A later conversation finds the image by natural-language description and displays it through `rm_asset_view`.
+8. A later conversation finds the image by natural-language description and displays it through `rm_asset_show(action="view")`.
 
 The user does not select or upload the same file a second time. Complete image base64 does not pass through model-visible text or MCP tool arguments.
 
@@ -52,7 +52,7 @@ This is not model-relayed base64, OCR reconstruction, screenshot recreation, or 
 Claude conversation attachment
 -> Claude code-execution container reads the current file
 -> user-controlled exact host is allowed for network egress
--> rm_asset_upload_link creates a short-lived signed endpoint from byte count and optional file metadata
+-> rm_asset_upload(action="link", expected_bytes=...) creates a short-lived signed endpoint from byte count and optional file metadata
 -> container sends HTTPS multipart/form-data
 -> AssetStore privacy-cleans and persists the file
 ```
@@ -117,10 +117,10 @@ Autonomy is judgment, not indiscriminate collection. Routine debugging images, a
 - Never substitute an older attachment, generated reconstruction, OCR text, or screenshot.
 - Never send bytes to a host outside the exact allowlist.
 - Do not expose local paths, complete hashes, bytes, base64, credentials, or signed URLs in model-visible text or repository files.
-- Do not provide, complete, guess, or invent a hash for `rm_asset_upload_link`.
+- Do not provide, complete, guess, or invent a hash for `rm_asset_upload(action="link")`.
 - Client execution code may compare its local hash with the server-computed `source_sha256` internally, but must not print a complete hash to stdout or chat text.
 - Stop on byte-count, hash, MIME, persistence, host, TLS, or authorization mismatch.
-- Do not claim success until `rm_asset_upload_status` and `rm_asset_get` confirm identity and persistence.
+- Do not claim success until `rm_asset_upload(action="status")` and `rm_asset_find(action="get")` confirm identity and persistence.
 
 ## Acceptance Record
 

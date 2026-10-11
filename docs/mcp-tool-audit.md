@@ -1,5 +1,11 @@
 # MCP Tool Audit
 
+> P3 文档迁移注记（2026-10-11）：下文的阶段、audit/acceptance 结论、已执行调用、回执、数量、日期、固定 SHA 和 Python 源符号属于历史快照，保留原名，不代表当前推荐 MCP 调用。当前 OB 操作使用 [README 推荐入口与兼容窗口](../README.md#推荐-mcp-工具与兼容窗口--recommended-mcp-tools-and-compatibility-window)：note 用 leave/list/get/dismiss，letter 用 get/seal，revision 用 list/restore；RM 上传用 rm_asset_upload 的 link/status，metadata/检索用 rm_asset_find 的 get/search，显示/模型视觉/导出分别用 rm_asset_show 的 view/inspect/download_link。每次必须传 action 和该分支参数，原参数名不改，未知或无关字段严格拒绝。
+>
+> The historical recommendations below are superseded for current OB calls by the README action examples. The current default surface is 35 = 20 recommended + 15 registered compatibility entries, plus 15 optional diagnostics. Compatibility lasts at least three days after P3 documentation rollout and requires Ting's confirmation of claude.ai, TG, new CC conversations, and manual migration before separate P4 removal. No rollout completion or deletion authorization is asserted here.
+>
+> Remember-Me 独立包的 MCP schema/EXPECTED_MCP_TOOLS、内部 Python 方法、测试名和源码链接是不同标识，保留真实名称；不要把它们改写为 server.note 等不存在的 Python 方法。生产工具 description 或原业务回执中的旧名也不由本次文档迁移改写。rm_asset_show(action="view") 仍为 UI/_meta 图像与 signed-link fallback，action="inspect" 仍为 ImageContent；确认 token 预览可省，执行须取得有效 token，300 秒/一次性/状态绑定不变。
+
 Audit date: July 24, 2026.
 
 Scope: tools registered through `@mcp.tool` in `server.py`. HTTP custom routes are excluded. The fixed `ui://remember-me/asset-viewer.html` MCP resource is noted separately.
@@ -41,7 +47,7 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 | Tool | Module | Purpose | Audience | Formal | Overlap or misuse risk | Recommendation |
 |---|---|---|---|---|---|---|
 | `breath` | Memory retrieval | Surface or search memories, including semantic and exact tag/topic filtered retrieval | User/model | Yes | Large parameter surface blurs search, surfacing, mailbox, and emotion modes | Keep; later put specialist modes behind workflows |
-| `get_letter` | Memory read | Read one handoff letter by exact `letter_id`, with sealed visibility opt-in | User/model | Yes | Narrow lookup should not be used as mailbox enumeration | Keep; use when the letter ID is already known |
+| `get_letter`（当前 OB：`letter(action="get")`） | Memory read | Read one handoff letter by exact `letter_id`, with sealed visibility opt-in | User/model | Yes | Narrow lookup should not be used as mailbox enumeration | Keep; use when the letter ID is already known |
 | `hold` | Memory write | Store one memory with tagging, identical-content reuse, emotion, and trigger metadata | User/model | Yes | Can be confused with `grow` for long input | Keep; sharpen routing guidance |
 | `grow` | Memory write | Split and archive journal-style content into multiple memories | User/model | Yes | Overlaps `hold` at the content-length boundary | Keep; add a write workflow that chooses `hold` or `grow` |
 | `trace` | Memory mutation | Update, append, replace, relate, merge, seal, or delete buckets | User/model power operation | Yes | Highly overloaded and includes destructive actions | Keep; later introduce narrower action groups and confirmations |
@@ -50,18 +56,18 @@ All registrations are in `server.py`. Asset persistence is implemented with `ass
 | `boot` | Startup context | Assemble pinned context, letters, sessions, and todos | Model workflow | Yes | Composite operation is better invoked as a startup workflow | Keep; add a prompt/workflow entry |
 | `pulse` | Memory status | Return system status and bucket listings | User/admin | Yes | Can be selected when `breath` is intended | Keep compatibility; candidate status resource |
 | `dream` | Reflection workflow | Read recent memories or requested details for reflection | Model workflow | Yes | Name is ambiguous and overlaps `breath` detail retrieval | Keep; prefer a documented reflection prompt/workflow |
-| `rm_asset_upload_link` | RM asset ingest | Create a signed browser upload from expected byte count plus optional filename/MIME; server computes the source hash | User/model | Yes | Confusable with the Stage 0 browser probe | Keep; make this the only ordinary upload tool and never ask the model for a hash |
-| `rm_asset_upload_status` | RM asset ingest | Read persistent upload completion and metadata | User/model | Yes | Lifecycle companion rather than a user intent | Keep; present through an upload workflow |
-| `rm_asset_get` | RM asset metadata | Read safe metadata for one asset | User/model | Yes | Overlaps search-result metadata | Keep compatibility; candidate `rm://assets/{asset_id}` resource |
+| `rm_asset_upload_link`（当前 OB：`rm_asset_upload(action="link")`） | RM asset ingest | Create a signed browser upload from expected byte count plus optional filename/MIME; server computes the source hash | User/model | Yes | Confusable with the Stage 0 browser probe | Keep; make this the only ordinary upload tool and never ask the model for a hash |
+| `rm_asset_upload_status`（当前 OB：`rm_asset_upload(action="status")`） | RM asset ingest | Read persistent upload completion and metadata | User/model | Yes | Lifecycle companion rather than a user intent | Keep; present through an upload workflow |
+| `rm_asset_get`（当前 OB：`rm_asset_find(action="get")`） | RM asset metadata | Read safe metadata for one asset | User/model | Yes | Overlaps search-result metadata | Keep compatibility; candidate `rm://assets/{asset_id}` resource |
 | `rm_asset_update_metadata` | RM asset metadata | Replace title, description, or tags without changing bytes | User/model | Yes | May be called before the image is actually inspected | Keep; workflow should require inspection before visual claims |
-| `rm_asset_search` | RM asset retrieval | Hybrid keyword, filter, and semantic search | User/model | Yes | Low risk; primary discovery entry | Keep |
-| `rm_asset_download_link` | RM asset delivery | Create a short-lived direct download | User/model | Yes | Can be selected when inline display is intended | Keep; clarify download intent versus `rm_asset_view` |
-| `rm_asset_view` | RM user display | Render one cleaned image to the user through MCP Apps | User-facing | Yes | Easily confused with model vision inspection | Keep separate; route user display here |
-| `rm_asset_inspect` | RM model vision | Return one cleaned image as MCP `ImageContent` | Model-facing | Yes | Easily confused with user display or metadata reads | Keep separate; route visual understanding here |
+| `rm_asset_search`（当前 OB：`rm_asset_find(action="search")`） | RM asset retrieval | Hybrid keyword, filter, and semantic search | User/model | Yes | Low risk; primary discovery entry | Keep |
+| `rm_asset_download_link`（当前 OB：`rm_asset_show(action="download_link")`） | RM asset delivery | Create a short-lived direct download | User/model | Yes | Can be selected when inline display is intended | Keep; clarify download intent versus `rm_asset_view` |
+| `rm_asset_view`（当前 OB：`rm_asset_show(action="view")`） | RM user display | Render one cleaned image to the user through MCP Apps | User-facing | Yes | Easily confused with model vision inspection | Historical: keep separate; current OB uses the view action of rm_asset_show for user display |
+| `rm_asset_inspect`（当前 OB：`rm_asset_show(action="inspect")`） | RM model vision | Return one cleaned image as MCP `ImageContent` | Model-facing | Yes | Easily confused with user display or metadata reads | Historical: keep separate; current OB uses the inspect action of the same rm_asset_show for model vision |
 | `rm_asset_reindex_embeddings` | RM maintenance | Backfill missing or stale asset vectors | Admin/maintenance | Maintenance | External API cost and unnecessary repeat calls | Keep, but make administrator-only |
 | `digest` | Memory maintenance | Plan or run digestion of old low-importance memories | Admin/maintenance | Maintenance | Mutating mode can be invoked despite dry-run default | Keep, but make administrator-only and workflow-confirmed |
 | `related_backfill` | Memory maintenance | Plan or write semantic related links | Admin/maintenance | Maintenance | Broad maintenance can be mistaken for search | Keep, but make administrator-only |
-| `seal_letter` | Sealed memory | Hide or unhide a handoff letter | Admin/model internal | Maintenance | Narrow implementation detail exposed at top level | Keep compatibility; move behind sealed-memory administration |
+| `seal_letter`（当前 OB：`letter(action="seal")`） | Sealed memory | Hide or unhide a handoff letter | Admin/model internal | Maintenance | Narrow implementation detail exposed at top level | Keep compatibility; move behind sealed-memory administration |
 | `asset_attachment_context_probe` | Stage 4 attachment boundary | Detect only whether standard MCP context exposes attachment reference, byte, or MIME signals | Developer diagnostics | No | A false result can be misread as disproving the separate Claude code-execution upload path | Keep diagnostic-only; Stage 4B uses the accepted container-to-signed-endpoint path and does not depend on this probe |
 | `asset_ingest_probe` | Stage 0 transport | Test one-call base64 upload and hashing | Developer diagnostics | No | Looks like real upload and moves base64 through the model | Mark deprecated; diagnostic-only, then remove |
 | `asset_ingest_begin` | Stage 0 transport | Start an in-memory chunked base64 upload | Developer diagnostics | No | Part of a four-tool state machine | Diagnostic-only; later merge into one action tool |
@@ -103,17 +109,17 @@ Do not replace the current surface in one release. The target is a smaller ordin
 
 ### Remember-Me assets
 
-- Keep `rm_asset_search` as the discovery entry.
-- Keep `rm_asset_view` and `rm_asset_inspect` separate: user display and model vision are distinct recipients and data channels.
+- Keep `rm_asset_search` (current OB call: `rm_asset_find(action="search")`) as the discovery entry.
+- Historical recommendation: keep `rm_asset_view` and `rm_asset_inspect` distinct by recipient and data channel. Current OB calls use `rm_asset_show(action="view")` and `rm_asset_show(action="inspect")` as two actions of the same tool; user display and model vision remain distinct.
 - Keep `rm_asset_update_metadata` separate from inspection so visual claims and updates remain explicit.
 - Present upload link plus status as one user-facing upload workflow without breaking the underlying tools.
-- Add an asset metadata resource for `rm_asset_get`.
+- Add an asset metadata resource for `rm_asset_get` (current OB call: `rm_asset_find(action="get")`).
 - Keep download as an explicit export action, not an automatic part of search.
 - Restrict reindexing to administrators.
 
 ### Sealed and administration
 
-- Group `digest`, `related_backfill`, `rm_asset_reindex_embeddings`, and `seal_letter` in an administrator profile or separately authorized set.
+- Group `digest`, `related_backfill`, `rm_asset_reindex_embeddings`, and `seal_letter` (current OB call: `letter(action="seal")`) in an administrator profile or separately authorized set.
 - Keep dry-run and explicit confirmation semantics for mutating maintenance.
 - Treat `trace` delete and merge modes as privileged even if ordinary metadata edits remain available.
 

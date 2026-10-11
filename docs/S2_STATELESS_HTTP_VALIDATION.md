@@ -1,5 +1,11 @@
 # S-2：MCP stateless HTTP 候选实现与断连风险验证
 
+> P3 文档迁移注记（2026-10-11）：下文的阶段、audit/acceptance 结论、已执行调用、回执、数量、日期、固定 SHA 和 Python 源符号属于历史快照，保留原名，不代表当前推荐 MCP 调用。当前 OB 操作使用 [README 推荐入口与兼容窗口](../README.md#推荐-mcp-工具与兼容窗口--recommended-mcp-tools-and-compatibility-window)：note 用 leave/list/get/dismiss，letter 用 get/seal，revision 用 list/restore；RM 上传用 rm_asset_upload 的 link/status，metadata/检索用 rm_asset_find 的 get/search，显示/模型视觉/导出分别用 rm_asset_show 的 view/inspect/download_link。每次必须传 action 和该分支参数，原参数名不改，未知或无关字段严格拒绝。
+>
+> The historical recommendations below are superseded for current OB calls by the README action examples. The current default surface is 35 = 20 recommended + 15 registered compatibility entries, plus 15 optional diagnostics. Compatibility lasts at least three days after P3 documentation rollout and requires Ting's confirmation of claude.ai, TG, new CC conversations, and manual migration before separate P4 removal. No rollout completion or deletion authorization is asserted here.
+>
+> Remember-Me 独立包的 MCP schema/EXPECTED_MCP_TOOLS、内部 Python 方法、测试名和源码链接是不同标识，保留真实名称；不要把它们改写为 server.note 等不存在的 Python 方法。生产工具 description 或原业务回执中的旧名也不由本次文档迁移改写。rm_asset_show(action="view") 仍为 UI/_meta 图像与 signed-link fallback，action="inspect" 仍为 ImageContent；确认 token 预览可省，执行须取得有效 token，300 秒/一次性/状态绑定不变。
+
 基线：`main = origin/main = 57053c83bef162504a619a026eebf503394709f3`。
 独立分支：`codex/s2-mcp-stateless-http`；worktree：`D:\Codex\projects\Ombre-Brain-S2-MCP-Stateless`。
 验证日期：2026-09-26。仅 local commit；没有 push、merge、部署或修改线上环境变量。
@@ -85,7 +91,7 @@ A：单次近原子写，任务取消风险较低。B：多步骤但有 durable 
 | trace delete | A / C，条件性 | 单桶 history → vector cleanup → remove；默认 embedding delete 是同步 SQLite，任务取消窗口较低。多桶删除、反向 supersession cleanup 先于删除，无 durable batch plan；若 cleanup/backend 真正异步，取消可跳过 False 分支补偿 | 中至高，条件性只读判断。当前默认同步实现不能据 await 数目宣称已复现半删；仍不具备通用取消安全保证 |
 | merge（trace.merge） | B | plan/journal + 每步 `apply_import_operation` atomic marker；finally 释放 running guard；CancelledError 不被 except Exception 转为 failed | 有可恢复 running 状态。HTTP 断连后 resume 实测通过；原重启回归通过。不是自动恢复，也不是所有时点永久零风险 |
 | digest consolidation / rebalance | B | provider output 落 journal，桶写带 durable marker，step 可 replay，finally 释放 running guard | rebalance 真 TCP 取消后恢复通过；consolidation marker/restart 原回归通过。日志可能仍 running，需原 preview/confirm resume |
-| dismiss_note | A | 预览 token 与确认是应用状态；消费后同步 CAS/SQLite dismiss，保留正文/history，无 provider await | 低，原回归通过；丢响应后的重试会读到已 dismiss 状态。只读取消边界检查 |
+| dismiss_note（当前 OB：`note(action="dismiss")`） | A | 预览 token 与确认是应用状态；消费后同步 CAS/SQLite dismiss，保留正文/history，无 provider await | 低，原回归通过；丢响应后的重试会读到已 dismiss 状态。只读取消边界检查 |
 | legacy import | C | chunk 级进度；chunk 内多项 create/update 后才存进度，没有每项 durable key；取消可绕过 except Exception 和 `_running=False` | 高，但**不是本 MCP flag 新增加的直连取消路径**：当前 Dashboard 上传用 `asyncio.create_task` 后台执行，MCP tools/list 无 import 工具。只读判断，未运行真实导入 |
 | raw-evidence durable import | B（数据）/ C（取消后的运行标记） | run/item journal、操作 key、memory marker、lineage reconciliation；数据可按已有流程恢复。CancelledError 可绕过正常/Exception 清理，`_running` 留 true | 中：数据有 durable 恢复；存活进程的运行标记可能需重启才能原流程恢复。当前后台 Dashboard 路径不受 MCP session flag 直接控制。未改 resume |
 | RM / asset metadata mutation | A / C | RM core metadata/update/delete 为同步调用；legacy metadata 提交后 await index refresh | RM 同步元数据路径较低取消风险；legacy 索引可能缺失/陈旧，中、可原 reindex 重建。无 exactly-once 承诺 |
