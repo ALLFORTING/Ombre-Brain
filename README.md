@@ -1028,6 +1028,15 @@ Automatic backup v1: `backup-auto.yml` in the private `ALLFORTING/ob-backup` rep
 - `metadata_only=true` 的手动运行即使开关为 false 也只做一次 metadata 认证探测，不采集。
 - `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；跳过恢复演练和保留删除，库存会持续增长。
 
+**恢复 / Restore**：
+
+- 用干净 venv 按 `requirements.txt` 装依赖（Remember-Me 需从 GitHub Release 下载，版本须为 `0.1.0`）。
+- 用 `offline_backup_bundle.restore_plain_bundle()` 恢复到独立 workspace，`expected_sha256`/`expected_size` 取自 Release 的 `success-receipt.json`；校验与对账规则见 [backup-auto-server-contract](docs/backup-auto-server-contract.md)。
+- 启动恢复出的 OB 时须带上与线上一致的环境变量，否则 boot 失败：`OMBRE_BUCKETS_DIR=<恢复树>`、`OMBRE_ASSET_AUTHORITY=rm`、`OMBRE_RM_RUNTIME_ENABLED=true`、`OMBRE_RM_DATA_ROOT=<恢复树>/remember-me`、`OMBRE_RESPONSE_SEAL`。备份包只含数据，不含环境变量，需另行保存。
+- 2026-10-12 已用实际自动备份包完整演练：恢复对账全部匹配，boot 七节齐全、breath、pulse health、图片检索均正常，数量与线上一致（差额为备份后新增）。
+
+Restore: install dependencies from `requirements.txt` in a clean venv (Remember-Me `0.1.0` is fetched from a GitHub Release), restore with `restore_plain_bundle()` using the size/SHA256 from `success-receipt.json`, and start the restored OB with the same environment as production (`OMBRE_BUCKETS_DIR`, `OMBRE_ASSET_AUTHORITY=rm`, `OMBRE_RM_RUNTIME_ENABLED=true`, `OMBRE_RM_DATA_ROOT`, `OMBRE_RESPONSE_SEAL`); bundles contain data only, not environment variables. A full end-to-end drill with a real automatic bundle passed on 2026-10-12.
+
 旧 `/api/backup/export`（`backups/YYYY-MM-DD.json`）只在 Render 入口 `backup_entry.py` 注册（允许仓库默认 `ALLFORTING/ob-backup`，可用 `OMBRE_BACKUP_REPOSITORY` 改），Docker/Zeabur 的 `server.py` 不提供；旧人工加密 v2（`OMBRE_BACKUP_V2_*`）继续兼容。
 
 The legacy `/api/backup/export` (`backups/YYYY-MM-DD.json`) is registered only by the Render entry `backup_entry.py` (allowed repository `ALLFORTING/ob-backup`, overridable with `OMBRE_BACKUP_REPOSITORY`), not by Docker/Zeabur `server.py`. The manual encrypted v2 path (`OMBRE_BACKUP_V2_*`) remains compatible.
