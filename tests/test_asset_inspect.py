@@ -91,15 +91,19 @@ async def test_rm_asset_inspect_protocol_returns_clean_image_content(
 
     async with create_connected_server_and_client_session(server.mcp) as client:
         tools = (await client.list_tools()).tools
-        tool = next(item for item in tools if item.name == "rm_asset_inspect")
-        assert tool.inputSchema["required"] == ["asset_id"]
+        tool = next(item for item in tools if item.name == "rm_asset_show")
+        assert tool.inputSchema["required"] == ["action"]
+        branch = next(item for item in tool.inputSchema["oneOf"]
+                      if item["properties"]["action"]["const"] == "inspect")
+        assert branch["properties"]["action"]["const"] == "inspect"
+        assert branch["required"] == ["action", "asset_id"]
         assert "actual visual understanding" in tool.description
-        assert "rm_asset_view" in tool.description
+        assert 'rm_asset_show(action="view")' in tool.description
         assert "Never guess image content from metadata" in tool.description
 
         result = await client.call_tool(
-            "rm_asset_inspect",
-            {"asset_id": asset["asset_id"]},
+            "rm_asset_show",
+            {"action": "inspect", "asset_id": asset["asset_id"]},
         )
 
     assert result.isError is False

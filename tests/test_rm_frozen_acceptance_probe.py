@@ -191,16 +191,18 @@ def test_mcp_read_paths_accept_production_nested_fastmcp_responses(monkeypatch):
     instance.mcp_token = "operator-token"
     missing = {"ok": False, "error": "asset_unavailable"}
     search = {"ok": True, "total": 0, "results": []}
-    responses = {
-        "rm_asset_search": search,
-        "rm_asset_get": missing,
-        "rm_asset_view": missing,
-        "rm_asset_inspect": missing,
-        "rm_asset_download_link": missing,
-    }
+    calls = []
+    expected = [
+        ("rm_asset_find", {"action": "get", "asset_id": probe.MISSING_ASSET_ID}),
+        ("rm_asset_find", {"action": "search", "query": "", "limit": 20, "offset": 0}),
+        ("rm_asset_show", {"action": "view", "asset_id": probe.MISSING_ASSET_ID}),
+        ("rm_asset_show", {"action": "inspect", "asset_id": probe.MISSING_ASSET_ID}),
+        ("rm_asset_show", {"action": "download_link", "asset_id": probe.MISSING_ASSET_ID}),
+    ]
 
     def mcp_tool(name, arguments):
-        payload = responses[name]
+        calls.append((name, arguments))
+        payload = search if arguments["action"] == "search" else missing
         return probe.HttpResult(200, {}, b""), _mcp_message(
             structured={"result": payload},
             text_payload=payload,
@@ -208,6 +210,7 @@ def test_mcp_read_paths_accept_production_nested_fastmcp_responses(monkeypatch):
 
     monkeypatch.setattr(instance, "mcp_tool", mcp_tool)
     instance.run_mcp_reads()
+    assert calls == expected
 
     for name in (
         "metadata_get",
@@ -223,7 +226,10 @@ def test_mcp_mutation_paths_accept_production_nested_fastmcp_responses(monkeypat
     instance.mcp_token = "operator-token"
     frozen = {"ok": False, "error": "asset_write_frozen"}
 
+    calls = []
+
     def mcp_tool(name, arguments):
+        calls.append((name, arguments))
         return probe.HttpResult(200, {}, b""), _mcp_message(
             structured={"result": frozen},
             text_payload=frozen,
@@ -231,6 +237,12 @@ def test_mcp_mutation_paths_accept_production_nested_fastmcp_responses(monkeypat
 
     monkeypatch.setattr(instance, "mcp_tool", mcp_tool)
     assert instance.run_mcp_mutations() is True
+
+    assert calls == [
+        ("rm_asset_upload", {"action": "link", "expected_bytes": 1, "filename": "probe.png", "mime_type": "image/png"}),
+        ("rm_asset_update_metadata", {"asset_id": probe.MISSING_ASSET_ID, "title": "rm-frozen-probe"}),
+        ("rm_asset_reindex_embeddings", {"asset_id": "", "limit": 1}),
+    ]
 
     for name in (
         "mcp_upload_rejected",

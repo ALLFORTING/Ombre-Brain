@@ -818,11 +818,11 @@ class Probe:
             return names
 
         calls = {
-            "metadata_get": ("rm_asset_get", {"asset_id": MISSING_ASSET_ID}),
-            "search": ("rm_asset_search", {"query": "", "limit": 20, "offset": 0}),
-            "view": ("rm_asset_view", {"asset_id": MISSING_ASSET_ID}),
-            "inspect": ("rm_asset_inspect", {"asset_id": MISSING_ASSET_ID}),
-            "download": ("rm_asset_download_link", {"asset_id": MISSING_ASSET_ID}),
+            "metadata_get": ("rm_asset_find", {"action": "get", "asset_id": MISSING_ASSET_ID}),
+            "search": ("rm_asset_find", {"action": "search", "query": "", "limit": 20, "offset": 0}),
+            "view": ("rm_asset_show", {"action": "view", "asset_id": MISSING_ASSET_ID}),
+            "inspect": ("rm_asset_show", {"action": "inspect", "asset_id": MISSING_ASSET_ID}),
+            "download": ("rm_asset_show", {"action": "download_link", "asset_id": MISSING_ASSET_ID}),
         }
         for check, (tool, arguments) in calls.items():
             result, message = self.mcp_tool(tool, arguments)
@@ -943,7 +943,7 @@ class Probe:
                 self.record(name, "INCOMPLETE", "mcp_authentication", "RM_PROBE_MCP_TOKEN is unavailable", authentication_available=False)
             return None
         calls = {
-            "mcp_upload_rejected": ("rm_asset_upload_link", {"expected_bytes": 1, "filename": "probe.png", "mime_type": "image/png"}),
+            "mcp_upload_rejected": ("rm_asset_upload", {"action": "link", "expected_bytes": 1, "filename": "probe.png", "mime_type": "image/png"}),
             "mcp_update_rejected": ("rm_asset_update_metadata", {"asset_id": MISSING_ASSET_ID, "title": "rm-frozen-probe"}),
             "public_reindex_rejected": ("rm_asset_reindex_embeddings", {"asset_id": "", "limit": 1}),
         }

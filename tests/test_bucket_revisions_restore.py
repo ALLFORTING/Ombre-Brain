@@ -290,6 +290,7 @@ async def test_resurrect_keeps_original_id_and_replays_relations(server):
     assert a not in ((await manager.get(b))["metadata"].get("related_buckets") or "")
     listing = await server.list_revisions(a)
     assert "当前状态：已删除" in listing
+    assert 'revision(action="restore", bucket_id=…, revision=<r或h编号>) 先预览，再带 confirm_token 执行。' in listing
     preview, _ = await restore(server, a, ref_of(server, a, "delete"))
     assert "复活已删除的桶" in preview
     restored = await manager.get(a)

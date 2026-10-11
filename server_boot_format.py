@@ -260,7 +260,7 @@ def _fit_sections_to_budget(
                 continuation = (
                     "；完整内容请用 "
                     + "、".join(
-                        f"get_letter(letter_id={letter_id})"
+                        f"letter(action=\"get\", letter_id={letter_id})"
                         for letter_id in letter_ids
                     )
                     + " 读取"

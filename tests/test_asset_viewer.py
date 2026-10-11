@@ -243,10 +243,15 @@ async def test_asset_view_protocol_smoke(tmp_path, monkeypatch):
 
     async with create_connected_server_and_client_session(server.mcp) as client:
         tools = (await client.list_tools()).tools
-        tool = next(item for item in tools if item.name == "rm_asset_view")
+        tool = next(item for item in tools if item.name == "rm_asset_show")
+        assert tool.outputSchema is None
         assert tool.meta["ui"]["resourceUri"] == ASSET_VIEWER_URI
         assert tool.meta["ui/resourceUri"] == ASSET_VIEWER_URI
-        assert tool.inputSchema["required"] == ["asset_id"]
+        assert tool.inputSchema["required"] == ["action"]
+        branch = next(item for item in tool.inputSchema["oneOf"]
+                      if item["properties"]["action"]["const"] == "view")
+        assert branch["properties"]["action"]["const"] == "view"
+        assert branch["required"] == ["action", "asset_id"]
 
         resources = (await client.list_resources()).resources
         resource = next(item for item in resources if str(item.uri) == ASSET_VIEWER_URI)
@@ -261,8 +266,8 @@ async def test_asset_view_protocol_smoke(tmp_path, monkeypatch):
         assert content.meta == ASSET_VIEWER_RESOURCE_META
 
         call_result = await client.call_tool(
-            "rm_asset_view",
-            {"asset_id": asset["asset_id"]},
+            "rm_asset_show",
+            {"action": "view", "asset_id": asset["asset_id"]},
         )
         assert call_result.isError is False
         assert call_result.structuredContent["asset_id"] == asset["asset_id"]
