@@ -1,6 +1,6 @@
 # Remember-Me Stage 3 Acceptance
 
-> P4 公开入口迁移注记（2026-10-11）：下文的阶段、audit/acceptance 结论、已执行调用、回执、数量、日期、固定 SHA 和 Python 源符号属于历史快照，保留原名，不代表当前推荐 MCP 调用。当前 OB 操作使用 [README 推荐入口与兼容窗口](../README.md#推荐-mcp-工具与兼容窗口--recommended-mcp-tools-and-compatibility-window)：note 用 leave/list/get/dismiss，letter 用 get/seal，revision 用 list/restore；RM 上传用 rm_asset_upload 的 link/status，metadata/检索用 rm_asset_find 的 get/search，显示/模型视觉/导出分别用 rm_asset_show 的 view/inspect/download_link。每次必须传 action 和该分支参数，原参数名不改，未知或无关字段严格拒绝。
+> P4 公开入口迁移注记（2026-10-11）：下文的阶段、audit/acceptance 结论、已执行调用、回执、数量、日期、固定 SHA 和 Python 源符号属于历史快照，保留原名，不代表当前推荐 MCP 调用。当前 OB 操作使用 [README 推荐入口与旧入口移除](../README.md#推荐-mcp-工具与旧入口移除--recommended-mcp-tools-and-legacy-entry-removal)：note 用 leave/list/get/dismiss，letter 用 get/seal，revision 用 list/restore；RM 上传用 rm_asset_upload 的 link/status，metadata/检索用 rm_asset_find 的 get/search，显示/模型视觉/导出分别用 rm_asset_show 的 view/inspect/download_link。每次必须传 action 和该分支参数，原参数名不改，未知或无关字段严格拒绝。
 >
 > The historical recommendations below are superseded for current OB calls by the README action examples. This P4 version removes the 15 legacy public registrations: the default surface is 20 tools, plus 15 optional diagnostics (35 total). Original Python functions and private SDK implementations remain available. Historical names, schemas, receipts, and acceptance evidence below are retained. This branch documentation does not assert PR merge, live rollout, or elapsed compatibility time.
 >

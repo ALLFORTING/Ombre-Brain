@@ -385,7 +385,7 @@ breath(query="今天很累")
 
 The current MCP surface has 20 default tools, 35 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
-### 推荐 MCP 工具与兼容窗口 / Recommended MCP tools and compatibility window
+### 推荐 MCP 工具与旧入口移除 / Recommended MCP tools and legacy entry removal
 
 本 P4 版本已取消 15 个旧公开入口注册，当前 20 个默认入口均为推荐入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
 
