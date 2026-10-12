@@ -161,27 +161,44 @@ def test_atomic_create_never_changes_process_umask(tmp_path, monkeypatch, contro
 
 @pytest.mark.parametrize("status", ["Name:\tpython\n", "Umask:\tinvalid\n",
                                   "Umask:\t1000\n", "Umask:\t-022\n"])
-def test_missing_or_invalid_proc_umask_fails_before_publication(tmp_path, monkeypatch, status):
+def test_missing_or_invalid_proc_umask_uses_cache(tmp_path, monkeypatch, status):
     from bucket_manager import BucketManager
     path = tmp_path / "new.md"
+    monkeypatch.setattr("bucket_manager._STARTUP_UMASK", 0o027)
     monkeypatch.setattr("bucket_manager.Path.read_text", lambda *args, **kwargs: status)
-    with pytest.raises(OSError, match="process_umask_unavailable"):
-        BucketManager._write_bytes_atomic(str(path), b"new bytes")
-    assert not path.exists()
+    BucketManager._write_bytes_atomic(str(path), b"new bytes")
+    assert path.read_bytes() == b"new bytes"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
     assert _no_temporaries(path)
 
 
-def test_unreadable_proc_umask_fails_before_publication(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cached_umask", [0o022, 0o027, 0o077])
+def test_unavailable_proc_creates_bucket_with_cached_umask(tmp_path, monkeypatch, cached_umask):
     from bucket_manager import BucketManager
     path = tmp_path / "new.md"
     def unavailable(*args, **kwargs):
-        raise OSError("procfs unavailable")
+        raise FileNotFoundError("procfs unavailable")
     monkeypatch.setattr("bucket_manager.Path.read_text", unavailable)
-    with pytest.raises(OSError, match="process_umask_unavailable"):
+    monkeypatch.setattr("bucket_manager._STARTUP_UMASK", cached_umask)
+    with monkeypatch.context() as scoped:
+        def forbidden(*args):
+            pytest.fail("fallback writer changed the process umask")
+        scoped.setattr(os, "umask", forbidden)
         BucketManager._write_bytes_atomic(str(path), b"new bytes")
-    assert not path.exists()
+    assert path.read_bytes() == b"new bytes"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o666 & ~cached_umask
     assert _no_temporaries(path)
 
+
+def test_module_load_caches_and_restores_umask(tmp_path):
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run([sys.executable, "-B", "-c",
+        "import os; os.umask(0o027); import bucket_manager; "
+        "assert bucket_manager._STARTUP_UMASK == 0o027; "
+        "assert os.umask(0o027) == 0o027"],
+        cwd=root, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 def test_rewrite_does_not_depend_on_proc_umask(tmp_path, monkeypatch, controlled_umask):
     from bucket_manager import BucketManager
