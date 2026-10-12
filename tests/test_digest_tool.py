@@ -591,7 +591,12 @@ async def test_digest_dedupe_is_readonly_skips_sealed_and_archived_buckets(tmp_p
     server.embedding_engine._store_embedding(second_id, [1.0, 0.0])
     server.embedding_engine._store_embedding(dormant_id, [0.9, 0.435889894])
     # Simulate a stale derived vector left behind after a bucket was sealed.
-    server.embedding_engine._store_embedding(sealed_id, [1.0, 0.0])
+    # This deliberately corrupt fixture bypasses the new production sealed gate.
+    with sqlite3.connect(server.embedding_engine.db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (bucket_id,embedding,model,updated_at) VALUES(?,?,?,?)",
+            (sealed_id, "[1.0,0.0]", server.embedding_engine.model, "2026-10-12"),
+        )
     server.embedding_engine._store_embedding(archive_id, [1.0, 0.0])
     server.embedding_engine._store_embedding("orphan-vector-row", [1.0, 0.0])
     with sqlite3.connect(server.embedding_engine.db_path) as conn:

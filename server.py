@@ -3816,13 +3816,49 @@ async def restore_revision(
     bucket_id = (bucket_id or "").strip()
     if not bucket_id:
         return "请提供有效的 bucket_id。"
+    previous = []
+
+    def receipt(text):
+        if not previous:
+            return text
+        try:
+            after = {row["restore_id"]: row for row in bucket_mgr.restoration_rows(bucket_id)}
+            notes = []
+            for row in previous:
+                current = after.get(row["restore_id"], {})
+                old_steps = (row.get("report") or {}).get("steps") or []
+                steps = [step for step in (current.get("report") or {}).get("steps", [])
+                         if step not in old_steps]
+                detail = ",".join(steps) or "无新增完成标记（可能已有未记账的变更）"
+                old_skipped = (row.get("report") or {}).get("skipped") or []
+                omissions = [item for item in (current.get("report") or {}).get("skipped", [])
+                             if item not in old_skipped]
+                if omissions:
+                    detail += "；跳过=" + ",".join(
+                        f"{item['kind']}({item['reason']})" for item in omissions)
+                notes.append(f"旧还原收尾 restore_id={row['restore_id']}：补做步骤={detail}；"
+                             f"status={current.get('status', 'unknown')}")
+        except Exception:
+            notes = ["旧还原收尾已尝试；补做清单暂无法确认。"]
+        head, separator, body = text.partition("\n")
+        preview_prefix = "restore preview: no changes made"
+        rejection_suffix = "; no changes made."
+        if head.startswith(preview_prefix):
+            head = "restore preview: 旧收尾已尝试，可能已产生变更" + head[len(preview_prefix):]
+        elif head.startswith("restore rejected:") and head.endswith(rejection_suffix):
+            head = head[:-len(rejection_suffix)] + "; 旧收尾已尝试，可能已产生变更."
+        return "\n".join(notes) + "\n" + head + separator + body
+
     try:
+        previous = [row for row in bucket_mgr.restoration_rows(bucket_id) if row["status"] == "published"]
         await bucket_mgr.resume_restorations(bucket_id)
         plan = bucket_mgr.plan_restore(bucket_id, revision)
     except RestoreError as exc:
-        return f"restore rejected: {exc.code}; no changes made."
+        return receipt(f"restore rejected: {exc.code}; no changes made.")
     except (RelatedError, BucketWriteLockError) as exc:
-        return f"restore rejected: {getattr(exc, 'code', type(exc).__name__)}; no changes made."
+        return receipt(f"restore rejected: {getattr(exc, 'code', type(exc).__name__)}; no changes made.")
+    except Exception as exc:
+        return receipt(f"restore failed: {type(exc).__name__}")
     if plan["blocked"]:
         counts = {}
         for effect in plan["pending_effects"]:
@@ -3837,7 +3873,7 @@ async def restore_revision(
         if len(plan["pending_effects"]) > 20:
             lines.append(f"  ... 另有 {len(plan['pending_effects']) - 20} 条")
         lines.append("先让这些操作完成或由 operator 处理，再重新预览。")
-        return "\n".join(lines)
+        return receipt("\n".join(lines))
     payload = bucket_mgr.restore_confirmation_payload(plan)
     show_body = include_sealed or not (plan["result_sealed"])
     if not (confirm_token or "").strip():
@@ -3870,16 +3906,16 @@ async def restore_revision(
             lines.append("  （无）")
         lines.append(f"有效期 {_MUTATION_CONFIRM_TTL_SECONDS} 秒；用相同 bucket_id、revision 和 confirm_token 再次调用才会执行。")
         lines.append(f"confirm_token: {token}")
-        return "\n".join(lines)
+        return receipt("\n".join(lines))
     if not _consume_mutation_confirmation("restore.revision", payload, confirm_token):
-        return "restore confirmation invalid, expired, used, or stale; preview again."
+        return receipt("restore confirmation invalid, expired, used, or stale; preview again.")
     try:
         result = await bucket_mgr.execute_restore(plan, actor="mcp")
     except RestoreError as exc:
-        return f"restore rejected: {exc.code}; preview again."
+        return receipt(f"restore rejected: {exc.code}; preview again.")
     except Exception as exc:
         logger.error("Restore failed for %s: %s", bucket_id, type(exc).__name__)
-        return f"restore failed: {getattr(exc, 'code', type(exc).__name__)}"
+        return receipt(f"restore failed: {type(exc).__name__}")
     report = result["report"]
     lines = [f"已还原 {bucket_id} → {plan['ref']}（restore_id: {result['restore_id']}）"]
     if result["pre_revision_id"]:
@@ -3888,7 +3924,7 @@ async def restore_revision(
     if skipped:
         lines.append("已跳过：")
         lines.extend(f"  {item['kind']} → {item['target']}（{item['reason']}）" for item in skipped)
-    return "\n".join(lines)
+    return receipt("\n".join(lines))
 
 
 # =============================================================
@@ -4077,6 +4113,64 @@ async def _trace_keyed(operation_id, values):
         return await bucket_mgr.execute_trace_request(operation_id, payload, normalization, planner)
     except (BucketIdempotencyError, RelatedError, ValueError) as exc:
         return str(exc)
+
+
+def _trace_digest_summary(bucket: dict) -> bool:
+    """Require digest writer markers together; provenance alone is insufficient."""
+    metadata = bucket.get("metadata", {})
+    tags, domains = metadata.get("tags"), metadata.get("domain")
+    return (
+        isinstance(tags, list) and {"digest", "auto-digested"}.issubset(tags)
+        and isinstance(domains, list) and "digest" in domains
+    )
+
+
+async def _trace_sealed_derivatives(bucket_id: str) -> str:
+    """Report explicit digest lineage without changing any derived bucket."""
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    by_id = {bucket["id"]: bucket for bucket in buckets}
+    summaries = {identity for identity, bucket in by_id.items() if _trace_digest_summary(bucket)}
+    successors = {}
+    for identity, bucket in by_id.items():
+        metadata = bucket.get("metadata", {})
+        raw = metadata.get("source_bucket")
+        if not isinstance(raw, str):
+            continue
+        sources = list(dict.fromkeys(_parse_csv_ids(raw)))
+        if metadata.get("digested") is True:
+            # Marked sources (including re-digested summaries) point FORWARD
+            # to one summary; their former source list has been overwritten.
+            if len(sources) == 1 and sources[0] in summaries:
+                successors.setdefault(identity, set()).add(sources[0])
+        elif metadata.get("digested") in (False, None) and identity in summaries:
+            # An unmarked summary still lists its input buckets.
+            for source in sources:
+                successors.setdefault(source, set()).add(identity)
+
+    found, pending = set(), [bucket_id]
+    visited = {bucket_id}
+    while pending:
+        for identity in successors.get(pending.pop(), ()):
+            if identity in visited:
+                continue
+            visited.add(identity)
+            found.add(identity)
+            pending.append(identity)
+    lines = []
+    for identity in sorted(found):
+        # Recheck visibility immediately before using a name, so a bucket
+        # sealed since inventory never leaks its name from the old snapshot.
+        current = await bucket_mgr.get(identity)
+        if current is None or not _trace_digest_summary(current):
+            continue
+        if _is_sealed(current):
+            lines.append(f"- {identity}")
+        else:
+            name = current.get("metadata", {}).get("name") or identity
+            lines.append(f"- {identity} | {name}")
+    if not lines:
+        return ""
+    return "\n已知衍生摘要：\n" + "\n".join(lines) + "\n可能还有未记录的副本。"
 
 
 @_guard_todo_drop_presence
@@ -4488,7 +4582,15 @@ async def trace(
             changed += "\n" + "\n".join(
                 f"- {record['text']} | todo_id:{record['id']}" for record in records
             )
-    return f"已修改记忆桶 {bucket_id}: {changed}"
+    result = f"已修改记忆桶 {bucket_id}: {changed}"
+    if sealed == 1:
+        try:
+            result += await _trace_sealed_derivatives(bucket_id)
+        except Exception:
+            # Sealing already succeeded. Never include provider/path/content
+            # details from a failed report scan or reinterpret it as a failure.
+            result += "\n已封存；副本清单暂无法确认。"
+    return result
 
 @mcp.tool()
 async def seal_letter(letter_id: int, sealed: int = 1) -> str:

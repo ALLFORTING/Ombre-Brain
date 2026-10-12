@@ -465,7 +465,7 @@ def test_public_parameter_defaults_preserved(server):
     assert defaults == {
         "query": "", "max_tokens": 10000, "domain": "", "valence": -1, "arousal": -1,
         "max_results": 5, "importance_min": -1, "mode": "summary", "recent_days": -1,
-        "emotion_trend": False, "include_dormant": False, "include_sealed": False,
+        "emotion_trend": False, "include_dormant": False, "include_sealed": False, "include_archive": False,
         "date_from": "", "date_to": "", "resonance": "", "mailbox": False,
         "mailbox_limit": 1, "feels": False, "tags_filter": None, "topic_filter": None,
         "wake_dormant": False, "touch": True, "min_score": -1, "as_of": "", "cursor": "",

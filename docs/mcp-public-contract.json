@@ -647,6 +647,10 @@
             "default": false,
             "type": "boolean"
           },
+          "include_archive": {
+            "default": false,
+            "type": "boolean"
+          },
           "include_sealed": {
             "default": false,
             "type": "boolean"

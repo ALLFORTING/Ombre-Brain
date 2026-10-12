@@ -705,6 +705,10 @@ class BucketManager(BucketRevisionMixin):
 
     def _confirmed_embedding_admission(self, bucket_id, *, require_source=True, expected_source=None):
         self.assert_confirmed_delete_writable(bucket_id)
+        if require_source:
+            path = self._find_bucket_file(bucket_id)
+            if path and _is_sealed_bucket(frontmatter.load(path)):
+                raise BucketIdempotencyError("sealed_embedding_source")
         if expected_source is not None:
             self.admit_delayed_effect(bucket_id,expected_source,'embedding')
         elif require_source and any(row['status']=='completed' for row in self.delete_admission.rows(bucket_id)):
