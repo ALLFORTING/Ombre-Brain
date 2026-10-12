@@ -58,6 +58,7 @@ def _next_cursor(result):
 async def test_breath_body_substring_is_not_exact_and_shows_retrieval_score(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket = _bucket("anchor", "only 琥珀风筝2309 appears here", name="anchor memory", score=37.25)
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bucket])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [bucket], {"anchor": {"fuzzy_lexical": 0.31, "semantic": 0.72}}
@@ -90,6 +91,7 @@ async def test_breath_exact_channel_requires_whole_name_or_tag(tmp_path, monkeyp
     name = _bucket("name", "unrelated body", name="琥珀 风筝", score=34.5)
     tag = _bucket("tag", "unrelated body", score=29.25)
     tag["metadata"]["tags"] = ["琥珀风筝"]
+    server.bucket_mgr.list_all = AsyncMock(return_value=[name, tag])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [name, tag],
@@ -112,6 +114,7 @@ async def test_breath_weak_matches_have_no_body_and_do_not_consume_budget(tmp_pa
     server = _load_server(tmp_path, monkeypatch)
     strong = _bucket("strong", "strong body", name="Strong")
     weak = _bucket("weak", "weak body must stay hidden", name="Weak", score=17.25)
+    server.bucket_mgr.list_all = AsyncMock(return_value=[strong, weak])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [strong, weak],
@@ -138,6 +141,7 @@ async def test_breath_cursor_freezes_scores_and_weak_group(tmp_path, monkeypatch
     strong = _bucket("strong", "strong body", name="Strong")
     weak = _bucket("weak", "weak body", name="Weak", score=17.25)
     by_id = {"strong": strong, "weak": weak}
+    server.bucket_mgr.list_all = AsyncMock(side_effect=lambda **kwargs: list(by_id.values()))
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [strong, weak],
@@ -168,6 +172,7 @@ async def test_legacy_cursor_keeps_page_but_does_not_relabel_old_sim(tmp_path, m
     first_bucket = _bucket("first", "first body", score=40.0)
     second_bucket = _bucket("second", "anchor in second body", score=19.5)
     by_id = {"first": first_bucket, "second": second_bucket}
+    server.bucket_mgr.list_all = AsyncMock(side_effect=lambda **kwargs: list(by_id.values()))
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [first_bucket, second_bucket],
@@ -202,6 +207,7 @@ async def test_cursor_reencoding_preserves_retrieval_display_and_weak_group(tmp_
     buckets = [_bucket(str(index), f"body {index}", score=40.0 - index) for index in range(4)]
     buckets[2]["vector_match"] = True
     by_id = {bucket["id"]: bucket for bucket in buckets}
+    server.bucket_mgr.list_all = AsyncMock(side_effect=lambda **kwargs: list(by_id.values()))
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             buckets,
@@ -232,6 +238,7 @@ async def test_cursor_reencoding_preserves_retrieval_display_and_weak_group(tmp_
 async def test_breath_dual_channel_keeps_channel_but_shows_retrieval_score(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket = _bucket("dual", "ordinary body")
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bucket])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [bucket], {"dual": {"fuzzy_lexical": 0.41, "semantic": 0.83}}
@@ -248,6 +255,7 @@ async def test_breath_dual_channel_keeps_channel_but_shows_retrieval_score(tmp_p
 async def test_breath_default_threshold_is_zero_and_explicit_value_overrides_env(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     bucket = _bucket("candidate", "ordinary body")
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bucket])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [bucket], {"candidate": {"fuzzy_lexical": 0.20, "semantic": 0.0}}
@@ -270,6 +278,7 @@ async def test_breath_pin_marker_requires_pinned_true(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     protected = _bucket("protected", "protected body", protected=True)
     pinned = _bucket("pinned", "pinned body", pinned=True)
+    server.bucket_mgr.list_all = AsyncMock(return_value=[protected, pinned])
     server.bucket_mgr.search = AsyncMock(
         side_effect=_search_with_scores(
             [protected, pinned],
