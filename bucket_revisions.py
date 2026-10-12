@@ -605,6 +605,24 @@ class BucketRevisionMixin:
         conn.execute("UPDATE ob_bucket_restorations SET " + ", ".join(assignments)
                      + " WHERE restore_id=?", (*args, restore_id))
 
+    def _restore_current_post(self, bucket_id):
+        """Caller holds the root lock; never compare display-normalized bodies."""
+        path = self._find_bucket_file(bucket_id)
+        return frontmatter.load(path) if path else None
+
+    @staticmethod
+    def _restore_forward_fingerprint(metadata):
+        return hashlib.sha256(_metadata_json({
+            key: metadata.get(key) for key in ("superseded_by", "superseded_at")
+        }).encode("utf-8")).hexdigest()
+
+    def _restore_publication_guard(self, bucket_id, post):
+        from related_integrity import parse_related
+        guard = self.delete_admission.capture(bucket_id)
+        guard["restore_related_fingerprint"] = parse_related(post.metadata).fingerprint
+        guard["restore_forward_fingerprint"] = self._restore_forward_fingerprint(post.metadata)
+        return guard
+
     @guarded_mutation("bucket_restore_publish")
     def _publish_restore(self, plan: dict, actor: str) -> str:
         """Durably record intent, then publish the restored file under one mutex hold."""
@@ -661,7 +679,7 @@ class BucketRevisionMixin:
                     self._restoration_update(conn, restore_id, status="failed")
                     conn.commit()
                     raise
-                guard = self.delete_admission.capture(bucket_id)
+                guard = self._restore_publication_guard(bucket_id, post)
                 self._restoration_update(conn, restore_id, status="published", published_guard=guard)
                 conn.commit()
         return restore_id
@@ -689,49 +707,82 @@ class BucketRevisionMixin:
         return report
 
     async def _restore_followups(self, restoration: dict) -> dict:
-        """Idempotent derived-state replay after the file is published."""
-        from related_integrity import RelatedError
+        """Replay unfinished steps only against freshly checked current state."""
+        from related_integrity import RelatedError, parse_related
         restore_id, plan = restoration["restore_id"], restoration["plan"]
         bucket_id = plan["bucket_id"]
+        guard = restoration.get("published_guard") or {}
         done = set((restoration.get("report") or {}).get("steps") or [])
+
+        def skipped(kind, reason, target=bucket_id):
+            return [{"kind": kind, "target": target, "reason": reason}]
+
         if "embedding" not in done:
-            if not plan["result_sealed"]:
-                await self._refresh_ordinary_embedding_best_effort(bucket_id, plan["content"])
-            self._restore_step(restore_id, "embedding")
+            reason = None
+            with bucket_write_scope(self.base_dir):
+                current = self._restore_current_post(bucket_id)
+                if current is None:
+                    reason = "current_missing"
+                elif _sealed(current.metadata):
+                    reason = "current_sealed"
+                elif current.content != plan["content"]:
+                    reason = "current_content_changed"
+            if reason is None:
+                await self._refresh_ordinary_embedding_best_effort(bucket_id, current.content)
+            self._restore_step(restore_id, "embedding",
+                               skipped=skipped("embedding", reason) if reason else [])
         if "related" not in done:
-            skipped = []
-            current = await self.get(bucket_id)
-            current_related = _related_ids(current["metadata"]) if current else []
-            if plan["related"] != current_related:
-                try:
-                    self.mutate_related(bucket_id, replace=",".join(plan["related"]))
-                except RelatedError as exc:
-                    skipped = [{"kind": "related", "target": identity, "reason": exc.code}
-                               for identity in plan["related"]]
-            self._restore_step(restore_id, "related", skipped=skipped)
+            omissions = []
+            with bucket_write_scope(self.base_dir):
+                current = self._restore_current_post(bucket_id)
+                if current is None:
+                    omissions = skipped("related", "current_missing")
+                elif "restore_related_fingerprint" not in guard:
+                    omissions = skipped("related", "published_related_guard_missing")
+                elif parse_related(current.metadata).fingerprint != guard["restore_related_fingerprint"]:
+                    omissions = skipped("related", "current_related_changed")
+                elif plan["related"] != _related_ids(current.metadata):
+                    try:
+                        self.mutate_related(bucket_id, replace=",".join(plan["related"]))
+                    except RelatedError as exc:
+                        omissions = [{"kind": "related", "target": identity, "reason": exc.code}
+                                     for identity in plan["related"]]
+                self._restore_step(restore_id, "related", skipped=omissions)
         if "supersession" not in done:
-            skipped = []
+            omissions = []
             forward = plan["forward"]
-            if forward.get("apply"):
-                try:
-                    ok = await self.update(bucket_id, superseded_by=forward["superseded_by"],
-                                           superseded_at=forward["superseded_at"],
-                                           _supersession_reverse=True,
-                                           _revision_op=("restore_supersession", restore_id))
-                    if not ok:
-                        skipped = [{"kind": "superseded_by", "target": forward["superseded_by"],
-                                    "reason": "update_refused"}]
-                except Exception as exc:  # skip and report; never fail the whole restore
-                    skipped = [{"kind": "superseded_by", "target": forward["superseded_by"],
-                                "reason": getattr(exc, "code", type(exc).__name__)}]
-            self._restore_step(restore_id, "supersession", skipped=skipped)
+            with bucket_write_scope(self.base_dir):
+                current = self._restore_current_post(bucket_id)
+                baseline = guard.get("restore_forward_fingerprint",
+                                     self._restore_forward_fingerprint(plan["metadata"]))
+                if current is None:
+                    omissions = skipped("superseded_by", "current_missing")
+                elif self._restore_forward_fingerprint(current.metadata) != baseline:
+                    omissions = skipped("superseded_by", "current_supersession_changed")
+                elif forward.get("apply"):
+                    try:
+                        ok = await self.update(bucket_id, superseded_by=forward["superseded_by"],
+                                               superseded_at=forward["superseded_at"],
+                                               _supersession_reverse=True,
+                                               _revision_op=("restore_supersession", restore_id))
+                        if not ok:
+                            omissions = skipped("superseded_by", "update_refused", forward["superseded_by"])
+                    except Exception as exc:
+                        omissions = skipped("superseded_by", getattr(exc, "code", type(exc).__name__),
+                                            forward["superseded_by"])
+                self._restore_step(restore_id, "supersession", skipped=omissions)
         if "boot_delta" not in done:
             with bucket_write_scope(self.base_dir):
-                guard = self.delete_admission.capture(bucket_id)
-                self._record_boot_delta_event(bucket_id, "restored",
-                                              {"mode": plan["mode"], "source_ref": plan["ref"]},
-                                              _expected_source=guard)
-            self._restore_step(restore_id, "boot_delta")
+                current = self._restore_current_post(bucket_id)
+                omissions = []
+                if current is None:
+                    omissions = skipped("boot_delta", "current_missing")
+                else:
+                    current_guard = self.delete_admission.capture(bucket_id)
+                    self._record_boot_delta_event(bucket_id, "restored",
+                                                  {"mode": plan["mode"], "source_ref": plan["ref"]},
+                                                  _expected_source=current_guard)
+                self._restore_step(restore_id, "boot_delta", skipped=omissions)
         return self._restore_step(restore_id, "", status="completed")
 
     @guarded_async_mutation("bucket_restore_execute")
@@ -773,7 +824,7 @@ class BucketRevisionMixin:
                     old_path = Path(self.base_dir) / old if old else None
                     if old_path and old_path.resolve() != target.resolve() and old_path.exists():
                         os.unlink(old_path)
-                    guard = self.delete_admission.capture(row["bucket_id"])
+                    guard = self._restore_publication_guard(row["bucket_id"], frontmatter.load(target))
                     self._restoration_update(conn, row["restore_id"], status="published", published_guard=guard)
                 else:
                     self._restoration_update(conn, row["restore_id"], status="failed")
