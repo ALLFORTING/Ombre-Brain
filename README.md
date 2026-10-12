@@ -393,7 +393,7 @@ This P4 version removes the 15 legacy public registrations and exposes 20 defaul
 
 旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 已在本 P4 版本取消公开注册；原 Python 函数及私有 SDK 实现保留。客户端须使用下表的新入口 + action。
 
-This P4 version removes the 15 legacy public entries while retaining their Python functions and private SDK implementations. Clients must use the replacement tools with action. This describes the branch version; it does not assert PR merge, live rollout, or elapsed compatibility time.
+This P4 version removes the 15 legacy public entries while retaining their Python functions and private SDK implementations. Clients must use the replacement tools with action.
 
 这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `letter(action="seal")` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
 
@@ -524,7 +524,7 @@ boot、todos 和 feel echo 默认排除完整、精确匹配 `test` 的 tag；�
 
 #### `trace`
 
-- `bucket_id` 支持逗号分隔批量 ID；批量模式忽略 `content` 和 `name`，不支持 `merge` / `bucket_id` accepts comma-separated IDs; batch mode ignores `content` and `name`, and cannot merge.
+- `bucket_id` 支持逗号分隔批量 ID；批量模式拒绝 `content` 和 `name`，不支持 `merge` / `bucket_id` accepts comma-separated IDs; batch mode rejects `content` and `name`, and cannot merge.
 - `append: bool = False` — `content` 默认替换正文；`append=True` 时以空行分隔追加 / `content` replaces by default; `append=True` appends with a blank-line separator.
 - 写前快照 / Write-ahead snapshots: replace、append、delete 前会写入 `bucket_history.sqlite3` 的 `bucket_history(bucket_id, old_content, changed_at, change_type)`，便于手工恢复 / Before replace, append, or delete, old content is stored in `bucket_history.sqlite3` for manual recovery.
 - `confirm_token: str = ""` — delete（含 batch）、merge、取消已有 pinned、permanent→dynamic、todo_done、todo_drop 使用两阶段确认：先无 token 预览，再回传绑定同一操作/计划的短时一次性 token；过期、重复使用或计划不符会拒绝，不越过保护检查。
@@ -1026,7 +1026,7 @@ Automatic backup v1: `backup-auto.yml` in the private `ALLFORTING/ob-backup` rep
 - 定时 `17 19 * * *` UTC（上海 03:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
 - Repository variables：`OMBRE_BACKUP_AUTO_ENABLED`（GitHub 侧调度开关，与服务端同名变量独立；为 false 时定时与普通手动运行都跳过）、`OMBRE_BACKUP_AUTO_MODE`（默认 `full`，当前用 `simple`）、`OMBRE_BACKUP_AUTO_MAX_DOWNLOAD_BYTES`、`OMBRE_BACKUP_AUTO_POLL_TIMEOUT_SECONDS`；secret `OMBRE_BACKUP_AUTO_ENDPOINT` 填服务 origin。
 - `metadata_only=true` 的手动运行即使开关为 false 也只做一次 metadata 认证探测，不采集。
-- `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；跳过恢复演练和保留删除，库存会持续增长。
+- `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；不做自动恢复演练；保留清理由 ob-backup 的独立步骤负责（变量 `OMBRE_BACKUP_PRUNE_MODE`，`dry-run` 只列计划、`apply` 才删除），规则：成功备份最近 30 天全留，更早每个有备份的月份留最早一份、最多 12 个月，attempt 超 7 天删除，最新成功备份永不删，当天未成功不清理。
 
 **恢复 / Restore**：
 
@@ -1234,8 +1234,6 @@ This is a recommended portable path, not an MCP protocol requirement. Clients ma
 | `migrate_to_domains.py` | 迁移平铺文件到域子目录 / Migrate flat files to domain subdirs |
 | `reclassify_domains.py` | 基于关键词重分类 / Reclassify by keywords |
 | `reclassify_api.py` | 用 API 重打标未分类桶 / Re-tag uncategorized buckets via API |
-| `test_tools.py` | MCP 工具集成测试（8 项） / MCP tool integration tests (8 tests) |
-| `test_smoke.py` | 冒烟测试 / Smoke test |
 
 ## 部署 / Deploy
 
@@ -1271,7 +1269,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 > **Free tier won't work**: Render free tier has **no persistent disk** — all memory data is lost on restart. It also sleeps on inactivity. **Starter plan ($7/mo) or above is required.**
 
 项目根目录已包含 `render.yaml`，点击按钮后：
-1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
+1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（强烈建议；未设置时 hold 与短 grow 的自动打标回落默认 metadata 并在回执标明，长 grow 拆分可能失败，脱水与语义检索不可用）
 2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
 3. （推荐）设置 `OMBRE_RESPONSE_SEAL`：`boot`/`breath` 返回验真暗语
 4. 设置 `OMBRE_AUTH_TOKEN`：公网 HTTP MCP 的首选认证方式；客户端发送 `Authorization: Bearer <your-token>`
@@ -1310,7 +1308,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
    - Zeabur auto-detects the `Dockerfile` in root and builds via Docker
 
 2. **设置环境变量 / Set environment variables**（服务页面 → **Variables** 标签页）
-   - `OMBRE_API_KEY`（**必需**）— LLM API 密钥；未设置时 hold/grow/dream 会报错
+   - `OMBRE_API_KEY`（强烈建议）— LLM API 密钥；未设置时 hold 与短 grow 回落默认 metadata，长 grow 拆分可能失败，脱水与语义检索不可用
    - `OMBRE_BASE_URL`（可选）— API 地址，如 `https://api.deepseek.com/v1`
    - `OMBRE_AUTH_TOKEN`（公网 HTTP MCP 首选）— 保护 `/mcp`、SSE 的 `/sse` 与 `/messages`；客户端发送 `Authorization: Bearer <your-token>`，不要把 `OMBRE_AUTH_TOKEN` 放进 URL
    - `OMBRE_AUTH_TOKEN` (preferred for public HTTP MCP) — protects `/mcp`, SSE `/sse`, and `/messages`; clients send `Authorization: Bearer <your-token>` and must not put `OMBRE_AUTH_TOKEN` in URLs
@@ -1529,43 +1527,18 @@ sudo systemctl restart ombre-brain   # 示例
 
 ## 测试 / Testing
 
-测试套件覆盖规格书所有场景（场景 01–11），以及 B-01 至 B-10 全部 bug 修复的回归测试。
-
-The test suite covers all spec scenarios (01–11) and regression tests for every bug fix (B-01 to B-10).
-
-### 快速运行 / Quick Start
+测试平铺在 `tests/` 下（约 150 个 `test_*.py`），没有子目录分层。CI 与本地用法一致：
+Tests live flat under `tests/` (about 150 `test_*.py` files). CI and local usage:
 
 ```bash
-pip install pytest pytest-asyncio
-pytest tests/                          # 全部测试
-pytest tests/unit/                     # 单元测试
-pytest tests/integration/             # 集成测试（场景全流程）
-pytest tests/regression/              # 回归测试（B-01..B-10）
-pytest tests/ -k "B01"               # 单个回归测试
-pytest tests/ -v                       # 详细输出
+pip install pytest pytest-asyncio -c constraints-py312-linux.txt
+python -m pytest -m "not external" --asyncio-mode=auto        # 全部离线测试 / all offline tests
+python -m pytest tests/test_bucket_atomic_writes.py --asyncio-mode=auto   # 单个文件 / one file
+python -m pytest -k "atomic" --asyncio-mode=auto              # 按名称筛选 / filter by name
 ```
 
-### 测试层级 / Test Layers
-
-| 目录 Directory | 内容 Contents |
-|---|---|
-| `tests/unit/` | 单独测试 calculate_score、topic_score、时间得分、CRUD 等核心函数 |
-| `tests/integration/` | 场景全流程：冷启动、hold、search、trace、decay、feel 等 11 个场景 |
-| `tests/regression/` | 每个 bug（B-01 至 B-10）独立回归测试，含边界条件 |
-
-### 回归测试覆盖 / Regression Coverage
-
-| 文件 | Bug | 核心断言 |
-|---|---|---|
-| `test_issue_B01.py` | resolved 桶不再自动归档 | `update(resolved=True)` 后桶留在 `dynamic/`，搜索仍可命中，得分 ×0.05 |
-| `test_issue_B03.py` | float activation_count 不被 int() 截断 | 1.3 > 1.0 得分，`_time_ripple` 写入 0.3 增量 |
-| `test_issue_B04.py` | create() 初始 activation_count=0 | 新建桶满足冷启动条件，touch() 后变 1 |
-| `test_issue_B05.py` | 时间衰减系数 0.02（原 0.1）| 30天 ≈ 0.549，非旧值 0.049 |
-| `test_issue_B06.py` | w_time 默认 1.5（原 2.5）| `BucketManager.w_time == 1.5` |
-| `test_issue_B07.py` | content_weight 默认 1.0（原 3.0）| 名字完全匹配得分 > 内容模糊匹配 |
-| `test_issue_B08.py` | auto_resolve 同轮应用降权因子 | stale meta 修复后 score ×0.05 立即生效 |
-| `test_issue_B09.py` | hold() 保留用户传入的 valence/arousal | 用户值优先于 analyze() 结果 |
-| `test_issue_B10.py` | feel 桶 domain=[] 不被填充 | feel 桶保持 `[]`；dynamic 桶正确填 `["未分类"]` |
+全量离线测试约 3800 项、耗时十几分钟，日常改动建议只跑相关文件，全量交给 GitHub CI。
+The full offline suite has about 3800 tests and takes over ten minutes; run related files locally and leave the full suite to GitHub CI.
 
 > **测试隔离**：所有测试运行在 `tmp_path` 临时目录，绝不触碰真实记忆数据。
 > **Test isolation**: All tests run in `tmp_path` — your real memory data is never touched.
