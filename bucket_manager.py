@@ -72,6 +72,25 @@ from utils import (
     now_iso,
 )
 
+def _new_bucket_file_mode() -> int:
+    """Read Linux's current umask without changing the process-wide mask."""
+    try:
+        status = Path("/proc/self/status").read_text(encoding="ascii")
+        for line in status.splitlines():
+            field, separator, value = line.partition(":")
+            if separator and field == "Umask":
+                value = value.strip()
+                if len(value) not in {3, 4} or any(char not in "01234567" for char in value):
+                    break
+                mask = int(value, 8)
+                if 0 <= mask <= 0o777:
+                    return 0o666 & ~mask
+                break
+    except (OSError, UnicodeError):
+        pass
+    # Never guess a mode or weaken permissions when Linux procfs is unavailable.
+    raise OSError("process_umask_unavailable")
+
 logger = logging.getLogger("ombre_brain.bucket")
 
 _IMPORT_MARKER_FIELD = "_ob_import_operations"
@@ -1666,9 +1685,7 @@ class BucketManager(BucketRevisionMixin):
             if target_stat is not None:
                 mode = stat.S_IMODE(target_stat.st_mode)
             else:
-                umask = os.umask(0)
-                os.umask(umask)
-                mode = 0o666 & ~umask
+                mode = _new_bucket_file_mode()
         fd, temporary = tempfile.mkstemp(
             prefix=f".{os.path.basename(file_path)}.",
             suffix=".tmp",
