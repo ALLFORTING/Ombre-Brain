@@ -30,7 +30,7 @@ async def test_breath_includes_related_id_and_name_without_content(
     await server.bucket_mgr.update(hit_id, related_buckets=related_id)
     hit = await server.bucket_mgr.get(hit_id)
     server.bucket_mgr.search = AsyncMock(return_value=[hit])
-    server.bucket_mgr.list_all = AsyncMock(return_value=[])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[hit])
 
     result = await server.breath(query="search needle")
 

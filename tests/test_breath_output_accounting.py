@@ -40,6 +40,7 @@ def _next_cursor(result: str) -> str:
 async def test_breath_vector_result_uses_utf8_semantic_label(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     server.bucket_mgr.search = AsyncMock(return_value=[_bucket(1, vector_match=True)])
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     server.dehydrator.dehydrate = AsyncMock(return_value="ordinary query summary")
 
     result = await server.breath(query="unique anchor")
@@ -55,6 +56,7 @@ async def test_breath_31_matches_displays_8_and_reports_23(tmp_path, monkeypatch
     server.bucket_mgr.search = AsyncMock(
         return_value=[_bucket(index) for index in range(31)]
     )
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None, **kwargs: content
     )
@@ -79,6 +81,7 @@ async def test_breath_counts_selected_items_omitted_by_token_budget(
     server.bucket_mgr.search = AsyncMock(
         return_value=[_bucket(index) for index in range(4)]
     )
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     summaries = iter(["short", "长" * 100, "unused third summary"])
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None, **kwargs: next(summaries)
@@ -108,6 +111,7 @@ async def test_breath_cursor_pages_are_stable_without_duplicates_or_gaps(
     buckets = [_bucket(index) for index in range(12)]
     by_id = {bucket["id"]: bucket for bucket in buckets}
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     server.bucket_mgr.get = AsyncMock(side_effect=lambda bucket_id: by_id.get(bucket_id))
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None, **kwargs: content
@@ -158,6 +162,7 @@ async def test_breath_cursor_rejects_changed_query_and_tampering(tmp_path, monke
     server = _load_server(tmp_path, monkeypatch)
     buckets = [_bucket(index) for index in range(6)]
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None: content
     )
