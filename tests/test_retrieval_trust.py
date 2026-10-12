@@ -47,6 +47,7 @@ async def test_query_full_returns_canonical_body_and_marks_truncation(tmp_path, 
     server = _server(tmp_path, monkeypatch)
     bucket = _bucket(1, content="canonical [[link]] " + "X" * 120)
     server.bucket_mgr.search = AsyncMock(return_value=[bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bucket])
     server.dehydrator.dehydrate = AsyncMock(side_effect=AssertionError("full must not dehydrate"))
 
     full = await server.breath(query="canonical", mode="full", touch=False)
@@ -90,6 +91,7 @@ async def test_compose_failure_keeps_bucket_and_does_not_cache(tmp_path, monkeyp
     server = _server(tmp_path, monkeypatch)
     bucket = _bucket(1)
     server.bucket_mgr.search = AsyncMock(return_value=[bucket])
+    server.bucket_mgr.list_all = AsyncMock(return_value=[bucket])
     server.dehydrator.dehydrate = AsyncMock(side_effect=RuntimeError("provider down"))
     server.dehydrator._set_cached_summary = AsyncMock()
     server._fire_webhook = AsyncMock()
@@ -110,6 +112,7 @@ async def test_budget_cursor_consumes_exactly_displayed_id_set(tmp_path, monkeyp
     buckets = [_bucket(i) for i in range(8)]
     by_id = {bucket["id"]: bucket for bucket in buckets}
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(side_effect=lambda **kwargs: list(by_id.values()))
     server.bucket_mgr.get = AsyncMock(side_effect=by_id.get)
     server.dehydrator.dehydrate = AsyncMock(side_effect=lambda body, meta, **kwargs: (body, "original"))
 
@@ -135,6 +138,7 @@ async def test_cursor_revalidates_deleted_dormant_and_sealed_candidates(tmp_path
     buckets = [_bucket(i) for i in range(5)]
     by_id = {bucket["id"]: bucket for bucket in buckets}
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(side_effect=lambda **kwargs: list(by_id.values()))
     server.bucket_mgr.get = AsyncMock(side_effect=by_id.get)
     server.dehydrator.dehydrate = AsyncMock(side_effect=lambda body, meta, **kwargs: (body, "original"))
 
@@ -157,6 +161,7 @@ async def test_summary_composition_stays_serial_and_ordered(tmp_path, monkeypatc
 
     server = _server(tmp_path, monkeypatch)
     server.bucket_mgr.search = AsyncMock(return_value=[_bucket(i) for i in range(4)])
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     active = 0
     peak = 0
 
@@ -181,6 +186,7 @@ async def test_unrenderable_bucket_is_counted_as_failed_omission(tmp_path, monke
     buckets = [_bucket(0), _bucket(1)]
     del buckets[0]["content"]
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(return_value=buckets)
     server.dehydrator.dehydrate = AsyncMock(side_effect=RuntimeError("provider unavailable"))
 
     result = await server.breath(query="canonical", touch=False)
@@ -194,6 +200,7 @@ async def test_first_summary_too_large_reports_counts_without_consuming(tmp_path
     server = _server(tmp_path, monkeypatch)
     buckets = [_bucket(0), _bucket(1)]
     server.bucket_mgr.search = AsyncMock(return_value=buckets)
+    server.bucket_mgr.list_all = AsyncMock(return_value=buckets)
     server.dehydrator.dehydrate = AsyncMock(return_value=("very long summary " * 50, "summary"))
 
     result = await server.breath(query="canonical", max_tokens=1, max_results=1, touch=False)
@@ -208,6 +215,7 @@ async def test_first_summary_too_large_reports_counts_without_consuming(tmp_path
 async def test_sealed_is_absent_from_public_count(tmp_path, monkeypatch):
     server = _server(tmp_path, monkeypatch)
     server.bucket_mgr.search = AsyncMock(return_value=[_bucket(1), _bucket(2, sealed=True)])
+    server.bucket_mgr.list_all = AsyncMock(return_value=server.bucket_mgr.search.return_value)
     server.dehydrator.dehydrate = AsyncMock(side_effect=lambda body, meta, **kwargs: (body, "original"))
 
     result = await server.breath(query="canonical", touch=False)
