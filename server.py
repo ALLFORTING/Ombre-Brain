@@ -3943,6 +3943,64 @@ async def _trace_keyed(operation_id, values):
         return str(exc)
 
 
+def _trace_digest_summary(bucket: dict) -> bool:
+    """Require digest writer markers together; provenance alone is insufficient."""
+    metadata = bucket.get("metadata", {})
+    tags, domains = metadata.get("tags"), metadata.get("domain")
+    return (
+        isinstance(tags, list) and {"digest", "auto-digested"}.issubset(tags)
+        and isinstance(domains, list) and "digest" in domains
+    )
+
+
+async def _trace_sealed_derivatives(bucket_id: str) -> str:
+    """Report explicit digest lineage without changing any derived bucket."""
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    by_id = {bucket["id"]: bucket for bucket in buckets}
+    summaries = {identity for identity, bucket in by_id.items() if _trace_digest_summary(bucket)}
+    successors = {}
+    for identity, bucket in by_id.items():
+        metadata = bucket.get("metadata", {})
+        raw = metadata.get("source_bucket")
+        if not isinstance(raw, str):
+            continue
+        sources = list(dict.fromkeys(_parse_csv_ids(raw)))
+        if metadata.get("digested") is True:
+            # Marked sources (including re-digested summaries) point FORWARD
+            # to one summary; their former source list has been overwritten.
+            if len(sources) == 1 and sources[0] in summaries:
+                successors.setdefault(identity, set()).add(sources[0])
+        elif metadata.get("digested") in (False, None) and identity in summaries:
+            # An unmarked summary still lists its input buckets.
+            for source in sources:
+                successors.setdefault(source, set()).add(identity)
+
+    found, pending = set(), [bucket_id]
+    visited = {bucket_id}
+    while pending:
+        for identity in successors.get(pending.pop(), ()):
+            if identity in visited:
+                continue
+            visited.add(identity)
+            found.add(identity)
+            pending.append(identity)
+    lines = []
+    for identity in sorted(found):
+        # Recheck visibility immediately before using a name, so a bucket
+        # sealed since inventory never leaks its name from the old snapshot.
+        current = await bucket_mgr.get(identity)
+        if current is None or not _trace_digest_summary(current):
+            continue
+        if _is_sealed(current):
+            lines.append(f"- {identity}")
+        else:
+            name = current.get("metadata", {}).get("name") or identity
+            lines.append(f"- {identity} | {name}")
+    if not lines:
+        return ""
+    return "\n已知衍生摘要：\n" + "\n".join(lines) + "\n可能还有未记录的副本。"
+
+
 @_guard_todo_drop_presence
 @mcp.tool()
 async def trace(
@@ -4351,7 +4409,15 @@ async def trace(
             changed += "\n" + "\n".join(
                 f"- {record['text']} | todo_id:{record['id']}" for record in records
             )
-    return f"已修改记忆桶 {bucket_id}: {changed}"
+    result = f"已修改记忆桶 {bucket_id}: {changed}"
+    if sealed == 1:
+        try:
+            result += await _trace_sealed_derivatives(bucket_id)
+        except Exception:
+            # Sealing already succeeded. Never include provider/path/content
+            # details from a failed report scan or reinterpret it as a failure.
+            result += "\n已封存；副本清单暂无法确认。"
+    return result
 
 @mcp.tool()
 async def seal_letter(letter_id: int, sealed: int = 1) -> str:
