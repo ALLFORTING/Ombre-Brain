@@ -12,6 +12,7 @@ import re
 
 from openai import AsyncOpenAI
 import frontmatter
+from bucket_manager import BucketManager
 from confirmed_delete_admission import DurableDeleteAdmission, DeleteAdmissionError
 
 ANALYZE_PROMPT = (
@@ -130,8 +131,7 @@ async def reclassify():
             except DeleteAdmissionError as exc:
                 print(f'skipped {basename}: {exc.code}')
                 continue
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            BucketManager._write_post_atomic(fpath, post)
 
             # 移动到正确目录
             primary = sanitize(new_domain[0]) if new_domain else "未分类"

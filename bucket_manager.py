@@ -33,6 +33,7 @@ import sqlite3
 import hashlib
 import json
 import tempfile
+import stat
 import inspect
 import copy
 import asyncio
@@ -1656,6 +1657,18 @@ class BucketManager(BucketRevisionMixin):
     def _write_bytes_atomic(file_path: str, payload: bytes, *, before_publish=None) -> None:
         """Publish frozen bytes with file and directory persistence barriers."""
         parent = os.path.dirname(file_path)
+        target_stat = None
+        if os.name != "nt":
+            try:
+                target_stat = os.stat(file_path)
+            except FileNotFoundError:
+                pass
+            if target_stat is not None:
+                mode = stat.S_IMODE(target_stat.st_mode)
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                mode = 0o666 & ~umask
         fd, temporary = tempfile.mkstemp(
             prefix=f".{os.path.basename(file_path)}.",
             suffix=".tmp",
@@ -1665,6 +1678,11 @@ class BucketManager(BucketRevisionMixin):
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload)
                 handle.flush()
+                if os.name != "nt":
+                    # chown may clear special mode bits; apply permissions last.
+                    if target_stat is not None and os.geteuid() == 0:
+                        os.fchown(handle.fileno(), target_stat.st_uid, target_stat.st_gid)
+                    os.fchmod(handle.fileno(), mode)
                 os.fsync(handle.fileno())
             if before_publish is not None:
                 before_publish()
