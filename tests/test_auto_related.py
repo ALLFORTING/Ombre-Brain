@@ -27,7 +27,11 @@ async def test_auto_related_links_top_matches_and_skips_sealed(tmp_path, monkeyp
 
     server.embedding_engine._store_embedding(target_id, [1.0, 0.0])
     server.embedding_engine._store_embedding(similar_id, [0.95, 0.05])
-    server.embedding_engine._store_embedding(sealed_id, [0.99, 0.01])
+    # Simulate a stale vector for the sealed bucket in the isolated database,
+    # bypassing the production sealed-embedding admission.
+    with sqlite3.connect(server.embedding_engine.db_path) as conn:
+        conn.execute("INSERT OR REPLACE INTO embeddings VALUES(?,?,?,?)",
+                     (sealed_id, "[0.99, 0.01]", server.embedding_engine.model, "2026-10-12"))
     server.embedding_engine._store_embedding(far_id, [0.0, 1.0])
 
     linked = await server._auto_link_related(target_id, threshold=0.75)
