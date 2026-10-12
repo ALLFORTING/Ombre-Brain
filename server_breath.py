@@ -113,6 +113,8 @@ def _prepare_breath_request(**arguments) -> dict:
         "default_emergence"
     )
     request["selector"] = selector
+    if request["include_archive"] is None:
+        request["include_archive"] = selector == "ordinary_query"
 
     def reject(parameter, reason):
         raise ValueError(_breath_parameter_error(selector, parameter, reason))
@@ -142,7 +144,7 @@ def _prepare_breath_request(**arguments) -> dict:
             if name in ("mailbox", "mailbox_limit", "include_sealed"):
                 continue
             value = request[name]
-            disabled = not value if name in ("tags_filter", "topic_filter") else value == defaults[name].default
+            disabled = not value if name in ("tags_filter", "topic_filter", "include_archive") else value == defaults[name].default
             if not disabled:
                 reject(name, "mailbox 是独立信件模型，不支持 bucket retrieval 参数")
         return request
@@ -1558,7 +1560,7 @@ async def _breath_impl(
     emotion_trend: bool = False,
     include_dormant: bool = False,
     include_sealed: bool = False,
-    include_archive: bool = False,
+    include_archive: bool | None = None,
     date_from: str = "",
     date_to: str = "",
     resonance: str = "",
@@ -1580,6 +1582,7 @@ async def _breath_impl(
     except ValueError as exc:
         return str(exc)
     selector = request["selector"]
+    include_archive = request["include_archive"]
     domain = request["domain"]
     mode = request["mode"]
     tags_filter, topic_filter = request["tags_filter"], request["topic_filter"]

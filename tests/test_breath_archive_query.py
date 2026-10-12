@@ -47,17 +47,20 @@ def cursor(result):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["summary", "full"])
 @pytest.mark.parametrize("tags", [None, ["selected"]])
-async def test_archive_opt_in_and_sealed_visibility(server, mode, tags):
+async def test_archive_default_and_sealed_visibility(server, mode, tags):
     active = await make(server, "active")
     archived = await make(server, "archived", archived=True)
     private = await make(server, "sealed", archived=True, sealed=True)
     arguments = dict(query="needle", mode=mode, tags_filter=tags, touch=False, max_tokens=20000)
     default = await server.breath(**arguments)
     explicit_false = await server.breath(**arguments, include_archive=False)
-    assert default == explicit_false
-    assert ids(default) == [active]
-    assert "[归档]" not in default
+    explicit_none = await server.breath(**arguments, include_archive=None)
+    assert default == explicit_none
+    assert set(ids(default)) == {active, archived}
+    assert ids(explicit_false) == [active]
+    assert "[归档]" not in explicit_false
     included = await server.breath(**arguments, include_archive=True)
+    assert included == default
     assert set(ids(included)) == {active, archived}
     assert private not in included
     assert included.count("[归档]") == 1
@@ -131,7 +134,7 @@ async def test_cursor_binds_archive_and_valid_pages(server, include_archive):
 async def test_false_cursor_drops_bucket_archived_after_first_page(server):
     for i in range(3):
         await make(server, f"moving{i}")
-    arguments = dict(query="needle", touch=False, max_results=1)
+    arguments = dict(query="needle", touch=False, include_archive=False, max_results=1)
     first = await server.breath(**arguments)
     token = cursor(first)
     pending = server._BREATH_CURSOR_STATES[token]["matches"][1]["id"]
@@ -169,14 +172,14 @@ async def test_marker_uses_storage_not_stale_type_and_covers_weak_and_fallback(s
 
 
 @pytest.mark.asyncio
-async def test_default_active_order_keeps_original_search_path(server):
+async def test_explicit_false_keeps_original_search_path(server):
     identifiers = [await make(server, f"rank{i}", importance=9-i) for i in range(3)]
     await make(server, "excluded", archived=True)
     original = server.bucket_mgr.search
     spy = AsyncMock(wraps=original)
     server.bucket_mgr.search = spy
 
-    result = await server.breath(query="needle", touch=False, max_tokens=20000)
+    result = await server.breath(query="needle", include_archive=False, touch=False, max_tokens=20000)
     assert ids(result) == identifiers
     assert "candidate_buckets" not in spy.call_args.kwargs
 
@@ -227,3 +230,99 @@ async def test_archive_query_time_and_resonance_filters(server):
         assert ids(result) == [near, far]
         assert old not in result
         assert result.count("[归档]") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    {}, {"query": " "}, {"domain": "session", "query": "needle"},
+    {"topic_filter": ["topic"], "query": "needle"}, {"domain": "feel", "query": "needle"},
+    {"feels": True, "query": "needle"}, {"mailbox": True},
+    {"as_of": "2026-10-01", "query": "needle"}, {"resonance": "0.5,0.5"},
+    {"importance_min": 7}, {"tags_filter": ["selected"]},
+])
+async def test_nonordinary_none_and_false_preserve_defaults(server, arguments):
+    await make(server, "active")
+    archived = await make(server, "archive", archived=True)
+    for value in (None, False):
+        request = server._prepare_breath_request(**arguments, include_archive=value)
+        assert request["include_archive"] is False
+    assert server._prepare_breath_request(**arguments)["include_archive"] is False
+    # Mailbox has its own touch default restriction.
+    options = arguments if arguments.get("mailbox") else dict(arguments, touch=False)
+    default = await server.breath(**options)
+    assert "breath mode=" not in default
+    assert default == await server.breath(**options, include_archive=None)
+    assert default == await server.breath(**options, include_archive=False)
+    assert archived not in default
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", ["omitted", None, True])
+async def test_cursor_default_none_and_true_are_equivalent(server, initial):
+    identifiers = [await make(server, f"equiv{i}", archived=True) for i in range(3)]
+    arguments = dict(query="needle", touch=False, max_results=1)
+    first_options = {} if initial == "omitted" else {"include_archive": initial}
+    first = await server.breath(**arguments, **first_options)
+    token = cursor(first)
+    assert "不匹配" in await server.breath(**arguments, include_archive=False, cursor=token)
+    second = await server.breath(**arguments, include_archive=None, cursor=token)
+    third = await server.breath(**arguments, include_archive=True, cursor=cursor(second))
+    assert set(ids(first) + ids(second) + ids(third)) == set(identifiers)
+
+
+@pytest.mark.asyncio
+async def test_default_cursor_restore_includes_new_archive_but_hides_new_seal(server):
+    for i in range(4):
+        await make(server, f"restore{i}")
+    arguments = dict(query="needle", touch=False, max_results=1)
+    first = await server.breath(**arguments)
+    token = cursor(first)
+    pending = server._BREATH_CURSOR_STATES[token]["matches"]
+    archived, sealed = pending[1]["id"], pending[2]["id"]
+    assert await server.bucket_mgr.archive(archived)
+    bucket = await server.bucket_mgr.get(sealed)
+    post = frontmatter.load(bucket["path"])
+    post["sealed"] = True
+    Path(bucket["path"]).write_text(frontmatter.dumps(post), encoding="utf-8")
+    rest = await server.breath(**{**arguments, "max_results": 5}, include_archive=True, cursor=token)
+    assert archived in ids(rest) and "[归档]" in rest
+    assert sealed not in ids(rest)
+    assert len(ids(rest)) == 2
+
+
+@pytest.mark.asyncio
+async def test_internal_default_uses_resolved_archive_candidates(server):
+    archived = await make(server, "internal", archived=True)
+    for tags in (None, ["selected"]):
+        result = await server._breath_impl(query="needle", tags_filter=tags, touch=False)
+        assert ids(result) == [archived]
+
+
+@pytest.mark.asyncio
+async def test_no_query_keeps_active_pinned_and_excludes_archive_pinned(server):
+    active = await server.bucket_mgr.create(content="needle active pinned", name="active pinned",
+                                            pinned=True, importance=8)
+    archived = await make(server, "archive pinned", archived=True)
+    bucket = await server.bucket_mgr.get(archived)
+    post = frontmatter.load(bucket["path"])
+    post["pinned"] = True
+    Path(bucket["path"]).write_text(frontmatter.dumps(post), encoding="utf-8")
+    for options in ({}, {"include_archive": None}, {"include_archive": False}):
+        result = await server.breath(touch=False, **options)
+        assert active in result
+        assert archived not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", ["omitted", None, False])
+async def test_historical_cursor_none_and_false_are_equivalent(server, initial):
+    identifiers = [await make(server, f"historical{i}") for i in range(3)]
+    arguments = dict(query="needle", as_of="2099-01-01", touch=False, max_results=1)
+    first_options = {} if initial == "omitted" else {"include_archive": initial}
+    first = await server.breath(**arguments, **first_options)
+    token = cursor(first)
+    invalid = await server.breath(**arguments, include_archive=True, cursor=token)
+    assert "include_archive" in invalid and "ordinary query" in invalid
+    second = await server.breath(**arguments, include_archive=None, cursor=token)
+    third = await server.breath(**arguments, include_archive=False, cursor=cursor(second))
+    assert set(ids(first) + ids(second) + ids(third)) == set(identifiers)
