@@ -648,8 +648,11 @@
             "type": "boolean"
           },
           "include_archive": {
-            "default": false,
-            "type": "boolean"
+            "anyOf": [
+              {"type": "boolean"},
+              {"type": "null"}
+            ],
+            "default": null
           },
           "include_sealed": {
             "default": false,
