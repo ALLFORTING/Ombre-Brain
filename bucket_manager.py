@@ -72,8 +72,21 @@ from utils import (
     now_iso,
 )
 
+def _capture_startup_umask() -> int:
+    """Cache the POSIX mask at import time, before background work starts."""
+    if os.name == "nt":
+        return 0  # The Windows writer does not use POSIX modes.
+    mask = os.umask(0)
+    try:
+        return mask
+    finally:
+        os.umask(mask)
+
+
+_STARTUP_UMASK = _capture_startup_umask()
+
 def _new_bucket_file_mode() -> int:
-    """Read Linux's current umask without changing the process-wide mask."""
+    """Use Linux's live mask, or the import-time cache when procfs is unavailable."""
     try:
         status = Path("/proc/self/status").read_text(encoding="ascii")
         for line in status.splitlines():
@@ -88,8 +101,8 @@ def _new_bucket_file_mode() -> int:
                 break
     except (OSError, UnicodeError):
         pass
-    # Never guess a mode or weaken permissions when Linux procfs is unavailable.
-    raise OSError("process_umask_unavailable")
+    # macOS and other POSIX hosts may have no procfs. Never change umask here.
+    return 0o666 & ~_STARTUP_UMASK
 
 logger = logging.getLogger("ombre_brain.bucket")
 
