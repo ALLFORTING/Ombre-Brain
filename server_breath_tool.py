@@ -46,6 +46,7 @@ async def breath(
     emotion_trend: bool = False,
     include_dormant: Annotated[bool, Field(description="Include dormant ordinary/historical candidates. Session/feel retain their existing eligibility and reject True; pinned/protected emergence retains its eligibility exception.")] = False,
     include_sealed: bool = False,
+    include_archive: bool = False,
     date_from: Annotated[str, Field(description="Inclusive YYYY-MM-DD lower bound on the bucket updated_at date, falling back to last_active/created. Empty disables it; must not exceed date_to. Unsupported with as_of/mailbox.")] = "",
     date_to: Annotated[str, Field(description="Inclusive YYYY-MM-DD upper bound using the same bucket date as date_from. Empty disables it. Unsupported with as_of/mailbox.")] = "",
     resonance: Annotated[str, Field(description="Optional valence,arousal pair, each 0-1, for emotional-distance ordering. With ordinary query it reorders matches; without query it selects a distance-ordered listing. Compatible metadata filters still intersect. Unsupported for session/feel/as_of/mailbox; it is not a related-bucket selector.")] = "",
@@ -107,6 +108,7 @@ async def breath(
 ) -> str:
     """Retrieve directed memories with query, or use the selected listing/default emergence.
 
+    include_archive=True adds archived candidates only to ordinary query.
     Related buckets are result annotations, not a search parameter. Remaining
     reports undisplayed results; pagination exists only when a query cursor is
     returned. touch=False skips activation updates, waking, decay startup and
@@ -137,6 +139,7 @@ async def breath(
         wake_dormant=wake_dormant,
         touch=touch,
         include_sealed=include_sealed,
+        include_archive=include_archive,
         date_from=date_from,
         date_to=date_to,
         resonance=resonance,
