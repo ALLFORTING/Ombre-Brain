@@ -2,7 +2,7 @@
   "baseline": "ab7a348b11e6c7d8725d8d0c4ad1f0a26e19cec6",
   "newline": "LF-normalized",
   "sha256": {
-    "bucket_manager.py": "ef450e320c84b9ff9f0e25372678d5d192a44ab221884732ea68095b76ff5fc8",
+    "bucket_manager.py": "99806d5e906efdfa961e32878235e330927b1f231c5af03f9cc9453190dffdcf",
     "bucket_revisions.py": "d3d4b04e4166c571b6b4e0fe631d9696b10d5ec616691dcd6d2ae6e3774fc5c6",
     "constraints-py312-linux.txt": "caf17013b66de5bf4b2578629031c69043affccef1453cb5c9c1036fca13919e",
     "dehydrator.py": "2cc74a773001f338fbf02cd7e6c3ee0379d231ae11a7b46fadf263434b513ee9",
