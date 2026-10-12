@@ -53,7 +53,7 @@
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
 _BREATH_ALLOWED = {
-    "ordinary_query": "query, domain, importance_min, tags_filter, recent_days, date_from, date_to, include_dormant, include_sealed, valence/arousal, resonance, min_score, max_results, max_tokens, mode, emotion_trend, touch, wake_dormant; cursor only without tags_filter",
+    "ordinary_query": "query, domain, importance_min, tags_filter, recent_days, date_from, date_to, include_dormant, include_sealed, include_archive, valence/arousal, resonance, min_score, max_results, max_tokens, mode, emotion_trend, touch, wake_dormant; cursor only without tags_filter",
     "session": "query, domain=session, importance_min, tags_filter, topic_filter, recent_days, date_from, date_to, include_sealed, max_results, max_tokens, emotion_trend, touch; mode=full only with query",
     "feel": "query, domain=feel or feels=True, importance_min, tags_filter, recent_days, date_from, date_to, include_sealed, max_results, max_tokens, emotion_trend, touch; mode=full only with query and tags_filter",
     "resonance": "resonance, domain, importance_min, tags_filter, recent_days, date_from, date_to, include_dormant, include_sealed, max_results, max_tokens, emotion_trend, touch, wake_dormant; mode=summary",
@@ -116,6 +116,9 @@ def _prepare_breath_request(**arguments) -> dict:
 
     def reject(parameter, reason):
         raise ValueError(_breath_parameter_error(selector, parameter, reason))
+
+    if request["include_archive"] and selector != "ordinary_query":
+        reject("include_archive", "include_archive=True 仅适用于 ordinary query（可带 tags_filter）")
 
     for name, reason in filter_errors:
         reject(name, reason)
@@ -252,6 +255,7 @@ async def _breath_filtered_impl(
     min_score: float,
     importance_min: int = -1,
     recent_days: int = -1,
+    include_archive: bool = False,
 ) -> str:
     """Retrieve exact-filtered candidates without changing old breath paths."""
     domain_values = [part.strip() for part in (domain or "").split(",") if part.strip()]
@@ -412,7 +416,7 @@ async def _breath_filtered_impl(
             return "读取 feel 失败。"
 
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        all_buckets = await bucket_mgr.list_all(include_archive=include_archive)
         candidates = apply_common_filters(all_buckets)
         # Feel has a dedicated route. The historical no-query route also
         # excludes feel buckets, so keep them out of deterministic tag-only
@@ -619,6 +623,7 @@ def _breath_cursor_scope(
     importance_min: int = -1,
     wake_dormant: bool = False,
     recent_days: int = -1,
+    include_archive: bool = False,
 ) -> str:
     payload = {
         "version": 2,
@@ -634,6 +639,7 @@ def _breath_cursor_scope(
         "recent_cutoff": recent_cutoff,
         "include_dormant": include_dormant,
         "include_sealed": include_sealed,
+        "include_archive": include_archive,
         "date_from": date_from,
         "date_to": date_to,
         "resonance": resonance,
@@ -872,6 +878,24 @@ def _order_breath_query_matches(matches: list[dict]) -> list[dict]:
     ]
 
 
+def _breath_bucket_is_archived(bucket: dict) -> bool:
+    """Use the loaded storage path, not a possibly stale type label."""
+    path = bucket.get("path")
+    if not path:
+        return False
+    archive_root = os.path.normcase(os.path.abspath(bucket_mgr.archive_dir))
+    try:
+        return os.path.commonpath([
+            archive_root, os.path.normcase(os.path.abspath(os.fspath(path)))
+        ]) == archive_root
+    except (TypeError, ValueError):
+        return False
+
+
+def _breath_archive_marker(bucket: dict) -> str:
+    return " [归档]" if _breath_bucket_is_archived(bucket) else ""
+
+
 async def _format_breath_query_summary(bucket: dict, summary: str) -> str:
     """Add the stable query-result header used by both Breath query paths."""
     meta = bucket.get("metadata", {})
@@ -881,7 +905,7 @@ async def _format_breath_query_summary(bucket: dict, summary: str) -> str:
     superseded_marker = await _superseded_marker(bucket)
     header = (
         f"[bucket_id:{bucket['id']}] {icon} [{_breath_retrieval_score_label(bucket)}] "
-        f"[通道:{channel}]{superseded_marker}{dormant_tag} {summary}"
+        f"[通道:{channel}]{superseded_marker}{dormant_tag}{_breath_archive_marker(bucket)} {summary}"
     )
     return "[语义关联] " + header if bucket.get("vector_match") else header
 
@@ -929,7 +953,7 @@ async def _compose_breath_query_matches(
             dormant_tag = " [休眠]" if meta.get("dormant", False) else ""
             line = (
                 f"[bucket_id:{bid}] {_bucket_display_icon(meta)} "
-                f"{meta.get('name', bid)} {_breath_retrieval_score_label(bucket)}{dormant_tag}"
+                f"{meta.get('name', bid)} {_breath_retrieval_score_label(bucket)}{dormant_tag}{_breath_archive_marker(bucket)}"
             )
             required = max(1, count_tokens_approx(line))
             if required > remaining_budget:
@@ -1534,6 +1558,7 @@ async def _breath_impl(
     emotion_trend: bool = False,
     include_dormant: bool = False,
     include_sealed: bool = False,
+    include_archive: bool = False,
     date_from: str = "",
     date_to: str = "",
     resonance: str = "",
@@ -1607,7 +1632,7 @@ async def _breath_impl(
     cursor_scope = _breath_cursor_scope(
         query=query, domain=domain, valence=valence, arousal=arousal,
         recent_cutoff=recent_cutoff, include_dormant=include_dormant,
-        include_sealed=include_sealed, date_from=date_from, date_to=date_to,
+        include_sealed=include_sealed, include_archive=include_archive, date_from=date_from, date_to=date_to,
         resonance=resonance, min_score=resolved_min_score, touch=touch, mode=mode,
         selector=selector, importance_min=importance_min,
         wake_dormant=wake_dormant, recent_days=recent_days,
@@ -1641,6 +1666,7 @@ async def _breath_impl(
             mode=mode,
             recent_cutoff=recent_cutoff,
             include_dormant=include_dormant, include_sealed=include_sealed,
+            include_archive=include_archive,
             wake_dormant=wake_dormant,
             touch=touch,
             date_from=date_from,
@@ -2054,6 +2080,8 @@ async def _breath_impl(
             bucket = await bucket_mgr.get(record["id"])
             if bucket is None:
                 continue
+            if not include_archive and _breath_bucket_is_archived(bucket):
+                continue
             rendered = dict(bucket)
             rendered["_breath_score"] = float(record["score"])
             rendered.pop("score", None)
@@ -2089,8 +2117,8 @@ async def _breath_impl(
     else:
         try:
             scoped_candidates = None
-            if domain_values or importance_min != -1 or recent_days != -1 or date_from or date_to:
-                scoped_candidates = common_filters(await bucket_mgr.list_all(include_archive=False))
+            if include_archive or domain_values or importance_min != -1 or recent_days != -1 or date_from or date_to:
+                scoped_candidates = common_filters(await bucket_mgr.list_all(include_archive=include_archive))
             matches = await bucket_mgr.search(
                 query,
                 limit=1000,
