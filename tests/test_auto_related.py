@@ -1,4 +1,5 @@
 import importlib
+import sqlite3
 import sys
 from unittest.mock import AsyncMock
 
