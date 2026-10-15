@@ -909,6 +909,17 @@
             "default": "",
             "type": "string"
           },
+          "trigger_repeat": {
+            "default": "once",
+            "enum": [
+              "once",
+              "daily",
+              "weekly",
+              "monthly",
+              "yearly"
+            ],
+            "type": "string"
+          },
           "valence": {
             "default": -1,
             "type": "number"
@@ -1316,6 +1327,17 @@
           },
           "trigger_date": {
             "default": "",
+            "type": "string"
+          },
+          "trigger_repeat": {
+            "default": "once",
+            "enum": [
+              "once",
+              "daily",
+              "weekly",
+              "monthly",
+              "yearly"
+            ],
             "type": "string"
           },
           "unrelate": {

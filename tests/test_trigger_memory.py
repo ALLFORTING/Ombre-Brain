@@ -6,6 +6,421 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+def _freeze_day(server, monkeypatch, day):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls.fromisoformat(day + "T12:00:00")
+            return value if tz is None else value.replace(tzinfo=tz)
+    monkeypatch.setattr(server, "datetime", FrozenDateTime)
+
+
+def _raw_trigger(server, bucket_id):
+    import frontmatter
+    return frontmatter.load(server.bucket_mgr._find_bucket_file(bucket_id))
+
+
+def _history_counts(server):
+    import sqlite3
+    with sqlite3.connect(server.bucket_mgr.history_db_path) as conn:
+        return tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                     for table in ("bucket_history", "bucket_revisions"))
+
+
+@pytest.mark.asyncio
+async def test_once_three_day_window_expiry_receipt_and_search(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-17")
+    await server.hold("unique expiry search phrase", trigger_date="2026-10-15")
+    bucket_id = (await server.bucket_mgr.list_all())[0]["id"]
+    before = _raw_trigger(server, bucket_id)
+    counts = _history_counts(server)
+    assert bucket_id in await server.boot()  # D+2, the third day
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    result = await server.boot()
+    assert f"已自动收起 1 条过期提醒：[bucket_id:{bucket_id}]" in result
+    after = _raw_trigger(server, bucket_id)
+    assert after["trigger_expired_at"] == "2026-10-18"
+    assert after["trigger_expiry_notified_at"] == "2026-10-18"
+    assert "已自动收起" not in await server.boot()
+    assert bucket_id in await server.breath(query="unique expiry search phrase", touch=False)
+    from bucket_manager import TRIGGER_FIELDS
+    assert {k:v for k,v in after.metadata.items() if k not in TRIGGER_FIELDS} == {
+        k:v for k,v in before.metadata.items() if k not in TRIGGER_FIELDS}
+    assert after.content == before.content
+    assert _history_counts(server) == counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat,expected", [
+    ("once", "2026-10-15"), ("daily", "2026-10-17"), ("weekly", "2026-10-22"),
+    ("monthly", "2026-11-15"), ("yearly", "2027-10-15"),
+])
+async def test_five_frequencies_advance_only_once_after_display(tmp_path, monkeypatch, repeat, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-16")
+    await server.hold("frequency reminder", trigger_date="2026-10-15", trigger_repeat=repeat)
+    bucket_id = (await server.bucket_mgr.list_all())[0]["id"]
+    before, counts = _raw_trigger(server, bucket_id), _history_counts(server)
+    assert bucket_id in await server.boot()
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert meta["trigger_date"] == expected
+    assert meta["trigger_anchor"] == "2026-10-15"
+    assert meta["trigger_last_seen"] == "2026-10-16"
+    assert bucket_id not in await server.boot()
+    assert meta["last_active"] == before["last_active"]
+    assert meta["updated_at"] == before["updated_at"]
+    assert _history_counts(server) == counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat,initial,days,expected", [
+    ("monthly", "2026-01-31", ["2026-01-31", "2026-02-28"], ["2026-02-28", "2026-03-31"]),
+    ("yearly", "2024-02-29", ["2024-02-29", "2025-02-28", "2026-02-28", "2027-02-28"],
+     ["2025-02-28", "2026-02-28", "2027-02-28", "2028-02-29"]),
+])
+async def test_calendar_anchor_survives_clamping(tmp_path, monkeypatch, repeat, initial, days, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.hold("calendar anchor", trigger_date=initial, trigger_repeat=repeat)
+    bucket_id = (await server.bucket_mgr.list_all())[0]["id"]
+    for day, next_date in zip(days, expected):
+        _freeze_day(server, monkeypatch, day)
+        assert bucket_id in await server.boot()
+        meta = _raw_trigger(server, bucket_id).metadata
+        assert (meta["trigger_date"], meta["trigger_anchor"]) == (next_date, initial)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat,expected", [
+    ("daily", "2026-10-19"), ("weekly", "2026-10-22"),
+    ("monthly", "2026-11-15"), ("yearly", "2027-10-15"),
+])
+async def test_missed_window_skips_without_display_or_expiry(tmp_path, monkeypatch, repeat, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    await server.hold("missed recurring reminder", trigger_date="2026-10-15", trigger_repeat=repeat)
+    bucket_id = (await server.bucket_mgr.list_all())[0]["id"]
+    before, counts = _raw_trigger(server, bucket_id), _history_counts(server)
+    result = await server.boot()
+    assert bucket_id not in result and "已自动收起" not in result
+    after = _raw_trigger(server, bucket_id)
+    assert after["trigger_date"] == expected
+    assert not after.get("trigger_expired_at") and not after.get("trigger_expiry_notified_at")
+    assert after["last_active"] == before["last_active"]
+    assert after["updated_at"] == before["updated_at"]
+    assert after.content == before.content and _history_counts(server) == counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_trace_frequency_only_reset_and_clear(tmp_path, monkeypatch, keyed):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("trace schedule changes")
+    sequence = iter(range(20))
+    async def edit(**fields):
+        extra = {"operation_id": f"trace-trigger-{next(sequence)}"} if keyed else {}
+        return await server.trace(bucket_id, **fields, **extra)
+    await edit(trigger_repeat="monthly")  # No date is legal; no guessed date.
+    assert _raw_trigger(server, bucket_id)["trigger_repeat"] == "monthly"
+    assert not _raw_trigger(server, bucket_id).get("trigger_date")
+    await edit(trigger_date="2026-01-31")
+    await server.bucket_mgr.update(bucket_id, trigger_last_seen="2026-02-01",
+        trigger_expired_at="2026-02-01", trigger_expiry_notified_at="2026-02-01")
+    await edit(name="unrelated metadata edit")
+    assert _raw_trigger(server, bucket_id)["trigger_repeat"] == "monthly"
+    await edit(trigger_repeat="yearly")
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert (meta["trigger_date"], meta["trigger_anchor"], meta["trigger_last_seen"]) == (
+        "2026-01-31", "2026-01-31", "2026-02-01")
+    assert not meta.get("trigger_expired_at") and not meta.get("trigger_expiry_notified_at")
+    await edit(trigger_date="2026-01-31")  # Same date is an explicit re-arm.
+    assert not _raw_trigger(server, bucket_id).get("trigger_last_seen")
+    await edit(trigger_date="none", trigger_repeat="daily")
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert not meta["trigger_date"] and not meta["trigger_last_seen"]
+    assert all(field not in meta for field in ("trigger_repeat", "trigger_anchor", "trigger_expired_at", "trigger_expiry_notified_at"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["", "hourly", "DAILY", " daily ", None, 1, []])
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_invalid_repeat_rejected_before_any_write(tmp_path, monkeypatch, value, keyed):
+    server = _load_server(tmp_path, monkeypatch)
+    extra = {"operation_id": "invalid-repeat"} if keyed else {}
+    result = await server.hold("must not be written", trigger_repeat=value, **extra)
+    assert "trigger_repeat must be" in result
+    assert await server.bucket_mgr.list_all() == []
+    bucket_id = await server.bucket_mgr.create("unchanged invalid trace")
+    path = server.bucket_mgr._find_bucket_file(bucket_id)
+    from pathlib import Path
+    before = Path(path).read_bytes()
+    result = await server.trace(bucket_id, trigger_date="none", trigger_repeat=value, **extra)
+    assert "trigger_repeat must be" in result
+    assert Path(path).read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyed", [False, True])
+@pytest.mark.parametrize("mode", ["ordinary", "feel", "pinned"])
+async def test_hold_reachable_modes_preserve_repeat_and_retry(tmp_path, monkeypatch, keyed, mode):
+    server = _load_server(tmp_path, monkeypatch)
+    fields = {"feel": True} if mode == "feel" else {"pinned": True} if mode == "pinned" else {}
+    if keyed:
+        fields["operation_id"] = f"hold-trigger-{mode}"
+    result = await server.hold("hold schedule modes", trigger_date="2026-10-15", trigger_repeat="monthly", **fields)
+    buckets = await server.bucket_mgr.list_all()
+    assert len(buckets) == 1, result
+    bucket_id = buckets[0]["id"]
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert (meta["trigger_date"], meta["trigger_repeat"], meta["trigger_anchor"]) == (
+        "2026-10-15", "monthly", "2026-10-15")
+    if keyed:
+        assert result == await server.hold("hold schedule modes", trigger_date="2026-10-15", trigger_repeat="monthly", **fields)
+        assert len(await server.bucket_mgr.list_all()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_duplicate_hold_omission_preserves_frequency_and_conflict_refuses(tmp_path, monkeypatch, keyed):
+    server = _load_server(tmp_path, monkeypatch)
+    await server.hold("duplicate schedule", trigger_date="2026-10-15", trigger_repeat="daily")
+    bucket = (await server.bucket_mgr.list_all())[0]
+    server.bucket_mgr.search = AsyncMock(return_value=[bucket])
+    extra = {"operation_id": "duplicate-trigger-omit"} if keyed else {}
+    result = await server.hold("duplicate schedule", **extra)
+    assert "reused=true" in result, result
+    assert _raw_trigger(server, bucket["id"])["trigger_repeat"] == "daily"
+    before = _raw_trigger(server, bucket["id"])
+    extra = {"operation_id": "duplicate-trigger-conflict"} if keyed else {}
+    result = await server.hold("duplicate schedule", trigger_repeat="weekly", **extra)
+    assert "conflicting trigger_repeat" in result
+    assert _raw_trigger(server, bucket["id"]).metadata == before.metadata
+
+
+@pytest.mark.asyncio
+async def test_legacy_bucket_defaults_once_and_malformed_repeat_is_not_guessed(tmp_path, monkeypatch):
+    import frontmatter
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    ids = [await server.bucket_mgr.create(text) for text in ("legacy reminder", "corrupt reminder")]
+    for index, bucket_id in enumerate(ids):
+        path = server.bucket_mgr._find_bucket_file(bucket_id)
+        post = frontmatter.load(path)
+        post["trigger_date"] = "2020-01-01"
+        if index == 0:
+            post.metadata.pop("trigger_repeat", None)
+        else:
+            post["trigger_repeat"] = "unknown-frequency"
+        frontmatter.dump(post, path)
+    result = await server.boot()
+    assert f"已自动收起 1 条过期提醒：[bucket_id:{ids[0]}]" in result
+    assert not _raw_trigger(server, ids[1]).get("trigger_expired_at")
+    assert _raw_trigger(server, ids[1])["trigger_date"] == "2020-01-01"
+
+
+@pytest.mark.asyncio
+async def test_repeat_wire_presence_enum_and_illegal_values(tmp_path, monkeypatch):
+    from mcp.shared.memory import create_connected_server_and_client_session
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("wire trigger")
+    async with create_connected_server_and_client_session(server.mcp) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        for name in ("hold", "trace"):
+            schema = tools[name].inputSchema["properties"]["trigger_repeat"]
+            assert schema["enum"] == ["once", "daily", "weekly", "monthly", "yearly"]
+            assert schema["default"] == "once"
+            for value in (None, "", "hourly", 2):
+                fields = {"content": "not written"} if name == "hold" else {"bucket_id": bucket_id, "trigger_date": "none"}
+                result = await client.call_tool(name, {**fields, "trigger_repeat": value})
+                assert result.isError
+                assert "trigger_repeat must be" in result.content[0].text
+        await client.call_tool("trace", {"bucket_id": bucket_id, "trigger_date": "2026-10-15", "trigger_repeat": "weekly"})
+        await client.call_tool("trace", {"bucket_id": bucket_id, "name": "wire omission"})
+        assert _raw_trigger(server, bucket_id)["trigger_repeat"] == "weekly"
+        await client.call_tool("trace", {"bucket_id": bucket_id, "trigger_repeat": "once"})
+        assert _raw_trigger(server, bucket_id)["trigger_repeat"] == "once"
+
+
+@pytest.mark.asyncio
+async def test_batch_trace_repeat_and_missing_anchor_initialization(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    ids = [await server.bucket_mgr.create(f"batch trigger {index}") for index in range(2)]
+    await server.trace(",".join(ids), trigger_date="2026-10-15", trigger_repeat="weekly")
+    for bucket_id in ids:
+        assert _raw_trigger(server, bucket_id)["trigger_repeat"] == "weekly"
+    await server.bucket_mgr.update(ids[0], trigger_anchor=None, trigger_last_seen="2026-10-15")
+    await server.trace(ids[0], trigger_repeat="monthly")
+    assert _raw_trigger(server, ids[0])["trigger_anchor"] == "2026-10-15"
+    assert _raw_trigger(server, ids[0])["trigger_last_seen"] == "2026-10-15"
+    await server.trace(",".join(ids), trigger_date="none", trigger_repeat="daily")
+    assert all(not _raw_trigger(server, bucket_id).get("trigger_anchor") for bucket_id in ids)
+
+
+@pytest.mark.asyncio
+async def test_restore_reminder_receipts_belong_to_exact_restored_schedule(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("restore original body")
+    await server.trace(bucket_id, trigger_date="2026-10-15", trigger_repeat="once")
+    await server.bucket_mgr.update(bucket_id, trigger_last_seen="2026-10-16",
+        trigger_expired_at="2026-10-18", trigger_expiry_notified_at="2026-10-18", _skip_revision=True)
+    await server.trace(bucket_id, content="restore changed body")
+    ref = next(row["ref"] for row in server.bucket_mgr.list_bucket_revisions(bucket_id) if row["op_kind"] == "replace")
+    same = server.bucket_mgr.plan_restore(bucket_id, ref)["metadata"]
+    assert same["trigger_expiry_notified_at"] == "2026-10-18"
+    await server.trace(bucket_id, trigger_date="2026-11-15", trigger_repeat="monthly")
+    await server.bucket_mgr.update(bucket_id, trigger_last_seen="2026-11-15", trigger_expired_at="2026-11-18",
+        trigger_expiry_notified_at="2026-11-18", _skip_revision=True)
+    changed = server.bucket_mgr.plan_restore(bucket_id, ref)["metadata"]
+    assert changed["trigger_date"] == "2026-10-15"
+    assert changed["trigger_repeat"] == "once"
+    assert all(not changed.get(field) for field in ("trigger_last_seen", "trigger_expired_at", "trigger_expiry_notified_at"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_hold_frequency_without_date_and_keyed_fingerprint(tmp_path, monkeypatch, keyed):
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    extra = {"operation_id": "frequency-before-date"} if keyed else {}
+    result = await server.hold("save frequency first", trigger_repeat="weekly", **extra)
+    buckets = await server.bucket_mgr.list_all()
+    assert len(buckets) == 1, result
+    meta = _raw_trigger(server, buckets[0]["id"]).metadata
+    assert meta["trigger_repeat"] == "weekly" and not meta["trigger_date"]
+    assert not meta.get("trigger_anchor")
+    assert "save frequency first" not in await server.boot()
+    if keyed:
+        assert result == await server.hold("save frequency first", trigger_repeat="weekly", **extra)
+        assert await server.hold("save frequency first", trigger_repeat="daily", **extra) == "operation_id_conflict"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["due", "expiry"])
+async def test_trigger_receipt_write_failure_keeps_retry_pending(tmp_path, monkeypatch, kind):
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    bucket_id = await server.bucket_mgr.create("receipt retry", name="write-failure-marker")
+    await server.trace(bucket_id, trigger_date="2026-10-18" if kind == "due" else "2026-10-01",
+                       trigger_repeat="daily" if kind == "due" else "once")
+    original = server.bucket_mgr._write_post_atomic
+    failures = []
+    def fail_receipt(path, post, **kwargs):
+        receipt = "trigger_last_seen" if kind == "due" else "trigger_expiry_notified_at"
+        if post.get(receipt) and not failures:
+            failures.append(receipt)
+            raise OSError("synthetic receipt disk failure")
+        return original(path, post, **kwargs)
+    monkeypatch.setattr(server.bucket_mgr, "_write_post_atomic", fail_receipt)
+    first = await server.boot()
+    assert "write-failure-marker" in first and failures
+    meta = _raw_trigger(server, bucket_id).metadata
+    if kind == "due":
+        assert meta["trigger_date"] == "2026-10-18" and not meta["trigger_last_seen"]
+    else:
+        assert meta["trigger_expired_at"] == "2026-10-18" and not meta.get("trigger_expiry_notified_at")
+    assert "write-failure-marker" in await server.boot()
+    meta = _raw_trigger(server, bucket_id).metadata
+    if kind == "due":
+        assert meta["trigger_date"] == "2026-10-19"
+    else:
+        assert meta["trigger_expiry_notified_at"] == "2026-10-18"
+
+
+@pytest.mark.asyncio
+async def test_trigger_only_cas_checks_schedule_and_file_incarnation(tmp_path, monkeypatch):
+    from pathlib import Path
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("CAS incarnation")
+    await server.trace(bucket_id, trigger_date="2026-10-18", trigger_repeat="daily")
+    prepared = server.bucket_mgr.prepare_boot_triggers([bucket_id], "2026-10-18")
+    await server.trace(bucket_id, trigger_date="2026-10-18")
+    assert not server.bucket_mgr.commit_boot_triggers(prepared["states"], {bucket_id: {"trigger_date": "2026-10-19"}})
+    prepared = server.bucket_mgr.prepare_boot_triggers([bucket_id], "2026-10-18")
+    path = Path(server.bucket_mgr._find_bucket_file(bucket_id))
+    path.write_bytes(path.read_bytes())  # Same fields, a different publication.
+    assert not server.bucket_mgr.commit_boot_triggers(prepared["states"], {bucket_id: {"trigger_date": "2026-10-19"}})
+    assert _raw_trigger(server, bucket_id)["trigger_date"] == "2026-10-18"
+
+
+@pytest.mark.asyncio
+async def test_automatic_expiry_respects_confirmed_delete_admission(tmp_path, monkeypatch):
+    from bucket_manager import BucketIdempotencyError
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    bucket_id = await server.bucket_mgr.create("guarded expiry")
+    healthy_id = await server.bucket_mgr.create("healthy admitted reminder", name="healthy-admission-marker")
+    await server.trace(bucket_id, trigger_date="2026-10-01")
+    await server.trace(healthy_id, trigger_date="2026-10-18")
+    before = _raw_trigger(server, bucket_id).metadata.copy()
+    original = server.bucket_mgr.assert_confirmed_delete_writable
+    def deny(bucket):
+        if bucket == bucket_id:
+            raise BucketIdempotencyError("confirmed_delete_pending")
+        return original(bucket)
+    monkeypatch.setattr(server.bucket_mgr, "assert_confirmed_delete_writable", deny)
+    result = await server.boot()
+    assert "healthy-admission-marker" in result
+    assert "已自动收起" not in result
+    assert _raw_trigger(server, bucket_id).metadata == before
+    monkeypatch.setattr(server.bucket_mgr, "assert_confirmed_delete_writable", original)
+    assert f"已自动收起 1 条过期提醒：[bucket_id:{bucket_id}]" in await server.boot()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat", ["once", "weekly"])
+async def test_prepare_io_failure_isolated_to_one_bucket_and_retryable(tmp_path, monkeypatch, repeat):
+    from pathlib import Path
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    failed_id = await server.bucket_mgr.create("failed background transition", name="failed-transition-marker")
+    healthy_id = await server.bucket_mgr.create("healthy reminder", name="healthy-transition-marker")
+    await server.trace(failed_id, trigger_date="2026-10-01", trigger_repeat=repeat)
+    await server.trace(healthy_id, trigger_date="2026-10-18")
+    path = Path(server.bucket_mgr._find_bucket_file(failed_id))
+    before, counts = path.read_bytes(), _history_counts(server)
+    original, failures = server.bucket_mgr._write_post_atomic, []
+    def fail_initial_transition(target, post, **kwargs):
+        if post["id"] == failed_id and not failures:
+            failures.append(post["id"])
+            raise OSError("synthetic initial transition failure")
+        return original(target, post, **kwargs)
+    monkeypatch.setattr(server.bucket_mgr, "_write_post_atomic", fail_initial_transition)
+    result = await server.boot()
+    assert "healthy-transition-marker" in result
+    assert "failed-transition-marker" not in result and "已自动收起" not in result
+    assert path.read_bytes() == before and failures == [failed_id]
+    assert _raw_trigger(server, healthy_id)["trigger_last_seen"] == "2026-10-18"
+    followup = await server.boot()
+    meta = _raw_trigger(server, failed_id).metadata
+    if repeat == "once":
+        assert f"已自动收起 1 条过期提醒：[bucket_id:{failed_id}]" in followup
+        assert meta["trigger_expired_at"] == meta["trigger_expiry_notified_at"] == "2026-10-18"
+    else:
+        assert "failed-transition-marker" not in followup and "已自动收起" not in followup
+        assert meta["trigger_date"] == "2026-10-22"
+        assert not meta.get("trigger_expired_at") and not meta.get("trigger_last_seen")
+    assert _history_counts(server) == counts
+
+
+@pytest.mark.asyncio
+async def test_prepare_keeps_system_maintenance_refusal_outside_bucket_catch(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from maintenance_write_gate import MaintenanceWriteError
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("system freeze must propagate")
+    await server.trace(bucket_id, trigger_date="2026-10-01")
+    before = _raw_trigger(server, bucket_id).metadata.copy()
+    @contextmanager
+    def refuse(operation):
+        raise MaintenanceWriteError("maintenance_frozen")
+        yield
+    monkeypatch.setattr(server.bucket_mgr, "write_coordinator", SimpleNamespace(writer_scope=refuse))
+    with pytest.raises(MaintenanceWriteError, match="maintenance_frozen"):
+        server.bucket_mgr.prepare_boot_triggers([bucket_id], "2026-10-18")
+    assert _raw_trigger(server, bucket_id).metadata == before
+
+
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)

@@ -6,6 +6,138 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["talk", "code", "tg"])
+async def test_lifecycle_low_budget_keeps_expiry_pending_and_repeating_items_unconsumed(tmp_path, monkeypatch, profile):
+    from tests.test_trigger_memory import _freeze_day, _raw_trigger
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    due_ids = []
+    for index in range(10):
+        bucket_id = await server.bucket_mgr.create("触" * 280 + f"END_REPEAT_{index}", name=f"due-{index}")
+        await server.trace(bucket_id, trigger_date="2026-10-18", trigger_repeat="daily")
+        due_ids.append(bucket_id)
+    expired_ids = []
+    for index in range(5):
+        bucket_id = await server.bucket_mgr.create("expired body", name=f"expired-{index}")
+        await server.trace(bucket_id, trigger_date="2026-10-01")
+        expired_ids.append(bucket_id)
+    result = await server.boot(profile=profile, max_tokens=1000)
+    assert server.count_tokens_approx(result) <= 1000
+    assert not all(_raw_trigger(server, bucket_id).get("trigger_expiry_notified_at") for bucket_id in expired_ids)
+    consumed = 0
+    for index, bucket_id in enumerate(due_ids):
+        complete = f"END_REPEAT_{index}" in result
+        meta = _raw_trigger(server, bucket_id).metadata
+        assert (meta["trigger_date"] == "2026-10-19") is complete
+        consumed += complete
+    assert consumed < len(due_ids)
+    followup = await server.boot(profile=profile, max_tokens=16000)
+    # TG's bounded selection may leave extra previews for subsequent boots;
+    # collect them until the pending expiry line can be delivered in full.
+    for _ in range(4):
+        if "已自动收起 5 条过期提醒：" in followup and "另有 2 条" in followup:
+            break
+        followup = await server.boot(profile=profile, max_tokens=16000)
+    assert "已自动收起 5 条过期提醒：" in followup and "另有 2 条" in followup
+    assert all(_raw_trigger(server, bucket_id)["trigger_expiry_notified_at"] == "2026-10-18" for bucket_id in expired_ids)
+    assert "已自动收起" not in await server.boot(profile=profile)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", [False, True])
+async def test_expiry_receipt_requires_complete_final_line(tmp_path, monkeypatch, partial):
+    from tests.test_trigger_memory import _freeze_day, _raw_trigger
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    bucket_id = await server.bucket_mgr.create("old expiry", name="receipt-tail-marker")
+    await server.trace(bucket_id, trigger_date="2026-10-01")
+    original = server._fit_sections_to_budget
+    def truncate_receipt(*args, **kwargs):
+        body, emitted = original(*args, **kwargs)
+        text = emitted["triggers"]
+        end = text.index("已自动收起")
+        clipped = text[:end + (12 if partial else 0)]
+        emitted["triggers"] = clipped
+        return body.replace(text, clipped), emitted
+    monkeypatch.setattr(server, "_fit_sections_to_budget", truncate_receipt)
+    result = await server.boot(max_tokens=1000)
+    assert "receipt-tail-marker" not in result
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert meta["trigger_expired_at"] == "2026-10-18"
+    assert not meta.get("trigger_expiry_notified_at")
+    monkeypatch.setattr(server, "_fit_sections_to_budget", original)
+    assert "receipt-tail-marker" in await server.boot()
+    assert _raw_trigger(server, bucket_id)["trigger_expiry_notified_at"] == "2026-10-18"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_boots_deliver_and_advance_one_occurrence_once(tmp_path, monkeypatch):
+    import asyncio
+    from tests.test_trigger_memory import _freeze_day, _raw_trigger
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    bucket_id = await server.bucket_mgr.create("only one occurrence", name="concurrent-reminder")
+    await server.trace(bucket_id, trigger_date="2026-10-18", trigger_repeat="daily")
+    ready, both_ready = 0, asyncio.Event()
+    async def barrier(buckets):
+        nonlocal ready
+        ready += 1
+        if ready == 2:
+            both_ready.set()
+        await asyncio.wait_for(both_ready.wait(), timeout=5)
+        return {}
+    monkeypatch.setattr(server, "_trigger_stale_hints", barrier)
+    results = await asyncio.gather(server.boot(profile="talk"), server.boot(profile="code"))
+    assert sum("concurrent-reminder" in result for result in results) == 1
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert meta["trigger_date"] == "2026-10-19"
+    assert meta["trigger_anchor"] == "2026-10-18"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_trace_rebuilds_final_trigger_output(tmp_path, monkeypatch):
+    from tests.test_trigger_memory import _freeze_day, _raw_trigger
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    bucket_id = await server.bucket_mgr.create("trace wins", name="stale-preview-must-disappear")
+    await server.trace(bucket_id, trigger_date="2026-10-18", trigger_repeat="daily")
+    async def reschedule(buckets):
+        await server.trace(bucket_id, trigger_date="2026-11-10", trigger_repeat="monthly")
+        return {}
+    monkeypatch.setattr(server, "_trigger_stale_hints", reschedule)
+    result = await server.boot()
+    assert "stale-preview-must-disappear" not in result
+    meta = _raw_trigger(server, bucket_id).metadata
+    assert (meta["trigger_date"], meta["trigger_repeat"], meta["trigger_anchor"]) == (
+        "2026-11-10", "monthly", "2026-11-10")
+    assert not meta.get("trigger_last_seen")
+
+
+@pytest.mark.asyncio
+async def test_final_delta_cas_recomposition_rechecks_expiry_line_delivery(tmp_path, monkeypatch):
+    from tests.test_trigger_memory import _freeze_day, _raw_trigger
+    server = _load_server(tmp_path, monkeypatch)
+    _freeze_day(server, monkeypatch, "2026-10-18")
+    await server.boot()
+    bucket_id = await server.bucket_mgr.create("CAS expiry body", name="cas-expiry-marker")
+    await server.trace(bucket_id, trigger_date="2026-10-01")
+    original = server.bucket_mgr.advance_boot_delta_checkpoint
+    calls = []
+    def conflict(expected, next_event_id, profile="talk"):
+        calls.append(next_event_id)
+        if len(calls) == 1:
+            original(expected, server.bucket_mgr.get_boot_delta_high_water(), profile=profile)
+            return False
+        return original(expected, next_event_id, profile=profile)
+    monkeypatch.setattr(server.bucket_mgr, "advance_boot_delta_checkpoint", conflict)
+    result = await server.boot(max_tokens=1000)
+    assert calls
+    assert "（无新增变化）" in result
+    assert "cas-expiry-marker" in result
+    assert _raw_trigger(server, bucket_id)["trigger_expiry_notified_at"] == "2026-10-18"
+
+
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "profile-seal")
