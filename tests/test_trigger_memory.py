@@ -10,6 +10,7 @@ def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
     monkeypatch.delenv("OMBRE_TRIGGER_STALE_THRESHOLD", raising=False)
+    monkeypatch.delenv("OMBRE_TRIGGER_STALE_LEAD", raising=False)
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
@@ -381,7 +382,7 @@ async def test_trigger_hint_default_threshold_boundary(tmp_path, monkeypatch, sc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("threshold,score,expected", [
-    ("0.90", 0.85, False), ("0.60", 0.64, True), ("0", 0.0, True),
+    ("0.90", 0.85, False), ("0.60", 0.64, True), ("0", 0.0, False),
     ("1", 0.9999, False), ("1", 1.0, True), (" 0.7 ", 0.70, True),
 ])
 async def test_trigger_hint_threshold_override(tmp_path, monkeypatch, threshold, score, expected):
@@ -420,16 +421,18 @@ async def test_trigger_hint_reloads_threshold_and_displays_one(tmp_path, monkeyp
         "⚠ 可能已过时（相似 1.00）：[bucket_id:newer] newer（2026-10-15）"
     )
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case,score,expected", [
     ("missing", None, False), ("none", None, False),
-    ("empty", "", False), ("zero", 0.0, True),
+    ("empty", "", False), ("zero", 0.0, False), ("positive", 0.01, True),
 ])
 async def test_trigger_hint_zero_threshold_requires_explicit_score(
     tmp_path, monkeypatch, case, score, expected
 ):
     server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setenv("OMBRE_TRIGGER_STALE_THRESHOLD", "0")
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", "0")
     candidate = _candidate(score=score)
     if case == "missing":
         candidate.pop("semantic_score")
@@ -437,4 +440,139 @@ async def test_trigger_hint_zero_threshold_requires_explicit_score(
     hint = await server._trigger_stale_hint(_trigger_bucket())
     assert bool(hint) is expected
     if expected:
-        assert "（相似 0.00）：" in hint
+        assert "（相似 0.01）：" in hint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second,expected", [
+    (0.68, 0.66, False), (0.66, 0.64, False),
+    (0.70, 0.64, True), (0.64, 0.50, False),
+])
+async def test_trigger_hint_requires_lead_including_below_threshold_runner_up(
+    tmp_path, monkeypatch, first, second, expected
+):
+    server = _load_server(tmp_path, monkeypatch)
+    server._recall_memory_candidates.return_value = _recall(
+        _candidate("second", score=second), _candidate("first", score=first)
+    )
+    hint = await server._trigger_stale_hint(_trigger_bucket())
+    assert bool(hint) is expected
+    if expected:
+        assert "[bucket_id:first]" in hint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("score", [0.80, 1.0])
+@pytest.mark.parametrize("lead", [None, "0"])
+async def test_trigger_hint_ties_are_suppressed_in_either_order(
+    tmp_path, monkeypatch, score, lead
+):
+    server = _load_server(tmp_path, monkeypatch)
+    if lead is not None:
+        monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", lead)
+    candidates = [_candidate("one", score=score), _candidate("two", score=score)]
+    for ordered in (candidates, list(reversed(candidates))):
+        server._recall_memory_candidates.return_value = _recall(*ordered)
+        assert await server._trigger_stale_hint(_trigger_bucket()) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("score,expected", [(0.0, False), (0.04, False), (0.05, True), (0.10, True)])
+async def test_trigger_hint_single_candidate_uses_zero_runner_up(tmp_path, monkeypatch, score, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_THRESHOLD", "0")
+    server._recall_memory_candidates.return_value = _recall(_candidate(score=score))
+    assert bool(await server._trigger_stale_hint(_trigger_bucket())) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second,expected", [
+    (0.70, 0.65, True), (0.80, 0.75, True),
+    (0.70, 0.6500000001, False), (0.7000000001, 0.65, True),
+])
+async def test_trigger_hint_lead_boundary_uses_raw_scores(tmp_path, monkeypatch, first, second, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    server._recall_memory_candidates.return_value = _recall(
+        _candidate("first", score=first), _candidate("second", score=second)
+    )
+    assert bool(await server._trigger_stale_hint(_trigger_bucket())) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lead,first,second,expected", [
+    ("0", 0.80, 0.79, True), ("0.03", 0.80, 0.76, True),
+    ("0.05", 0.80, 0.76, False), ("0.04", 0.80, 0.76, True),
+    ("1", 1.0, None, True), ("1", 1.0, 0.01, False), (" 0.1 ", 0.80, 0.70, True),
+])
+async def test_trigger_hint_lead_override(tmp_path, monkeypatch, lead, first, second, expected):
+    server = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", lead)
+    candidates = [_candidate("first", score=first)]
+    if second is not None:
+        candidates.append(_candidate("second", score=second))
+    server._recall_memory_candidates.return_value = _recall(*candidates)
+    assert bool(await server._trigger_stale_hint(_trigger_bucket())) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [None, "", "  ", "broken", "NaN", "nan", "inf", "-inf", "1e999", "-0.01", "1.01"])
+async def test_trigger_hint_invalid_lead_falls_back(tmp_path, monkeypatch, configured):
+    server = _load_server(tmp_path, monkeypatch)
+    if configured is not None:
+        monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", configured)
+    assert server._trigger_stale_lead() == 0.05
+    server._recall_memory_candidates.return_value = _recall(
+        _candidate("first", score=0.80), _candidate("second", score=0.76)
+    )
+    assert await server._trigger_stale_hint(_trigger_bucket()) == ""
+    server._recall_memory_candidates.return_value = _recall(
+        _candidate("first", score=0.70), _candidate("second", score=0.65)
+    )
+    assert "[bucket_id:first]" in await server._trigger_stale_hint(_trigger_bucket())
+
+
+@pytest.mark.asyncio
+async def test_trigger_hint_reloads_lead_per_check(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    server._recall_memory_candidates.return_value = _recall(
+        _candidate("first", score=0.80), _candidate("second", score=0.76)
+    )
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", "0.03")
+    assert "[bucket_id:first]" in await server._trigger_stale_hint(_trigger_bucket())
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", "0.05")
+    assert await server._trigger_stale_hint(_trigger_bucket()) == ""
+    monkeypatch.setenv("OMBRE_TRIGGER_STALE_LEAD", "broken")
+    assert await server._trigger_stale_hint(_trigger_bucket()) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "self", "sealed", "test", "dormant", "superseded", "older", "equal", "mixed_zone",
+    "bad_time", "missing_time", "missing_score", "none_score", "nan", "infinity",
+])
+async def test_trigger_hint_filters_runner_up_before_lead(tmp_path, monkeypatch, case):
+    server = _load_server(tmp_path, monkeypatch)
+    runner_up = _candidate("runner", score=0.89)
+    if case == "self":
+        runner_up["id"] = "reminder"
+    elif case in {"sealed", "dormant"}:
+        runner_up["metadata"][case] = True
+    elif case == "test":
+        runner_up["metadata"]["tags"] = ["test"]
+    elif case == "superseded":
+        runner_up["metadata"]["superseded_by"] = "none"
+    elif case in {"older", "equal", "mixed_zone", "bad_time", "missing_time"}:
+        runner_up["metadata"]["created"] = {
+            "older": "2026-10-15T08:00:00", "equal": "2026-10-15T09:00:00",
+            "mixed_zone": "2026-10-15T10:00:00+08:00", "bad_time": "invalid", "missing_time": None,
+        }[case]
+    elif case == "missing_score":
+        runner_up.pop("semantic_score")
+    else:
+        runner_up["semantic_score"] = {
+            "none_score": None, "nan": float("nan"), "infinity": float("inf"),
+        }[case]
+    server._recall_memory_candidates.return_value = _recall(
+        runner_up, _candidate("first", score=0.90)
+    )
+    assert "[bucket_id:first]" in await server._trigger_stale_hint(_trigger_bucket())

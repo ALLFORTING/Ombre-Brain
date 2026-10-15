@@ -11,6 +11,7 @@ def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "profile-seal")
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
     monkeypatch.delenv("OMBRE_TRIGGER_STALE_THRESHOLD", raising=False)
+    monkeypatch.delenv("OMBRE_TRIGGER_STALE_LEAD", raising=False)
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
@@ -362,3 +363,31 @@ async def test_trigger_hint_budget_and_cas_keep_preview_consumption(
         assert (metadata["trigger_last_seen"] == today) is (f"END_HINT_{index}" in result)
         assert not metadata.get("resolved", False)
         assert not metadata.get("superseded_by")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["talk", "code", "tg"])
+async def test_profile_boot_suppresses_tied_one_point_zero_hints(tmp_path, monkeypatch, profile):
+    from datetime import datetime
+
+    server = _load_server(tmp_path, monkeypatch)
+    today = datetime.now().date().isoformat()
+    bucket_id = await server.bucket_mgr.create("TIED_HINT_PREVIEW_SURVIVES", name="due reminder")
+    await server.bucket_mgr.update(bucket_id, trigger_date=today)
+    recall = _newer_trigger_recall()
+    recall["candidates"][0]["semantic_score"] = 1.0
+    recall["candidates"].append({
+        "id": "second-reference",
+        "metadata": {"name": "other newer information", "created": "2099-01-01T10:00:00"},
+        "content": "OTHER_CANDIDATE_BODY_MUST_NOT_LEAK",
+        "semantic_score": 1.0,
+    })
+    server._recall_memory_candidates.return_value = recall
+
+    result = await server.boot(profile=profile)
+
+    assert "TIED_HINT_PREVIEW_SURVIVES" in result
+    assert "⚠ 可能已过时" not in result
+    assert "CANDIDATE_BODY_MUST_NOT_LEAK" not in result
+    assert "OTHER_CANDIDATE_BODY_MUST_NOT_LEAK" not in result
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["trigger_last_seen"] == today

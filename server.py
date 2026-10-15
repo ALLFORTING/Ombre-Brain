@@ -40,6 +40,7 @@ import errno
 import io
 import random
 import logging
+import math
 import asyncio
 import weakref
 import copy
@@ -2188,6 +2189,8 @@ _TRIGGER_HINT_TIMEOUT_SECONDS = 5.0
 # 0.65 is an uncalibrated estimate. Display the semantic score so observation
 # can guide tuning; a possible-staleness hint never invalidates a fact.
 _TRIGGER_HINT_DEFAULT_THRESHOLD = 0.65
+# The minimum lead is also an uncalibrated estimate.
+_TRIGGER_HINT_DEFAULT_LEAD = 0.05
 
 
 def _trigger_stale_threshold() -> float:
@@ -2196,6 +2199,14 @@ def _trigger_stale_threshold() -> float:
     except (TypeError, ValueError):
         return _TRIGGER_HINT_DEFAULT_THRESHOLD
     return value if 0.0 <= value <= 1.0 else _TRIGGER_HINT_DEFAULT_THRESHOLD
+
+
+def _trigger_stale_lead() -> float:
+    try:
+        value = float(os.getenv("OMBRE_TRIGGER_STALE_LEAD", "").strip())
+    except (TypeError, ValueError):
+        return _TRIGGER_HINT_DEFAULT_LEAD
+    return value if 0.0 <= value <= 1.0 else _TRIGGER_HINT_DEFAULT_LEAD
 
 
 def _trigger_created(metadata: dict) -> datetime | None:
@@ -2218,7 +2229,7 @@ async def _trigger_stale_hint(bucket: dict) -> str:
         if recall.get("semantic", {}).get("status") != "available":
             return ""
         threshold = _trigger_stale_threshold()
-        best = None
+        scored = []
         for candidate in recall.get("candidates", []):
             try:
                 meta = candidate.get("metadata", {})
@@ -2230,7 +2241,7 @@ async def _trigger_stale_hint(bucket: dict) -> str:
                 ):
                     continue
                 score = float(candidate["semantic_score"])
-                if not threshold <= score <= 1.0:
+                if not 0.0 <= score <= 1.0:
                     continue
                 newer = _trigger_created(meta)
                 if newer is None or (newer.tzinfo is None) != (created.tzinfo is None):
@@ -2238,13 +2249,22 @@ async def _trigger_stale_hint(bucket: dict) -> str:
                 # Aware datetimes compare by instant; naive timestamps stay local.
                 if newer <= created:
                     continue
-                if best is None or score > best[0]:
-                    best = (score, candidate_id, meta, newer)
+                scored.append((score, candidate_id, meta, newer))
             except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
                 continue
-        if best is None:
+        if not scored:
             return ""
-        score, candidate_id, meta, newer = best
+        scored.sort(key=lambda item: item[0], reverse=True)
+        score, candidate_id, meta, newer = scored[0]
+        # Keep the runner-up even below threshold; missing second place is zero.
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        if score < threshold or score <= second_score:
+            return ""  # A tie never has a winner, including when lead is zero.
+        lead = _trigger_stale_lead()
+        gap = score - second_score
+        # Unit-range scores need only a tiny subtraction-error allowance, not rounding.
+        if gap < lead and not math.isclose(gap, lead, rel_tol=0.0, abs_tol=1e-12):
+            return ""
         name = " ".join(str(meta.get("name") or candidate_id).split())
         if len(name) > 80:
             name = name[:77].rstrip() + "..."
