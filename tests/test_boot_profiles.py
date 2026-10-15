@@ -10,9 +10,13 @@ def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     monkeypatch.setenv("OMBRE_RESPONSE_SEAL", "profile-seal")
     monkeypatch.delenv("OMBRE_API_KEY", raising=False)
+    monkeypatch.delenv("OMBRE_TRIGGER_STALE_THRESHOLD", raising=False)
     sys.modules.pop("server", None)
     server = importlib.import_module("server")
     server.decay_engine.ensure_started = AsyncMock(return_value=None)
+    server._recall_memory_candidates = AsyncMock(
+        return_value={"candidates": [], "semantic": {"status": "disabled"}}
+    )
     server.dehydrator.dehydrate = AsyncMock(
         side_effect=lambda content, metadata=None: content[:120]
     )
@@ -221,3 +225,140 @@ async def test_profile_boot_does_not_touch_bucket_files(tmp_path, monkeypatch):
     await server.boot(profile="tg")
 
     assert open(path, "rb").read() == before
+
+
+def _newer_trigger_recall():
+    return {
+        "semantic": {"status": "available"},
+        "candidates": [{
+            "id": "newer-reference",
+            "metadata": {"name": "newer information", "created": "2099-01-01T10:00:00"},
+            "content": "CANDIDATE_BODY_MUST_NOT_LEAK",
+            "semantic_score": 0.90,
+        }],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile,limit", [("talk", 10), ("code", 10), ("tg", 5)])
+async def test_profile_trigger_hints_only_recall_shown_items(tmp_path, monkeypatch, profile, limit):
+    from datetime import datetime
+
+    server = _load_server(tmp_path, monkeypatch)
+    today = datetime.now().date().isoformat()
+    ids = []
+    for index in range(12):
+        bucket_id = await server.bucket_mgr.create(f"shown reminder {index}", name=f"reminder {index}")
+        await server.bucket_mgr.update(bucket_id, trigger_date=today)
+        ids.append(bucket_id)
+    server._recall_memory_candidates.return_value = _newer_trigger_recall()
+
+    result = await server.boot(profile=profile)
+
+    assert server._recall_memory_candidates.await_count == limit
+    assert result.count("⚠ 可能已过时（相似 0.90）：[bucket_id:newer-reference] newer information（2099-01-01）") == limit
+    assert "CANDIDATE_BODY_MUST_NOT_LEAK" not in result
+    assert server.count_tokens_approx(result) <= server.BOOT_PROFILE_CONFIG[profile]["max_tokens"]
+    seen = 0
+    for bucket_id in ids:
+        metadata = (await server.bucket_mgr.get(bucket_id))["metadata"]
+        seen += metadata.get("trigger_last_seen") == today
+        assert not metadata.get("resolved", False)
+        assert not metadata.get("superseded_by")
+    assert seen == limit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["talk", "code", "tg"])
+@pytest.mark.parametrize("failure", ["error", "disabled", "empty", "timeout"])
+async def test_profile_boot_survives_trigger_recall_failure(tmp_path, monkeypatch, profile, failure):
+    import asyncio
+    from datetime import datetime
+
+    server = _load_server(tmp_path, monkeypatch)
+    today = datetime.now().date().isoformat()
+    bucket_id = await server.bucket_mgr.create("FAILURE_PREVIEW_SURVIVES", name="due reminder")
+    await server.bucket_mgr.update(bucket_id, trigger_date=today)
+    cancelled = []
+    if failure == "error":
+        server._recall_memory_candidates.side_effect = RuntimeError("PRIVATE_RECALL_FAILURE")
+    elif failure == "timeout":
+        monkeypatch.setattr(server, "_TRIGGER_HINT_TIMEOUT_SECONDS", 0.01)
+
+        async def recall(content, limit):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+
+        server._recall_memory_candidates.side_effect = recall
+    else:
+        server._recall_memory_candidates.return_value = {
+            "semantic": {"status": "disabled" if failure == "disabled" else "available"},
+            "candidates": [],
+        }
+
+    result = await server.boot(profile=profile)
+
+    assert result.startswith(f"boot profile: {profile}\n")
+    assert "FAILURE_PREVIEW_SURVIVES" in result
+    assert "⚠" not in result and "PRIVATE_RECALL_FAILURE" not in result
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["trigger_last_seen"] == today
+    if failure == "timeout":
+        assert cancelled == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_tokens", [1000, 16000])
+@pytest.mark.parametrize("cas_conflict", [False, True])
+async def test_trigger_hint_budget_and_cas_keep_preview_consumption(
+    tmp_path, monkeypatch, max_tokens, cas_conflict
+):
+    from datetime import datetime
+
+    server = _load_server(tmp_path, monkeypatch)
+    await server.boot()
+    today = datetime.now().date().isoformat()
+    ids = []
+    for index in range(8):
+        bucket_id = await server.bucket_mgr.create(
+            "触" * 280 + f"END_HINT_{index}", name=f"due hint {index}"
+        )
+        await server.bucket_mgr.update(bucket_id, trigger_date=today)
+        ids.append(bucket_id)
+    # Keep the same delta text across the two deliveries; real checkpoints still advance.
+    monkeypatch.setattr(server, "_format_boot_delta", lambda **kwargs: (
+        "=== boot: 增量摘要 ===\n（无新增变化）", kwargs["high_water"]
+    ))
+    baseline = await server.boot(max_tokens=max_tokens)
+    for bucket_id in ids:
+        await server.bucket_mgr.update(bucket_id, trigger_last_seen="")
+    await server.bucket_mgr.create("checkpoint advance only", tags=["test"])
+    server._recall_memory_candidates.reset_mock()
+    server._recall_memory_candidates.return_value = _newer_trigger_recall()
+    original = server.bucket_mgr.advance_boot_delta_checkpoint
+    advances = []
+
+    def concurrent_advance(expected_event_id, next_event_id, profile="talk"):
+        advances.append(next_event_id)
+        advanced = original(expected_event_id, next_event_id, profile=profile)
+        return False if cas_conflict and len(advances) == 1 else advanced
+
+    monkeypatch.setattr(server.bucket_mgr, "advance_boot_delta_checkpoint", concurrent_advance)
+    result = await server.boot(max_tokens=max_tokens)
+
+    assert server._recall_memory_candidates.await_count == 8  # CAS never repeats recall.
+    assert advances
+    assert server.count_tokens_approx(result) <= max_tokens
+    if max_tokens == 1000:
+        assert result == baseline  # All previews/other sections retain their original budget.
+        assert "⚠" not in result
+        assert 0 < sum(f"END_HINT_{index}" in result for index in range(8)) < 8
+    else:
+        assert result.count("⚠ 可能已过时（相似 0.90）：") == 8
+    for index, bucket_id in enumerate(ids):
+        assert (f"END_HINT_{index}" in baseline) == (f"END_HINT_{index}" in result)
+        metadata = (await server.bucket_mgr.get(bucket_id))["metadata"]
+        assert (metadata["trigger_last_seen"] == today) is (f"END_HINT_{index}" in result)
+        assert not metadata.get("resolved", False)
+        assert not metadata.get("superseded_by")
