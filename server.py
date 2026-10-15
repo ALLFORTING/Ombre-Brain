@@ -67,6 +67,9 @@ from urllib.parse import urlparse
 from typing import Union
 from functools import wraps
 import inspect
+from contextvars import ContextVar
+from bucket_manager import (TRIGGER_REPEATS, TRIGGER_FIELDS, trigger_metadata_updates,
+                            hold_trigger_metadata_updates, next_trigger_date)
 from contextlib import asynccontextmanager, nullcontext
 from typing_extensions import Annotated, Literal
 from pydantic import Field
@@ -306,6 +309,23 @@ async def _fire_webhook(event: str, payload: dict) -> None:
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
+_TRIGGER_REPEAT_SUPPLIED = ContextVar("trigger_repeat_supplied", default=False)
+TRIGGER_REPEAT_DESCRIPTION = (
+    "Reminder frequency: once (default, show on the date and the following two days, then retire); "
+    "daily (every day), weekly (every seven days), monthly (original day, clamped to month end), "
+    "yearly (original month/day, clamped for leap day). Repeating reminders advance after complete "
+    "boot display; missed three-day windows are skipped. Omitting this field preserves an existing "
+    "frequency; new reminders default to once. No date means no reminder."
+)
+
+
+def _trigger_repeat_argument_error(arguments):
+    if "trigger_repeat" in arguments and (not isinstance(arguments["trigger_repeat"], str)
+                                            or arguments["trigger_repeat"] not in TRIGGER_REPEATS):
+        return "trigger_repeat must be once, daily, weekly, monthly, or yearly."
+    return None
+
+
 def _todo_drop_argument_error(arguments: dict) -> str | None:
     """Check explicit drop arguments before SDK defaults are expanded."""
     if arguments.get('operation_id') is not None and 'todo_drop' in arguments:
@@ -343,22 +363,30 @@ def _finish_stateless_tool_call(task):
 
 class _TodoDropGuardFastMCP(FastMCP):
     async def call_tool(self, name: str, arguments: dict):
+        if name in ("hold", "trace"):
+            error = _trigger_repeat_argument_error(arguments)
+            if error:
+                return CallToolResult(isError=True, content=[TextContent(type="text", text=error)])
         if name == "trace":
             error = _todo_drop_argument_error(arguments)
             if error:
                 return CallToolResult(isError=True, content=[TextContent(type="text", text=error)])
-        if not (self.settings.stateless_http and _SHIELD_STATELESS_TOOL_CALLS):
-            return await super().call_tool(name, arguments)
-        task = asyncio.create_task(super().call_tool(name, arguments))
-        _STATELESS_TOOL_CALL_TASKS.add(task)
-        task.add_done_callback(_finish_stateless_tool_call)
+        presence = _TRIGGER_REPEAT_SUPPLIED.set("trigger_repeat" in arguments)
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if not task.done():
-                task._ob_waiter_gone = True
-                logger.info("client left during tool %s; finishing it without a reply", name)
-            raise
+            if not (self.settings.stateless_http and _SHIELD_STATELESS_TOOL_CALLS):
+                return await super().call_tool(name, arguments)
+            task = asyncio.create_task(super().call_tool(name, arguments))
+            _STATELESS_TOOL_CALL_TASKS.add(task)
+            task.add_done_callback(_finish_stateless_tool_call)
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    task._ob_waiter_gone = True
+                    logger.info("client left during tool %s; finishing it without a reply", name)
+                raise
+        finally:
+            _TRIGGER_REPEAT_SUPPLIED.reset(presence)
 
 
 def _guard_todo_drop_presence(fn):
@@ -367,10 +395,16 @@ def _guard_todo_drop_presence(fn):
     @wraps(fn)
     async def guarded(*args, **kwargs):
         supplied = signature.bind_partial(*args, **kwargs).arguments
-        error = _todo_drop_argument_error(supplied)
+        error = _trigger_repeat_argument_error(supplied)
+        if error is None and fn.__name__ == "trace":
+            error = _todo_drop_argument_error(supplied)
         if error:
             return error
-        return await fn(*args, **kwargs)
+        presence = _TRIGGER_REPEAT_SUPPLIED.set("trigger_repeat" in supplied)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _TRIGGER_REPEAT_SUPPLIED.reset(presence)
     return guarded
 
 
@@ -828,6 +862,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     trigger_date: str = "",
+    trigger_repeat: str | None = None,
     todos: list | None = None,
     provenance_kind: str | None = None,
     source_id_out: list[str] | None = None,
@@ -862,16 +897,7 @@ async def _merge_or_create(
         ):
             # Deterministic duplicate only: reuse the existing record without
             # invoking the lossy LLM merge path.
-            writes = {}
-            if trigger_date:
-                old_date = str(metadata.get("trigger_date", "") or "").strip()
-                if old_date and old_date != trigger_date:
-                    raise ValueError(
-                        f"duplicate bucket {bucket['id']} has trigger_date={old_date}; "
-                        f"requested {trigger_date} was rejected without writing"
-                    )
-                if old_date != trigger_date:
-                    writes.update(trigger_date=trigger_date, trigger_last_seen="")
+            writes = hold_trigger_metadata_updates(metadata, trigger_date, trigger_repeat)
             if incoming_todos:
                 existing_todos = _canonical_todos(metadata.get("todos"))
                 merged_todos, merged_provenance = merge_todo_provenance(
@@ -913,9 +939,9 @@ async def _merge_or_create(
         provenance_kind=provenance_kind,
     )
     await _auto_link_related(bucket_id)
-    if trigger_date:
-        if not await bucket_mgr.update(bucket_id, trigger_date=trigger_date,
-                                       trigger_last_seen=""):
+    trigger_writes = trigger_metadata_updates({}, trigger_date=trigger_date or None, trigger_repeat=trigger_repeat)
+    if trigger_writes:
+        if not await bucket_mgr.update(bucket_id, **trigger_writes):
             raise RuntimeError(f"trigger_date was not written to new bucket {bucket_id}")
     if source_id_out is not None:
         source_id_out.append(bucket_id)
@@ -924,7 +950,7 @@ async def _merge_or_create(
                            written_fields=["content", "tags", "importance", "domain",
                                            "valence", "arousal", "name", "todos",
                                            *(["todo_provenance"] if incoming_provenance else []),
-                                           *(["trigger_date"] if trigger_date else [])],
+                                           *sorted(trigger_writes)],
                            ignored_fields=[])
     return bucket_id, False
 
@@ -2293,13 +2319,24 @@ async def _format_due_triggers(
     *,
     show_preview_truncation: bool = False,
     baseline_out: dict | None = None,
+    today: str | None = None,
+    expired: list[dict] | None = None,
+    include_hints: bool = True,
 ) -> tuple[str, list[tuple[str, int]]]:
-    today = datetime.now().date().isoformat()
+    today = today or datetime.now().date().isoformat()
+    today_date = datetime.fromisoformat(today).date()
     due = []
     for bucket in active_buckets:
         meta = bucket.get("metadata", {})
         trigger_date = str(meta.get("trigger_date", "") or "").strip()
         if not trigger_date or trigger_date > today:
+            continue
+        try:
+            if (today_date - datetime.fromisoformat(trigger_date).date()).days > 2:
+                continue
+        except ValueError:
+            continue
+        if meta.get("trigger_expired_at"):
             continue
         if meta.get("resolved", False) or _is_sealed(bucket) or _superseded_by_id(meta):
             continue
@@ -2320,9 +2357,20 @@ async def _format_due_triggers(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
             f"trigger_date:{meta.get('trigger_date')}\n{preview}"
         )
+    expiry_line = ""
+    if expired:
+        named = expired[:3]
+        names = [f"[bucket_id:{bucket['id']}] " + _format_note_preview(str(bucket['metadata'].get('name') or bucket['id']), 40)
+                 for bucket in named]
+        expiry_line = f"已自动收起 {len(expired)} 条过期提醒：" + "；".join(names)
+        if len(expired) > len(named):
+            expiry_line += f"；另有 {len(expired)-len(named)} 条"
+
     def render(rendered_lines: list[str]) -> tuple[str, list[tuple[str, int]]]:
         header = "=== boot: 今日浮现 ===\n"
         text = header + ("\n---\n".join(rendered_lines) if rendered_lines else "（今日无到期提醒）")
+        if expiry_line:
+            text += "\n" + expiry_line
         end = len(header)
         complete_items = []
         for bucket, line in zip(shown, rendered_lines):
@@ -2333,8 +2381,8 @@ async def _format_due_triggers(
 
     baseline_text, baseline_items = render(lines)
     if baseline_out is not None:
-        baseline_out.update(text=baseline_text, items=baseline_items)
-    hints = await _trigger_stale_hints(shown)
+        baseline_out.update(text=baseline_text, items=baseline_items, expiry_line=expiry_line)
+    hints = await _trigger_stale_hints(shown) if include_hints else {}
     return render([
         line + ("\n" + hints[bucket["id"]] if bucket["id"] in hints else "")
         for bucket, line in zip(shown, lines)
@@ -2859,7 +2907,7 @@ async def _run_legacy_archive(store, payload, frozen_config):
 
 
 @guarded_async_mutation('legacy_pinned_post_effects')
-async def _run_legacy_pinned(values, emotion, trigger_date):
+async def _run_legacy_pinned(values, emotion, trigger_date, trigger_repeat=None):
     publication = {}
     identity = await bucket_mgr.create(**values, _publication_out=publication)
     guard = publication['source_guard']
@@ -2867,10 +2915,11 @@ async def _run_legacy_pinned(values, emotion, trigger_date):
         bucket_mgr.admit_delayed_effect(identity, guard, 'pinned_post_effects')
         if emotion is not None:
             _record_emotion_snapshot(*emotion, 'hold', identity, _expected_source=guard, _strict=True)
-        if trigger_date:
+        if trigger_date or trigger_repeat is not None:
             # This metadata-only update has no suspended provider work. The
             # outer root mutex binds admission, field preimage and publication.
-            if not await bucket_mgr.update(identity, trigger_date=trigger_date, trigger_last_seen='',
+            if not await bucket_mgr.update(identity, **trigger_metadata_updates(
+                    {}, trigger_date=trigger_date or None, trigger_repeat=trigger_repeat),
                                            _expected_source=guard):
                 raise BucketIdempotencyError('legacy_trigger_write_failed')
             guard = bucket_mgr.delete_admission.capture(identity)
@@ -2911,6 +2960,8 @@ async def _hold_grow_keyed(operation_id, kind, values):
                 supersedes_id=values['supersedes_id'].strip(), valence=float(values['valence']),
                 arousal=float(values['arousal']), trigger_date=_parse_optional_date(values['trigger_date'], 'trigger_date') or '',
                 provenance_kind=_parse_explicit_provenance_kind(values['provenance_kind']))
+            if values.get('trigger_repeat') is not None:
+                payload['trigger_repeat'] = values['trigger_repeat']
         _, digest = manager._canonical_import_payload(payload)
         if existing and (existing['kind'] != kind or existing['payload_digest'] != digest):
             return 'operation_id_conflict'
@@ -3064,7 +3115,8 @@ def _hold_grow_item_values(payload, parent, entry):
         arousal=analysis.get('arousal', .3), name=analysis.get('name') or analysis.get('suggested_name') or _canonical_body_name(content),
         todos=_canonical_todos(analysis.get('todos')), provenance_kind='summary' if mode == 'digest' else None)
     if payload['kind'] == 'hold':
-        values.update(importance=payload['importance'], provenance_kind=payload['provenance_kind'], trigger_date=payload['trigger_date'])
+        values.update(importance=payload['importance'], provenance_kind=payload['provenance_kind'],
+                      trigger_date=payload['trigger_date'], trigger_repeat=payload.get('trigger_repeat'))
         values['tags'] = list(dict.fromkeys(analysis.get('tags', []) + payload['tags']))
         for field in ('valence', 'arousal'):
             if payload[field] != -1:
@@ -3218,18 +3270,19 @@ def _hold_grow_admit_effect(manager, context, ordinal, kind):
             fresh = _hold_grow_relation_receipt(manager,plan['keys']['relation'],relation,plan['target'],guard)
             own_effect = fresh['non_relation_hash'] == (guard or {}).get('non_relation_hash')
         date = plan['values'].get('trigger_date','')
-        if not own_effect and not plan['reused'] and date:
+        if not own_effect and not plan['reused'] and (date or plan['values'].get('trigger_repeat') is not None):
             try:
                 fresh = manager.delete_admission.published_lineage(plan['target'],guard)
             except DeleteAdmissionError as lineage_exc:
                 raise BucketIdempotencyError(lineage_exc.code) from lineage_exc
             post = frontmatter.load(manager._find_bucket_file(plan['target']))
             marker = manager._operation_marker(post,plan['keys']['trigger'])
-            _, expected_digest = manager._canonical_import_payload({'kwargs':{'trigger_date':date,'trigger_last_seen':''}})
-            omitted = {'related_buckets','last_active','updated_at','trigger_date','trigger_last_seen','_ob_import_operations'}
+            trigger_updates = plan.get('trigger_updates', {'trigger_date':date,'trigger_last_seen':''})
+            _, expected_digest = manager._canonical_import_payload({'kwargs': trigger_updates})
+            omitted = {'related_buckets','last_active','updated_at','_ob_import_operations', *TRIGGER_FIELDS}
             own_effect = (marker is not None and marker.get('operation_kind')=='update'
                 and marker['payload_digest']==expected_digest
-                and post.get('trigger_date')==date and post.get('trigger_last_seen')==''
+                and all(post.get(field) == value for field, value in trigger_updates.items())
                 and post.content==plan['embedding_input']
                 and {k:v for k,v in post.metadata.items() if k not in omitted}
                     == {k:v for k,v in plan['metadata'].items() if k not in omitted})
@@ -3349,6 +3402,7 @@ def _hold_grow_item_response(payload, parent, ordinal, resolutions):
     return result
 
 
+@_guard_todo_drop_presence
 @mcp.tool()
 @_with_quote_reminder(lambda a: (a["content"],), _hold_grow_wrote)
 async def hold(
@@ -3361,12 +3415,23 @@ async def hold(
     valence: Annotated[float, Field(description="-1 means unspecified and uses analysis fallback; 0.0-1.0 sets the stored valence.")] = -1,
     arousal: Annotated[float, Field(description="-1 means unspecified and uses analysis fallback; 0.0-1.0 sets the stored arousal.")] = -1,
     trigger_date: str = "",
+    trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
     operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
         description="Opaque retry identity shared with trace/grow. Preserved verbatim; keyed supersedes_id is unsupported. None preserves legacy behavior.")] | None = None,
 ) -> str:
-    """存储单条记忆并自动打标；匹配到规范化正文相同的可复用桶时复用，未新建，不做语义合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。"""
+    """存储单条记忆并自动打标；匹配到规范化正文相同的可复用桶时复用，未新建，不做语义合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。supersedes_id 是同一桶原地演化，不新建桶。
+
+    trigger_repeat: once 默认一次性提醒，在日期当天及随后两天显示；daily 每天；weekly 每七天；
+    monthly 按原始日号逐月（小月夹至月末）；yearly 按原始月日逐年（闰日夹至 2/28）。
+    重复提醒完整展示后推进到未来，错过三天窗口直接跳过。无日期时仅保存频率，不推测日期。
+    """
+    trigger_repeat = trigger_repeat if _TRIGGER_REPEAT_SUPPLIED.get() else None
+    try:
+        trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
+    except ValueError as exc:
+        return str(exc)
     if operation_id is not None:
         return await _hold_grow_keyed(operation_id, 'hold', {
             key: value for key, value in locals().items() if key != 'operation_id'})
@@ -3403,6 +3468,8 @@ async def hold(
             update_kwargs = {"content": content}
             if explicit_provenance_kind is not None:
                 update_kwargs["provenance_kind"] = explicit_provenance_kind
+            update_kwargs.update(trigger_metadata_updates(metadata, trigger_date=trigger_date or None,
+                                                          trigger_repeat=trigger_repeat))
             updated = await bucket_mgr.update(target_id, **update_kwargs)
         except Exception as exc:
             logger.warning(f"Explicit supersession failed for {target_id}: {exc}")
@@ -3456,8 +3523,9 @@ async def hold(
         )
         if should_record_emotion:
             _record_emotion_snapshot(valence, arousal, "hold", bucket_id)
-        if trigger_date:
-            await bucket_mgr.update(bucket_id, trigger_date=trigger_date, trigger_last_seen="")
+        if trigger_date or trigger_repeat is not None:
+            await bucket_mgr.update(bucket_id, **trigger_metadata_updates(
+                {}, trigger_date=trigger_date or None, trigger_repeat=trigger_repeat))
         await _auto_link_related(bucket_id)
         # --- Mark source memory as digested + store model's valence perspective ---
         # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
@@ -3538,7 +3606,7 @@ async def hold(
         )
         bucket_id = await _await_legacy_post_effects(
             _run_legacy_pinned, copy.deepcopy(values),
-            (valence, arousal) if should_record_emotion else None, trigger_date)
+            (valence, arousal) if should_record_emotion else None, trigger_date, trigger_repeat)
         response = f"📌{await _format_hold_created(bucket_id)}"
         if similarity_notice:
             response += f"\nsimilarity: {similarity_notice}"
@@ -3561,6 +3629,7 @@ async def hold(
             arousal=final_arousal,
             name=suggested_name,
             trigger_date=trigger_date,
+            trigger_repeat=trigger_repeat,
             todos=analysis_todos,
             provenance_kind=explicit_provenance_kind,
             source_id_out=source_ids,
@@ -4161,6 +4230,8 @@ async def _trace_keyed(operation_id, values):
         trigger = values['trigger_date']
         payload['trigger_date'] = ('none' if trigger.strip().lower() == 'none' else
                                    (_parse_optional_date(trigger, 'trigger_date') or ''))
+        if values.get('trigger_repeat') is not None:
+            payload['trigger_repeat'] = values['trigger_repeat']
         payload['todos'] = ([aliases(v) for v in _canonical_todos(values['todos'])]
                             if values['todos'] is not None else None)
         payload['todo_items'] = None
@@ -4193,9 +4264,9 @@ async def _trace_keyed(operation_id, values):
             for field in ('resolved', 'digested', 'dormant'):
                 if payload[field] != -1:
                     updates[field] = bool(payload[field])
-            if payload['trigger_date']:
-                updates.update(trigger_date='' if payload['trigger_date'] == 'none' else payload['trigger_date'],
-                               trigger_last_seen='')
+            updates.update(trigger_metadata_updates(metadata,
+                trigger_date=('' if payload['trigger_date'] == 'none' else payload['trigger_date']) if payload['trigger_date'] else None,
+                trigger_repeat=payload.get('trigger_repeat')))
             if payload['content']:
                 updates['content'] = (f"{bucket['content']}\n\n{payload['content']}"
                     if payload['append'] and bucket['content'] else payload['content'])
@@ -4324,6 +4395,7 @@ async def trace(
     merge: str = "",
     append: bool = False,
     trigger_date: str = "",
+    trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
     delete: bool = False,
     confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
     todo_done: Annotated[str | None, Field(description="Use only when Ting explicitly says the task is completed. Complete one stable todo ID using preview then confirm_token. Call alone with bucket_id; never resolves the bucket; dropped todos cannot be completed.")] = None,
@@ -4332,8 +4404,17 @@ async def trace(
         description="Opaque caller retry identity for ordinary single-bucket trace. Preserved verbatim; reuse only with the same payload. None preserves legacy behavior.")] | None = None,
 ) -> str:
     # MCP schema note: related and superseded_by stay in the signature for relations.
-    """Mixed memory operation: metadata/content, relations, merge, seal, delete, and confirmed todo completion/abandonment driven by Ting's explicit intent; no MCP undo command."""
+    """Mixed memory operation: metadata/content, relations, merge, seal, delete, and confirmed todo completion/abandonment driven by Ting's explicit intent; no MCP undo command.
 
+    trigger_repeat: once means a one-time reminder shown on its date and the next two days;
+    daily means every day; weekly every seven days; monthly the original day clamped to month end;
+    yearly the original month/day with leap-day clamping. Omission preserves the existing frequency.
+    Repeating reminders advance after complete display, or skip missed three-day windows.
+    Setting trigger_date, even to the same date, re-arms it and resets its anchor and delivery receipts.
+    trigger_date="none" clears the date, frequency, anchor and all reminder delivery/expiry receipts.
+    """
+
+    trigger_repeat = trigger_repeat if _TRIGGER_REPEAT_SUPPLIED.get() else None
     if operation_id is not None:
         return await _trace_keyed(operation_id, {
             key: value for key, value in locals().items() if key != 'operation_id'
@@ -4348,7 +4429,7 @@ async def trace(
                 tags or todos is not None or todo_items is not None or resolved != -1 or
                 pinned != -1 or permanent != -1 or digested != -1 or dormant != -1 or
                 sealed != -1 or content or provenance_kind or related or unrelate or
-                superseded_by is not None or merge or append or trigger_date or delete or
+                superseded_by is not None or merge or append or trigger_date or trigger_repeat is not None or delete or
                 (todo_done is not None and todo_drop is not None)):
             return f"{action} must be called alone with bucket_id, {action}, and optional confirm_token."
         targets = list(dict.fromkeys(_parse_csv_ids(bucket_id)))
@@ -4430,6 +4511,7 @@ async def trace(
                 merge="",
                 append=append,
                 trigger_date=trigger_date,
+                **({"trigger_repeat": trigger_repeat} if trigger_repeat is not None else {}),
                 delete=delete,
                 confirm_token=confirm_token,
             )
@@ -4446,7 +4528,7 @@ async def trace(
                 permanent != -1 or digested != -1 or dormant != -1 or
                 sealed != -1 or content or explicit_provenance_kind is not None or
                 related or unrelate or superseded_by is not None or append or
-                trigger_date):
+                trigger_date or trigger_repeat is not None):
             return "merge must be called alone with bucket_id, merge, and optional confirm_token."
         return await _merge_bucket_into_target(bucket_id, merge.strip(), confirm_token)
     try:
@@ -4547,9 +4629,9 @@ async def trace(
         updates["dormant"] = bool(dormant)
     if sealed in (0, 1):
         updates["sealed"] = sealed
-    if trigger_date:
-        updates["trigger_date"] = "" if trigger_date == "none" else trigger_date
-        updates["trigger_last_seen"] = ""
+    updates.update(trigger_metadata_updates(metadata,
+        trigger_date=("" if trigger_date == "none" else trigger_date) if trigger_date else None,
+        trigger_repeat=trigger_repeat))
     if content:
         if append:
             current_content = bucket.get("content", "")
@@ -4914,6 +4996,7 @@ async def boot(
     """
     if not isinstance(profile, str) or profile not in BOOT_PROFILE_NAMES:
         return "profile 必须是 talk、code 或 tg。"
+    today = datetime.now().date().isoformat()
     await decay_engine.ensure_started()
     profile_config = BOOT_PROFILE_CONFIG[profile]
     pinned_chars = max(
@@ -4966,11 +5049,14 @@ async def boot(
         )
 
     trigger_baseline = {}
+    trigger_ids = [bucket["id"] for bucket in active_buckets]
+    trigger_prepared = bucket_mgr.prepare_boot_triggers(trigger_ids, today)
     trigger_text, trigger_items = await _format_due_triggers(
-        active_buckets,
+        trigger_prepared["buckets"],
         max_items=int(profile_config["trigger_items"]),
         show_preview_truncation=profile == "tg",
         baseline_out=trigger_baseline,
+        today=today, expired=trigger_prepared["expired"],
     )
 
     pinned = [
@@ -5133,31 +5219,60 @@ async def boot(
                 return hinted
         return baseline
 
-    for _ in range(3):
-        delta_text, safe_event_id = _delta_candidate()
-        body, emitted_sections = _compose_boot_body(delta_text)
-        expected_event_id = (
-            int(checkpoint["last_event_id"]) if checkpoint is not None else None
-        )
-        # An omitted delta has no consumed range. A partial delta only crosses
-        # the contiguous eligible prefix selected by _format_boot_delta.
-        next_event_id = (
-            safe_event_id if emitted_sections.get("delta") == delta_text
-            else expected_event_id
-        )
-        if next_event_id == expected_event_id or bucket_mgr.advance_boot_delta_checkpoint(
-            expected_event_id,
-            next_event_id,
-            profile=profile,
-        ):
-            break
-        # A concurrent boot advanced this profile. Recalculate both the body
-        # and every consumption decision against the new checkpoint.
-        checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
-        high_water = bucket_mgr.get_boot_delta_high_water()
+    for trigger_attempt in range(3):
+        # No provider await under this mutex. Revalidate before advancing delta
+        # or composing the returned text, so a competing boot/trace cannot
+        # consume an occurrence and leave this boot returning its old preview.
+        with bucket_write_scope(bucket_mgr.base_dir):
+            if bucket_mgr.commit_boot_triggers(trigger_prepared["states"], {}):
+                for _ in range(3):
+                    delta_text, safe_event_id = _delta_candidate()
+                    body, emitted_sections = _compose_boot_body(delta_text)
+                    expected_event_id = int(checkpoint["last_event_id"]) if checkpoint is not None else None
+                    next_event_id = safe_event_id if emitted_sections.get("delta") == delta_text else expected_event_id
+                    if next_event_id == expected_event_id or bucket_mgr.advance_boot_delta_checkpoint(
+                            expected_event_id, next_event_id, profile=profile):
+                        break
+                    checkpoint = bucket_mgr.get_boot_delta_checkpoint(profile=profile)
+                    high_water = bucket_mgr.get_boot_delta_high_water()
+                else:
+                    delta_text, _ = _delta_candidate()
+                    body, emitted_sections = _compose_boot_body(delta_text)
+                emitted_triggers = emitted_sections.get("triggers", "")
+                actions = {}
+                if selected_trigger_text.startswith(emitted_triggers):
+                    by_id = {bucket["id"]: bucket for bucket in trigger_prepared["buckets"]}
+                    for bucket_id, end_offset in selected_trigger_items:
+                        if end_offset <= len(emitted_triggers):
+                            meta = by_id[bucket_id]["metadata"]
+                            updates = {"trigger_last_seen": today}
+                            repeat = meta.get("trigger_repeat", "once")
+                            if repeat != "once":
+                                updates.update(trigger_date=next_trigger_date(meta["trigger_date"], repeat, meta.get("trigger_anchor"), today),
+                                               trigger_anchor=str(meta.get("trigger_anchor") or meta["trigger_date"]))
+                            actions[bucket_id] = updates
+                    if trigger_baseline["expiry_line"] and emitted_triggers == selected_trigger_text:
+                        for bucket in trigger_prepared["expired"]:
+                            actions[bucket["id"]] = {"trigger_expiry_notified_at": today}
+                try:
+                    if bucket_mgr.commit_boot_triggers(trigger_prepared["states"], actions):
+                        break
+                except Exception:
+                    # Returning the complete text is safe; uncommitted receipts
+                    # remain pending and may be presented again after a write error.
+                    logger.exception("Boot trigger delivery state update failed")
+                    break
+        trigger_prepared = bucket_mgr.prepare_boot_triggers(trigger_ids, today)
+        trigger_baseline = {}
+        trigger_text, trigger_items = await _format_due_triggers(
+            trigger_prepared["buckets"], max_items=int(profile_config["trigger_items"]),
+            show_preview_truncation=profile == "tg", baseline_out=trigger_baseline,
+            today=today, expired=trigger_prepared["expired"], include_hints=False)
     else:
-        # Do not advance after repeated CAS conflicts. The final body still
-        # determines note and trigger consumption.
+        # Bounded contention: return no stale occurrence and consume no receipt.
+        trigger_text = "=== boot: 今日浮现 ===\n（提醒状态正在变化，请再次 boot 获取）"
+        trigger_items = []
+        trigger_baseline = {"text": trigger_text, "items": [], "expiry_line": ""}
         delta_text, _ = _delta_candidate()
         body, emitted_sections = _compose_boot_body(delta_text)
 
@@ -5167,15 +5282,6 @@ async def boot(
             bucket_mgr.mark_note_boot_delivered(deliver_note_id, delivered_at=note_now)
         except Exception:
             logger.exception("Boot note delivery state update failed")
-    emitted_triggers = emitted_sections.get("triggers", "")
-    if selected_trigger_text.startswith(emitted_triggers):
-        today = datetime.now().date().isoformat()
-        for bucket_id, end_offset in selected_trigger_items:
-            if end_offset <= len(emitted_triggers):
-                try:
-                    await bucket_mgr.update(bucket_id, trigger_last_seen=today, _skip_revision=True)
-                except Exception:
-                    logger.exception("Boot trigger delivery state update failed")
     return response
 
 

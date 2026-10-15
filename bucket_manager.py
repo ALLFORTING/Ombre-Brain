@@ -26,6 +26,7 @@
 # ============================================================
 
 import os
+import calendar
 import math
 import logging
 import shutil
@@ -46,7 +47,7 @@ from bucket_write_lock import bucket_write_scope, initialize_bucket_write_lock
 from confirmed_delete_admission import DeleteAdmissionError
 from bucket_revisions import BucketRevisionMixin, RevisionCaptureError, revision_snapshot
 from uuid import UUID, uuid4
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -71,6 +72,73 @@ from utils import (
     safe_path,
     now_iso,
 )
+
+
+TRIGGER_REPEATS = ("once", "daily", "weekly", "monthly", "yearly")
+TRIGGER_RUNTIME_FIELDS = ("trigger_last_seen", "trigger_expired_at", "trigger_expiry_notified_at")
+TRIGGER_FIELDS = ("trigger_date", "trigger_repeat", "trigger_anchor", *TRIGGER_RUNTIME_FIELDS)
+
+
+def trigger_metadata_updates(metadata, *, trigger_date=None, trigger_repeat=None):
+    """Build one explicit reminder edit; None denotes an omitted argument."""
+    if trigger_repeat is not None and trigger_repeat not in TRIGGER_REPEATS:
+        raise ValueError("trigger_repeat must be once, daily, weekly, monthly, or yearly.")
+    if trigger_date is not None:
+        if not trigger_date:
+            return {field: ("" if field in ("trigger_date", "trigger_last_seen") else None)
+                    for field in TRIGGER_FIELDS}
+        return dict(trigger_date=trigger_date,
+                    trigger_repeat=trigger_repeat if trigger_repeat is not None else metadata.get("trigger_repeat", "once"),
+                    trigger_anchor=trigger_date, trigger_last_seen="",
+                    trigger_expired_at=None, trigger_expiry_notified_at=None)
+    if trigger_repeat is None:
+        return {}
+    updates = {"trigger_repeat": trigger_repeat}
+    if metadata.get("trigger_date") and not metadata.get("trigger_anchor"):
+        updates["trigger_anchor"] = str(metadata["trigger_date"])
+    if trigger_repeat != metadata.get("trigger_repeat", "once"):
+        updates.update(trigger_expired_at=None, trigger_expiry_notified_at=None)
+    return updates
+
+
+def next_trigger_date(trigger_date, repeat, anchor, today):
+    """Return the next anchored occurrence strictly after today, without backlog."""
+    current, now = date.fromisoformat(str(trigger_date)), date.fromisoformat(str(today))
+    original = date.fromisoformat(str(anchor or trigger_date))
+    if repeat in ("daily", "weekly"):
+        period = 1 if repeat == "daily" else 7
+        return (current + timedelta(days=max(1, (now-current).days // period + 1) * period)).isoformat()
+    if repeat == "monthly":
+        month_index = max(now.year * 12 + now.month - 1, current.year * 12 + current.month - 1)
+        year, month = divmod(month_index, 12)
+        candidate = date(year, month+1, min(original.day, calendar.monthrange(year, month+1)[1]))
+        if candidate <= max(now, current):
+            year, month = divmod(month_index+1, 12)
+            candidate = date(year, month+1, min(original.day, calendar.monthrange(year, month+1)[1]))
+        return candidate.isoformat()
+    if repeat == "yearly":
+        year = max(now.year, current.year)
+        candidate = date(year, original.month, min(original.day, calendar.monthrange(year, original.month)[1]))
+        if candidate <= max(now, current):
+            year += 1
+            candidate = date(year, original.month, min(original.day, calendar.monthrange(year, original.month)[1]))
+        return candidate.isoformat()
+    raise ValueError("A repeating trigger requires daily, weekly, monthly, or yearly.")
+
+
+def hold_trigger_metadata_updates(metadata, trigger_date="", trigger_repeat=None):
+    """Duplicate hold never silently changes an existing reminder's schedule."""
+    old_date = str(metadata.get("trigger_date") or "")
+    old_repeat = metadata.get("trigger_repeat", "once")
+    if trigger_date and old_date and trigger_date != old_date:
+        raise ValueError(f"duplicate bucket has trigger_date={old_date}; requested {trigger_date} was rejected without writing")
+    if trigger_repeat is not None and trigger_repeat != old_repeat and (old_date or old_repeat != "once"):
+        raise ValueError("duplicate bucket has conflicting trigger_repeat; use trace to change its frequency")
+    if trigger_date and not old_date:
+        return trigger_metadata_updates(metadata, trigger_date=trigger_date, trigger_repeat=trigger_repeat)
+    if trigger_repeat is not None:
+        return trigger_metadata_updates(metadata, trigger_repeat=trigger_repeat)
+    return {}
 
 def _capture_startup_umask() -> int:
     """Cache the POSIX mask at import time, before background work starts."""
@@ -2356,10 +2424,7 @@ class BucketManager(BucketRevisionMixin):
                     raise BucketIdempotencyError('operation_state_conflict')
                 date = values.get('trigger_date', '')
                 old_date = str(post.get('trigger_date', '') or '').strip()
-                if date and old_date and old_date != date:
-                    raise ValueError(f"duplicate bucket {target} has trigger_date={old_date}; requested {date} was rejected without writing")
-                if date and old_date != date:
-                    updates.update(trigger_date=date, trigger_last_seen='')
+                updates.update(hold_trigger_metadata_updates(post.metadata, date, values.get('trigger_repeat')))
                 old_todos = canonicalize_todos(post.get('todos'))
                 if todos:
                     merged, records = merge_todo_provenance(old_todos, post.get('todo_provenance'), todos, provenance)
@@ -2405,10 +2470,13 @@ class BucketManager(BucketRevisionMixin):
                 delta = [['created', {}]]
                 written = ['content', 'tags', 'importance', 'domain', 'valence', 'arousal', 'name', 'todos',
                            *(['todo_provenance'] if provenance else []),
-                           *(['trigger_date'] if values.get('trigger_date') else [])]
+                           *sorted(trigger_metadata_updates(post.metadata,
+                               trigger_date=values.get('trigger_date') or None, trigger_repeat=values.get('trigger_repeat')))]
                 ignored = []
             _, child_digest = self._canonical_import_payload(child_payload)
             item_plan = dict(target=target, reused=reused, values=values, keys=keys,
+                trigger_updates=trigger_metadata_updates(post.metadata,
+                    trigger_date=values.get('trigger_date') or None, trigger_repeat=values.get('trigger_repeat')),
                 logical_time=logical_time, updates=updates, preimage_digest=preimage,
                 source_guard=self.delete_admission.capture(target) if reused else None,
                 child_payload=child_payload, child_digest=child_digest, relative_path=relative_path,
@@ -2495,10 +2563,11 @@ class BucketManager(BucketRevisionMixin):
             plan = request['plan']['items'][ordinal]['plan']
             self.assert_confirmed_delete_writable(plan['target'])
             date = plan['values'].get('trigger_date', '')
-            if plan['reused'] or not date:
+            repeat = plan['values'].get('trigger_repeat')
+            if plan['reused'] or (not date and repeat is None):
                 return {'outcome': 'not_requested'}
             key = plan['keys']['trigger']
-            payload = {'kwargs': {'trigger_date': date, 'trigger_last_seen': ''}}
+            payload = {'kwargs': plan.get('trigger_updates', {'trigger_date': date, 'trigger_last_seen': ''})}
             _, digest = self._canonical_import_payload(payload)
             child = self._ensure_import_operation(key, operation_kind='update', target_bucket_id=plan['target'],
                                                  payload=payload, payload_digest=digest)
@@ -2517,7 +2586,11 @@ class BucketManager(BucketRevisionMixin):
                 raise BucketIdempotencyError('operation_marker_missing')
             if _is_sealed_bucket(post) or str(post.get('trigger_date') or '') not in ('', date):
                 raise BucketIdempotencyError('operation_state_conflict')
-            post.metadata.update(payload['kwargs'])
+            for field, value in payload['kwargs'].items():
+                if value is None:
+                    post.metadata.pop(field, None)
+                else:
+                    post[field] = value
             post['last_active'], post['updated_at'] = plan['logical_time'], _date_only(plan['logical_time'])
             self._append_operation_marker(post, operation_key=key, operation_kind='update', payload_digest=digest)
             self._trace_fence(context)
@@ -3294,6 +3367,7 @@ class BucketManager(BucketRevisionMixin):
             "related_buckets": "",
             "source_bucket": "",
             "trigger_date": "",
+            "trigger_repeat": "once",
             "trigger_last_seen": "",
             "dormant": False,
             "sealed": 1 if sealed else 0,
@@ -3951,6 +4025,110 @@ class BucketManager(BucketRevisionMixin):
             draft["updated_at"] = _date_only()
         return list(neighbors.values())
 
+    @staticmethod
+    def _trigger_signature(metadata):
+        return tuple(metadata.get(field, "once" if field == "trigger_repeat" else "") or ""
+                     for field in TRIGGER_FIELDS)
+
+    @guarded_mutation("trigger_boot_prepare")
+    def prepare_boot_triggers(self, bucket_ids, today):
+        """Retire overdue occurrences, retaining a durable pending expiry receipt."""
+        now = date.fromisoformat(today)
+        buckets, states, expired = [], {}, []
+        with bucket_write_scope(self.base_dir):
+            for bucket_id in bucket_ids:
+                try:
+                    path = self._find_bucket_file(bucket_id)
+                    if not path:
+                        continue
+                    post = frontmatter.load(path)
+                    if (_is_sealed_bucket(post) or post.get("resolved", False)
+                            or str(post.get("superseded_by") or "").strip()):
+                        continue
+                    raw_date = str(post.get("trigger_date") or "")
+                    repeat = post.get("trigger_repeat", "once")
+                    if not raw_date:
+                        continue
+                    due = date.fromisoformat(raw_date)
+                    if repeat not in TRIGGER_REPEATS:
+                        raise ValueError("invalid stored trigger_repeat")
+                    if due > now:
+                        continue
+                    updates = {}
+                    if (now-due).days > 2:
+                        if repeat == "once":
+                            if not post.get("trigger_expired_at"):
+                                updates = {"trigger_expired_at": today, "trigger_expiry_notified_at": None}
+                        else:
+                            updates = dict(trigger_date=next_trigger_date(raw_date, repeat, post.get("trigger_anchor"), today),
+                                           trigger_anchor=str(post.get("trigger_anchor") or raw_date),
+                                           trigger_expired_at=None, trigger_expiry_notified_at=None)
+                    if updates:
+                        self.assert_confirmed_delete_writable(bucket_id)
+                        for field, value in updates.items():
+                            if value is None:
+                                post.metadata.pop(field, None)
+                            else:
+                                post[field] = value
+                        self._write_post_atomic(path, post)
+                    bucket = self._load_bucket(path)
+                    if bucket is None:
+                        continue
+                    pending = repeat == "once" and post.get("trigger_expired_at") and not post.get("trigger_expiry_notified_at")
+                    visible = ((now-due).days <= 2 and not post.get("trigger_expired_at")
+                               and str(post.get("trigger_last_seen") or "") != today)
+                    if repeat != "once" and (now-due).days > 2:
+                        visible = False
+                    if not pending and not visible:
+                        continue
+                    states[bucket_id] = {"signature": self._trigger_signature(post.metadata),
+                                         "source": self.delete_admission.capture(bucket_id)}
+                    buckets.append(bucket)
+                    if pending:
+                        expired.append(bucket)
+                except (OSError, DeleteAdmissionError, BucketIdempotencyError) as exc:
+                    # Per-bucket background maintenance is retryable. Never
+                    # claim an expiry or delivery whose storage/admission failed.
+                    # The root mutex and maintenance decorator stay outside
+                    # this catch, so a system-wide refusal still propagates.
+                    logger.warning("Skipping reminder maintenance for %s: %s", bucket_id, exc)
+                except (ValueError, TypeError):
+                    logger.warning("Skipping malformed reminder metadata for %s", bucket_id)
+        expired.sort(key=lambda bucket: (str(bucket["metadata"].get("trigger_expired_at")), bucket["id"]))
+        return {"buckets": buckets, "states": states, "expired": expired}
+
+    @guarded_mutation("trigger_boot_commit")
+    def commit_boot_triggers(self, states, actions):
+        """CAS a prepared boot under the root mutex; never refresh activity/history."""
+        with bucket_write_scope(self.base_dir):
+            posts = {}
+            for bucket_id, expected in states.items():
+                try:
+                    self.admit_delayed_effect(bucket_id, expected["source"], "trigger_boot_commit")
+                    path = self._find_bucket_file(bucket_id)
+                    if not path:
+                        return False
+                    post = frontmatter.load(path)
+                    if self._trigger_signature(post.metadata) != expected["signature"]:
+                        return False
+                    posts[bucket_id] = (path, post)
+                except (DeleteAdmissionError, BucketIdempotencyError):
+                    return False
+            if set(actions) - set(posts):
+                raise ValueError("Unprepared trigger action")
+            for bucket_id, updates in actions.items():
+                if set(updates) - set(TRIGGER_FIELDS):
+                    raise ValueError("Boot may only write trigger fields")
+                self.assert_confirmed_delete_writable(bucket_id)
+                path, post = posts[bucket_id]
+                for field, value in updates.items():
+                    if value is None:
+                        post.metadata.pop(field, None)
+                    else:
+                        post[field] = value
+                self._write_post_atomic(path, post)
+            return True
+
     @guarded_async_mutation("bucket_update")
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
@@ -4266,6 +4444,12 @@ class BucketManager(BucketRevisionMixin):
                 post["trigger_date"] = kwargs["trigger_date"]
             if "trigger_last_seen" in kwargs:
                 post["trigger_last_seen"] = kwargs["trigger_last_seen"]
+            for field in ("trigger_repeat", "trigger_anchor", "trigger_expired_at", "trigger_expiry_notified_at"):
+                if field in kwargs:
+                    if kwargs[field] is None:
+                        post.metadata.pop(field, None)
+                    else:
+                        post[field] = kwargs[field]
             if "superseded_by" in kwargs:
                 if kwargs["superseded_by"] is None:
                     post.metadata.pop("superseded_by", None)
@@ -5364,6 +5548,7 @@ class BucketManager(BucketRevisionMixin):
             metadata.setdefault("sealed", 0)
             metadata.setdefault("source_bucket", "")
             metadata.setdefault("trigger_date", "")
+            metadata.setdefault("trigger_repeat", "once")
             metadata.setdefault("trigger_last_seen", "")
             metadata["provenance_kind"] = normalize_provenance_kind(
                 metadata.get("provenance_kind")
