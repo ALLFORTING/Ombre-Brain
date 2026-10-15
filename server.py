@@ -40,6 +40,7 @@ import errno
 import io
 import random
 import logging
+import math
 import asyncio
 import weakref
 import copy
@@ -2184,11 +2185,114 @@ def _format_ting_note_for_boot(now: str, max_tokens: int) -> tuple[str, int | No
     )
 
 
+_TRIGGER_HINT_TIMEOUT_SECONDS = 5.0
+# 0.65 is an uncalibrated estimate. Display the semantic score so observation
+# can guide tuning; a possible-staleness hint never invalidates a fact.
+_TRIGGER_HINT_DEFAULT_THRESHOLD = 0.65
+# The minimum lead is also an uncalibrated estimate.
+_TRIGGER_HINT_DEFAULT_LEAD = 0.05
+
+
+def _trigger_stale_threshold() -> float:
+    try:
+        value = float(os.getenv("OMBRE_TRIGGER_STALE_THRESHOLD", "").strip())
+    except (TypeError, ValueError):
+        return _TRIGGER_HINT_DEFAULT_THRESHOLD
+    return value if 0.0 <= value <= 1.0 else _TRIGGER_HINT_DEFAULT_THRESHOLD
+
+
+def _trigger_stale_lead() -> float:
+    try:
+        value = float(os.getenv("OMBRE_TRIGGER_STALE_LEAD", "").strip())
+    except (TypeError, ValueError):
+        return _TRIGGER_HINT_DEFAULT_LEAD
+    return value if 0.0 <= value <= 1.0 else _TRIGGER_HINT_DEFAULT_LEAD
+
+
+def _trigger_created(metadata: dict) -> datetime | None:
+    """Require a real creation timestamp; never infer a timezone or missing time."""
+    value = metadata.get("created")
+    if not isinstance(value, str) or len(value.strip()) <= 10:
+        return None
+    try:
+        return datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
+async def _trigger_stale_hint(bucket: dict) -> str:
+    created = _trigger_created(bucket.get("metadata", {}))
+    if created is None:
+        return ""
+    try:
+        recall = await _recall_memory_candidates(bucket.get("content", ""), limit=8)
+        if recall.get("semantic", {}).get("status") != "available":
+            return ""
+        threshold = _trigger_stale_threshold()
+        scored = []
+        for candidate in recall.get("candidates", []):
+            try:
+                meta = candidate.get("metadata", {})
+                candidate_id = str(candidate.get("id", "") or "")
+                if (
+                    not candidate_id or candidate_id == bucket["id"]
+                    or _is_sealed(candidate) or _is_test_bucket(candidate)
+                    or meta.get("dormant", False) or _superseded_by_id(meta)
+                ):
+                    continue
+                score = float(candidate["semantic_score"])
+                if not 0.0 <= score <= 1.0:
+                    continue
+                newer = _trigger_created(meta)
+                if newer is None or (newer.tzinfo is None) != (created.tzinfo is None):
+                    continue
+                # Aware datetimes compare by instant; naive timestamps stay local.
+                if newer <= created:
+                    continue
+                scored.append((score, candidate_id, meta, newer))
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                continue
+        if not scored:
+            return ""
+        scored.sort(key=lambda item: item[0], reverse=True)
+        score, candidate_id, meta, newer = scored[0]
+        # Keep the runner-up even below threshold; missing second place is zero.
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        if score < threshold or score <= second_score:
+            return ""  # A tie never has a winner, including when lead is zero.
+        lead = _trigger_stale_lead()
+        gap = score - second_score
+        # Unit-range scores need only a tiny subtraction-error allowance, not rounding.
+        if gap < lead and not math.isclose(gap, lead, rel_tol=0.0, abs_tol=1e-12):
+            return ""
+        name = " ".join(str(meta.get("name") or candidate_id).split())
+        if len(name) > 80:
+            name = name[:77].rstrip() + "..."
+        return f"⚠ 可能已过时（相似 {score:.2f}）：[bucket_id:{candidate_id}] {name}（{newer.date().isoformat()}）"
+    except Exception:
+        return ""
+
+
+async def _trigger_stale_hints(shown: list[dict]) -> dict[str, str]:
+    """One awaited deadline for the entire optional check; cancellation propagates."""
+    hints = {}
+    try:
+        async with asyncio.timeout(_TRIGGER_HINT_TIMEOUT_SECONDS):
+            for bucket in shown:
+                hint = await _trigger_stale_hint(bucket)
+                if hint:
+                    hints[bucket["id"]] = hint
+    except TimeoutError:
+        return {}
+    return hints
+
+
 async def _format_due_triggers(
     active_buckets: list[dict],
     max_items: int = 10,
     *,
     show_preview_truncation: bool = False,
+    baseline_out: dict | None = None,
 ) -> tuple[str, list[tuple[str, int]]]:
     today = datetime.now().date().isoformat()
     due = []
@@ -2197,13 +2301,13 @@ async def _format_due_triggers(
         trigger_date = str(meta.get("trigger_date", "") or "").strip()
         if not trigger_date or trigger_date > today:
             continue
-        if meta.get("resolved", False) or _is_sealed(bucket):
+        if meta.get("resolved", False) or _is_sealed(bucket) or _superseded_by_id(meta):
             continue
         if str(meta.get("trigger_last_seen", "") or "") == today:
             continue
         due.append(bucket)
     due.sort(key=lambda b: (str(b["metadata"].get("trigger_date", "")), -int(b["metadata"].get("importance", 0) or 0)))
-    shown = due[:max_items]
+    shown = due[:max(0, min(10, max_items))]
     lines = []
     for bucket in shown:
         meta = bucket.get("metadata", {})
@@ -2216,15 +2320,25 @@ async def _format_due_triggers(
             f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])} "
             f"trigger_date:{meta.get('trigger_date')}\n{preview}"
         )
-    header = "=== boot: 今日浮现 ===\n"
-    text = header + ("\n---\n".join(lines) if lines else "（今日无到期提醒）")
-    end = len(header)
-    complete_items = []
-    for bucket, line in zip(shown, lines):
-        end += len(line)
-        complete_items.append((bucket["id"], end))
-        end += len("\n---\n")
-    return text, complete_items
+    def render(rendered_lines: list[str]) -> tuple[str, list[tuple[str, int]]]:
+        header = "=== boot: 今日浮现 ===\n"
+        text = header + ("\n---\n".join(rendered_lines) if rendered_lines else "（今日无到期提醒）")
+        end = len(header)
+        complete_items = []
+        for bucket, line in zip(shown, rendered_lines):
+            end += len(line)
+            complete_items.append((bucket["id"], end))
+            end += len("\n---\n")
+        return text, complete_items
+
+    baseline_text, baseline_items = render(lines)
+    if baseline_out is not None:
+        baseline_out.update(text=baseline_text, items=baseline_items)
+    hints = await _trigger_stale_hints(shown)
+    return render([
+        line + ("\n" + hints[bucket["id"]] if bucket["id"] in hints else "")
+        for bucket, line in zip(shown, lines)
+    ])
 
 
 def _format_feel_echo(active_buckets: list[dict]) -> str:
@@ -4851,10 +4965,12 @@ async def boot(
             return_progress=True,
         )
 
+    trigger_baseline = {}
     trigger_text, trigger_items = await _format_due_triggers(
         active_buckets,
         max_items=int(profile_config["trigger_items"]),
         show_preview_truncation=profile == "tg",
+        baseline_out=trigger_baseline,
     )
 
     pinned = [
@@ -4942,11 +5058,16 @@ async def boot(
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
 
+    selected_trigger_text, selected_trigger_items = trigger_text, trigger_items
+
     def _compose_boot_body(current_delta_text: str) -> tuple[str, dict[str, str]]:
+        nonlocal selected_trigger_text, selected_trigger_items
+        selected_trigger_text = trigger_baseline["text"]
+        selected_trigger_items = trigger_baseline["items"]
         sections = [
             ("ting_note", "婷留言", ting_note_text),
             ("delta", "增量摘要", current_delta_text),
-            ("triggers", "今日触发", trigger_text),
+            ("triggers", "今日触发", selected_trigger_text),
         ]
         if profile_config["include_mailbox"]:
             sections.append(("mailbox", "最新 letter", mailbox_text))
@@ -4974,26 +5095,43 @@ async def boot(
             }
             truncation_notice_tokens = BOOT_TG_TRUNCATION_NOTICE_TOKENS
         fitter = _fit_tg_boot_sections if profile == "tg" else _fit_sections_to_budget
-        return fitter(
-            sections,
-            max_tokens=max_tokens if profile == "tg" else max_tokens - 40,
-            minimum_chars={
-                **profile_config["section_minimums"],
-                "ting_note": len(ting_note_text),
-                "delta": len(current_delta_text),
-            },
-            atomic_sections={"ting_note", "delta"},
-            omission_item_refs=omission_item_refs,
-            truncation_notice_tokens=truncation_notice_tokens,
-            todo_display=todo_display,
-            **({
-                "recovery_items": recovery_items,
-                "omission_item_ends": {"pinned": [
-                    (f"bucket_id:{bucket_id}", end)
-                    for bucket_id, _, _, end in recovery_items
-                ]},
-            } if profile == "tg" else {"return_sections": True}),
-        )
+
+        def fit(parts):
+            return fitter(
+                parts,
+                max_tokens=max_tokens if profile == "tg" else max_tokens - 40,
+                minimum_chars={
+                    **profile_config["section_minimums"],
+                    "ting_note": len(ting_note_text),
+                    "delta": len(current_delta_text),
+                },
+                atomic_sections={"ting_note", "delta"},
+                omission_item_refs=omission_item_refs,
+                truncation_notice_tokens=truncation_notice_tokens,
+                todo_display=todo_display,
+                **({
+                    "recovery_items": recovery_items,
+                    "omission_item_ends": {"pinned": [
+                        (f"bucket_id:{bucket_id}", end)
+                        for bucket_id, _, _, end in recovery_items
+                    ]},
+                } if profile == "tg" else {"return_sections": True}),
+            )
+
+        baseline = fit(sections)
+        # Optional hints may not displace any baseline preview or other section.
+        if trigger_text != selected_trigger_text and all(
+            baseline[1].get(key) == text for key, _, text in sections
+        ):
+            hinted_sections = [
+                (key, label, trigger_text if key == "triggers" else text)
+                for key, label, text in sections
+            ]
+            hinted = fit(hinted_sections)
+            if all(hinted[1].get(key) == text for key, _, text in hinted_sections):
+                selected_trigger_text, selected_trigger_items = trigger_text, trigger_items
+                return hinted
+        return baseline
 
     for _ in range(3):
         delta_text, safe_event_id = _delta_candidate()
@@ -5030,9 +5168,9 @@ async def boot(
         except Exception:
             logger.exception("Boot note delivery state update failed")
     emitted_triggers = emitted_sections.get("triggers", "")
-    if trigger_text.startswith(emitted_triggers):
+    if selected_trigger_text.startswith(emitted_triggers):
         today = datetime.now().date().isoformat()
-        for bucket_id, end_offset in trigger_items:
+        for bucket_id, end_offset in selected_trigger_items:
             if end_offset <= len(emitted_triggers):
                 try:
                     await bucket_mgr.update(bucket_id, trigger_last_seen=today, _skip_revision=True)
