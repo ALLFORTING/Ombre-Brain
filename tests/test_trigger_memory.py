@@ -54,12 +54,11 @@ def test_plain_bucket_construction_preserves_full_pre_repeat_metadata(kwargs, ov
     assert post.content == "plain default body"
 
 
-def test_c2_pure_fixture_serialization_preserves_frozen_pre_repeat_hashes(monkeypatch):
+def test_c2_pure_fixture_serialization_preserves_frozen_pre_repeat_hashes():
     import hashlib
     from pathlib import Path
     import frontmatter
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "deploy/lsf-zeabur"))
-    import c2_seed
+    from bucket_manager import BucketManager
     # Frozen at the pre-PR125 builder with day=2026-10-08. This test needs
     # neither Git history nor a volume/initializer; only pure definitions.
     expected = {
@@ -85,7 +84,46 @@ def test_c2_pure_fixture_serialization_preserves_frozen_pre_repeat_hashes(monkey
         "c20000000020": ("dynamic/c2-v1/C2-PAGE-20_c20000000020.md", "b72734e6272e1956a53483af60b0c01b34198ca93b2a526b49bca219ae0dd851"),
         "c20000000021": ("dynamic/c2-v1/C2-PAGE-LONG_c20000000021.md", "af7ab2ac8eb473d8bd064be5d4719094799501ec9fdd0ffe6c901cf731678367"),
     }
-    rows = c2_seed.definitions("2026-10-08")
+    # Keep frozen inputs test-local: main has no LSF deployment package.
+    day, previous = "2026-10-08", "2026-10-07"
+    rows = []
+    def add(n, name, domain, body, importance=5, date=None, kind="dynamic",
+            tags=(), valence=.5, arousal=.3, **extra):
+        bucket_id, date = f"c2{n:010d}", date or day
+        post = BucketManager._build_bucket_post(
+            bucket_id, body, name=name, domain=domain, tags=["c2-v1", *tags],
+            importance=importance, valence=valence, arousal=arousal,
+            bucket_type=kind, created=date + "T00:00:00",
+            last_active=date + "T00:00:00", created_date=date,
+            pinned=extra.pop("pinned", False), topics=extra.pop("topics", None))
+        post.metadata.update(extra)
+        folder = {"permanent": "permanent", "archive": "archive", "feel": "feel"}.get(kind, "dynamic")
+        rows.append((Path(folder) / "c2-v1" / f"{name}_{bucket_id}.md", post))
+    add(1, "C2-NAME-EXACT", ["c2-lex"], "C2-LEX-01", 8)
+    add(2, "C2-NAME-EXACT-NEAR", ["c2-lex"], "C2-LEX-02", 8)
+    add(3, "C2-TAG-TODAY", ["c2-lex"], "C2-LEX-03", 8,
+        tags=["C2-TAG-EXACT", "C2-ZERO"], valence=0, arousal=0)
+    add(4, "C2-BODY-LOW", ["c2-lex"], "C2-BODY-NEEDLE：仅用于正文子串检索。", 2)
+    add(5, "C2-TAG-YESTERDAY", ["c2-lex"], "C2-LEX-05", 9, date=previous,
+        tags=["C2-TAG-EXACT", "C2-ZERO"], valence=1, arousal=1)
+    add(6, "C2-OTHER-DOMAIN", ["c2-other"], "C2-LEX-06", 9, tags=["C2-TAG-EXACT"])
+    add(7, "C2-DORMANT", ["c2-state"], "C2STATE dormant", dormant=True)
+    add(8, "C2-SEALED", ["c2-state"], "C2STATE sealed", sealed=1)
+    add(9, "C2-COMPRESSED", ["c2-state"], "C2STATE compressed：正文保留。", tags=["compressed"])
+    add(10, "C2-OLD", ["c2-state"], "C2STATE old",
+        superseded_by="c20000000011", superseded_at=day + "T00:00:00")
+    add(11, "C2-SUCCESSOR", ["c2-state"], "C2STATE successor", supersedes=["c20000000010"])
+    add(12, "C2-FEEL", [], "C2FEEL synthetic emotion", kind="feel", tags=["C2-FEEL"])
+    add(13, "C2-SESSION", ["session"], "C2SESSION synthetic archive",
+        kind="archive", tags=["C2-SESSION"], topics=["C2-TOPIC"])
+    add(14, "C2-PIN", ["c2-emerge"], "C2EMERGE synthetic pinned",
+        importance=10, kind="permanent", pinned=True)
+    add(15, "C2-HISTORY", ["c2-history"], "C2HISTORY NEW-V2", date="2026-10-01",
+        updated_at="2026-10-02", last_active="2026-10-02T00:00:00")
+    for n in range(16, 21):
+        add(n, f"C2-PAGE-{n}", ["c2-page"], f"C2PAGE short {n}")
+    add(21, "C2-PAGE-LONG", ["c2-page"], "C2PAGE C2-LONG-HEAD\n" +
+        "这是一段只用于隔离验收的合成长文。" * 400 + "\nC2-LONG-TAIL")
     actual = {post["id"]: (path.as_posix(), hashlib.sha256(frontmatter.dumps(post).encode()).hexdigest())
               for path, post in rows}
     assert len(rows) == len(actual) == 21
