@@ -169,6 +169,8 @@ REGISTERED_BOUNDARIES: dict[str, dict[str, str]] = {
         "create": "guarded_async_mutation",
         "_move_bucket": "guarded_mutation",
         "update": "guarded_async_mutation",
+        "prepare_boot_triggers": "guarded_mutation",
+        "commit_boot_triggers": "guarded_mutation",
         "complete_todo": "guarded_mutation",
         "drop_todo": "guarded_mutation",
         "delete": "guarded_async_mutation",
