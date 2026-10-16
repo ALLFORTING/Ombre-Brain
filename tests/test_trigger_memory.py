@@ -27,6 +27,113 @@ def _history_counts(server):
                      for table in ("bucket_history", "bucket_revisions"))
 
 
+@pytest.mark.parametrize("kwargs,overrides", [
+    ({}, {}),
+    ({"bucket_type": "feel"}, {"type": "feel", "domain": []}),
+    ({"bucket_type": "archive"}, {"type": "archive"}),
+    ({"pinned": True}, {"type": "permanent", "importance": 10, "pinned": True}),
+    ({"protected": True}, {"importance": 10, "protected": True}),
+    ({"provenance_kind": "summary"}, {"provenance_kind": "summary"}),
+])
+def test_plain_bucket_construction_preserves_full_pre_repeat_metadata(kwargs, overrides):
+    from bucket_manager import BucketManager
+    stamp, day = "2026-10-08T00:00:00", "2026-10-08"
+    post = BucketManager._build_bucket_post(
+        "fixture-default", "plain default body", created=stamp,
+        last_active=stamp, created_date=day, _aliases=[], **kwargs)
+    expected = {
+        "id": "fixture-default", "name": "fixture-default", "tags": [], "domain": ["未分类"],
+        "valence": 0.5, "arousal": 0.3, "importance": 5, "type": "dynamic",
+        "created": stamp, "last_active": stamp, "created_at": day, "updated_at": day,
+        "emotion_history": "[]", "related_buckets": "", "source_bucket": "",
+        "trigger_date": "", "trigger_last_seen": "", "dormant": False, "sealed": 0,
+        "activation_count": 0, "todos": [],
+    }
+    expected.update(overrides)
+    assert post.metadata == expected
+    assert post.content == "plain default body"
+
+
+def test_c2_pure_fixture_serialization_preserves_frozen_pre_repeat_hashes(monkeypatch):
+    import hashlib
+    from pathlib import Path
+    import frontmatter
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "deploy/lsf-zeabur"))
+    import c2_seed
+    # Frozen at the pre-PR125 builder with day=2026-10-08. This test needs
+    # neither Git history nor a volume/initializer; only pure definitions.
+    expected = {
+        "c20000000001": ("dynamic/c2-v1/C2-NAME-EXACT_c20000000001.md", "63004518742823089df3b68b771bd29504778253e9c50e1e5e3cfdcb29d545f4"),
+        "c20000000002": ("dynamic/c2-v1/C2-NAME-EXACT-NEAR_c20000000002.md", "2630373d6c45adf9e7dacc2fe60d055fc4c7af20613cb31c6bc40028dac724e2"),
+        "c20000000003": ("dynamic/c2-v1/C2-TAG-TODAY_c20000000003.md", "7e24f25b6891bc952ce8b86107db9fcbf7019491d56389c6d75ba62a99dac0b0"),
+        "c20000000004": ("dynamic/c2-v1/C2-BODY-LOW_c20000000004.md", "f90c3c8837a5ce1dd62555bb2ee41e94f1c1e62b8682ea7f67ac18bec945454c"),
+        "c20000000005": ("dynamic/c2-v1/C2-TAG-YESTERDAY_c20000000005.md", "692248369cff7c25eb5c5d8f62b0d7d8fd58c623cf569ff0135928dd77d7e845"),
+        "c20000000006": ("dynamic/c2-v1/C2-OTHER-DOMAIN_c20000000006.md", "1b0a0ab91377ddd6be1a78a66d5a3bba543c9755f9234e96a757b4a87e49efcb"),
+        "c20000000007": ("dynamic/c2-v1/C2-DORMANT_c20000000007.md", "e51c8d2ffeeeb2841b614b844749b77ad695683054c7614321e2518646c95303"),
+        "c20000000008": ("dynamic/c2-v1/C2-SEALED_c20000000008.md", "205b0ed25e82138aa2e0924d23961760e552a7b7fdcda1a9f728bdc57ac595ed"),
+        "c20000000009": ("dynamic/c2-v1/C2-COMPRESSED_c20000000009.md", "c3a367af86dd3291b3bb2e2c98f46c7186e9a50738a5ac8437b1c7a9e09fa5bd"),
+        "c20000000010": ("dynamic/c2-v1/C2-OLD_c20000000010.md", "df34b7496ae80f5c8e24407d77e811dad4f0b6fccf21359328af1dbf50667e1b"),
+        "c20000000011": ("dynamic/c2-v1/C2-SUCCESSOR_c20000000011.md", "ff8594a7b0f3a5445d3002dc4ff8b1701b1bf5d322441d5f4bef426edd204885"),
+        "c20000000012": ("feel/c2-v1/C2-FEEL_c20000000012.md", "88e1695c945ffda2b2c38bc647c99b36e5f1d8009969aa233b8e8c9f52e77071"),
+        "c20000000013": ("archive/c2-v1/C2-SESSION_c20000000013.md", "d1c31ed7fae05329fbf4414053ebf7efee923bffe6edcbad8e36ec87d07469d5"),
+        "c20000000014": ("permanent/c2-v1/C2-PIN_c20000000014.md", "c0496df313f312b7dbd409e1e66859f186e575a5cbd0c110aac72f22e7b14024"),
+        "c20000000015": ("dynamic/c2-v1/C2-HISTORY_c20000000015.md", "56f31ad36c8a0329ec2da55a46c6064526e1a045afc01eb998b20ea3f02f62d4"),
+        "c20000000016": ("dynamic/c2-v1/C2-PAGE-16_c20000000016.md", "c45f6cdc30d27f5eca3dafcc8d6866f6483e28dd1d35903dd184c37433097c50"),
+        "c20000000017": ("dynamic/c2-v1/C2-PAGE-17_c20000000017.md", "1b13d9046ba0cf2bfb83d3245cb610411dad1f9869b2ba81ab275652c325789b"),
+        "c20000000018": ("dynamic/c2-v1/C2-PAGE-18_c20000000018.md", "8aca013a6d3a5da1862f8e439c3dba3142a16b5a7e7aeeabff2cbfab75d3193b"),
+        "c20000000019": ("dynamic/c2-v1/C2-PAGE-19_c20000000019.md", "02fd4da8876c7c1f892d8b741f4b4d7c1519bd30c87bc27a79dea0cc86d1f66b"),
+        "c20000000020": ("dynamic/c2-v1/C2-PAGE-20_c20000000020.md", "b72734e6272e1956a53483af60b0c01b34198ca93b2a526b49bca219ae0dd851"),
+        "c20000000021": ("dynamic/c2-v1/C2-PAGE-LONG_c20000000021.md", "af7ab2ac8eb473d8bd064be5d4719094799501ec9fdd0ffe6c901cf731678367"),
+    }
+    rows = c2_seed.definitions("2026-10-08")
+    actual = {post["id"]: (path.as_posix(), hashlib.sha256(frontmatter.dumps(post).encode()).hexdigest())
+              for path, post in rows}
+    assert len(rows) == len(actual) == 21
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["create", "hold", "feel", "pinned", "keyed-hold", "keyed-feel", "keyed-pinned"])
+async def test_no_reminder_entrypoints_persist_only_original_trigger_fields(tmp_path, monkeypatch, entry):
+    server = _load_server(tmp_path, monkeypatch)
+    if entry == "create":
+        bucket_id = await server.bucket_mgr.create("plain bucket entry")
+    else:
+        extra = {"operation_id": "plain-hold-entry"} if entry.startswith("keyed-") else {}
+        if entry.endswith("feel"):
+            extra["feel"] = True
+        if entry.endswith("pinned"):
+            extra["pinned"] = True
+        result = await server.hold("plain bucket entry", **extra)
+        buckets = await server.bucket_mgr.list_all()
+        assert len(buckets) == 1, result
+        bucket_id = buckets[0]["id"]
+    raw = _raw_trigger(server, bucket_id)
+    assert {key: value for key, value in raw.metadata.items() if key.startswith("trigger_")} == {
+        "trigger_date": "", "trigger_last_seen": ""}
+    loaded = await server.bucket_mgr.get(bucket_id)
+    assert loaded["metadata"]["trigger_repeat"] == "once"  # Read default remains available.
+    assert "trigger_repeat" not in _raw_trigger(server, bucket_id).metadata
+
+
+@pytest.mark.asyncio
+async def test_read_default_does_not_leak_through_edits_or_restore(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    bucket_id = await server.bucket_mgr.create("plain original body")
+    assert (await server.bucket_mgr.get(bucket_id))["metadata"]["trigger_repeat"] == "once"
+    await server.trace(bucket_id, name="plain renamed bucket")
+    await server.trace(bucket_id, content="plain changed body")
+    ref = next(row["ref"] for row in server.bucket_mgr.list_bucket_revisions(bucket_id) if row["op_kind"] == "replace")
+    plan = server.bucket_mgr.plan_restore(bucket_id, ref)
+    assert {key: value for key, value in plan["metadata"].items() if key.startswith("trigger_")} == {
+        "trigger_date": "", "trigger_last_seen": ""}
+    monkeypatch.setattr(server.bucket_mgr, "_refresh_ordinary_embedding_best_effort", AsyncMock())
+    await server.bucket_mgr.execute_restore(plan, actor="test")
+    await server.boot()
+    assert {key: value for key, value in _raw_trigger(server, bucket_id).metadata.items() if key.startswith("trigger_")} == {
+        "trigger_date": "", "trigger_last_seen": ""}
+
+
 @pytest.mark.asyncio
 async def test_once_three_day_window_expiry_receipt_and_search(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
