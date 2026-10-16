@@ -3367,7 +3367,6 @@ class BucketManager(BucketRevisionMixin):
             "related_buckets": "",
             "source_bucket": "",
             "trigger_date": "",
-            "trigger_repeat": "once",
             "trigger_last_seen": "",
             "dormant": False,
             "sealed": 1 if sealed else 0,
