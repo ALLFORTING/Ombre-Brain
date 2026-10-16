@@ -487,8 +487,24 @@ class BucketRevisionMixin:
 
         metadata = copy.deepcopy(source_meta)
         metadata["id"] = bucket_id
+        # Reminder delivery belongs to a particular schedule. Preserve live
+        # receipts only for that same schedule; restoring a different schedule
+        # must not borrow either its old or its current expiry notification.
+        schedule_fields = ("trigger_date", "trigger_repeat", "trigger_anchor")
+        def schedule(meta):
+            return tuple(str(meta.get(field, "once" if field == "trigger_repeat" else "") or "")
+                         for field in schedule_fields)
+        reminder_runtime = ("trigger_last_seen", "trigger_expired_at", "trigger_expiry_notified_at")
+        same_schedule = mode == "existing" and schedule(metadata) == schedule(current_meta)
+        for field in reminder_runtime:
+            if same_schedule and field in current_meta:
+                metadata[field] = copy.deepcopy(current_meta[field])
+            else:
+                metadata.pop(field, None)
         if mode == "existing":
             for field in RUNTIME_FIELDS:
+                if field in reminder_runtime:
+                    continue
                 if field in current_meta:
                     metadata[field] = copy.deepcopy(current_meta[field])
                 else:
