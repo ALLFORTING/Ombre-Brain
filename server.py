@@ -766,8 +766,7 @@ _RECALL_MIN_QUERY_CHARS = 4
 _RECALL_SNIPPET_CHARS = 300
 _RECALL_DEBUG_CANDIDATES = 5
 _RECALL_DEFAULT_MIN_SCORE = 0.65
-_RECALL_DEFAULT_LEAD = 0.05
-# Both defaults are uncalibrated estimates; tune from debug scores.
+# The default threshold is an uncalibrated estimate; tune from debug scores.
 
 
 def _recall_env_unit(name: str, default: float) -> float:
@@ -860,18 +859,10 @@ async def recall_hook(request):
             return respond(reason, candidates=debug_candidates)
 
         threshold = _recall_env_unit("OMBRE_RECALL_MIN_SCORE", _RECALL_DEFAULT_MIN_SCORE)
-        lead = _recall_env_unit("OMBRE_RECALL_LEAD", _RECALL_DEFAULT_LEAD)
-        top_score = ranked[0][1]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        if top_score < threshold:
+        passed = [item for item in ranked if item[1] >= threshold]
+        if not passed:
             return respond("below_threshold", candidates=debug_candidates)
-        gap = top_score - second_score
-        if gap < lead and not math.isclose(gap, lead, rel_tol=0.0, abs_tol=1e-12):
-            return respond("no_lead", candidates=debug_candidates)
-
-        picked = [ranked[0]]
-        if max_items > 1 and len(ranked) > 1 and second_score >= threshold:
-            picked.append(ranked[1])
+        picked = passed[:max_items]
         items = []
         for bid, score in picked:
             bucket = eligible[bid]

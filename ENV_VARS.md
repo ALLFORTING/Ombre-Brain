@@ -95,7 +95,7 @@ Clean first deployment requires the operator-configured `OMBRE_DASHBOARD_SETUP_T
 
 - `OMBRE_RM_RUNTIME_ENABLED` 默认关闭。关闭时 `OMBRE_RM_DATA_ROOT` 即使是非法值也不会被读取或验证。开启时 `OMBRE_RM_DATA_ROOT` 必须是绝对路径，例如 `C:\example\remember-me-data` 或 `/tmp/remember-me-data`；启动失败会 fail closed，不会回退到旧 AssetStore。
 
-- `POST /recall-hook`（只读，按一句话召回旧记忆，最多 2 条）复用 `OMBRE_HOOK_TOKEN`。`OMBRE_RECALL_MIN_SCORE`（默认 `0.65`，0–1）为第 1 名/第 2 名的最低语义相似度；`OMBRE_RECALL_LEAD`（默认 `0.05`，0–1）为第 1 名须领先第 2 名的最小差值。两个默认值都是未校准的估计值，用请求里的 `"debug": true` 看分数再调；非法值回退默认。每次调用对 query 生成一次 embedding（外部 API，无缓存）。
+- `POST /recall-hook`（只读，按一句话召回旧记忆）复用 `OMBRE_HOOK_TOKEN`。`OMBRE_RECALL_MIN_SCORE`（默认 `0.65`，0–1）为过线的最低语义相似度（≥ 即过线）；过线的取分数最高的至多 2 条（受请求 `max_items` 限制），没有过线的返回空。默认值是未校准的估计值，用请求里的 `"debug": true` 看分数再调；非法值回退默认。每次调用对 query 生成一次 embedding（外部 API，无缓存）。
 
 ## Hook deployment order
 
