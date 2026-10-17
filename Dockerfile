@@ -29,9 +29,6 @@ COPY config.example.yaml ./config.yaml
 ARG ZEABUR_GIT_COMMIT_SHA
 RUN python -c 'import os,re,json,pathlib; v=os.environ.get("ZEABUR_GIT_COMMIT_SHA",""); valid=re.fullmatch("[0-9a-f]{40}",v) is not None; pathlib.Path("/app/.backup-v2-build.json").write_text(json.dumps({"source":"zeabur-build","status":"valid" if valid else ("missing" if not v else "invalid"),"commit":v if valid else None}),encoding="ascii")'
 
-# Persistent mount point: bucket data
-# 持久化挂载点：记忆数据
-VOLUME ["/app/buckets"]
 
 # Default to streamable-http for container (remote access)
 # 容器场景默认用 streamable-http
