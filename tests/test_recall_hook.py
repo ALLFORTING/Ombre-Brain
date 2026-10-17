@@ -22,7 +22,7 @@ def _load_server(tmp_path, monkeypatch, *, hook_token=HOOK_TOKEN):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
     for name in (
         "OMBRE_DASHBOARD_PASSWORD", "OMBRE_HOOK_TOKEN", "OMBRE_AUTH_TOKEN",
-        "OMBRE_RECALL_MIN_SCORE", "OMBRE_RECALL_LEAD",
+        "OMBRE_RECALL_MIN_SCORE",
     ):
         monkeypatch.delenv(name, raising=False)
     if hook_token is not None:
@@ -154,47 +154,63 @@ def test_all_excluded_returns_no_candidates(tmp_path, monkeypatch):
     engine.search_similar.assert_not_awaited()
 
 
-def test_below_threshold(tmp_path, monkeypatch):
+def _ids(server, scores, **body):
+    buckets = [_bucket(bid) for bid in scores]
+    _install(server, buckets, scores)
+    return _post(server, {"query": QUERY, **body}).json()
+
+
+def test_zero_pass_returns_below_threshold(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a")], {"a": 0.64})
-    assert _post(server, {"query": QUERY}).json() == {"items": [], "reason": "below_threshold"}
+    body = _ids(server, {"a": 0.64, "b": 0.3})
+    assert body == {"items": [], "reason": "below_threshold"}
 
 
-def test_no_lead_when_gap_too_small(tmp_path, monkeypatch):
+def test_one_pass_returns_one(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a"), _bucket("b")], {"a": 0.80, "b": 0.78})
-    assert _post(server, {"query": QUERY}).json() == {"items": [], "reason": "no_lead"}
+    body = _ids(server, {"a": 0.90, "b": 0.60})
+    assert [i["bucket_id"] for i in body["items"]] == ["a"]
 
 
-def test_lead_exactly_at_limit_passes(tmp_path, monkeypatch):
+def test_two_pass_returns_two(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a"), _bucket("b")], {"a": 0.80, "b": 0.75})
-    body = _post(server, {"query": QUERY}).json()
+    body = _ids(server, {"a": 0.90, "b": 0.70, "c": 0.2})
     assert [i["bucket_id"] for i in body["items"]] == ["a", "b"]
 
 
-def test_second_item_only_when_it_also_reaches_threshold(tmp_path, monkeypatch):
+def test_three_or_more_pass_takes_highest_two(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a"), _bucket("b")], {"a": 0.90, "b": 0.60})
-    assert [i["bucket_id"] for i in _post(server, {"query": QUERY}).json()["items"]] == ["a"]
+    body = _ids(server, {"c": 0.70, "a": 0.95, "d": 0.66, "b": 0.80})
+    assert [i["bucket_id"] for i in body["items"]] == ["a", "b"]
 
 
-def test_max_items_is_capped_at_two_and_can_be_one(tmp_path, monkeypatch):
+def test_close_scores_both_returned(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a"), _bucket("b"), _bucket("c")], {"a": 0.95, "b": 0.70, "c": 0.68})
-    assert len(_post(server, {"query": QUERY, "max_items": 9}).json()["items"]) == 2
-    assert len(_post(server, {"query": QUERY, "max_items": 1}).json()["items"]) == 1
-    assert len(_post(server, {"query": QUERY, "max_items": "x"}).json()["items"]) == 2
+    body = _ids(server, {"a": 0.80, "b": 0.78})
+    assert [i["bucket_id"] for i in body["items"]] == ["a", "b"]
+    assert body["reason"] == ""
 
 
-def test_env_overrides_threshold_and_lead(tmp_path, monkeypatch):
+def test_score_exactly_at_threshold_passes(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    _install(server, [_bucket("a"), _bucket("b")], {"a": 0.55, "b": 0.54})
+    body = _ids(server, {"a": 0.65})
+    assert [i["bucket_id"] for i in body["items"]] == ["a"]
+
+
+def test_max_items_one_returns_one_and_cap_is_two(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    scores = {"a": 0.95, "b": 0.70, "c": 0.68}
+    assert len(_ids(server, scores, max_items=1)["items"]) == 1
+    assert len(_ids(server, scores, max_items=9)["items"]) == 2
+    assert len(_ids(server, scores, max_items="x")["items"]) == 2
+
+
+def test_env_overrides_threshold(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
     monkeypatch.setenv("OMBRE_RECALL_MIN_SCORE", "0.5")
-    monkeypatch.setenv("OMBRE_RECALL_LEAD", "0.0")
-    assert [i["bucket_id"] for i in _post(server, {"query": QUERY}).json()["items"]] == ["a", "b"]
+    assert [i["bucket_id"] for i in _ids(server, {"a": 0.55, "b": 0.54})["items"]] == ["a", "b"]
     monkeypatch.setenv("OMBRE_RECALL_MIN_SCORE", "bogus")
-    assert _post(server, {"query": QUERY}).json()["reason"] == "below_threshold"
+    assert _ids(server, {"a": 0.55})["reason"] == "below_threshold"
 
 
 def test_item_shape_snippet_and_date(tmp_path, monkeypatch):
