@@ -445,6 +445,12 @@ def test_docker_build_injection_and_runtime_reader(tmp_path, value, status):
         if status == "missing":
             assert backup_v2_runtime.resolve_runtime_commit(
                 {"RENDER_GIT_COMMIT": COMMIT}, metadata_path=output) == COMMIT
+            assert backup_v2_runtime.resolve_runtime_commit(
+                {"RAILWAY_GIT_COMMIT_SHA": COMMIT}, metadata_path=output) == COMMIT
+            with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError, match="conflict"):
+                backup_v2_runtime.resolve_runtime_commit(
+                    {"RENDER_GIT_COMMIT": COMMIT, "RAILWAY_GIT_COMMIT_SHA": "2" * 40},
+                    metadata_path=output)
             with pytest.raises(backup_v2_runtime.BackupV2RuntimeConfigError):
                 backup_v2_runtime.resolve_runtime_commit(
                     {"RENDER_GIT_COMMIT": COMMIT, "ZEABUR_SERVICE_ID": "synthetic"},

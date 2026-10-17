@@ -374,7 +374,7 @@ BUILD_METADATA_PATH = Path(__file__).resolve().parent / ".backup-v2-build.json"
 
 
 def resolve_runtime_commit(env: Mapping[str, str], *, metadata_path: Path | None = None) -> str:
-    """Use image build provenance or Render's provider-issued runtime SHA only."""
+    """Use image build provenance or Render/Railway provider-issued runtime SHA only."""
     path = BUILD_METADATA_PATH if metadata_path is None else metadata_path
     commits = []
     build_valid = False
@@ -402,11 +402,12 @@ def resolve_runtime_commit(env: Mapping[str, str], *, metadata_path: Path | None
         if not isinstance(zeabur_runtime, str) or _GIT_SHA.fullmatch(zeabur_runtime) is None:
             raise BackupV2RuntimeConfigError("backup_v2_commit_invalid")
         commits.append(zeabur_runtime)
-    render_commit = env.get("RENDER_GIT_COMMIT")
-    if render_commit is not None:
-        if not isinstance(render_commit, str) or _GIT_SHA.fullmatch(render_commit) is None:
-            raise BackupV2RuntimeConfigError("backup_v2_commit_invalid")
-        commits.append(render_commit)
+    for name in ("RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT_SHA"):
+        provider_commit = env.get(name)
+        if provider_commit is not None:
+            if not isinstance(provider_commit, str) or _GIT_SHA.fullmatch(provider_commit) is None:
+                raise BackupV2RuntimeConfigError("backup_v2_commit_invalid")
+            commits.append(provider_commit)
     if not commits:
         raise BackupV2RuntimeConfigError("backup_v2_commit_missing")
     if len(set(commits)) != 1:
