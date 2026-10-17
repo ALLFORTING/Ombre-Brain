@@ -758,6 +758,138 @@ async def dream_hook(request):
 
 
 # =============================================================
+# /recall-hook endpoint: read-only recall by one sentence
+# 按一句话召回旧记忆（UserPromptSubmit hook 用，绝对只读）
+# =============================================================
+_RECALL_MAX_ITEMS = 2
+_RECALL_MIN_QUERY_CHARS = 4
+_RECALL_SNIPPET_CHARS = 300
+_RECALL_DEBUG_CANDIDATES = 5
+_RECALL_DEFAULT_MIN_SCORE = 0.65
+_RECALL_DEFAULT_LEAD = 0.05
+# Both defaults are uncalibrated estimates; tune from debug scores.
+
+
+def _recall_env_unit(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if 0.0 <= value <= 1.0 else default
+
+
+def _recall_eligible(bucket: dict) -> bool:
+    """Same exclusions as boot/breath-hook; archive is already left out by list_all."""
+    meta = bucket.get("metadata", {})
+    return bool(
+        str(bucket.get("id", "") or "")
+        and not _is_sealed(bucket)
+        and not _is_test_bucket(bucket)
+        and not _superseded_by_id(meta)
+        and not meta.get("resolved", False)
+        and not meta.get("dormant", False)
+        and not meta.get("pinned", False)
+        and not meta.get("protected", False)
+        and meta.get("type") != "feel"
+    )
+
+
+def _recall_name(bucket: dict) -> str:
+    return " ".join(str(bucket.get("metadata", {}).get("name") or bucket["id"]).split())
+
+
+@mcp.custom_route("/recall-hook", methods=["POST"])
+async def recall_hook(request):
+    from starlette.responses import JSONResponse
+    auth_error = _require_hook_auth(request)
+    if auth_error:
+        return auth_error
+
+    def respond(reason: str, items=None, candidates=None):
+        body = {"items": items or [], "reason": "" if items else reason}
+        if candidates is not None:
+            body["candidates"] = candidates
+        return JSONResponse(body)
+
+    debug = False
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return respond("error")
+        debug = payload.get("debug") is True
+        query = payload.get("query")
+        query = query if isinstance(query, str) else ""
+        try:
+            max_items = int(payload.get("max_items", _RECALL_MAX_ITEMS))
+        except (TypeError, ValueError):
+            max_items = _RECALL_MAX_ITEMS
+        max_items = max(1, min(_RECALL_MAX_ITEMS, max_items))
+        debug_candidates = [] if debug else None
+
+        if len(re.sub(r"[\W_]+", "", query)) < _RECALL_MIN_QUERY_CHARS:
+            return respond("query_too_short", candidates=debug_candidates)
+
+        eligible = {
+            str(b["id"]): b
+            for b in await bucket_mgr.list_all(include_archive=False)
+            if _recall_eligible(b)
+        }
+        if not eligible:
+            return respond("no_candidates", candidates=debug_candidates)
+        if not embedding_engine or not getattr(embedding_engine, "enabled", False):
+            return respond("embedding_unavailable", candidates=debug_candidates)
+
+        error_before = str(getattr(embedding_engine, "last_error", "") or "")
+        ranked = await embedding_engine.search_similar(
+            query, top_k=_RECALL_DEBUG_CANDIDATES, candidate_ids=set(eligible)
+        )
+        ranked = [(str(bid), float(score)) for bid, score in ranked if str(bid) in eligible]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        if debug:
+            debug_candidates = [
+                {"bucket_id": bid, "name": _recall_name(eligible[bid]), "score": round(score, 4)}
+                for bid, score in ranked[:_RECALL_DEBUG_CANDIDATES]
+            ]
+        if not ranked:
+            error_after = str(getattr(embedding_engine, "last_error", "") or "")
+            reason = (
+                "embedding_unavailable"
+                if error_after and error_after != error_before
+                else "no_candidates"
+            )
+            return respond(reason, candidates=debug_candidates)
+
+        threshold = _recall_env_unit("OMBRE_RECALL_MIN_SCORE", _RECALL_DEFAULT_MIN_SCORE)
+        lead = _recall_env_unit("OMBRE_RECALL_LEAD", _RECALL_DEFAULT_LEAD)
+        top_score = ranked[0][1]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if top_score < threshold:
+            return respond("below_threshold", candidates=debug_candidates)
+        gap = top_score - second_score
+        if gap < lead and not math.isclose(gap, lead, rel_tol=0.0, abs_tol=1e-12):
+            return respond("no_lead", candidates=debug_candidates)
+
+        picked = [ranked[0]]
+        if max_items > 1 and len(ranked) > 1 and second_score >= threshold:
+            picked.append(ranked[1])
+        items = []
+        for bid, score in picked:
+            bucket = eligible[bid]
+            meta = bucket.get("metadata", {})
+            items.append({
+                "bucket_id": bid,
+                "name": _recall_name(bucket),
+                "date": _bucket_date(meta, "created", "created_at", "updated_at"),
+                "score": round(score, 4),
+                "snippet": strip_wikilinks(bucket.get("content", ""))[:_RECALL_SNIPPET_CHARS],
+            })
+        return respond("", items=items, candidates=debug_candidates)
+    except Exception as e:
+        logger.warning(f"Recall hook failed: {type(e).__name__}: {e}")
+        return respond("error", candidates=[] if debug else None)
+
+
+# =============================================================
 # Internal helper: deduplicate-or-create
 # 内部辅助：仅复用确定性重复，否则新建
 # Shared by hold and grow to avoid duplicate logic
