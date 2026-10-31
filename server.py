@@ -4248,6 +4248,8 @@ async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
             entry = anchors_mod.make_log_entry(anchor_note)
         except ValueError as exc:
             return str(exc)
+        if anchors_mod.append_log(meta.get("anchor_log"), entry) is None:
+            return f"{anchors_mod.ANCHOR_NOTE_DEDUPE_MINUTES} 分钟内已有相同记录，未重复追加：bucket_id={bucket_id}"
         if not await bucket_mgr.update(bucket_id, anchor_log_append=entry):
             return f"锚点记录写入失败：{bucket_id}"
         return f"锚点记录已追加：bucket_id={bucket_id} {entry['at']} {entry['text']}"
