@@ -80,6 +80,7 @@
 !server_dashboard_auth.py
 !server_assets.py
 !server_boot_format.py
+!server_anchors.py
 !server_common.py
 !server_http_security.py
 !source_span_producer.py
