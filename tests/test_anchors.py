@@ -105,7 +105,8 @@ async def test_notes_timestamped_dedupe_five_shown_and_dream_shows_all(tmp_path,
     _at(server, monkeypatch, "2026-10-31T20:10:00")
     bucket_id = await _hold(server)
     assert "已追加" in await server.trace(bucket_id, anchor_note="（Opus 5.5 / TG）问过她喉咙，好点了")
-    assert "ssss" not in await server.trace(bucket_id, anchor_note="（Opus 5.5 / TG）问过她喉咙，好点了")
+    duplicate = await server.trace(bucket_id, anchor_note="（Opus 5.5 / TG）问过她喉咙，好点了")
+    assert "10 分钟内已有相同记录，未重复追加" in duplicate and "已追加" not in duplicate.replace("未重复追加", "")
     assert len(_raw(server, bucket_id)["anchor_log"]) == 1
     for minute in range(1, 7):
         _at(server, monkeypatch, f"2026-10-31T21:{minute:02d}:00")
