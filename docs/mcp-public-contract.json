@@ -857,6 +857,7 @@
       "input_schema_contract": {
         "type": "object",
         "properties": {
+          "anchor_until": {"default": "", "type": "string"},
           "arousal": {
             "default": -1,
             "type": "number"
@@ -1137,6 +1138,8 @@
       "input_schema_contract": {
         "type": "object",
         "properties": {
+          "anchor_until": {"default": "", "type": "string"},
+          "anchor_note": {"default": "", "type": "string"},
           "append": {
             "default": false,
             "type": "boolean"

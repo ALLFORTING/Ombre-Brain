@@ -72,6 +72,7 @@ from utils import (
     safe_path,
     now_iso,
 )
+from server_anchors import append_log as append_anchor_log
 
 
 TRIGGER_REPEATS = ("once", "daily", "weekly", "monthly", "yearly")
@@ -4449,6 +4450,18 @@ class BucketManager(BucketRevisionMixin):
                         post.metadata.pop(field, None)
                     else:
                         post[field] = kwargs[field]
+            # Anchor fields are only ever written when used (never defaulted at creation).
+            if "anchor_until" in kwargs:
+                post["anchor_until"] = str(kwargs["anchor_until"])
+            if "anchor_ended_at" in kwargs:
+                if kwargs["anchor_ended_at"] is None:
+                    post.metadata.pop("anchor_ended_at", None)
+                else:
+                    post["anchor_ended_at"] = str(kwargs["anchor_ended_at"])
+            if "anchor_log_append" in kwargs:
+                appended = append_anchor_log(post.get("anchor_log"), kwargs["anchor_log_append"])
+                if appended is not None:
+                    post["anchor_log"] = appended
             if "superseded_by" in kwargs:
                 if kwargs["superseded_by"] is None:
                     post.metadata.pop("superseded_by", None)
