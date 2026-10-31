@@ -70,6 +70,7 @@ import inspect
 from contextvars import ContextVar
 from bucket_manager import (TRIGGER_REPEATS, TRIGGER_FIELDS, trigger_metadata_updates,
                             hold_trigger_metadata_updates, next_trigger_date)
+import server_anchors as anchors_mod
 from contextlib import asynccontextmanager, nullcontext
 from typing_extensions import Annotated, Literal
 from pydantic import Field
@@ -1531,7 +1532,8 @@ async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = F
     provenance_kind = normalize_provenance_kind(
         bucket.get("metadata", {}).get("provenance_kind")
     )
-    lines = [f"[prov={provenance_kind}] {text}"]
+    anchor_tag = anchors_mod.breath_tag(bucket.get("metadata", {}), anchors_mod.shanghai_now().date())
+    lines = [f"[prov={provenance_kind}] {anchor_tag}{text}"]
     meta = bucket.get("metadata", {})
     current_todos, _ = active_todo_projection(
         meta.get("todos"), meta.get("todo_provenance")
@@ -3541,6 +3543,7 @@ async def hold(
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
+    anchor_until: Annotated[str, Field(description="YYYY-MM-DD. Creates an anchor: a note every window keeps seeing in boot until the end of that day (Asia/Shanghai) or until Ting ends it. Not a todo. At most 4 active anchors; body at most 300 characters. Cannot combine with feel, pinned, supersedes_id, trigger_date or operation_id.")] = "",
     operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
         description="Opaque retry identity shared with trace/grow. Preserved verbatim; keyed supersedes_id is unsupported. None preserves legacy behavior.")] | None = None,
 ) -> str:
@@ -3549,15 +3552,22 @@ async def hold(
     trigger_repeat: once 默认一次性提醒，在日期当天及随后两天显示；daily 每天；weekly 每七天；
     monthly 按原始日号逐月（小月夹至月末）；yearly 按原始月日逐年（闰日夹至 2/28）。
     重复提醒完整展示后推进到未来，错过三天窗口直接跳过。无日期时仅保存频率，不推测日期。
+
+    anchor_until: 建「锚点」——一段时间内每个窗口 boot 都要看到的事（不是待办，不需要完成）。
+    有效到该日全天，到期自动不再显示；婷明说好了才用 trace(anchor_until="end") 结束。
     """
     trigger_repeat = trigger_repeat if _TRIGGER_REPEAT_SUPPLIED.get() else None
     try:
         trigger_date = _parse_optional_date(trigger_date, "trigger_date") or ""
     except ValueError as exc:
         return str(exc)
+    if anchor_until and anchor_until.strip():
+        return await _hold_anchor(content, tags, importance, anchor_until, feel=feel, pinned=pinned,
+                                  supersedes_id=supersedes_id, trigger_date=trigger_date,
+                                  source_bucket=source_bucket, operation_id=operation_id)
     if operation_id is not None:
         return await _hold_grow_keyed(operation_id, 'hold', {
-            key: value for key, value in locals().items() if key != 'operation_id'})
+            key: value for key, value in locals().items() if key not in ('operation_id', 'anchor_until')})
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -4306,6 +4316,118 @@ def _trace_todo_drop(bucket_id: str, todo_id: str, confirm_token: str) -> str:
             f"dropped_at={outcome['dropped_at']}; history preserved; bucket resolved unchanged.")
 
 
+async def _active_anchor_count() -> int:
+    today = anchors_mod.shanghai_now().date()
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    return len(anchors_mod.collect_active(
+        buckets, today, is_sealed=_is_sealed, is_test=lambda b: False, superseded_by=_superseded_by_id))
+
+
+async def _hold_anchor(content, tags, importance, anchor_until, *, feel, pinned, supersedes_id,
+                       trigger_date, source_bucket, operation_id):
+    if operation_id is not None:
+        return "anchor_until does not support operation_id; call without it."
+    if feel or pinned or (supersedes_id or "").strip() or trigger_date or (source_bucket or "").strip():
+        return "anchor_until cannot be combined with feel, pinned, supersedes_id, trigger_date or source_bucket."
+    if not content or not content.strip():
+        return "内容为空，无法存储。"
+    if not 1 <= importance <= 10:
+        return "importance must be within 1-10."
+    try:
+        until = anchors_mod.parse_anchor_date(anchor_until)
+    except ValueError as exc:
+        return str(exc)
+    today = anchors_mod.shanghai_now().date()
+    if until < today:
+        return f"anchor_until {until.isoformat()} is before today ({today.isoformat()})."
+    body = _apply_display_aliases(content).strip()
+    if len(body) > anchors_mod.ANCHOR_BODY_MAX_CHARS:
+        return (f"锚点正文最多 {anchors_mod.ANCHOR_BODY_MAX_CHARS} 字（现在 {len(body)} 字）；"
+                "细节放进别的桶，锚点只写要一直留意的事和该做什么。")
+    active = await _active_anchor_count()
+    if active >= anchors_mod.ANCHOR_MAX_ACTIVE:
+        return (f"同时最多 {anchors_mod.ANCHOR_MAX_ACTIVE} 个有效锚点，现在已有 {active} 个；"
+                "先撤掉（婷说好了）或合并其中一个再建。")
+    extra_tags = [t.strip() for t in (tags or "").split(",") if t.strip()]
+    all_tags = list(dict.fromkeys([anchors_mod.ANCHOR_TAG, *extra_tags]))
+    bucket_id = await bucket_mgr.create(
+        content=body, tags=all_tags, importance=importance, domain=["未分类"],
+        name=_canonical_body_name(body),
+    )
+    if not await bucket_mgr.update(bucket_id, anchor_until=until.isoformat()):
+        return f"锚点桶已创建但 anchor_until 写入失败：{bucket_id}；用 trace(bucket_id, anchor_until=...) 补写。"
+    return (f"锚点已建：bucket_id={bucket_id} 有效至 {until.isoformat()}（当天全天有效，上海时区）；"
+            "每个窗口 boot 都会看到；各窗口用 trace(bucket_id, anchor_note=...) 记自己做了什么。")
+
+
+def _anchor_end_payload(bucket_id: str, until: str) -> dict:
+    return {"bucket_id": bucket_id, "anchor_until": until}
+
+
+async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
+    if anchor_until and anchor_note:
+        return "anchor_until and anchor_note cannot be combined; call them separately."
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return f"未找到记忆桶: {bucket_id}"
+    if _is_sealed(bucket):
+        return "指定记忆桶已封存，不能操作锚点。"
+    meta = bucket.get("metadata", {})
+    today = anchors_mod.shanghai_now().date()
+    state = anchors_mod.anchor_state(meta, today)
+    if anchor_note:
+        if state == "none":
+            return f"{bucket_id} 不是锚点。"
+        if state != "active":
+            return f"锚点已{'结束' if state == 'ended' else '到期'}，不能再追加记录；需要的话先 trace(anchor_until=新日期) 延期。"
+        try:
+            entry = anchors_mod.make_log_entry(anchor_note)
+        except ValueError as exc:
+            return str(exc)
+        if anchors_mod.append_log(meta.get("anchor_log"), entry) is None:
+            return f"{anchors_mod.ANCHOR_NOTE_DEDUPE_MINUTES} 分钟内已有相同记录，未重复追加：bucket_id={bucket_id}"
+        if not await bucket_mgr.update(bucket_id, anchor_log_append=entry):
+            return f"锚点记录写入失败：{bucket_id}"
+        return f"锚点记录已追加：bucket_id={bucket_id} {entry['at']} {entry['text']}"
+    if anchor_until == anchors_mod.ANCHOR_END:
+        if state == "none":
+            return f"{bucket_id} 不是锚点。"
+        if state == "ended":
+            return f"锚点已在 {meta.get('anchor_ended_at')} 结束，无需重复操作。"
+        payload = _anchor_end_payload(bucket_id, str(meta.get("anchor_until")))
+        if not (confirm_token or "").strip():
+            token = _issue_mutation_confirmation("trace.anchor_end", payload)
+            return (f"anchor end preview: no changes made; bucket_id={bucket_id}; "
+                    f"anchor_until={meta.get('anchor_until')}; action=结束锚点（之后各窗口 boot 不再显示，记录保留）。"
+                    "只在婷明确说好了/不用了时执行。\n"
+                    f"confirm_token: {token}")
+        if not _consume_mutation_confirmation("trace.anchor_end", payload, confirm_token):
+            return "anchor end confirmation invalid, expired, used, or stale; preview again."
+        if not await bucket_mgr.update(bucket_id, anchor_ended_at=today.isoformat()):
+            return f"锚点结束写入失败：{bucket_id}"
+        return f"锚点已结束：bucket_id={bucket_id} ended_at={today.isoformat()}；记录保留，可用 trace(anchor_until=新日期) 重新打开。"
+    try:
+        until = anchors_mod.parse_anchor_date(anchor_until)
+    except ValueError as exc:
+        return str(exc)
+    if state == "none":
+        if anchors_mod.ANCHOR_TAG not in (meta.get("tags") or []):
+            return f"{bucket_id} 不是锚点；新建锚点请用 hold(anchor_until=...)。"
+    if state in ("none", "ended", "expired") and until >= today:
+        active = await _active_anchor_count()
+        if active >= anchors_mod.ANCHOR_MAX_ACTIVE:
+            return (f"同时最多 {anchors_mod.ANCHOR_MAX_ACTIVE} 个有效锚点，现在已有 {active} 个；先撤掉或合并一个再重开。")
+    if not await bucket_mgr.update(bucket_id, anchor_until=until.isoformat(), anchor_ended_at=None):
+        return f"锚点日期写入失败：{bucket_id}"
+    note = "（今天之前，已到期）" if until < today else ""
+    return f"锚点有效期已设为 {until.isoformat()}{note}：bucket_id={bucket_id}"
+
+
+def _dream_anchor_block(meta: dict) -> str:
+    block = anchors_mod.dream_lines(meta, anchors_mod.shanghai_now().date())
+    return block + "\n" if block else ""
+
+
 async def _trace_keyed(operation_id, values):
     """Normalize an ordinary trace and freeze its bucket-dependent choices once."""
     try:
@@ -4519,6 +4641,8 @@ async def trace(
     append: bool = False,
     trigger_date: str = "",
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
+    anchor_until: Annotated[str, Field(description="Anchor control, call alone with bucket_id. YYYY-MM-DD sets or extends the anchor's last valid day (Asia/Shanghai, whole day) and reopens an ended anchor; 'end' ends it (two-stage with confirm_token; only when Ting explicitly says it is over).")] = "",
+    anchor_note: Annotated[str, Field(description="Append one window record to an active anchor, call alone with bucket_id: start with (model / window) then what you did, at most 80 characters. The server adds the time. Duplicates within 10 minutes are ignored.")] = "",
     delete: bool = False,
     confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
     todo_done: Annotated[str | None, Field(description="Use only when Ting explicitly says the task is completed. Complete one stable todo ID using preview then confirm_token. Call alone with bucket_id; never resolves the bucket; dropped todos cannot be completed.")] = None,
@@ -4539,8 +4663,10 @@ async def trace(
 
     trigger_repeat = trigger_repeat if _TRIGGER_REPEAT_SUPPLIED.get() else None
     if operation_id is not None:
+        if (anchor_until or "").strip() or (anchor_note or "").strip():
+            return "anchor_until/anchor_note do not support operation_id; call without it."
         return await _trace_keyed(operation_id, {
-            key: value for key, value in locals().items() if key != 'operation_id'
+            key: value for key, value in locals().items() if key not in ('operation_id', 'anchor_until', 'anchor_note')
         })
 
     if not bucket_id or not bucket_id.strip():
@@ -4591,6 +4717,8 @@ async def trace(
     if not bucket_ids:
         return "请提供有效的 bucket_id。"
     if len(bucket_ids) > 1:
+        if (anchor_until or "").strip() or (anchor_note or "").strip():
+            return "批量 trace 不支持 anchor_until/anchor_note，请逐桶操作。"
         if name or content:
             return "批量 trace 不支持修改 content/name，请逐桶操作。"
         if explicit_provenance_kind is not None:
@@ -4641,6 +4769,16 @@ async def trace(
             results.append(f"[{current_id}] {result}")
         return "\n".join(results)
     bucket_id = bucket_ids[0]
+
+    if (anchor_until or "").strip() or (anchor_note or "").strip():
+        if (name or domain or valence != -1 or arousal != -1 or importance != -1 or tags or
+                todos is not None or todo_items is not None or resolved != -1 or pinned != -1 or
+                permanent != -1 or digested != -1 or dormant != -1 or sealed != -1 or content or
+                explicit_provenance_kind is not None or related or unrelate or
+                superseded_by is not None or merge or append or trigger_date or
+                trigger_repeat is not None or delete):
+            return "anchor_until/anchor_note must be called alone with bucket_id (and confirm_token for end)."
+        return await _trace_anchor(bucket_id, (anchor_until or "").strip(), (anchor_note or "").strip(), confirm_token)
 
     if merge and delete:
         return "merge 不能与 delete 同时使用。"
@@ -5267,6 +5405,15 @@ async def boot(
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
 
+    anchors_today = anchors_mod.shanghai_now().date()
+    anchors_text = anchors_mod.format_section(
+        anchors_mod.collect_active(
+            active_buckets, anchors_today,
+            is_sealed=_is_sealed, is_test=_is_test_bucket, superseded_by=_superseded_by_id),
+        anchors_today,
+        token_cap=anchors_mod.ANCHOR_TG_TOKEN_CAP if profile == "tg" else None)
+    anchor_sections = [("anchors", "锚点", anchors_text)] if anchors_text else []
+
     selected_trigger_text, selected_trigger_items = trigger_text, trigger_items
 
     def _compose_boot_body(current_delta_text: str) -> tuple[str, dict[str, str]]:
@@ -5275,6 +5422,7 @@ async def boot(
         selected_trigger_items = trigger_baseline["items"]
         sections = [
             ("ting_note", "婷留言", ting_note_text),
+            *anchor_sections,
             ("delta", "增量摘要", current_delta_text),
             ("triggers", "今日触发", selected_trigger_text),
         ]
@@ -5297,6 +5445,7 @@ async def boot(
 
             omission_item_refs = {
                 "ting_note": _stable_refs(ting_note_text),
+                "anchors": _stable_refs(anchors_text),
                 "delta": _stable_refs(current_delta_text),
                 "triggers": [f"bucket_id:{bucket_id}" for bucket_id, _ in trigger_items],
                 "mailbox": _stable_refs(mailbox_text),
@@ -5312,9 +5461,10 @@ async def boot(
                 minimum_chars={
                     **profile_config["section_minimums"],
                     "ting_note": len(ting_note_text),
+                    "anchors": len(anchors_text),
                     "delta": len(current_delta_text),
                 },
-                atomic_sections={"ting_note", "delta"},
+                atomic_sections={"ting_note", "anchors", "delta"},
                 omission_item_refs=omission_item_refs,
                 truncation_notice_tokens=truncation_notice_tokens,
                 todo_display=todo_display,
@@ -5935,6 +6085,7 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False, touch: bool = 
                 f"[{meta.get('name', bucket_id)}]{resolved_tag}{await _superseded_marker(bucket)} "
                 f"主题:{domains} V{val:.1f}/A{aro:.1f} 更新:{updated}\n"
                 f"ID: {bucket_id}\n"
+                f"{_dream_anchor_block(meta)}"
                 f"{detail_prefix}{strip_wikilinks(bucket.get('content', ''))}"
             )
             if touch:
