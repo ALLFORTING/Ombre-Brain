@@ -51,19 +51,19 @@ def _rows(server, sql, args=()):
         return conn.execute(sql, args).fetchall()
 
 
-RULES = [{"from": "北京", "to": "帝都"}]
+RULES = [{"from": "旧城", "to": "新城"}]
 
 
 async def _seed(server):
-    a = await server.bucket_mgr.create(content="我在北京工作，北京很大。", name="北京日记",
-                                       tags=["北京", "工作"], domain=["日常"])
+    a = await server.bucket_mgr.create(content="我在旧城工作，旧城很大。", name="旧城日记",
+                                       tags=["旧城", "工作"], domain=["日常"])
     b = await server.bucket_mgr.create(content="与地名无关的内容", name="无关", tags=["x"], domain=["日常"])
-    sealed = await server.bucket_mgr.create(content="秘密北京SEALEDBODY", name="封", domain=["日常"])
+    sealed = await server.bucket_mgr.create(content="秘密旧城SEALEDBODY", name="封", domain=["日常"])
     await server.bucket_mgr.update(sealed, sealed=1)
     for bucket_id in (a, b):
         _age(server, bucket_id)
-    server.bucket_mgr.record_letter("信里写着北京和北京。", "s1")
-    server.bucket_mgr.record_letter("封存信北京LETTERSEALED", "s2", sealed=True)
+    server.bucket_mgr.record_letter("信里写着旧城和旧城。", "s1")
+    server.bucket_mgr.record_letter("封存信旧城LETTERSEALED", "s2", sealed=True)
     return a, b, sealed
 
 
@@ -80,7 +80,7 @@ async def test_dry_run_shows_diff_and_writes_nothing(tmp_path, monkeypatch):
     out = await server.bulk_replace(RULES)
 
     assert "no changes made" in out and "plan_hash:" in out and "confirm_token:" in out
-    assert "【北京 → 帝都】" in out and a in out and "letter:1" in out
+    assert "【旧城 → 新城】" in out and a in out and "letter:1" in out
     assert "sealed 桶 1 个、sealed 信 1 封" in out
     assert "SEALEDBODY" not in out and "LETTERSEALED" not in out and sealed not in out
     assert {i: Path(server.bucket_mgr._find_bucket_file(i)).read_bytes() for i in (a, b, sealed)} == snapshot
@@ -104,8 +104,8 @@ async def test_execute_applies_keeps_time_fields_and_is_undoable(tmp_path, monke
 
     assert "已更新 2 个（桶 1 / 信 1）" in out
     post = _post(server, a)
-    assert post.content == "我在帝都工作，帝都很大。"
-    assert post["name"] == "帝都日记" and post["tags"] == ["帝都", "工作"]
+    assert post.content == "我在新城工作，新城很大。"
+    assert post["name"] == "新城日记" and post["tags"] == ["新城", "工作"]
     assert post["provenance_kind"] == "unknown"
     for field in ("last_active", "updated_at", "created"):
         assert post[field] == before_meta[field]
@@ -134,13 +134,13 @@ async def test_letters_replaced_sealed_skipped_and_restorable(tmp_path, monkeypa
     op_id = re.search(r"op_id=(\S+)", out).group(1)
 
     rows = {r[0]: r[1:] for r in _rows(server, "SELECT id, content, created_at, session_id, sealed FROM letters")}
-    assert rows[1][0] == "信里写着帝都和帝都。" and rows[1][2] == "s1" and rows[1][3] == 0
-    assert rows[2][0] == "封存信北京LETTERSEALED" and rows[2][3] == 1
+    assert rows[1][0] == "信里写着新城和新城。" and rows[1][2] == "s1" and rows[1][3] == 0
+    assert rows[2][0] == "封存信旧城LETTERSEALED" and rows[2][3] == 1
     saved = _rows(server, "SELECT old_content, change_type FROM bucket_history WHERE bucket_id='letter:1'")
-    assert saved == [("信里写着北京和北京。", op_id)]
+    assert saved == [("信里写着旧城和旧城。", op_id)]
 
     assert server.bucket_mgr.restore_bulk_replace_letters(op_id) == {"restored": [1], "missing": []}
-    assert _rows(server, "SELECT content FROM letters WHERE id=1") == [("信里写着北京和北京。",)]
+    assert _rows(server, "SELECT content FROM letters WHERE id=1") == [("信里写着旧城和旧城。",)]
 
 
 @pytest.mark.asyncio
@@ -153,7 +153,7 @@ async def test_token_is_one_shot_and_bound_to_the_plan(tmp_path, monkeypatch):
     assert "invalid" in await server.bulk_replace(RULES, dry_run=False, confirm_token="nope")
 
     token = _token(await server.bulk_replace(RULES))
-    other = [{"from": "北京", "to": "别处"}]
+    other = [{"from": "旧城", "to": "别处"}]
     assert "invalid" in await server.bulk_replace(other, dry_run=False, confirm_token=token)
     assert "invalid" in await server.bulk_replace(RULES, fields="content", dry_run=False, confirm_token=token)
     assert Path(server.bucket_mgr._find_bucket_file(a)).read_bytes() == before
@@ -170,38 +170,38 @@ async def test_token_is_void_when_a_bucket_changes_after_preview(tmp_path, monke
     server = _load_server(tmp_path, monkeypatch)
     a, _, _ = await _seed(server)
     token = _token(await server.bulk_replace(RULES))
-    await server.bucket_mgr.update(a, content="我在北京工作，北京很大。又加了一句。")
+    await server.bucket_mgr.update(a, content="我在旧城工作，旧城很大。又加了一句。")
 
     out = await server.bulk_replace(RULES, dry_run=False, confirm_token=token)
 
     assert "invalid" in out
-    assert "北京" in _post(server, a).content
+    assert "旧城" in _post(server, a).content
 
 
 @pytest.mark.asyncio
 async def test_bucket_ids_scope_limits_a_rule(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    a = await server.bucket_mgr.create(content="北京一号", name="甲", domain=["d"])
-    b = await server.bucket_mgr.create(content="北京二号", name="乙", domain=["d"])
-    rules = [{"from": "北京", "to": "帝都", "bucket_ids": [a, "ghost"]}]
+    a = await server.bucket_mgr.create(content="旧城一号", name="甲", domain=["d"])
+    b = await server.bucket_mgr.create(content="旧城二号", name="乙", domain=["d"])
+    rules = [{"from": "旧城", "to": "新城", "bucket_ids": [a, "ghost"]}]
 
     preview = await server.bulk_replace(rules, scope="buckets")
     assert "ghost" in preview and "读不到" in preview
     await server.bulk_replace(rules, scope="buckets", dry_run=False, confirm_token=_token(preview))
 
-    assert _post(server, a).content == "帝都一号"
-    assert _post(server, b).content == "北京二号"
+    assert _post(server, a).content == "新城一号"
+    assert _post(server, b).content == "旧城二号"
 
 
 @pytest.mark.asyncio
 async def test_fields_subset_and_provenance_keep(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
-    a = await server.bucket_mgr.create(content="北京", name="北京", tags=["北京"], domain=["d"],
+    a = await server.bucket_mgr.create(content="旧城", name="旧城", tags=["旧城"], domain=["d"],
                                        provenance_kind="summary")
     token = _token(await server.bulk_replace(RULES, fields="name", scope="buckets"))
     await server.bulk_replace(RULES, fields="name", scope="buckets", dry_run=False, confirm_token=token)
     post = _post(server, a)
-    assert (post["name"], post.content, post["tags"]) == ("帝都", "北京", ["北京"])
+    assert (post["name"], post.content, post["tags"]) == ("新城", "旧城", ["旧城"])
     assert post["provenance_kind"] == "summary"
 
     token = _token(await server.bulk_replace(RULES, fields="content", provenance="keep", scope="buckets"))
@@ -209,8 +209,8 @@ async def test_fields_subset_and_provenance_keep(tmp_path, monkeypatch):
                               dry_run=False, confirm_token=token)
     assert _post(server, a)["provenance_kind"] == "summary"
 
-    token = _token(await server.bulk_replace([{"from": "帝都", "to": "X"}], scope="buckets", fields="name"))
-    await server.bulk_replace([{"from": "帝都", "to": "X"}], scope="buckets", fields="name",
+    token = _token(await server.bulk_replace([{"from": "新城", "to": "X"}], scope="buckets", fields="name"))
+    await server.bulk_replace([{"from": "新城", "to": "X"}], scope="buckets", fields="name",
                               dry_run=False, confirm_token=token)
     assert _post(server, a)["provenance_kind"] == "summary"
 
@@ -258,11 +258,11 @@ async def test_apply_refuses_stale_preimage_and_sealed(tmp_path, monkeypatch):
 async def test_dry_run_paginates(tmp_path, monkeypatch):
     server = _load_server(tmp_path, monkeypatch)
     for i in range(5):
-        await server.bucket_mgr.create(content=f"北京{i}", domain=["d"])
+        await server.bucket_mgr.create(content=f"旧城{i}", domain=["d"])
     first = await server.bulk_replace(RULES, scope="buckets", page_size=2)
     last = await server.bulk_replace(RULES, scope="buckets", page_size=2, page=3)
     assert "第 1/3 页" in first and "第 3/3 页" in last
-    assert first.count("【北京 → 帝都】") == 2 and last.count("【北京 → 帝都】") == 1
+    assert first.count("【旧城 → 新城】") == 2 and last.count("【旧城 → 新城】") == 1
     assert "命中 5 个，共 5 处" in first
 
 
@@ -275,8 +275,8 @@ def test_rules_apply_in_order_and_tags_collapse():
 
 
 def test_plan_payload_changes_with_any_input():
-    scan = {"sources": [{"id": "x", "name": None, "tags": None, "content": "北京",
-                         "preimage_sha256": "h1", "extra": {"tg_summary": "北京北京"}}],
+    scan = {"sources": [{"id": "x", "name": None, "tags": None, "content": "旧城",
+                         "preimage_sha256": "h1", "extra": {"tg_summary": "旧城旧城"}}],
             "skipped_sealed": 0, "unreadable": 0, "duplicate_ids": 0}
     base = br.build_plan(scan, br.normalize_rules(RULES), ["content"], "unknown")
     again = br.build_plan(scan, br.normalize_rules(RULES), ["content"], "unknown")
