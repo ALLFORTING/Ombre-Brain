@@ -5,12 +5,12 @@ from zoneinfo import ZoneInfo
 
 from tests.test_boot_profiles import _load_server
 
-TZ = ZoneInfo("Asia/Shanghai")
+TZ = ZoneInfo("Asia/Tokyo")
 
 
 def _at(server, monkeypatch, stamp):
     now = datetime.fromisoformat(stamp).replace(tzinfo=TZ)
-    monkeypatch.setattr(server.anchors_mod, "shanghai_now", lambda: now)
+    monkeypatch.setattr(server.anchors_mod, "tokyo_now", lambda: now)
 
 
 def _raw(server, bucket_id):

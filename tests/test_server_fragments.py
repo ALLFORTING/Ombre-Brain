@@ -34,14 +34,14 @@ FRAGMENTS = {
     "server_breath.py": ("_auto_link_related", "digest", "_breath_impl"),
     "server_assets.py": ("_auto_link_related", "digest", "_selected_asset_backend"),
     "server_breath_tool.py": ("related_backfill", "_format_hold_created", "breath"),
-    "server_dashboard_api.py": ("dream", None, "api_system_status"),
+    "server_dashboard_api.py": ("bulk_replace", None, "api_system_status"),
 }
 
 DEFAULT_TOOL_ORDER = [
     "rm_asset_update_metadata", "rm_asset_reindex_embeddings",
     "digest", "related_backfill", "breath", "hold", "grow",
     "trace", "archive_session", "todos", "boot",
-    "refresh_tg_summary", "pulse", "dream",
+    "refresh_tg_summary", "pulse", "dream", "bulk_replace",
     "note", "letter", "revision", "rm_asset_upload", "rm_asset_find", "rm_asset_show",
 ]
 
@@ -159,7 +159,7 @@ def test_retained_and_action_tool_registration_order(tmp_path):
 
 def test_diagnostic_tools_register_before_digest(tmp_path):
     names = _list_tools(tmp_path, diagnostics=True)
-    assert len(names) == 35
+    assert len(names) == 36
     digest_index = names.index("digest")
     diagnostic = [name for name in names if name.startswith("asset_")]
     assert len(diagnostic) == 15

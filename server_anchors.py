@@ -3,7 +3,7 @@
 An anchor is an ordinary bucket tagged ANCHOR_TAG with extra metadata that is
 only written when used (never defaulted by the bucket builder):
 
-* anchor_until      YYYY-MM-DD; valid through the whole of that day (Asia/Shanghai)
+* anchor_until      YYYY-MM-DD; valid through the whole of that day (Asia/Tokyo)
 * anchor_ended_at   date Ting ended it manually
 * anchor_log        [{"at": "YYYY-MM-DDTHH:MM", "text": "..."}] window records
 
@@ -27,10 +27,10 @@ ANCHOR_NOTE_DEDUPE_MINUTES = 10
 ANCHOR_END = "end"
 ANCHOR_FIELDS = ("anchor_until", "anchor_ended_at", "anchor_log")
 
-_TZ = ZoneInfo("Asia/Shanghai")
+_TZ = ZoneInfo("Asia/Tokyo")
 
 
-def shanghai_now() -> datetime:
+def tokyo_now() -> datetime:
     return datetime.now(_TZ)
 
 
@@ -93,7 +93,7 @@ def clean_note(text: str) -> str:
 
 
 def make_log_entry(text: str, now: datetime | None = None) -> dict:
-    now = now or shanghai_now()
+    now = now or tokyo_now()
     return {"at": now.strftime("%Y-%m-%dT%H:%M"), "text": clean_note(text)}
 
 

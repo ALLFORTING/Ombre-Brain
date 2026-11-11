@@ -33,6 +33,7 @@
 | `dream` | 可选的最近记忆反思/详情读取；不要求自动调用 |
 | `digest` | 受控维护工具；默认 `dry_run=True`；消化与 importance rebalance 使用各自的确认 token，一次只执行一类；`limit` 仅限制 rebalance 预览显示；失败后用返回的续做 token 继续，消化可能产生 provider/API 成本 |
 | `related_backfill` | 受控维护/回填工具；默认 `dry_run=True`，执行模式会写 semantic related links |
+| `bulk_replace` | 受控维护：按替换表批量改未封存桶和信的文字；默认 `dry_run=True`，执行必须带预览给的 `confirm_token`，sealed 跳过；只在婷明确要求时用 |
 | `seal_letter` | sealed-memory handoff-letter 维护；改变 letter 可见性，不是普通检索 |
 | `rm_asset_reindex_embeddings` | Remember-Me 维护/回填；处理缺失或过期 vectors，不改变 asset bytes 或 metadata |
 
