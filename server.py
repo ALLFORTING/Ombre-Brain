@@ -6065,6 +6065,101 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False) -> str:
     return final_text
 
 
+# =============================================================
+# bulk_replace — literal find/replace across unsealed buckets and letters
+# 按替换表批量改桶/信文字：dry_run + 一次性 confirm_token，执行前存旧版本
+# =============================================================
+async def _bulk_replace_plan(rules, fields, scope, provenance):
+    import bulk_replace as br
+    scan = {"sources": [], "skipped_sealed": 0, "skipped_sealed_letters": 0,
+            "unreadable": 0, "duplicate_ids": 0}
+    if "buckets" in scope:
+        scan.update(await asyncio.to_thread(bucket_mgr.scan_bulk_replace_sources))
+    if "letters" in scope and "content" in fields:
+        found = await asyncio.to_thread(bucket_mgr.scan_bulk_replace_letters)
+        scan["sources"] = scan["sources"] + found["sources"]
+        scan["skipped_sealed_letters"] = found["skipped_sealed_letters"]
+    return br.build_plan(scan, rules, fields, provenance, scope=scope)
+
+
+@mcp.tool()
+async def bulk_replace(
+    rules: Annotated[list[dict], Field(description='Ordered literal rules, each {"from": str, "to": str, "bucket_ids": optional list of ids}. bucket_ids limits that rule to those ids (a letter is "letter:<id>"). Rules run in order, each on the previous result; no regex.')],
+    fields: Annotated[str, Field(description="Comma list of content, name, tags. Letters only have content.")] = "content,name,tags",
+    scope: Annotated[str, Field(description="Comma list of buckets, letters.")] = "buckets,letters",
+    provenance: Annotated[str, Field(description="provenance_kind written to a bucket whose body changes: unknown (same as other body rewrites), keep, summary, inference or system.")] = "unknown",
+    dry_run: bool = True,
+    confirm_token: Annotated[str, Field(description="Issued by the dry run for exactly this plan; one-shot and short-lived. Any change to rules, matched buckets or their content voids it.")] = "",
+    page: Annotated[int, Field(description="Dry-run page of matched items.")] = 1,
+    page_size: Annotated[int, Field(description="Dry-run items per page, 1-50.")] = 10,
+) -> str:
+    """Controlled maintenance: literal batch find/replace in unsealed bucket content/name/tags and letter bodies. Dry run (default) shows every hit with context, a plan hash and a confirm_token; execution needs that token. Sealed buckets and letters are skipped and only counted. Each bucket's pre-image is saved as a revision first (revision(action="restore") undoes it); letter bodies are saved to bucket_history. Time fields (last_active, updated_at) are not touched. Use only when Ting explicitly asks in the current conversation."""
+    import bulk_replace as br
+    try:
+        rules_n = br.normalize_rules(rules)
+        fields_n = br.normalize_fields(fields)
+        scope_n = br.normalize_scope(scope)
+        provenance_n = br.normalize_provenance(provenance)
+        page = int(page)
+        page_size = max(1, min(int(page_size), 50))
+    except (br.BulkReplaceError, TypeError, ValueError) as exc:
+        return _with_response_seal(f"bulk_replace rejected: {exc}\nno changes made.")
+    try:
+        plan = await _bulk_replace_plan(rules_n, fields_n, scope_n, provenance_n)
+    except Exception as exc:
+        logger.error("bulk_replace planning failed: %s", type(exc).__name__)
+        return _with_response_seal(f"bulk_replace planning failed: {type(exc).__name__}; no changes made.")
+    plan_hash = _confirmation_payload_digest(plan["payload"])
+    if dry_run:
+        token = _issue_mutation_confirmation("bulk_replace", plan["payload"]) if plan["buckets"] else None
+        return _with_response_seal(br.render_preview(
+            plan, plan_hash, token, _MUTATION_CONFIRM_TTL_SECONDS, page, page_size))
+    if not plan["buckets"]:
+        return _with_response_seal("bulk_replace: nothing matches; no changes made.")
+    if not _consume_mutation_confirmation("bulk_replace", plan["payload"], confirm_token):
+        return _with_response_seal(
+            "bulk_replace confirmation invalid, expired, used, or stale; no changes made. "
+            "Run dry_run=True again and use the new confirm_token.")
+    op_id = "bulk_replace:" + plan_hash[:16]
+    outcome: dict[str, list[str]] = {}
+    aborted = False
+    for item in plan["buckets"]:
+        try:
+            if item["id"].startswith("letter:"):
+                status = bucket_mgr.apply_bulk_replace_letter(
+                    int(item["id"].split(":", 1)[1]), expected_preimage_sha256=item["pre"],
+                    new_content=item["changes"]["content"], op_id=op_id)
+            else:
+                status = await bucket_mgr.apply_bulk_replace_bucket(
+                    item["id"], expected_preimage_sha256=item["pre"], changes=item["changes"],
+                    provenance=plan["provenance"], op_id=op_id)
+        except MaintenanceWriteError as exc:
+            status, aborted = f"blocked:{exc.code}", True
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+        outcome.setdefault(status, []).append(item["id"])
+        if aborted:
+            break
+    done = outcome.pop("updated", [])
+    logger.info("bulk_replace %s: updated=%d other=%s", op_id, len(done),
+                {k: len(v) for k, v in outcome.items()})
+    lines = [f"bulk_replace 已执行 op_id={op_id}",
+             f"已更新 {len(done)} 个（桶 {sum(1 for i in done if not i.startswith('letter:'))} / "
+             f"信 {sum(1 for i in done if i.startswith('letter:'))}）"]
+    for status, ids in sorted(outcome.items()):
+        lines.append(f"未更新 {status}：{len(ids)} 个 " + ", ".join(ids[:20]) + (" …" if len(ids) > 20 else ""))
+    if aborted:
+        skipped = len(plan["buckets"]) - len(done) - sum(len(v) for v in outcome.values())
+        lines.append(f"维护冻结中途停止，另有 {skipped} 个未处理；重新 dry_run 会只列出尚未改的。")
+    if outcome:
+        lines.append("未更新的项重新 dry_run 即可看到剩余命中。")
+    lines.append('撤销：桶用 revision(action="list", bucket_id=...) 找 op=bulk_replace 的最新 r<id>，再 '
+                 'revision(action="restore", bucket_id=..., revision="r<id>")；'
+                 "信的旧正文存在 bucket_history（bucket_id=letter:<id>，change_type=本 op_id），"
+                 "用 BucketManager.restore_bulk_replace_letters(op_id) 整批恢复。")
+    return _with_response_seal("\n".join(lines))
+
+
 # --- Fragment server_dashboard_api.py: Dashboard API, host vault, import API and status ---
 _exec_server_fragment("server_dashboard_api.py")
 

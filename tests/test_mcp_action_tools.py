@@ -95,7 +95,7 @@ async def test_each_action_keeps_wire_and_exact_sdk_arguments(server, monkeypatc
 async def test_metadata_descriptions_and_schema(server):
     async with create_connected_server_and_client_session(server.mcp) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-        assert len(tools) == 20
+        assert len(tools) == 21
         assert tools["rm_asset_show"].meta == server.mcp._tool_manager.get_tool("rm_asset_show").targets["view"].meta
         assert tools["rm_asset_show"].outputSchema is None
         assert len((await client.list_resources()).resources) == 1
