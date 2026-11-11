@@ -10,7 +10,8 @@ import hashlib
 import json
 from typing import Any
 
-FIELDS = ("content", "name", "tags")
+FIELDS = ("content", "name", "tags", "todos")
+DEFAULT_FIELDS = "content,name,tags,todos"
 SCOPES = ("buckets", "letters")
 PROVENANCE_CHOICES = ("unknown", "keep", "summary", "inference", "system")
 MAX_RULES = 500
@@ -55,11 +56,11 @@ def normalize_rules(rules: Any) -> list[dict]:
 
 
 def normalize_fields(raw: Any) -> list[str]:
-    text = "content,name,tags" if raw is None or str(raw).strip() == "" else str(raw)
+    text = DEFAULT_FIELDS if raw is None or str(raw).strip() == "" else str(raw)
     selected = list(dict.fromkeys(part.strip().lower() for part in text.split(",") if part.strip()))
     bad = [name for name in selected if name not in FIELDS]
     if bad or not selected:
-        raise BulkReplaceError("fields 只能是 content、name、tags 的逗号组合。")
+        raise BulkReplaceError("fields 只能是 content、name、tags、todos 的逗号组合。")
     return [name for name in FIELDS if name in selected]
 
 
@@ -72,7 +73,7 @@ def normalize_scope(raw: Any) -> list[str]:
 
 
 def normalize_provenance(raw: Any) -> str:
-    value = str(raw or "unknown").strip().lower()
+    value = str(raw or "keep").strip().lower()
     if value not in PROVENANCE_CHOICES:
         raise BulkReplaceError("provenance 只能是 " + "、".join(PROVENANCE_CHOICES) + "。")
     return value
@@ -141,6 +142,31 @@ def plan_bucket(source: dict, rules: list[dict], fields: list[str], context: int
                 isinstance(i, str) for i in new_items) else new_items
             changes["tags"] = merged[0] if isinstance(tags, str) else merged
             hits += tag_hits
+    todos = source.get("todos")
+    if "todos" in fields and isinstance(todos, list):
+        new_todos, todo_hits, touched = [], [], False
+        for item in todos:
+            if not isinstance(item, str):
+                new_todos.append(item)
+                continue
+            new, found = _apply_text(item, indexed, max(context, len(item)))
+            if new != item:
+                touched = True
+                todo_hits += [dict(h, field="todos") for h in found]
+            new_todos.append(new)
+        if touched:
+            changes["todos"] = new_todos
+            hits += todo_hits
+            # Keep the sidecar texts in step; id, said_by, said_at, source_bucket stay as is.
+            records = source.get("todo_provenance")
+            if isinstance(records, list):
+                new_records = []
+                for record in records:
+                    if isinstance(record, dict) and isinstance(record.get("text"), str):
+                        record = dict(record, text=_apply_text(record["text"], indexed, 0)[0])
+                    new_records.append(record)
+                if new_records != records:
+                    changes["todo_provenance"] = new_records
     if not changes:
         return None
     return {"id": bucket_id, "name": source.get("name"), "label": source.get("label"),
@@ -180,6 +206,8 @@ def build_plan(scan: dict, rules: list[dict], fields: list[str], provenance: str
     untouched: dict[str, int] = {}
     for source in sources:
         for key, value in (source.get("extra") or {}).items():
+            if "todos" in fields and key in ("todos", "todo_provenance"):
+                continue
             total = sum(_count(value, r["from"]) for r in rules
                         if r["bucket_ids"] is None or source["id"] in r["bucket_ids"])
             if total:
@@ -191,7 +219,7 @@ def build_plan(scan: dict, rules: list[dict], fields: list[str], provenance: str
         "provenance": provenance,
         "buckets": [{"id": b["id"], "pre": b["pre"],
                      "post": hashlib.sha256(json.dumps(
-                         [b["changes"].get(k) for k in FIELDS], ensure_ascii=False
+                         [b["changes"].get(k) for k in (*FIELDS, "todo_provenance")], ensure_ascii=False
                      ).encode("utf-8")).hexdigest()} for b in buckets],
     }
     return {"rules": rules, "fields": fields, "scope": scope, "provenance": provenance,
@@ -225,7 +253,7 @@ def render_preview(plan: dict, plan_hash: str, token: str | None, ttl: int,
              f"正文改动后 provenance_kind: "
              f"{'保持不变' if plan['provenance'] == 'keep' else plan['provenance']}（信不带该字段）",
              f"扫描未封存对象 {plan['scanned']} 个（桶和信）；命中 {len(buckets)} 个，共 {total_hits} 处"
-             f"（content {by_field['content']} / name {by_field['name']} / tags {by_field['tags']}）",
+             f"（content {by_field['content']} / name {by_field['name']} / tags {by_field['tags']} / todos {by_field['todos']}）",
              f"跳过：sealed 桶 {plan['skipped_sealed']} 个、sealed 信 {plan['skipped_sealed_letters']} 封"
              f"（不读取、不显示）；无法读取 {plan['unreadable']} 个；重复 id {plan['duplicate_ids']} 个"]
     lines.append("规则统计：")

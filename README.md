@@ -405,7 +405,7 @@ The current MCP surface has 25 default tools, 40 tools when diagnostics are enab
 | `archive_session` | 归档一次会话摘要，可附 highlights/mood/VA 和 mailbox letter / Archive a session summary with optional handoff letter |
 | `todos` | 汇总未 resolved 且非 sealed 桶中的 todos；`include_provenance=True` 才按明确来源分组显示 / Summarize todos from unresolved, non-sealed buckets; explicit provenance grouping is opt-in |
 | `related_backfill` | 维护/回填 semantic related；默认 `dry_run=True`，执行模式会写 relation 并跳过 sealed 桶 / Maintenance backfill; `dry_run=True` by default, execution writes links |
-| `bulk_replace` | 维护：按替换表（字面串，不用正则）批量改未封存桶的 content/name/tags 和信正文；默认 `dry_run=True`，输出逐处 diff、`plan_hash` 和一次性 `confirm_token`，执行必须带该 token；改前每桶存 revision（信存进 `bucket_history`），不改 `last_active` 等时间字段，跳过 sealed 并只报数量 / Controlled literal batch replace over unsealed buckets and letters; dry-run by default with per-hit diff, plan hash and a one-shot confirm_token; pre-images are saved first, time fields are untouched, sealed items are skipped and only counted |
+| `bulk_replace` | 维护：按替换表（字面串，不用正则）批量改未封存桶的 content/name/tags/todos 文本和信正文；默认 `dry_run=True`，输出逐处 diff、`plan_hash` 和一次性 `confirm_token`，执行必须带该 token；改前每桶存 revision（信存进 `bucket_history`），不改 `last_active` 等时间字段，跳过 sealed 并只报数量 / Controlled literal batch replace over unsealed buckets and letters; dry-run by default with per-hit diff, plan hash and a one-shot confirm_token; pre-images are saved first, time fields are untouched, sealed items are skipped and only counted |
 | `digest` | 维护/规划旧桶消化；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 / Controlled digestion maintenance; dry-run by default, confirmed execution may write results and incur provider/API cost |
 | `rm_asset_upload_link` / `rm_asset_upload_status` | Remember-Me 持久 asset 上传生命周期：短期 signed link 与 metadata-only 状态查询 / Persistent asset upload lifecycle: short-lived signed link plus metadata-only status |
 | `rm_asset_get` | 按 ID 读取持久 asset metadata，不返回 bytes / Read persistent asset metadata by ID; no file bytes |
@@ -560,8 +560,8 @@ The only required argument remains `summary`. Generate the optional case-sensiti
 
 #### `bulk_replace`
 
-- `bulk_replace(rules, fields="content,name,tags", scope="buckets,letters", provenance="unknown", dry_run=True, confirm_token="", page=1, page_size=10)`。`rules` 是 `[{"from", "to", "bucket_ids"(可选)}]`，按顺序逐条作用在上一条的结果上；`bucket_ids` 限定该规则只在这些桶生效（信写作 `letter:<id>`）。预览按页列出每处命中的前后文，给 `plan_hash` 和 5 分钟有效、一次性的 `confirm_token`；token 绑定规则、命中桶和桶内容，任何变化都要重新预览。
-- 执行前每个桶的旧版本存为 `op_kind=bulk_replace` 的 revision，用 `revision(action="restore")` 撤销；信的旧正文存在 `bucket_history`（`bucket_id=letter:<id>`，`change_type=op_id`），整批恢复用 `BucketManager.restore_bulk_replace_letters(op_id)`。正文改动后 `provenance_kind` 默认置 `unknown`（`provenance="keep"` 保持原值）。不改时间字段，不记 boot delta，不计作 touch；其他 frontmatter 字段（todos、tg_summary 等）不改，预览会提示其中的字面命中数。
+- `bulk_replace(rules, fields="content,name,tags,todos", scope="buckets,letters", provenance="keep", dry_run=True, confirm_token="", page=1, page_size=10)`。`rules` 是 `[{"from", "to", "bucket_ids"(可选)}]`，按顺序逐条作用在上一条的结果上；`bucket_ids` 限定该规则只在这些桶生效（信写作 `letter:<id>`）。预览按页列出每处命中的前后文，给 `plan_hash` 和 5 分钟有效、一次性的 `confirm_token`；token 绑定规则、命中桶和桶内容，任何变化都要重新预览。
+- 执行前每个桶的旧版本存为 `op_kind=bulk_replace` 的 revision，用 `revision(action="restore")` 撤销；信的旧正文存在 `bucket_history`（`bucket_id=letter:<id>`，`change_type=op_id`），整批恢复用 `BucketManager.restore_bulk_replace_letters(op_id)`。正文改动后 `provenance_kind` 默认保持不变（`provenance="unknown"` 等显式值才会写入）；`todos` 字段改桶里 todo 文本及其 provenance 记录的 text，todo id、said_by 等不动。不改时间字段，不记 boot delta，不计作 touch；其他 frontmatter 字段（todos、tg_summary 等）不改，预览会提示其中的字面命中数。
 
 #### `hold` similarity and conflict warnings
 

@@ -6085,15 +6085,15 @@ async def _bulk_replace_plan(rules, fields, scope, provenance):
 @mcp.tool()
 async def bulk_replace(
     rules: Annotated[list[dict], Field(description='Ordered literal rules, each {"from": str, "to": str, "bucket_ids": optional list of ids}. bucket_ids limits that rule to those ids (a letter is "letter:<id>"). Rules run in order, each on the previous result; no regex.')],
-    fields: Annotated[str, Field(description="Comma list of content, name, tags. Letters only have content.")] = "content,name,tags",
+    fields: Annotated[str, Field(description="Comma list of content, name, tags, todos (todo texts; ids and attribution untouched). Letters only have content.")] = "content,name,tags,todos",
     scope: Annotated[str, Field(description="Comma list of buckets, letters.")] = "buckets,letters",
-    provenance: Annotated[str, Field(description="provenance_kind written to a bucket whose body changes: unknown (same as other body rewrites), keep, summary, inference or system.")] = "unknown",
+    provenance: Annotated[str, Field(description="provenance_kind for a bucket whose body changes: keep (default, unchanged), unknown, summary, inference or system.")] = "keep",
     dry_run: bool = True,
     confirm_token: Annotated[str, Field(description="Issued by the dry run for exactly this plan; one-shot and short-lived. Any change to rules, matched buckets or their content voids it.")] = "",
     page: Annotated[int, Field(description="Dry-run page of matched items.")] = 1,
     page_size: Annotated[int, Field(description="Dry-run items per page, 1-50.")] = 10,
 ) -> str:
-    """Controlled maintenance: literal batch find/replace in unsealed bucket content/name/tags and letter bodies. Dry run (default) shows every hit with context, a plan hash and a confirm_token; execution needs that token. Sealed buckets and letters are skipped and only counted. Each bucket's pre-image is saved as a revision first (revision(action="restore") undoes it); letter bodies are saved to bucket_history. Time fields (last_active, updated_at) are not touched. Use only when Ting explicitly asks in the current conversation."""
+    """Controlled maintenance: literal batch find/replace in unsealed bucket content/name/tags/todo texts and letter bodies. Dry run (default) shows every hit with context, a plan hash and a confirm_token; execution needs that token. Sealed buckets and letters are skipped and only counted. Each bucket's pre-image is saved as a revision first (revision(action="restore") undoes it); letter bodies are saved to bucket_history. Time fields (last_active, updated_at) are not touched. Use only when Ting explicitly asks in the current conversation."""
     import bulk_replace as br
     try:
         rules_n = br.normalize_rules(rules)

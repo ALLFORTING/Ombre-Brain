@@ -5726,6 +5726,8 @@ class BucketManager(BucketRevisionMixin):
                         "name": post.get("name"),
                         "tags": post.get("tags"),
                         "content": str(post.content or ""),
+                        "todos": copy.deepcopy(post.get("todos")),
+                        "todo_provenance": copy.deepcopy(post.get("todo_provenance")),
                         "preimage_sha256": revision_snapshot(
                             post, self._relative_bucket_path(path))["preimage_sha256"],
                         "extra": {key: value for key, value in post.metadata.items()
@@ -5749,7 +5751,8 @@ class BucketManager(BucketRevisionMixin):
     ) -> str:
         """Apply one planned bulk_replace change set to one bucket.
 
-        Writes only content/name/tags (and provenance_kind when the body changes).
+        Writes only content/name/tags/todos (todo texts and their provenance sidecar texts;
+        ids and attribution untouched) and provenance_kind when the body changes and not "keep".
         last_active, updated_at and every other time field are left untouched; no
         touch, ripple or boot-delta event is recorded. The pre-image is stored as
         a revision (op_kind="bulk_replace") in the same transaction as the write.
@@ -5784,6 +5787,10 @@ class BucketManager(BucketRevisionMixin):
                 post["name"] = changes["name"]
             if "tags" in changes:
                 post["tags"] = changes["tags"]
+            if "todos" in changes:
+                post["todos"] = changes["todos"]
+                if "todo_provenance" in changes:
+                    post["todo_provenance"] = changes["todo_provenance"]
             try:
                 self.write_with_revision(bucket_id, snapshot, "bulk_replace", op_id,
                                          lambda: self._write_post_atomic(file_path, post))
