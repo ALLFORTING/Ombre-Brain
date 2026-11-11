@@ -477,7 +477,7 @@ The recent session Summary preview remains limited to 700 characters. When that 
 
 boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未 resolved、非 sealed 桶中的活动待办（含 archive），不按年龄、importance 门槛或项目标签过滤；明确带完整 `test` tag 的桶除外。T 按展示 identity 计数：每个活动 `(bucket_id, todo_id)` 一项；同文本的不同活动 ID 分别计数；legacy 无 ID 按 `(bucket_id, canonical todo text)` 去重。completed/dropped identity 不展示，专用 `todos()` 的既有输出格式保持不变。
 
-候选按桶 importance 降序、稳定展示键升序排列。talk/code/tg 分别用前 3/2/1 项定义 priority anchor；其余候选按稳定键建 tail。每天固定使用 `Asia/Shanghai`，从与 tail 长度互质、最接近 profile 目标 3/3/2 的步长计算起点（同距离取较小步长）。同一日期/profile/候选快照下，tail 起点与顺序不受实际预算影响。稳定 tail 的起点最迟 M 日遍历全部 M 个位置；实际是否显示取决于预算，不承诺固定等待天数。
+候选按桶 importance 降序、稳定展示键升序排列。talk/code/tg 分别用前 3/2/1 项定义 priority anchor；其余候选按稳定键建 tail。每天固定使用 `Asia/Tokyo`，从与 tail 长度互质、最接近 profile 目标 3/3/2 的步长计算起点（同距离取较小步长）。同一日期/profile/候选快照下，tail 起点与顺序不受实际预算影响。稳定 tail 的起点最迟 M 日遍历全部 M 个位置；实际是否显示取决于预算，不承诺固定等待天数。
 
 预算足够时显示全部；不足时保留 priority 与 rotation 的机会，能容纳一条时可优先展示当天 rotation 项，再沿当天顺序使用剩余预算。anchor 数量不是展示上限。每个 todo 一行，完整保留 bucket_id、todo_id（legacy 为 null）和 importance；正文上限分别为 120/100/40 字符，截断标注 `…[正文已截]`。legacy 标记“旧格式；不能单条 todo_done”，读取不补 ID。
 
@@ -1030,7 +1030,7 @@ Automatic backup v1: `backup-auto.yml` in the private `ALLFORTING/ob-backup` rep
 
 **客户端 / Client**（`ALLFORTING/ob-backup`）：
 
-- 定时 `17 19 * * *` UTC（上海 03:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
+- 定时 `17 19 * * *` UTC（东京 04:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
 - Repository variables：`OMBRE_BACKUP_AUTO_ENABLED`（GitHub 侧调度开关，与服务端同名变量独立；为 false 时定时与普通手动运行都跳过）、`OMBRE_BACKUP_AUTO_MODE`（默认 `full`，当前用 `simple`）、`OMBRE_BACKUP_AUTO_MAX_DOWNLOAD_BYTES`、`OMBRE_BACKUP_AUTO_POLL_TIMEOUT_SECONDS`；secret `OMBRE_BACKUP_AUTO_ENDPOINT` 填服务 origin。
 - `metadata_only=true` 的手动运行即使开关为 false 也只做一次 metadata 认证探测，不采集。
 - `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；不做自动恢复演练；保留清理由 ob-backup 的独立步骤负责（变量 `OMBRE_BACKUP_PRUNE_MODE`，`dry-run` 只列计划、`apply` 才删除），规则：成功备份最近 30 天全留，更早每个有备份的月份留最早一份、最多 12 个月，attempt 超 7 天删除，最新成功备份永不删，当天未成功不清理。

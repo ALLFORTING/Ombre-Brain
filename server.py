@@ -61,7 +61,7 @@ import frontmatter
 from bucket_write_lock import BucketWriteLockError
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfoNotFoundError
-from boot_todos import active_display_candidates, todo_page, fit_todos, shanghai_date, TodoPage
+from boot_todos import active_display_candidates, todo_page, fit_todos, tokyo_date, TodoPage
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
@@ -1532,7 +1532,7 @@ async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = F
     provenance_kind = normalize_provenance_kind(
         bucket.get("metadata", {}).get("provenance_kind")
     )
-    anchor_tag = anchors_mod.breath_tag(bucket.get("metadata", {}), anchors_mod.shanghai_now().date())
+    anchor_tag = anchors_mod.breath_tag(bucket.get("metadata", {}), anchors_mod.tokyo_now().date())
     lines = [f"[prov={provenance_kind}] {anchor_tag}{text}"]
     meta = bucket.get("metadata", {})
     current_todos, _ = active_todo_projection(
@@ -3543,7 +3543,7 @@ async def hold(
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
-    anchor_until: Annotated[str, Field(description="YYYY-MM-DD. Creates an anchor: a note every window keeps seeing in boot until the end of that day (Asia/Shanghai) or until Ting ends it. Not a todo. At most 4 active anchors; body at most 300 characters. Cannot combine with feel, pinned, supersedes_id, trigger_date or operation_id.")] = "",
+    anchor_until: Annotated[str, Field(description="YYYY-MM-DD. Creates an anchor: a note every window keeps seeing in boot until the end of that day (Asia/Tokyo) or until Ting ends it. Not a todo. At most 4 active anchors; body at most 300 characters. Cannot combine with feel, pinned, supersedes_id, trigger_date or operation_id.")] = "",
     operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
         description="Opaque retry identity shared with trace/grow. Preserved verbatim; keyed supersedes_id is unsupported. None preserves legacy behavior.")] | None = None,
 ) -> str:
@@ -4317,7 +4317,7 @@ def _trace_todo_drop(bucket_id: str, todo_id: str, confirm_token: str) -> str:
 
 
 async def _active_anchor_count() -> int:
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     buckets = await bucket_mgr.list_all(include_archive=False)
     return len(anchors_mod.collect_active(
         buckets, today, is_sealed=_is_sealed, is_test=lambda b: False, superseded_by=_superseded_by_id))
@@ -4337,7 +4337,7 @@ async def _hold_anchor(content, tags, importance, anchor_until, *, feel, pinned,
         until = anchors_mod.parse_anchor_date(anchor_until)
     except ValueError as exc:
         return str(exc)
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     if until < today:
         return f"anchor_until {until.isoformat()} is before today ({today.isoformat()})."
     body = _apply_display_aliases(content).strip()
@@ -4356,7 +4356,7 @@ async def _hold_anchor(content, tags, importance, anchor_until, *, feel, pinned,
     )
     if not await bucket_mgr.update(bucket_id, anchor_until=until.isoformat()):
         return f"锚点桶已创建但 anchor_until 写入失败：{bucket_id}；用 trace(bucket_id, anchor_until=...) 补写。"
-    return (f"锚点已建：bucket_id={bucket_id} 有效至 {until.isoformat()}（当天全天有效，上海时区）；"
+    return (f"锚点已建：bucket_id={bucket_id} 有效至 {until.isoformat()}（当天全天有效，东京时区）；"
             "每个窗口 boot 都会看到；各窗口用 trace(bucket_id, anchor_note=...) 记自己做了什么。")
 
 
@@ -4373,7 +4373,7 @@ async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
     if _is_sealed(bucket):
         return "指定记忆桶已封存，不能操作锚点。"
     meta = bucket.get("metadata", {})
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     state = anchors_mod.anchor_state(meta, today)
     if anchor_note:
         if state == "none":
@@ -4424,7 +4424,7 @@ async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
 
 
 def _dream_anchor_block(meta: dict) -> str:
-    block = anchors_mod.dream_lines(meta, anchors_mod.shanghai_now().date())
+    block = anchors_mod.dream_lines(meta, anchors_mod.tokyo_now().date())
     return block + "\n" if block else ""
 
 
@@ -4641,7 +4641,7 @@ async def trace(
     append: bool = False,
     trigger_date: str = "",
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
-    anchor_until: Annotated[str, Field(description="Anchor control, call alone with bucket_id. YYYY-MM-DD sets or extends the anchor's last valid day (Asia/Shanghai, whole day) and reopens an ended anchor; 'end' ends it (two-stage with confirm_token; only when Ting explicitly says it is over).")] = "",
+    anchor_until: Annotated[str, Field(description="Anchor control, call alone with bucket_id. YYYY-MM-DD sets or extends the anchor's last valid day (Asia/Tokyo, whole day) and reopens an ended anchor; 'end' ends it (two-stage with confirm_token; only when Ting explicitly says it is over).")] = "",
     anchor_note: Annotated[str, Field(description="Append one window record to an active anchor, call alone with bucket_id: start with (model / window) then what you did, at most 80 characters. The server adds the time. Duplicates within 10 minutes are ignored.")] = "",
     delete: bool = False,
     confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
@@ -5283,9 +5283,9 @@ async def boot(
     archive_buckets = [bucket for bucket in archive_buckets if not _is_test_bucket(bucket)]
 
     try:
-        todo_display = todo_page(active_display_candidates(archive_buckets), profile, shanghai_date())
+        todo_display = todo_page(active_display_candidates(archive_buckets), profile, tokyo_date())
     except ZoneInfoNotFoundError:
-        return _with_response_seal("boot 无法计算每日待办轮转：缺少 Asia/Shanghai 时区数据，请安装 tzdata。")
+        return _with_response_seal("boot 无法计算每日待办轮转：缺少 Asia/Tokyo 时区数据，请安装 tzdata。")
     except (ValueError, TypeError, KeyError):
         return _with_response_seal("boot 待办活动总数无法确认：todo provenance conflict 或损坏的展示 identity。")
 
@@ -5405,7 +5405,7 @@ async def boot(
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
 
-    anchors_today = anchors_mod.shanghai_now().date()
+    anchors_today = anchors_mod.tokyo_now().date()
     anchors_text = anchors_mod.format_section(
         anchors_mod.collect_active(
             active_buckets, anchors_today,

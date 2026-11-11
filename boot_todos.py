@@ -46,12 +46,12 @@ class TodoFit:
     text: str
 
 
-def shanghai_date(now: datetime | None = None) -> date:
+def tokyo_date(now: datetime | None = None) -> date:
     """Do not substitute the host timezone if IANA data is unavailable."""
     instant = now if now is not None else datetime.now(timezone.utc)
     if instant.tzinfo is None:
-        raise ValueError("Shanghai date requires an aware instant.")
-    return instant.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        raise ValueError("Tokyo date requires an aware instant.")
+    return instant.astimezone(ZoneInfo("Asia/Tokyo")).date()
 
 
 def rotation_stride(size: int, target: int) -> int:

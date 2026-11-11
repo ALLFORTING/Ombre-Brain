@@ -716,7 +716,7 @@ async def test_conflict_unavailable_is_explicit_and_does_not_block_hold(tmp_path
         ("Ting planned a Kyoto trip on June 1", "Ting planned a Kyoto trip on September 1", "dynamic", False),
         ("Ting attended a workshop", "Ting received a promotion", "dynamic", False),
         ("Ting plans to visit Kyoto", "Ting visited Kyoto", "dynamic", False),
-        ("Ting lives in Beijing", "Ting lives in Shanghai", "dynamic", False),
+        ("Ting lives in Tokyo", "Ting lives in Osaka", "dynamic", False),
         ("Ting likes tea", "Ting does not like tea", "dynamic", False),
         ("Alice likes tea", "Bob likes tea", "dynamic", False),
         ("Ting prefers tea", "Ting prefers coffee", "dynamic", False),
