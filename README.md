@@ -410,7 +410,7 @@ This P4 version removes the 15 legacy public entries while retaining their Pytho
 | `todos` | 汇总未 resolved 且非 sealed 桶中的 todos；`include_provenance=True` 才按明确来源分组显示 / Summarize todos from unresolved, non-sealed buckets; explicit provenance grouping is opt-in |
 | `refresh_tg_summary` | 为钉选桶写入调用方生成的 TG 压缩版（≤1200 字），只写 metadata 不动正文；须带 TG boot 给出的 `source_hash`，正文已变则拒绝 / Store a caller-generated TG pinned summary as metadata only; requires the `source_hash` from TG boot and is rejected if the body changed |
 | `related_backfill` | 维护/回填 semantic related；默认 `dry_run=True`，执行模式会写 relation 并跳过 sealed 桶 / Maintenance backfill; `dry_run=True` by default, execution writes links |
-| `bulk_replace` | 维护：按替换表（字面串，不用正则）批量改未封存桶的 content/name/tags 和信正文；默认 `dry_run=True`，输出逐处 diff、`plan_hash` 和一次性 `confirm_token`，执行必须带该 token；改前每桶存 revision（信存进 `bucket_history`），不改 `last_active` 等时间字段，跳过 sealed 并只报数量 / Controlled literal batch replace over unsealed buckets and letters; dry-run by default with per-hit diff, plan hash and a one-shot confirm_token; pre-images are saved first, time fields are untouched, sealed items are skipped and only counted |
+| `bulk_replace` | 维护：按替换表（字面串，不用正则）批量改未封存桶的 content/name/tags/todos 文本和信正文；默认 `dry_run=True`，输出逐处 diff、`plan_hash` 和一次性 `confirm_token`，执行必须带该 token；改前每桶存 revision（信存进 `bucket_history`），不改 `last_active` 等时间字段，跳过 sealed 并只报数量 / Controlled literal batch replace over unsealed buckets and letters; dry-run by default with per-hit diff, plan hash and a one-shot confirm_token; pre-images are saved first, time fields are untouched, sealed items are skipped and only counted |
 | `digest` | 维护/规划旧桶消化；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 / Controlled digestion maintenance; dry-run by default, confirmed execution may write results and incur provider/API cost |
 | `rm_asset_update_metadata` | 更新 title/description/tags，不改变 asset bytes 或 hashes / Update metadata without changing asset bytes or hashes |
 | `rm_asset_reindex_embeddings` | Remember-Me maintenance/backfill：为缺失或过期 vector 做有界回填；不改 asset bytes 或 metadata / Bounded maintenance backfill for missing or stale vectors; asset bytes and metadata are unchanged |
@@ -596,8 +596,8 @@ The only required argument remains `summary`. Generate the optional case-sensiti
 
 #### `bulk_replace`
 
-- `bulk_replace(rules, fields="content,name,tags", scope="buckets,letters", provenance="unknown", dry_run=True, confirm_token="", page=1, page_size=10)`。`rules` 是 `[{"from", "to", "bucket_ids"(可选)}]`，按顺序逐条作用在上一条的结果上；`bucket_ids` 限定该规则只在这些桶生效（信写作 `letter:<id>`）。预览按页列出每处命中的前后文，给 `plan_hash` 和 5 分钟有效、一次性的 `confirm_token`；token 绑定规则、命中桶和桶内容，任何变化都要重新预览。
-- 执行前每个桶的旧版本存为 `op_kind=bulk_replace` 的 revision，用 `revision(action="restore")` 撤销；信的旧正文存在 `bucket_history`（`bucket_id=letter:<id>`，`change_type=op_id`），整批恢复用 `BucketManager.restore_bulk_replace_letters(op_id)`。正文改动后 `provenance_kind` 默认置 `unknown`（`provenance="keep"` 保持原值）。不改时间字段，不记 boot delta，不计作 touch；other frontmatter 字段（todos、tg_summary 等）不改，预览会提示其中的字面命中数。
+- `bulk_replace(rules, fields="content,name,tags,todos", scope="buckets,letters", provenance="keep", dry_run=True, confirm_token="", page=1, page_size=10)`。`rules` 是 `[{"from", "to", "bucket_ids"(可选)}]`，按顺序逐条作用在上一条的结果上；`bucket_ids` 限定该规则只在这些桶生效（信写作 `letter:<id>`）。预览按页列出每处命中的前后文，给 `plan_hash` 和 5 分钟有效、一次性的 `confirm_token`；token 绑定规则、命中桶和桶内容，任何变化都要重新预览。
+- 执行前每个桶的旧版本存为 `op_kind=bulk_replace` 的 revision，用 `revision(action="restore")` 撤销；信的旧正文存在 `bucket_history`（`bucket_id=letter:<id>`，`change_type=op_id`），整批恢复用 `BucketManager.restore_bulk_replace_letters(op_id)`。正文改动后 `provenance_kind` 默认保持不变（`provenance="unknown"` 等显式值才会写入）；`todos` 字段改桶里 todo 文本及其 provenance 记录的 text，todo id、said_by 等不动。不改时间字段，不记 boot delta，不计作 touch；other frontmatter 字段（todos、tg_summary 等）不改，预览会提示其中的字面命中数。
 
 #### 写入回执的引号提醒 / Quote reminder in write receipts
 

@@ -106,7 +106,7 @@ async def test_execute_applies_keeps_time_fields_and_is_undoable(tmp_path, monke
     post = _post(server, a)
     assert post.content == "我在新城工作，新城很大。"
     assert post["name"] == "新城日记" and post["tags"] == ["新城", "工作"]
-    assert post["provenance_kind"] == "unknown"
+    assert post.get("provenance_kind") == before_meta.get("provenance_kind")
     for field in ("last_active", "updated_at", "created"):
         assert post[field] == before_meta[field]
     assert Path(server.bucket_mgr._find_bucket_file(sealed)).read_bytes() == sealed_bytes
@@ -287,3 +287,50 @@ def test_plan_payload_changes_with_any_input():
     assert br.build_plan(scan, br.normalize_rules(RULES), ["content"], "keep")["payload"] != base["payload"]
     digest = hashlib.sha256(b"x").hexdigest()
     assert len(digest) == 64
+
+
+@pytest.mark.asyncio
+async def test_provenance_explicit_value_applies_only_when_body_changes(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    a = await server.bucket_mgr.create(content="旧城", name="旧城", domain=["d"], provenance_kind="summary")
+    b = await server.bucket_mgr.create(content="无关", name="旧城", domain=["d"], provenance_kind="summary")
+    token = _token(await server.bulk_replace(RULES, scope="buckets", provenance="unknown"))
+    await server.bulk_replace(RULES, scope="buckets", provenance="unknown", dry_run=False, confirm_token=token)
+    assert _post(server, a)["provenance_kind"] == "unknown"
+    assert _post(server, b)["provenance_kind"] == "summary"
+    assert _post(server, b)["name"] == "新城"
+
+
+@pytest.mark.asyncio
+async def test_todos_text_and_sidecar_replaced_ids_untouched_and_undoable(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    a = await server.bucket_mgr.create(content="正文", domain=["d"], todos=["去旧城办事", "买菜"])
+    before = _post(server, a)
+    old_todos, old_prov = list(before["todos"]), [dict(r) for r in before["todo_provenance"]]
+    assert old_prov and all("id" in r for r in old_prov)
+
+    preview = await server.bulk_replace(RULES, scope="buckets")
+    assert "todos #1" in preview and "【旧城 → 新城】" in preview and "todos 1）" in preview
+    assert _post(server, a)["todos"] == old_todos
+    await server.bulk_replace(RULES, scope="buckets", dry_run=False, confirm_token=_token(preview))
+
+    after = _post(server, a)
+    assert after["todos"] == ["去新城办事", "买菜"]
+    assert after.content == "正文"
+    for old, new in zip(old_prov, after["todo_provenance"]):
+        assert new["text"] == old["text"].replace("旧城", "新城")
+        assert {k: v for k, v in new.items() if k != "text"} == {k: v for k, v in old.items() if k != "text"}
+
+    revision = server.bucket_mgr.list_bucket_revisions(a)[0]
+    await server.bucket_mgr.execute_restore(server.bucket_mgr.plan_restore(a, revision["ref"]), actor="test")
+    restored = _post(server, a)
+    assert restored["todos"] == old_todos and restored["todo_provenance"] == old_prov
+
+
+@pytest.mark.asyncio
+async def test_fields_without_todos_leave_todos_alone(tmp_path, monkeypatch):
+    server = _load_server(tmp_path, monkeypatch)
+    a = await server.bucket_mgr.create(content="旧城", domain=["d"], todos=["去旧城"])
+    token = _token(await server.bulk_replace(RULES, scope="buckets", fields="content"))
+    await server.bulk_replace(RULES, scope="buckets", fields="content", dry_run=False, confirm_token=token)
+    assert _post(server, a)["todos"] == ["去旧城"]

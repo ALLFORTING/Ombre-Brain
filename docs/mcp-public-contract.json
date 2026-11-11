@@ -1043,7 +1043,7 @@
             "type": "boolean"
           },
           "fields": {
-            "default": "content,name,tags",
+            "default": "content,name,tags,todos",
             "type": "string"
           },
           "page": {
@@ -1055,7 +1055,7 @@
             "type": "integer"
           },
           "provenance": {
-            "default": "unknown",
+            "default": "keep",
             "type": "string"
           },
           "rules": {
