@@ -381,21 +381,21 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-当前 MCP 表面包含 20 个默认工具、35 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
+当前 MCP 表面包含 21 个默认工具、36 个诊断启用时的工具、1 个 resource、1 个可选 prompt 和 0 个 resource templates。支持 MCP prompts 的客户端可以调用 `start_ombre_brain` 获取 onboarding guidance；不支持 prompts 的客户端仍可直接使用相同工具。精确名称、暴露条件、受众、可变性和 input schema 以 [`docs/mcp-public-contract.json`](docs/mcp-public-contract.json) 为准；架构背景见 [`docs/mcp-surface-architecture-audit.md`](docs/mcp-surface-architecture-audit.md)。
 
-The current MCP surface has 20 default tools, 35 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
+The current MCP surface has 21 default tools, 36 tools when diagnostics are enabled, 1 resource, 1 optional prompt, and 0 resource templates. Clients that support MCP prompts may invoke `start_ombre_brain` for optional onboarding guidance; tool-only clients remain fully supported. The machine-readable manifest is the source of truth for names, exposure, audience, mutability, and input schemas. MCP clients may expose tools and resources differently; this README does not assume that a client provides prompt support or exposes chat-attachment bytes inside MCP request context.
 
 ### 推荐 MCP 工具与旧入口移除 / Recommended MCP tools and legacy entry removal
 
-本 P4 版本已取消 15 个旧公开入口注册，当前 20 个默认入口均为推荐入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
+本 P4 版本已取消 15 个旧公开入口注册，当前 21 个默认入口均为推荐入口；诊断开关另外增加 15 个工具。下表按推荐入口列出，六个合并工具用必填 `action` 选择操作，原参数名、类型、默认值和业务回执保持原行为。必须只传该 action 接受的参数；未知字段、其他 action 的字段（即使传默认值）都会被严格拒绝。
 
-This P4 version removes the 15 legacy public registrations and exposes 20 default recommended tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
+This P4 version removes the 15 legacy public registrations and exposes 21 default recommended tools; diagnostics add another 15. Each merged tool requires `action`, preserves the selected operation's original parameters and receipts, and rejects unknown or unrelated fields before business execution.
 
 旧入口 `leave_note`、`list_notes`、`get_note`、`dismiss_note`、`get_letter`、`seal_letter`、`list_revisions`、`restore_revision`、`rm_asset_upload_link`、`rm_asset_upload_status`、`rm_asset_get`、`rm_asset_search`、`rm_asset_view`、`rm_asset_inspect`、`rm_asset_download_link` 已在本 P4 版本取消公开注册；原 Python 函数及私有 SDK 实现保留。客户端须使用下表的新入口 + action。
 
 This P4 version removes the 15 legacy public entries while retaining their Python functions and private SDK implementations. Clients must use the replacement tools with action.
 
-这些工具默认可见，但其中 `digest`、`related_backfill`、`rm_asset_reindex_embeddings` 和 `letter(action="seal")` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
+这些工具默认可见，但其中 `digest`、`related_backfill`、`bulk_replace`、`rm_asset_reindex_embeddings` 和 `letter(action="seal")` 面向受控维护；`trace` 也包含高影响和 destructive 模式。Default-visible does not mean ordinary end-user safe.
 
 | 工具 Tool | 作用与边界 Purpose and boundary |
 |-----------|-------------------------------|
@@ -410,6 +410,7 @@ This P4 version removes the 15 legacy public entries while retaining their Pytho
 | `todos` | 汇总未 resolved 且非 sealed 桶中的 todos；`include_provenance=True` 才按明确来源分组显示 / Summarize todos from unresolved, non-sealed buckets; explicit provenance grouping is opt-in |
 | `refresh_tg_summary` | 为钉选桶写入调用方生成的 TG 压缩版（≤1200 字），只写 metadata 不动正文；须带 TG boot 给出的 `source_hash`，正文已变则拒绝 / Store a caller-generated TG pinned summary as metadata only; requires the `source_hash` from TG boot and is rejected if the body changed |
 | `related_backfill` | 维护/回填 semantic related；默认 `dry_run=True`，执行模式会写 relation 并跳过 sealed 桶 / Maintenance backfill; `dry_run=True` by default, execution writes links |
+| `bulk_replace` | 维护：按替换表（字面串，不用正则）批量改未封存桶的 content/name/tags/todos 文本和信正文；默认 `dry_run=True`，输出逐处 diff、`plan_hash` 和一次性 `confirm_token`，执行必须带该 token；改前每桶存 revision（信存进 `bucket_history`），不改 `last_active` 等时间字段，跳过 sealed 并只报数量 / Controlled literal batch replace over unsealed buckets and letters; dry-run by default with per-hit diff, plan hash and a one-shot confirm_token; pre-images are saved first, time fields are untouched, sealed items are skipped and only counted |
 | `digest` | 维护/规划旧桶消化；默认 `dry_run=True`，确认执行可能写入消化结果并产生 provider/API 成本 / Controlled digestion maintenance; dry-run by default, confirmed execution may write results and incur provider/API cost |
 | `rm_asset_update_metadata` | 更新 title/description/tags，不改变 asset bytes 或 hashes / Update metadata without changing asset bytes or hashes |
 | `rm_asset_reindex_embeddings` | Remember-Me maintenance/backfill：为缺失或过期 vector 做有界回填；不改 asset bytes 或 metadata / Bounded maintenance backfill for missing or stale vectors; asset bytes and metadata are unchanged |
@@ -476,7 +477,7 @@ The recent session Summary preview remains limited to 700 characters. When that 
 
 boot 的待办段在 talk/code/tg 共享 canonical active projection：包含未 resolved、非 sealed 桶中的活动待办（含 archive），不按年龄、importance 门槛或项目标签过滤；明确带完整 `test` tag 的桶除外。T 按展示 identity 计数：每个活动 `(bucket_id, todo_id)` 一项；同文本的不同活动 ID 分别计数；legacy 无 ID 按 `(bucket_id, canonical todo text)` 去重。completed/dropped identity 不展示，专用 `todos()` 的既有输出格式保持不变。
 
-候选按桶 importance 降序、稳定展示键升序排列。talk/code/tg 分别用前 3/2/1 项定义 priority anchor；其余候选按稳定键建 tail。每天固定使用 `Asia/Shanghai`，从与 tail 长度互质、最接近 profile 目标 3/3/2 的步长计算起点（同距离取较小步长）。同一日期/profile/候选快照下，tail 起点与顺序不受实际预算影响。稳定 tail 的起点最迟 M 日遍历全部 M 个位置；实际是否显示取决于预算，不承诺固定等待天数。
+候选按桶 importance 降序、稳定展示键升序排列。talk/code/tg 分别用前 3/2/1 项定义 priority anchor；其余候选按稳定键建 tail。每天固定使用 `Asia/Tokyo`，从与 tail 长度互质、最接近 profile 目标 3/3/2 的步长计算起点（同距离取较小步长）。同一日期/profile/候选快照下，tail 起点与顺序不受实际预算影响。稳定 tail 的起点最迟 M 日遍历全部 M 个位置；实际是否显示取决于预算，不承诺固定等待天数。
 
 预算足够时显示全部；不足时保留 priority 与 rotation 的机会，能容纳一条时可优先展示当天 rotation 项，再沿当天顺序使用剩余预算。anchor 数量不是展示上限。每个 todo 一行，完整保留 bucket_id、todo_id（legacy 为 null）和 importance；正文上限分别为 120/100/40 字符，截断标注 `…[正文已截]`。legacy 标记“旧格式；不能单条 todo_done”，读取不补 ID。
 
@@ -592,6 +593,11 @@ The only required argument remains `summary`. Generate the optional case-sensiti
 
 - `digest(mode="dedupe")` 的 `M` 是所选目录中的原始 `.md` 文件数，`N` 是关联到范围内未 sealed 桶、且当前模型 JSON 为有限非空一维向量的可用行数；`K=M-N` 只是两个不同口径的算术差，不表示“缺失 embedding”。archive 是否纳入由 `include_archive` 决定；sealed、无效、元数据不可读与 orphan 行分别计数，orphan 只报数量而不输出 ID。
 - `related_backfill(dry_run=True, limit=100, threshold=-1)` 默认只输出计划关联；`threshold=-1` 使用环境变量/默认阈值 / `related_backfill(...)` only plans links by default; `threshold=-1` uses env/default threshold.
+
+#### `bulk_replace`
+
+- `bulk_replace(rules, fields="content,name,tags,todos", scope="buckets,letters", provenance="keep", dry_run=True, confirm_token="", page=1, page_size=10)`。`rules` 是 `[{"from", "to", "bucket_ids"(可选)}]`，按顺序逐条作用在上一条的结果上；`bucket_ids` 限定该规则只在这些桶生效（信写作 `letter:<id>`）。预览按页列出每处命中的前后文，给 `plan_hash` 和 5 分钟有效、一次性的 `confirm_token`；token 绑定规则、命中桶和桶内容，任何变化都要重新预览。
+- 执行前每个桶的旧版本存为 `op_kind=bulk_replace` 的 revision，用 `revision(action="restore")` 撤销；信的旧正文存在 `bucket_history`（`bucket_id=letter:<id>`，`change_type=op_id`），整批恢复用 `BucketManager.restore_bulk_replace_letters(op_id)`。正文改动后 `provenance_kind` 默认保持不变（`provenance="unknown"` 等显式值才会写入）；`todos` 字段改桶里 todo 文本及其 provenance 记录的 text，todo id、said_by 等不动。不改时间字段，不记 boot delta，不计作 touch；other frontmatter 字段（todos、tg_summary 等）不改，预览会提示其中的字面命中数。
 
 #### 写入回执的引号提醒 / Quote reminder in write receipts
 
@@ -1024,7 +1030,7 @@ Automatic backup v1: `backup-auto.yml` in the private `ALLFORTING/ob-backup` rep
 
 **客户端 / Client**（`ALLFORTING/ob-backup`）：
 
-- 定时 `17 19 * * *` UTC（上海 03:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
+- 定时 `17 19 * * *` UTC（东京 04:17），GitHub schedule 可能延迟数小时；也可 `gh workflow run backup-auto.yml --ref main -f metadata_only=false` 手动触发。
 - Repository variables：`OMBRE_BACKUP_AUTO_ENABLED`（GitHub 侧调度开关，与服务端同名变量独立；为 false 时定时与普通手动运行都跳过）、`OMBRE_BACKUP_AUTO_MODE`（默认 `full`，当前用 `simple`）、`OMBRE_BACKUP_AUTO_MAX_DOWNLOAD_BYTES`、`OMBRE_BACKUP_AUTO_POLL_TIMEOUT_SECONDS`；secret `OMBRE_BACKUP_AUTO_ENDPOINT` 填服务 origin。
 - `metadata_only=true` 的手动运行即使开关为 false 也只做一次 metadata 认证探测，不采集。
 - `simple`：每次整量采集，明文 `<bundle_id>.obplain.tar` 与 success/cleanup 回执存为 Release asset（不提交进 Git），完整回读校验后 ack 清理服务端临时包；不做自动恢复演练；保留清理由 ob-backup 的独立步骤负责（变量 `OMBRE_BACKUP_PRUNE_MODE`，`dry-run` 只列计划、`apply` 才删除），规则：成功备份最近 30 天全留，更早每个有备份的月份留最早一份、最多 12 个月，attempt 超 7 天删除，最新成功备份永不删，当天未成功不清理。

@@ -12,7 +12,7 @@ import pytest
 
 from boot_todos import (
     PROFILE_TODOS, TEXT_TRUNCATION, active_display_candidates,
-    fit_todos, rotation_stride, shanghai_date, todo_page,
+    fit_todos, rotation_stride, tokyo_date, todo_page,
 )
 from utils import count_tokens_approx
 
@@ -213,16 +213,16 @@ def test_multiline_body_stays_one_display_row():
     assert_counts(result, 1)
 
 
-def test_shanghai_boundary_and_missing_zone_is_not_local_fallback(monkeypatch):
-    assert shanghai_date(datetime(2026, 9, 25, 15, 59, 59, tzinfo=timezone.utc)) == date(2026, 9, 25)
-    assert shanghai_date(datetime(2026, 9, 25, 16, 0, 0, tzinfo=timezone.utc)) == DAY
+def test_tokyo_boundary_and_missing_zone_is_not_local_fallback(monkeypatch):
+    assert tokyo_date(datetime(2026, 9, 25, 14, 59, 59, tzinfo=timezone.utc)) == date(2026, 9, 25)
+    assert tokyo_date(datetime(2026, 9, 25, 15, 0, 0, tzinfo=timezone.utc)) == DAY
     from zoneinfo import ZoneInfoNotFoundError
     import boot_todos
     def missing(_):
         raise ZoneInfoNotFoundError("synthetic unavailable timezone")
     monkeypatch.setattr(boot_todos, "ZoneInfo", missing)
     with pytest.raises(ZoneInfoNotFoundError):
-        shanghai_date()
+        tokyo_date()
 
 
 def test_tzdata_supplies_zone_without_system_database():
@@ -230,7 +230,7 @@ def test_tzdata_supplies_zone_without_system_database():
         sys.executable, "-B", "-c",
         "from zoneinfo import ZoneInfo, reset_tzpath; "
         "from datetime import datetime; reset_tzpath(()); "
-        "assert datetime(2026, 9, 26, tzinfo=ZoneInfo('Asia/Shanghai')).utcoffset().total_seconds() == 28800",
+        "assert datetime(2026, 9, 26, tzinfo=ZoneInfo('Asia/Tokyo')).utcoffset().total_seconds() == 32400",
     ], capture_output=True, text=True)
     assert check.returncode == 0, check.stderr
 
@@ -243,7 +243,7 @@ def server(tmp_path, monkeypatch):
     sys.modules.pop("server", None)
     module = importlib.import_module("server")
     module.decay_engine.ensure_started = AsyncMock(return_value=None)
-    monkeypatch.setattr(module, "shanghai_date", lambda: DAY)
+    monkeypatch.setattr(module, "tokyo_date", lambda: DAY)
     return module
 
 

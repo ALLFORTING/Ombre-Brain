@@ -61,7 +61,7 @@ import frontmatter
 from bucket_write_lock import BucketWriteLockError
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfoNotFoundError
-from boot_todos import active_display_candidates, todo_page, fit_todos, shanghai_date, TodoPage
+from boot_todos import active_display_candidates, todo_page, fit_todos, tokyo_date, TodoPage
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Union
@@ -1532,7 +1532,7 @@ async def _append_bucket_extras(text: str, bucket: dict, emotion_trend: bool = F
     provenance_kind = normalize_provenance_kind(
         bucket.get("metadata", {}).get("provenance_kind")
     )
-    anchor_tag = anchors_mod.breath_tag(bucket.get("metadata", {}), anchors_mod.shanghai_now().date())
+    anchor_tag = anchors_mod.breath_tag(bucket.get("metadata", {}), anchors_mod.tokyo_now().date())
     lines = [f"[prov={provenance_kind}] {anchor_tag}{text}"]
     meta = bucket.get("metadata", {})
     current_todos, _ = active_todo_projection(
@@ -3543,7 +3543,7 @@ async def hold(
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
     supersedes_id: str = "",
     provenance_kind: Annotated[str, Field(description="Optional body provenance classification: unknown, summary, inference, or system. Blank leaves normal writer defaults in effect.")] = "",
-    anchor_until: Annotated[str, Field(description="YYYY-MM-DD. Creates an anchor: a note every window keeps seeing in boot until the end of that day (Asia/Shanghai) or until Ting ends it. Not a todo. At most 4 active anchors; body at most 300 characters. Cannot combine with feel, pinned, supersedes_id, trigger_date or operation_id.")] = "",
+    anchor_until: Annotated[str, Field(description="YYYY-MM-DD. Creates an anchor: a note every window keeps seeing in boot until the end of that day (Asia/Tokyo) or until Ting ends it. Not a todo. At most 4 active anchors; body at most 300 characters. Cannot combine with feel, pinned, supersedes_id, trigger_date or operation_id.")] = "",
     operation_id: Annotated[str, Field(strict=True, min_length=1, max_length=128,
         description="Opaque retry identity shared with trace/grow. Preserved verbatim; keyed supersedes_id is unsupported. None preserves legacy behavior.")] | None = None,
 ) -> str:
@@ -4317,7 +4317,7 @@ def _trace_todo_drop(bucket_id: str, todo_id: str, confirm_token: str) -> str:
 
 
 async def _active_anchor_count() -> int:
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     buckets = await bucket_mgr.list_all(include_archive=False)
     return len(anchors_mod.collect_active(
         buckets, today, is_sealed=_is_sealed, is_test=lambda b: False, superseded_by=_superseded_by_id))
@@ -4337,7 +4337,7 @@ async def _hold_anchor(content, tags, importance, anchor_until, *, feel, pinned,
         until = anchors_mod.parse_anchor_date(anchor_until)
     except ValueError as exc:
         return str(exc)
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     if until < today:
         return f"anchor_until {until.isoformat()} is before today ({today.isoformat()})."
     body = _apply_display_aliases(content).strip()
@@ -4356,7 +4356,7 @@ async def _hold_anchor(content, tags, importance, anchor_until, *, feel, pinned,
     )
     if not await bucket_mgr.update(bucket_id, anchor_until=until.isoformat()):
         return f"锚点桶已创建但 anchor_until 写入失败：{bucket_id}；用 trace(bucket_id, anchor_until=...) 补写。"
-    return (f"锚点已建：bucket_id={bucket_id} 有效至 {until.isoformat()}（当天全天有效，上海时区）；"
+    return (f"锚点已建：bucket_id={bucket_id} 有效至 {until.isoformat()}（当天全天有效，东京时区）；"
             "每个窗口 boot 都会看到；各窗口用 trace(bucket_id, anchor_note=...) 记自己做了什么。")
 
 
@@ -4373,7 +4373,7 @@ async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
     if _is_sealed(bucket):
         return "指定记忆桶已封存，不能操作锚点。"
     meta = bucket.get("metadata", {})
-    today = anchors_mod.shanghai_now().date()
+    today = anchors_mod.tokyo_now().date()
     state = anchors_mod.anchor_state(meta, today)
     if anchor_note:
         if state == "none":
@@ -4424,7 +4424,7 @@ async def _trace_anchor(bucket_id, anchor_until, anchor_note, confirm_token):
 
 
 def _dream_anchor_block(meta: dict) -> str:
-    block = anchors_mod.dream_lines(meta, anchors_mod.shanghai_now().date())
+    block = anchors_mod.dream_lines(meta, anchors_mod.tokyo_now().date())
     return block + "\n" if block else ""
 
 
@@ -4641,7 +4641,7 @@ async def trace(
     append: bool = False,
     trigger_date: str = "",
     trigger_repeat: Annotated[Literal["once", "daily", "weekly", "monthly", "yearly"], Field(description=TRIGGER_REPEAT_DESCRIPTION)] = "once",
-    anchor_until: Annotated[str, Field(description="Anchor control, call alone with bucket_id. YYYY-MM-DD sets or extends the anchor's last valid day (Asia/Shanghai, whole day) and reopens an ended anchor; 'end' ends it (two-stage with confirm_token; only when Ting explicitly says it is over).")] = "",
+    anchor_until: Annotated[str, Field(description="Anchor control, call alone with bucket_id. YYYY-MM-DD sets or extends the anchor's last valid day (Asia/Tokyo, whole day) and reopens an ended anchor; 'end' ends it (two-stage with confirm_token; only when Ting explicitly says it is over).")] = "",
     anchor_note: Annotated[str, Field(description="Append one window record to an active anchor, call alone with bucket_id: start with (model / window) then what you did, at most 80 characters. The server adds the time. Duplicates within 10 minutes are ignored.")] = "",
     delete: bool = False,
     confirm_token: Annotated[str, Field(description="Two-stage confirmation for delete (including batch), merge, unpinning an already pinned bucket, permanent-to-dynamic conversion, todo_done and todo_drop. First call without a token to preview; then return the issued short-lived, one-shot token with the same operation and plan. Expired, used or mismatched tokens are rejected; a token does not bypass protection checks.")] = "",
@@ -5283,9 +5283,9 @@ async def boot(
     archive_buckets = [bucket for bucket in archive_buckets if not _is_test_bucket(bucket)]
 
     try:
-        todo_display = todo_page(active_display_candidates(archive_buckets), profile, shanghai_date())
+        todo_display = todo_page(active_display_candidates(archive_buckets), profile, tokyo_date())
     except ZoneInfoNotFoundError:
-        return _with_response_seal("boot 无法计算每日待办轮转：缺少 Asia/Shanghai 时区数据，请安装 tzdata。")
+        return _with_response_seal("boot 无法计算每日待办轮转：缺少 Asia/Tokyo 时区数据，请安装 tzdata。")
     except (ValueError, TypeError, KeyError):
         return _with_response_seal("boot 待办活动总数无法确认：todo provenance conflict 或损坏的展示 identity。")
 
@@ -5405,7 +5405,7 @@ async def boot(
     note_now = datetime.now().isoformat(timespec="seconds")
     ting_note_text, deliver_note_id = _format_ting_note_for_boot(note_now, max_tokens)
 
-    anchors_today = anchors_mod.shanghai_now().date()
+    anchors_today = anchors_mod.tokyo_now().date()
     anchors_text = anchors_mod.format_section(
         anchors_mod.collect_active(
             active_buckets, anchors_today,
@@ -6208,6 +6208,101 @@ async def dream(detail_ids: str = "", wake_dormant: bool = False, touch: bool = 
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# bulk_replace — literal find/replace across unsealed buckets and letters
+# 按替换表批量改桶/信文字：dry_run + 一次性 confirm_token，执行前存旧版本
+# =============================================================
+async def _bulk_replace_plan(rules, fields, scope, provenance):
+    import bulk_replace as br
+    scan = {"sources": [], "skipped_sealed": 0, "skipped_sealed_letters": 0,
+            "unreadable": 0, "duplicate_ids": 0}
+    if "buckets" in scope:
+        scan.update(await asyncio.to_thread(bucket_mgr.scan_bulk_replace_sources))
+    if "letters" in scope and "content" in fields:
+        found = await asyncio.to_thread(bucket_mgr.scan_bulk_replace_letters)
+        scan["sources"] = scan["sources"] + found["sources"]
+        scan["skipped_sealed_letters"] = found["skipped_sealed_letters"]
+    return br.build_plan(scan, rules, fields, provenance, scope=scope)
+
+
+@mcp.tool()
+async def bulk_replace(
+    rules: Annotated[list[dict], Field(description='Ordered literal rules, each {"from": str, "to": str, "bucket_ids": optional list of ids}. bucket_ids limits that rule to those ids (a letter is "letter:<id>"). Rules run in order, each on the previous result; no regex.')],
+    fields: Annotated[str, Field(description="Comma list of content, name, tags, todos (todo texts; ids and attribution untouched). Letters only have content.")] = "content,name,tags,todos",
+    scope: Annotated[str, Field(description="Comma list of buckets, letters.")] = "buckets,letters",
+    provenance: Annotated[str, Field(description="provenance_kind for a bucket whose body changes: keep (default, unchanged), unknown, summary, inference or system.")] = "keep",
+    dry_run: bool = True,
+    confirm_token: Annotated[str, Field(description="Issued by the dry run for exactly this plan; one-shot and short-lived. Any change to rules, matched buckets or their content voids it.")] = "",
+    page: Annotated[int, Field(description="Dry-run page of matched items.")] = 1,
+    page_size: Annotated[int, Field(description="Dry-run items per page, 1-50.")] = 10,
+) -> str:
+    """Controlled maintenance: literal batch find/replace in unsealed bucket content/name/tags/todo texts and letter bodies. Dry run (default) shows every hit with context, a plan hash and a confirm_token; execution needs that token. Sealed buckets and letters are skipped and only counted. Each bucket's pre-image is saved as a revision first (revision(action="restore") undoes it); letter bodies are saved to bucket_history. Time fields (last_active, updated_at) are not touched. Use only when Ting explicitly asks in the current conversation."""
+    import bulk_replace as br
+    try:
+        rules_n = br.normalize_rules(rules)
+        fields_n = br.normalize_fields(fields)
+        scope_n = br.normalize_scope(scope)
+        provenance_n = br.normalize_provenance(provenance)
+        page = int(page)
+        page_size = max(1, min(int(page_size), 50))
+    except (br.BulkReplaceError, TypeError, ValueError) as exc:
+        return _with_response_seal(f"bulk_replace rejected: {exc}\nno changes made.")
+    try:
+        plan = await _bulk_replace_plan(rules_n, fields_n, scope_n, provenance_n)
+    except Exception as exc:
+        logger.error("bulk_replace planning failed: %s", type(exc).__name__)
+        return _with_response_seal(f"bulk_replace planning failed: {type(exc).__name__}; no changes made.")
+    plan_hash = _confirmation_payload_digest(plan["payload"])
+    if dry_run:
+        token = _issue_mutation_confirmation("bulk_replace", plan["payload"]) if plan["buckets"] else None
+        return _with_response_seal(br.render_preview(
+            plan, plan_hash, token, _MUTATION_CONFIRM_TTL_SECONDS, page, page_size))
+    if not plan["buckets"]:
+        return _with_response_seal("bulk_replace: nothing matches; no changes made.")
+    if not _consume_mutation_confirmation("bulk_replace", plan["payload"], confirm_token):
+        return _with_response_seal(
+            "bulk_replace confirmation invalid, expired, used, or stale; no changes made. "
+            "Run dry_run=True again and use the new confirm_token.")
+    op_id = "bulk_replace:" + plan_hash[:16]
+    outcome: dict[str, list[str]] = {}
+    aborted = False
+    for item in plan["buckets"]:
+        try:
+            if item["id"].startswith("letter:"):
+                status = bucket_mgr.apply_bulk_replace_letter(
+                    int(item["id"].split(":", 1)[1]), expected_preimage_sha256=item["pre"],
+                    new_content=item["changes"]["content"], op_id=op_id)
+            else:
+                status = await bucket_mgr.apply_bulk_replace_bucket(
+                    item["id"], expected_preimage_sha256=item["pre"], changes=item["changes"],
+                    provenance=plan["provenance"], op_id=op_id)
+        except MaintenanceWriteError as exc:
+            status, aborted = f"blocked:{exc.code}", True
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+        outcome.setdefault(status, []).append(item["id"])
+        if aborted:
+            break
+    done = outcome.pop("updated", [])
+    logger.info("bulk_replace %s: updated=%d other=%s", op_id, len(done),
+                {k: len(v) for k, v in outcome.items()})
+    lines = [f"bulk_replace 已执行 op_id={op_id}",
+             f"已更新 {len(done)} 个（桶 {sum(1 for i in done if not i.startswith('letter:'))} / "
+             f"信 {sum(1 for i in done if i.startswith('letter:'))}）"]
+    for status, ids in sorted(outcome.items()):
+        lines.append(f"未更新 {status}：{len(ids)} 个 " + ", ".join(ids[:20]) + (" …" if len(ids) > 20 else ""))
+    if aborted:
+        skipped = len(plan["buckets"]) - len(done) - sum(len(v) for v in outcome.values())
+        lines.append(f"维护冻结中途停止，另有 {skipped} 个未处理；重新 dry_run 会只列出尚未改的。")
+    if outcome:
+        lines.append("未更新的项重新 dry_run 即可看到剩余命中。")
+    lines.append('撤销：桶用 revision(action="list", bucket_id=...) 找 op=bulk_replace 的最新 r<id>，再 '
+                 'revision(action="restore", bucket_id=..., revision="r<id>")；'
+                 "信的旧正文存在 bucket_history（bucket_id=letter:<id>，change_type=本 op_id），"
+                 "用 BucketManager.restore_bulk_replace_letters(op_id) 整批恢复。")
+    return _with_response_seal("\n".join(lines))
 
 
 # --- Fragment server_dashboard_api.py: Dashboard API, host vault, import API and status ---

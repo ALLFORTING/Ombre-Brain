@@ -282,6 +282,8 @@ talk / code 的 pinned 和最近归档截断同样给 ID、显示/总字符数�
 
 **related_backfill**：默认 `dry_run=True`，执行时会写 related 链接（跳过 sealed）。不主动发起。
 
+**bulk_replace**：按替换表批量改未封存桶和信的文字。默认 `dry_run=True`，执行必须带预览给的 `confirm_token`；sealed 跳过。只在婷明确要求时用。
+
 **seal_letter(letter_id, sealed=1)**：改 letter 的可见性，`sealed=0` 解封。不是普通检索工具，只在用户要求时用。
 
 ---
