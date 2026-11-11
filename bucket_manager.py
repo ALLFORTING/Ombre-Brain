@@ -5697,3 +5697,171 @@ class BucketManager(BucketRevisionMixin):
             "remaining": remaining,
             "changed": changed,
         }
+
+    def scan_bulk_replace_sources(self) -> dict:
+        """Read-only snapshot of every unsealed bucket for bulk_replace planning.
+
+        Sealed bodies are never kept; they are only counted. Duplicate ids are
+        excluded because a write could not be bound to a single file.
+        """
+        found: dict[str, list] = {}
+        skipped_sealed = unreadable = 0
+        for base_dir in (self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir):
+            if not os.path.exists(base_dir):
+                continue
+            for root, _, files in os.walk(base_dir):
+                for filename in sorted(files):
+                    if not filename.endswith(".md"):
+                        continue
+                    path = os.path.join(root, filename)
+                    try:
+                        post = frontmatter.load(path)
+                    except Exception:
+                        unreadable += 1
+                        continue
+                    if _is_sealed_bucket(post):
+                        skipped_sealed += 1
+                        continue
+                    bucket_id = str(post.get("id", Path(path).stem))
+                    found.setdefault(bucket_id, []).append({
+                        "id": bucket_id,
+                        "name": post.get("name"),
+                        "tags": post.get("tags"),
+                        "content": str(post.content or ""),
+                        "preimage_sha256": revision_snapshot(
+                            post, self._relative_bucket_path(path))["preimage_sha256"],
+                        "extra": {key: value for key, value in post.metadata.items()
+                                  if key not in ("id", "name", "tags", _IMPORT_MARKER_FIELD)
+                                  and isinstance(value, (str, list, dict))},
+                    })
+        duplicate_ids = sum(1 for items in found.values() if len(items) > 1)
+        return {"sources": [items[0] for items in found.values() if len(items) == 1],
+                "skipped_sealed": skipped_sealed, "unreadable": unreadable,
+                "duplicate_ids": duplicate_ids}
+
+    @guarded_async_mutation("bucket_bulk_replace")
+    async def apply_bulk_replace_bucket(
+        self,
+        bucket_id: str,
+        *,
+        expected_preimage_sha256: str,
+        changes: dict,
+        provenance: str,
+        op_id: str,
+    ) -> str:
+        """Apply one planned bulk_replace change set to one bucket.
+
+        Writes only content/name/tags (and provenance_kind when the body changes).
+        last_active, updated_at and every other time field are left untouched; no
+        touch, ripple or boot-delta event is recorded. The pre-image is stored as
+        a revision (op_kind="bulk_replace") in the same transaction as the write.
+        """
+        with bucket_write_scope(self.base_dir):
+            self.assert_confirmed_delete_writable(bucket_id)
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return "missing"
+            try:
+                post = frontmatter.load(file_path)
+            except Exception:
+                return "invalid"
+            if _is_sealed_bucket(post):
+                return "sealed"
+            snapshot = revision_snapshot(post, self._relative_bucket_path(file_path))
+            if snapshot["preimage_sha256"] != expected_preimage_sha256:
+                return "stale"
+            previous_content = str(post.content or "")
+            content_changed = "content" in changes and changes["content"] != previous_content
+            if content_changed:
+                try:
+                    self.record_history(bucket_id, previous_content, "bulk_replace",
+                                        _expected_source=self.delete_admission.capture(bucket_id))
+                except Exception as exc:
+                    logger.error("Refusing bulk_replace: history capture failed for %s: %s", bucket_id, exc)
+                    return "history_failed"
+                post.content = changes["content"]
+                if provenance != "keep":
+                    post["provenance_kind"] = normalize_provenance_kind(provenance, strict=True)
+            if "name" in changes:
+                post["name"] = changes["name"]
+            if "tags" in changes:
+                post["tags"] = changes["tags"]
+            try:
+                self.write_with_revision(bucket_id, snapshot, "bulk_replace", op_id,
+                                         lambda: self._write_post_atomic(file_path, post))
+            except (OSError, RevisionCaptureError) as exc:
+                logger.error("bulk_replace write failed for %s: %s", bucket_id, exc)
+                return "write_failed"
+        if content_changed:
+            await self._refresh_ordinary_embedding_best_effort(bucket_id, post.content)
+        return "updated"
+
+    @staticmethod
+    def _letter_preimage(row) -> str:
+        return hashlib.sha256(json.dumps(
+            ["letter", int(row[0]), row[1], int(row[4])], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def scan_bulk_replace_letters(self) -> dict:
+        """Read-only snapshot of unsealed handoff letters; sealed ones are only counted."""
+        sources, skipped_sealed = [], 0
+        with sqlite3.connect(self.history_db_path) as conn:
+            rows = conn.execute(
+                "SELECT id, content, created_at, session_id, sealed FROM letters ORDER BY id").fetchall()
+        for row in rows:
+            if int(row[4] or 0) == 1:
+                skipped_sealed += 1
+                continue
+            sources.append({"id": f"letter:{row[0]}", "name": None, "tags": None,
+                            "label": f"信 {str(row[2])[:19]}", "content": str(row[1] or ""),
+                            "preimage_sha256": self._letter_preimage(row), "extra": {}})
+        return {"sources": sources, "skipped_sealed_letters": skipped_sealed}
+
+    @guarded_mutation("bucket_bulk_replace_letter")
+    def apply_bulk_replace_letter(self, letter_id: int, *, expected_preimage_sha256: str,
+                                  new_content: str, op_id: str) -> str:
+        """Replace one letter body; the old body is saved first, in one transaction.
+
+        Letters have no revision table, so the pre-image goes to bucket_history as
+        bucket_id="letter:<id>", change_type=<op_id>. created_at/session_id/sealed
+        are never touched. Undo with restore_bulk_replace_letters(op_id).
+        """
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            row = conn.execute(
+                "SELECT id, content, created_at, session_id, sealed FROM letters WHERE id=?",
+                (int(letter_id),)).fetchone()
+            if row is None:
+                return "missing"
+            if int(row[4] or 0) == 1:
+                return "sealed"
+            if self._letter_preimage(row) != expected_preimage_sha256:
+                return "stale"
+            conn.execute(
+                "INSERT INTO bucket_history(bucket_id, old_content, changed_at, change_type) VALUES(?,?,?,?)",
+                (f"letter:{row[0]}", row[1] or "", now_iso(), op_id))
+            conn.execute("UPDATE letters SET content=? WHERE id=?", (new_content, int(letter_id)))
+        return "updated"
+
+    @guarded_mutation("bucket_bulk_replace_letter_restore")
+    def restore_bulk_replace_letters(self, op_id: str) -> dict:
+        """Put back the letter bodies saved by one bulk_replace run (earliest save per letter)."""
+        restored, missing = [], []
+        with bucket_write_scope(self.base_dir), sqlite3.connect(self.history_db_path) as conn:
+            saved = conn.execute(
+                "SELECT id, bucket_id, old_content FROM bucket_history "
+                "WHERE change_type=? AND bucket_id LIKE 'letter:%' ORDER BY id", (op_id,)).fetchall()
+            seen = set()
+            for _, bucket_id, old_content in saved:
+                if bucket_id in seen:
+                    continue
+                seen.add(bucket_id)
+                letter_id = int(bucket_id.split(":", 1)[1])
+                current = conn.execute("SELECT content FROM letters WHERE id=?", (letter_id,)).fetchone()
+                if current is None:
+                    missing.append(letter_id)
+                    continue
+                conn.execute(
+                    "INSERT INTO bucket_history(bucket_id, old_content, changed_at, change_type) VALUES(?,?,?,?)",
+                    (bucket_id, current[0] or "", now_iso(), f"restore:{op_id}"))
+                conn.execute("UPDATE letters SET content=? WHERE id=?", (old_content, letter_id))
+                restored.append(letter_id)
+        return {"restored": restored, "missing": missing}

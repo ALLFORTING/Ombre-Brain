@@ -1020,6 +1020,62 @@
       }
     },
     {
+      "name": "bulk_replace",
+      "primitive": "tool",
+      "category": "maintenance",
+      "audience": "controlled_operator",
+      "exposure": "default",
+      "diagnostic_only": false,
+      "feature_flag": null,
+      "mutability": "maintenance",
+      "auth_relevance": "endpoint_auth_maintenance_sensitive",
+      "compatibility_status": "compatibility_sensitive",
+      "output_kind": "text",
+      "input_schema_contract": {
+        "type": "object",
+        "properties": {
+          "confirm_token": {
+            "default": "",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "type": "boolean"
+          },
+          "fields": {
+            "default": "content,name,tags",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "provenance": {
+            "default": "unknown",
+            "type": "string"
+          },
+          "rules": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "default": "buckets,letters",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rules"
+        ]
+      }
+    },
+    {
       "name": "rm_asset_reindex_embeddings",
       "primitive": "tool",
       "category": "maintenance",
